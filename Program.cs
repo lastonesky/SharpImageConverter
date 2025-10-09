@@ -1,13 +1,22 @@
 using System;
+using System.IO;
 
 class Program
 {
-    public static string InputPath = @"d:\img-1.jpg";
-    static void Main()
+    static void Main(string[] args)
     {
+        if (args.Length < 1)
+        {
+            Console.WriteLine("用法: dotnet run -- <输入JPEG路径> [输出BMP路径]");
+            Console.WriteLine("当未提供输出路径时，默认写入到与输入同目录同名的 .bmp，且不覆盖已存在文件。");
+            return;
+        }
+        string inputPath = args[0];
+        string? outputPath = args.Length >= 2 ? args[1] : null;
+
         Console.WriteLine("Step 5: 解析 JPEG 量化表...");
 
-        string path = InputPath;
+        string path = inputPath;
         JpegParser parser = new JpegParser();
         parser.Parse(path);
 
@@ -43,10 +52,31 @@ class Program
 
         Console.WriteLine("Step 8: 基线JPEG解码到RGB并写BMP...");
         var decoder = new JpegDecoder(parser);
-        byte[] rgb = decoder.DecodeToRGB(InputPath);
-        string outPath = @"d:\out.bmp";
+        byte[] rgb = decoder.DecodeToRGB(inputPath);
+        string outPath = ResolveOutputPath(inputPath, outputPath);
         BmpWriter.Write24(outPath, parser.Width, parser.Height, rgb);
         Console.WriteLine($"✅ BMP 写入完成: {outPath}");
 
+    }
+
+    private static string ResolveOutputPath(string inputPath, string? outputPath)
+    {
+        string desired = outputPath ?? Path.Combine(
+            Path.GetDirectoryName(inputPath) ?? ".",
+            Path.GetFileNameWithoutExtension(inputPath) + ".bmp");
+
+        if (!File.Exists(desired)) return desired;
+
+        string dir = Path.GetDirectoryName(desired) ?? ".";
+        string nameNoExt = Path.GetFileNameWithoutExtension(desired);
+        string ext = Path.GetExtension(desired);
+        int idx = 1;
+        string candidate;
+        do
+        {
+            candidate = Path.Combine(dir, $"{nameNoExt} ({idx}){ext}");
+            idx++;
+        } while (File.Exists(candidate));
+        return candidate;
     }
 }
