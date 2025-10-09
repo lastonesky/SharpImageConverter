@@ -11,6 +11,10 @@ public class JpegParser
 
     public int Width { get; private set; }
     public int Height { get; private set; }
+    public List<(byte id, byte h, byte v, byte quantId)> FrameComponents { get; } = new();
+    public int MaxH { get; private set; }
+    public int MaxV { get; private set; }
+    public ushort RestartInterval { get; private set; }
 
     public void Parse(string path)
     {
@@ -65,11 +69,35 @@ public class JpegParser
                     byte precision = buf[0];
                     Height = (buf[1] << 8) | buf[2];
                     Width = (buf[3] << 8) | buf[4];
+                    int nf = buf[5];
+                    FrameComponents.Clear();
+                    MaxH = 0; MaxV = 0;
+                    int pos = 6;
+                    for (int i = 0; i < nf; i++)
+                    {
+                        byte cid = buf[pos++];
+                        byte hv = buf[pos++];
+                        byte qid = buf[pos++];
+                        byte h = (byte)(hv >> 4);
+                        byte v = (byte)(hv & 0x0F);
+                        FrameComponents.Add((cid, h, v, qid));
+                        if (h > MaxH) MaxH = h;
+                        if (v > MaxV) MaxV = v;
+                    }
                 }
                 // =============== 解析 DHT 段 ===============
                 else if (marker == 0xFFC4)
                 {
                     ParseHuffmanTables(fs, segLen);
+                }
+                // =============== 解析 DRI 段 ===============
+                else if (marker == 0xFFDD)
+                {
+                    // Restart Interval, 2 字节无符号
+                    int rhi = fs.ReadByte();
+                    int rlo = fs.ReadByte();
+                    if (rhi == -1 || rlo == -1) throw new Exception("DRI 段不完整");
+                    RestartInterval = (ushort)((rhi << 8) | rlo);
                 }
                 else if (marker == 0xFFDA) // SOS
                 {

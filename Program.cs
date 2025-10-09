@@ -1,12 +1,13 @@
-﻿using System;
+using System;
 
 class Program
 {
+    public static string InputPath = @"d:\img-1.jpg";
     static void Main()
     {
         Console.WriteLine("Step 5: 解析 JPEG 量化表...");
 
-        string path = @"d:\img-1.jpg";
+        string path = InputPath;
         JpegParser parser = new JpegParser();
         parser.Parse(path);
 
@@ -39,6 +40,13 @@ class Program
             }
         }
         Console.WriteLine("Step 7 OK: SOS 段解析完成");
+
+        Console.WriteLine("Step 8: 基线JPEG解码到RGB并写BMP...");
+        var decoder = new JpegDecoder(parser);
+        byte[] rgb = decoder.DecodeToRGB(InputPath);
+        string outPath = @"d:\out.bmp";
+        BmpWriter.Write24(outPath, parser.Width, parser.Height, rgb);
+        Console.WriteLine($"✅ BMP 写入完成: {outPath}");
 
     }
 }
