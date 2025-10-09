@@ -73,10 +73,8 @@ public class JpegParser
                 }
                 else if (marker == 0xFFDA) // SOS
                 {
-                    lenHi = fs.ReadByte();
-                    lenLo = fs.ReadByte();
-                    segLen = (lenHi << 8) | lenLo; // 包含长度字节
-                    int remaining = segLen - 2;        // 段内容长度
+                    // 注意：segLen 已在上方统一读取，这里不应再次读取。
+                    int remaining = segLen - 2;        // 段内容长度（不含长度字节）
 
                     int nbChannels = fs.ReadByte();
                     remaining--;
@@ -105,12 +103,21 @@ public class JpegParser
                         if (b == 0xFF)
                         {
                             int next = fs.ReadByte();
-                            if (next != 0x00)
+                            if (next == -1) break;
+                            if (next == 0x00)
                             {
-                                fs.Position -= 2; // 回到 marker 起始
-                                scanEnd = fs.Position;
-                                break;
+                                // 0xFF00 表示字节填充，实际数据中的 0xFF
+                                continue;
                             }
+                            // RSTn 重启标记 (FFD0-FFD7) 出现在熵编码数据中，不能作为扫描结束
+                            if (next >= 0xD0 && next <= 0xD7)
+                            {
+                                continue;
+                            }
+                            // 其他非填充的 0xFFxx 视为下一个段的标记
+                            fs.Position -= 2; // 回到 marker 起始
+                            scanEnd = fs.Position;
+                            break;
                         }
                     }
                     scanDataLength = scanEnd - scanDataOffset;
