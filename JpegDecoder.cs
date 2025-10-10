@@ -92,20 +92,30 @@ public class JpegDecoder
     {
         T.Assert(_parser.Scans.Count > 0, "未找到扫描数据");
         T.Assert(_parser.FrameComponents.Count > 0, "未找到SOF0组件");
-        if (_parser.MaxH != 1 || _parser.MaxV != 1)
-        {
-            throw new NotSupportedException("当前实现仅支持4:4:4采样。如需支持4:2:0/4:2:2，请确认后我再继续实现上采样和MCU映射。");
-        }
 
         int width = _parser.Width;
         int height = _parser.Height;
-        var Y = new int[width * height];
-        var Cb = new int[width * height];
-        var Cr = new int[width * height];
-
+        // 子采样分量的子平面（按各自采样分辨率），稍后上采样到全分辨率
         var compIndexById = new Dictionary<byte, int>();
         for (int i = 0; i < _parser.FrameComponents.Count; i++)
             compIndexById[_parser.FrameComponents[i].id] = i;
+
+        // MCU 尺寸取决于最大采样因子
+        int mcuWidth = 8 * _parser.MaxH;
+        int mcuHeight = 8 * _parser.MaxV;
+        int mcusX = (width + mcuWidth - 1) / mcuWidth;
+        int mcusY = (height + mcuHeight - 1) / mcuHeight;
+
+        // 为每个分量分配子平面
+        var subPlanes = new Dictionary<byte, (int w, int h, int[] data)>();
+        foreach (var f in _parser.FrameComponents)
+        {
+            int wComp = mcusX * f.h * 8;
+            int hComp = mcusY * f.v * 8;
+            subPlanes[f.id] = (wComp, hComp, new int[wComp * hComp]);
+        }
+
+        // 上方已建立 compIndexById
 
         using var fs = new FileStream(inputPath, FileMode.Open, FileAccess.Read);
         var scan = _parser.Scans[0]; // 基线假设：单扫描
@@ -134,10 +144,7 @@ public class JpegDecoder
             dequants[f.id] = dq;
         }
 
-        int mcuWidth = 8;
-        int mcuHeight = 8;
-        int mcusX = (width + mcuWidth - 1) / mcuWidth;
-        int mcusY = (height + mcuHeight - 1) / mcuHeight;
+        // MCU 尺寸与数量已在上方计算
 
         int[] prevDC = new int[256];
         Array.Clear(prevDC, 0, prevDC.Length);
@@ -151,70 +158,77 @@ public class JpegDecoder
                 {
                     byte cid = sc.channelId;
                     var f = _parser.FrameComponents[compIndexById[cid]];
+                    var (wComp, hComp, plane) = subPlanes[cid];
 
-                    // 4:4:4: 每个分量一个8x8
-                    short[] block = new short[64];
+                    // 每个分量在一个 MCU 中有 h×v 个 8×8 块
+                    int baseXSub = mx * (8 * f.h);
+                    int baseYSub = my * (8 * f.v);
 
-                    // DC
-                    var dcTable = _parser.HuffmanTables[(0, sc.dcTableId)];
-                    int ssss = DecodeSymbol(br, dcCanon[sc.dcTableId], dcTable);
-                    int dcDiff = (ssss == 0) ? 0 : ExtendSign(br.GetBits(ssss), ssss);
-                    int dc = prevDC[cid] + dcDiff;
-                    prevDC[cid] = dc;
-                    block[0] = (short)dc;
-
-                    // AC
-                    var acTable = _parser.HuffmanTables[(1, sc.acTableId)];
-                    int k = 1;
-                    while (k < 64)
+                    for (int vy = 0; vy < f.v; vy++)
                     {
-                        int rs = DecodeSymbol(br, acCanon[sc.acTableId], acTable);
-                        int r = rs >> 4;
-                        int s = rs & 0x0F;
-                        if (s == 0)
+                        for (int hx = 0; hx < f.h; hx++)
                         {
-                            if (r == 0) // EOB
-                                break;
-                            if (r == 15) // ZRL: 跳过 16 个零系数
+                            short[] block = new short[64];
+
+                            // DC
+                            var dcTable = _parser.HuffmanTables[(0, sc.dcTableId)];
+                            int ssss = DecodeSymbol(br, dcCanon[sc.dcTableId], dcTable);
+                            int dcDiff = (ssss == 0) ? 0 : ExtendSign(br.GetBits(ssss), ssss);
+                            int dc = prevDC[cid] + dcDiff;
+                            prevDC[cid] = dc;
+                            block[0] = (short)dc;
+
+                            // AC
+                            var acTable = _parser.HuffmanTables[(1, sc.acTableId)];
+                            int k = 1;
+                            while (k < 64)
                             {
-                                k += 16;
-                                continue;
+                                int rs = DecodeSymbol(br, acCanon[sc.acTableId], acTable);
+                                int r = rs >> 4;
+                                int s = rs & 0x0F;
+                                if (s == 0)
+                                {
+                                    if (r == 0) // EOB
+                                        break;
+                                    if (r == 15) // ZRL: 跳过 16 个零系数
+                                    {
+                                        k += 16;
+                                        continue;
+                                    }
+                                    k += r;
+                                    continue;
+                                }
+                                k += r;
+                                if (k >= 64) break; // 防越界
+                                int val = ExtendSign(br.GetBits(s), s);
+                                block[UnZigZag[k]] = (short)val;
+                                k++;
                             }
-                            k += r;
-                            continue;
-                        }
-                        k += r;
-                        if (k >= 64) break; // 防越界
-                        int val = ExtendSign(br.GetBits(s), s);
-                        block[UnZigZag[k]] = (short)val;
-                        k++;
-                    }
 
-                    // 反量化（自然顺序）
-                    var dq = dequants[cid];
-                    for (int i = 0; i < 64; i++)
-                        block[i] = (short)(block[i] * dq[i]);
+                            // 反量化（自然顺序）
+                            var dq = dequants[cid];
+                            for (int i = 0; i < 64; i++)
+                                block[i] = (short)(block[i] * dq[i]);
 
-                    // IDCT
-                    int[] pix = new int[64];
-                    Idct.IDCT8x8(block, 0, pix, 0);
+                            // IDCT
+                            int[] pix = new int[64];
+                            Idct.IDCT8x8(block, 0, pix, 0);
 
-                    // 放置到图像
-                    int baseX = mx * 8;
-                    int baseY = my * 8;
-                    for (int yy = 0; yy < 8; yy++)
-                    {
-                        int py = baseY + yy;
-                        if (py >= height) break;
-                        for (int xx = 0; xx < 8; xx++)
-                        {
-                            int px = baseX + xx;
-                            if (px >= width) break;
-                            int dst = py * width + px;
-                            int v = pix[yy * 8 + xx];
-                            if (cid == 1) Y[dst] = v;
-                            else if (cid == 2) Cb[dst] = v;
-                            else if (cid == 3) Cr[dst] = v;
+                            // 放置到分量子平面
+                            int blockBaseX = baseXSub + hx * 8;
+                            int blockBaseY = baseYSub + vy * 8;
+                            for (int yy = 0; yy < 8; yy++)
+                            {
+                                int py = blockBaseY + yy;
+                                if (py >= hComp) break;
+                                for (int xx = 0; xx < 8; xx++)
+                                {
+                                    int px = blockBaseX + xx;
+                                    if (px >= wComp) break;
+                                    int dst = py * wComp + px;
+                                    plane[dst] = pix[yy * 8 + xx];
+                                }
+                            }
                         }
                     }
                 }
@@ -228,13 +242,49 @@ public class JpegDecoder
             }
         }
 
+        // 最近邻上采样到全分辨率
+        var Y_full = new int[width * height];
+        var Cb_full = new int[width * height];
+        var Cr_full = new int[width * height];
+
+        foreach (var f in _parser.FrameComponents)
+        {
+            var (wComp, hComp, plane) = subPlanes[f.id];
+            int sx = _parser.MaxH / Math.Max(1, (int)f.h);
+            int sy = _parser.MaxV / Math.Max(1, (int)f.v);
+
+            for (int ySub = 0; ySub < hComp; ySub++)
+            {
+                int yFullBase = ySub * sy;
+                for (int xSub = 0; xSub < wComp; xSub++)
+                {
+                    int xFullBase = xSub * sx;
+                    int val = plane[ySub * wComp + xSub];
+                    for (int dy = 0; dy < sy; dy++)
+                    {
+                        int py = yFullBase + dy;
+                        if (py >= height) break;
+                        for (int dx = 0; dx < sx; dx++)
+                        {
+                            int px = xFullBase + dx;
+                            if (px >= width) break;
+                            int dst = py * width + px;
+                            if (f.id == 1) Y_full[dst] = val;
+                            else if (f.id == 2) Cb_full[dst] = val;
+                            else if (f.id == 3) Cr_full[dst] = val;
+                        }
+                    }
+                }
+            }
+        }
+
         // YCbCr -> RGB (BT.601)
         byte[] rgb = new byte[width * height * 3];
         for (int i = 0; i < width * height; i++)
         {
-            int y = Y[i];
-            int cb = Cb[i] - 128;
-            int cr = Cr[i] - 128;
+            int y = Y_full[i];
+            int cb = Cb_full[i] - 128;
+            int cr = Cr_full[i] - 128;
             int R = (int)Math.Round(y + 1.402 * cr);
             int G = (int)Math.Round(y - 0.344136 * cb - 0.714136 * cr);
             int B = (int)Math.Round(y + 1.772 * cb);
