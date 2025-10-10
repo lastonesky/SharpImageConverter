@@ -58,14 +58,14 @@ public class JpegParser
                 if (marker == 0xFFDB)
                 {
                     byte[] buf = new byte[segLen - 2];
-                    fs.Read(buf, 0, buf.Length);
+                    fs.ReadExactly(buf, 0, buf.Length);
                     ParseQuantTables(buf);
                 }
                 // =============== 解析 SOF0 段 ===============
                 else if (marker == 0xFFC0)
                 {
                     byte[] buf = new byte[segLen - 2];
-                    fs.Read(buf, 0, buf.Length);
+                    fs.ReadExactly(buf, 0, buf.Length);
                     byte precision = buf[0];
                     Height = (buf[1] << 8) | buf[2];
                     Width = (buf[3] << 8) | buf[4];
@@ -220,9 +220,7 @@ public class JpegParser
             }
 
             byte[] symbols = new byte[totalSymbols];
-            int n = fs.Read(symbols, 0, totalSymbols);
-            if (n != totalSymbols)
-                throw new Exception($"DHT 段符号数量 ({totalSymbols}) 超过剩余字节 ({n})");
+            fs.ReadExactly(symbols, 0, totalSymbols);
             bytesRead += totalSymbols;
 
             HuffmanTables[(tableClass, tableId)] = new JpegHuffmanTable(tableClass, tableId, codeLengths, symbols);

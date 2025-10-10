@@ -52,10 +52,17 @@ class Program
 
         Console.WriteLine("Step 8: 基线JPEG解码到RGB并写BMP...");
         var decoder = new JpegDecoder(parser);
+        var swTotal = System.Diagnostics.Stopwatch.StartNew();
+        var swDecode = System.Diagnostics.Stopwatch.StartNew();
         byte[] rgb = decoder.DecodeToRGB(inputPath);
+        swDecode.Stop();
         string outPath = ResolveOutputPath(inputPath, outputPath);
+        var swWrite = System.Diagnostics.Stopwatch.StartNew();
         BmpWriter.Write24(outPath, parser.Width, parser.Height, rgb);
+        swWrite.Stop();
+        swTotal.Stop();
         Console.WriteLine($"✅ BMP 写入完成: {outPath}");
+        Console.WriteLine($"⏱️ 解码耗时: {swDecode.ElapsedMilliseconds} ms, 写入耗时: {swWrite.ElapsedMilliseconds} ms, 总耗时: {swTotal.ElapsedMilliseconds} ms");
 
     }
 

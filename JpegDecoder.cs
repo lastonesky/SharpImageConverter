@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Diagnostics;
 
 public class JpegDecoder
 {
@@ -150,6 +151,10 @@ public class JpegDecoder
         Array.Clear(prevDC, 0, prevDC.Length);
         int mcusProcessed = 0;
 
+        // 性能计时
+        var swEntropy = Stopwatch.StartNew();
+        long idctTicks = 0;
+
         for (int my = 0; my < mcusY; my++)
         {
             for (int mx = 0; mx < mcusX; mx++)
@@ -164,26 +169,35 @@ public class JpegDecoder
                     int baseXSub = mx * (8 * f.h);
                     int baseYSub = my * (8 * f.v);
 
+                    // 预取该分量的表与反量化，减少字典查找
+                    var dcTable = _parser.HuffmanTables[(0, sc.dcTableId)];
+                    var acTable = _parser.HuffmanTables[(1, sc.acTableId)];
+                    var dcCanonRef = dcCanon[sc.dcTableId];
+                    var acCanonRef = acCanon[sc.acTableId];
+                    var dq = dequants[cid];
+
+                    // 复用块与像素缓冲，避免频繁分配
+                    short[] block = new short[64];
+                    int[] pix = new int[64];
+
                     for (int vy = 0; vy < f.v; vy++)
                     {
                         for (int hx = 0; hx < f.h; hx++)
                         {
-                            short[] block = new short[64];
+                            Array.Clear(block, 0, 64);
 
                             // DC
-                            var dcTable = _parser.HuffmanTables[(0, sc.dcTableId)];
-                            int ssss = DecodeSymbol(br, dcCanon[sc.dcTableId], dcTable);
+                            int ssss = DecodeSymbol(br, dcCanonRef, dcTable);
                             int dcDiff = (ssss == 0) ? 0 : ExtendSign(br.GetBits(ssss), ssss);
                             int dc = prevDC[cid] + dcDiff;
                             prevDC[cid] = dc;
                             block[0] = (short)dc;
 
                             // AC
-                            var acTable = _parser.HuffmanTables[(1, sc.acTableId)];
                             int k = 1;
                             while (k < 64)
                             {
-                                int rs = DecodeSymbol(br, acCanon[sc.acTableId], acTable);
+                                int rs = DecodeSymbol(br, acCanonRef, acTable);
                                 int r = rs >> 4;
                                 int s = rs & 0x0F;
                                 if (s == 0)
@@ -206,13 +220,30 @@ public class JpegDecoder
                             }
 
                             // 反量化（自然顺序）
-                            var dq = dequants[cid];
                             for (int i = 0; i < 64; i++)
                                 block[i] = (short)(block[i] * dq[i]);
 
                             // IDCT
-                            int[] pix = new int[64];
-                            Idct.IDCT8x8(block, 0, pix, 0);
+                            bool dcOnly = true;
+                            for (int i = 1; i < 64; i++)
+                            {
+                                if (block[i] != 0) { dcOnly = false; break; }
+                            }
+
+                            if (dcOnly)
+                            {
+                                int val = (block[0] / 8) + 128;
+                                if (val < 0) val = 0;
+                                if (val > 255) val = 255;
+                                for (int i = 0; i < 64; i++) pix[i] = val;
+                            }
+                            else
+                            {
+                                var swId = Stopwatch.StartNew();
+                                Idct.IDCT8x8Fast(block, 0, pix, 0);
+                                swId.Stop();
+                                idctTicks += swId.ElapsedTicks;
+                            }
 
                             // 放置到分量子平面
                             int blockBaseX = baseXSub + hx * 8;
@@ -242,7 +273,10 @@ public class JpegDecoder
             }
         }
 
+        swEntropy.Stop();
+
         // 最近邻上采样到全分辨率
+        var swUpsample = Stopwatch.StartNew();
         var Y_full = new int[width * height];
         var Cb_full = new int[width * height];
         var Cr_full = new int[width * height];
@@ -277,17 +311,20 @@ public class JpegDecoder
                 }
             }
         }
+        swUpsample.Stop();
 
-        // YCbCr -> RGB (BT.601)
+        // YCbCr -> RGB (BT.601) — 使用整数近似提升性能
+        var swColor = Stopwatch.StartNew();
         byte[] rgb = new byte[width * height * 3];
         for (int i = 0; i < width * height; i++)
         {
             int y = Y_full[i];
             int cb = Cb_full[i] - 128;
             int cr = Cr_full[i] - 128;
-            int R = (int)Math.Round(y + 1.402 * cr);
-            int G = (int)Math.Round(y - 0.344136 * cb - 0.714136 * cr);
-            int B = (int)Math.Round(y + 1.772 * cb);
+            // 近似系数 *256：R = y + 1.402*cr → 359, G = y - 0.344136*cb - 0.714136*cr → -88, -183, B = y + 1.772*cb → 454
+            int R = y + ((359 * cr) >> 8);
+            int G = y - ((88 * cb + 183 * cr) >> 8);
+            int B = y + ((454 * cb) >> 8);
             if (R < 0) R = 0; if (R > 255) R = 255;
             if (G < 0) G = 0; if (G > 255) G = 255;
             if (B < 0) B = 0; if (B > 255) B = 255;
@@ -295,6 +332,14 @@ public class JpegDecoder
             rgb[i * 3 + 1] = (byte)G;
             rgb[i * 3 + 2] = (byte)R;
         }
+        swColor.Stop();
+
+        // 打印分阶段耗时（ms）
+        double toMs(long ticks) => (ticks * 1000.0) / Stopwatch.Frequency;
+        Console.WriteLine($"⏱️ 熵解码+反量化耗时: {swEntropy.ElapsedMilliseconds} ms");
+        Console.WriteLine($"⏱️ IDCT耗时: {toMs(idctTicks):F1} ms");
+        Console.WriteLine($"⏱️ 上采样耗时: {swUpsample.ElapsedMilliseconds} ms");
+        Console.WriteLine($"⏱️ 颜色转换耗时: {swColor.ElapsedMilliseconds} ms");
 
         return rgb;
     }
