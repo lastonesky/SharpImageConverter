@@ -18,6 +18,16 @@ public class JpegDecoder
        35,36,48,49,57,58,62,63
     };
 
+    // 逆映射：ZigZag 索引 -> 自然序索引
+    private static readonly int[] UnZigZag = BuildInverse(ZigZag);
+
+    private static int[] BuildInverse(int[] map)
+    {
+        var inv = new int[64];
+        for (int i = 0; i < 64; i++) inv[map[i]] = i;
+        return inv;
+    }
+
     public JpegDecoder(JpegParser parser)
     {
         _parser = parser;
@@ -120,7 +130,7 @@ public class JpegDecoder
             ushort[] dq = new ushort[64];
             var qt = _parser.QuantTables[f.quantId];
             // qt.Values按读取顺序（JPEG标准为ZigZag），映射到自然顺序
-            for (int j = 0; j < 64; j++) dq[ZigZag[j]] = qt.Values[j];
+            for (int j = 0; j < 64; j++) dq[j] = qt.Values[ZigZag[j]];
             dequants[f.id] = dq;
         }
 
@@ -165,12 +175,18 @@ public class JpegDecoder
                         {
                             if (r == 0) // EOB
                                 break;
+                            if (r == 15) // ZRL: 跳过 16 个零系数
+                            {
+                                k += 16;
+                                continue;
+                            }
                             k += r;
                             continue;
                         }
                         k += r;
+                        if (k >= 64) break; // 防越界
                         int val = ExtendSign(br.GetBits(s), s);
-                        block[ZigZag[k]] = (short)val;
+                        block[UnZigZag[k]] = (short)val;
                         k++;
                     }
 
