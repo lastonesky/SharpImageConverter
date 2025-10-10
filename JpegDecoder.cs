@@ -79,7 +79,7 @@ public class JpegDecoder
         public int MaxFastBits = 12;
     }
 
-    private CanonicalHuff BuildCanonical(JpegHuffmanTable ht)
+    private static CanonicalHuff BuildCanonical(JpegHuffmanTable ht)
     {
         var first = new int[17];
         var count = new int[17];
@@ -100,7 +100,7 @@ public class JpegDecoder
         return new CanonicalHuff { FirstCode = first, CodeCount = count, SymbolOffset = off };
     }
 
-    private FastHuff BuildFast(JpegHuffmanTable ht, CanonicalHuff ch)
+    private static FastHuff BuildFast(JpegHuffmanTable ht, CanonicalHuff ch)
     {
         var fh = new FastHuff();
         for (int i = 0; i < fh.Lookup.Length; i++) fh.Lookup[i] = -1;
@@ -127,7 +127,7 @@ public class JpegDecoder
         return fh;
     }
 
-    private int ExtendSign(int v, int t)
+    private static int ExtendSign(int v, int t)
     {
         int vt = 1 << (t - 1);
         if (v < vt)
@@ -135,7 +135,7 @@ public class JpegDecoder
         return v;
     }
 
-    private int DecodeSymbolSlow(BitReader br, CanonicalHuff ch, JpegHuffmanTable ht)
+    private static int DecodeSymbolSlow(BitReader br, CanonicalHuff ch, JpegHuffmanTable ht)
     {
         int code = 0;
         for (int len = 1; len <= 16; len++)
@@ -154,7 +154,7 @@ public class JpegDecoder
         throw new Exception("霍夫曼码未匹配");
     }
 
-    private int DecodeSymbol(BitReader br, CanonicalHuff ch, FastHuff fh, JpegHuffmanTable ht)
+    private static int DecodeSymbol(BitReader br, CanonicalHuff ch, FastHuff fh, JpegHuffmanTable ht)
     {
         // 快速路径：预取 12 位
         if (br.EnsureBits(fh.MaxFastBits))
@@ -193,11 +193,11 @@ public class JpegDecoder
 
         // 为每个分量分配子平面
         var subPlanes = new Dictionary<byte, (int w, int h, int[] data)>();
-        foreach (var f in _parser.FrameComponents)
+        foreach (var (id, h, v, _) in _parser.FrameComponents)
         {
-            int wComp = mcusX * f.h * 8;
-            int hComp = mcusY * f.v * 8;
-            subPlanes[f.id] = (wComp, hComp, new int[wComp * hComp]);
+            int wComp = mcusX * h * 8;
+            int hComp = mcusY * v * 8;
+            subPlanes[id] = (wComp, hComp, new int[wComp * hComp]);
         }
 
         // 上方已建立 compIndexById
@@ -224,13 +224,13 @@ public class JpegDecoder
 
         // 每个分量的反量化表（按自然顺序）
         var dequants = new Dictionary<byte, ushort[]>();
-        foreach (var f in _parser.FrameComponents)
+        foreach (var (id, h, v, quantId) in _parser.FrameComponents)
         {
             ushort[] dq = new ushort[64];
-            var qt = _parser.QuantTables[f.quantId];
+            var qt = _parser.QuantTables[quantId];
             // qt.Values按读取顺序（JPEG标准为ZigZag），映射到自然顺序
             for (int j = 0; j < 64; j++) dq[j] = qt.Values[ZigZag[j]];
-            dequants[f.id] = dq;
+            dequants[id] = dq;
         }
 
         // MCU 尺寸与数量已在上方计算

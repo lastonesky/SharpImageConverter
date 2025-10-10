@@ -22,7 +22,7 @@ public class JpegParser
     {
         T.Assert(File.Exists(path), $"文件不存在: {path}");
 
-        using (FileStream fs = new FileStream(path, FileMode.Open, FileAccess.Read))
+        using (FileStream fs = new (path, FileMode.Open, FileAccess.Read))
         {
             int b1 = fs.ReadByte();
             int b2 = fs.ReadByte();
