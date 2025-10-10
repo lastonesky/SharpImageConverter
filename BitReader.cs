@@ -66,4 +66,32 @@ public class BitReader
     }
 
     public int GetBit() => GetBits(1);
+
+    // 确保位缓冲中至少有 n 位（不消耗），用于快速霍夫曼查表
+    public bool EnsureBits(int n)
+    {
+        while (_bitCount < n && !_eof)
+        {
+            int b = ReadByteStuffed();
+            if (b == -1 || b == -2) { _eof = true; break; }
+            _bitBuf = (_bitBuf << 8) | b;
+            _bitCount += 8;
+        }
+        return _bitCount >= n;
+    }
+
+    // 查看高位的 n 位，不消耗
+    public int PeekBits(int n)
+    {
+        if (!EnsureBits(n)) throw new EndOfStreamException("位流不足");
+        return (_bitBuf >> (_bitCount - n)) & ((1 << n) - 1);
+    }
+
+    // 丢弃高位的 n 位
+    public void DropBits(int n)
+    {
+        if (n > _bitCount) throw new ArgumentOutOfRangeException(nameof(n), "丢弃位数超过缓冲");
+        _bitCount -= n;
+        _bitBuf &= (1 << _bitCount) - 1;
+    }
 }

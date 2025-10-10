@@ -41,6 +41,44 @@ public class JpegDecoder
         public int[] SymbolOffset; // 1..16
     }
 
+    // 颜色转换查表，减少每像素乘法
+    private static readonly int[] CrToR = BuildCrToR();
+    private static readonly int[] CbToB = BuildCbToB();
+    private static readonly int[] CrToG = BuildCrToG();
+    private static readonly int[] CbToG = BuildCbToG();
+
+    private static int[] BuildCrToR()
+    {
+        var t = new int[256];
+        for (int i = 0; i < 256; i++) t[i] = (359 * (i - 128)) >> 8; // 1.402*256≈359
+        return t;
+    }
+    private static int[] BuildCbToB()
+    {
+        var t = new int[256];
+        for (int i = 0; i < 256; i++) t[i] = (454 * (i - 128)) >> 8; // 1.772*256≈454
+        return t;
+    }
+    private static int[] BuildCrToG()
+    {
+        var t = new int[256];
+        for (int i = 0; i < 256; i++) t[i] = (183 * (i - 128)) >> 8; // 0.714136*256≈183
+        return t;
+    }
+    private static int[] BuildCbToG()
+    {
+        var t = new int[256];
+        for (int i = 0; i < 256; i++) t[i] = (88 * (i - 128)) >> 8; // 0.344136*256≈88
+        return t;
+    }
+
+    // 快速霍夫曼：派生表，包含最大 12 位前缀查找（常用）
+    private class FastHuff
+    {
+        public int[] Lookup = new int[1 << 12]; // 值: (len<<8) | symbol, 若为 -1 则需慢速路径
+        public int MaxFastBits = 12;
+    }
+
     private CanonicalHuff BuildCanonical(JpegHuffmanTable ht)
     {
         var first = new int[17];
@@ -62,6 +100,33 @@ public class JpegDecoder
         return new CanonicalHuff { FirstCode = first, CodeCount = count, SymbolOffset = off };
     }
 
+    private FastHuff BuildFast(JpegHuffmanTable ht, CanonicalHuff ch)
+    {
+        var fh = new FastHuff();
+        for (int i = 0; i < fh.Lookup.Length; i++) fh.Lookup[i] = -1;
+        for (int len = 1; len <= Math.Min(12, 16); len++)
+        {
+            int fc = ch.FirstCode[len];
+            int cnt = ch.CodeCount[len];
+            if (cnt == 0) continue;
+            for (int r = 0; r < cnt; r++)
+            {
+                int code = fc + r;
+                int idx = ch.SymbolOffset[len] + r;
+                int sym = ht.Symbols[idx];
+                // 扩展到 12 位前缀空间
+                int fill = fh.MaxFastBits - len;
+                int baseCode = code << fill;
+                int end = baseCode | ((1 << fill) - 1);
+                for (int x = baseCode; x <= end; x++)
+                {
+                    fh.Lookup[x] = (len << 8) | sym;
+                }
+            }
+        }
+        return fh;
+    }
+
     private int ExtendSign(int v, int t)
     {
         int vt = 1 << (t - 1);
@@ -70,7 +135,7 @@ public class JpegDecoder
         return v;
     }
 
-    private int DecodeSymbol(BitReader br, CanonicalHuff ch, JpegHuffmanTable ht)
+    private int DecodeSymbolSlow(BitReader br, CanonicalHuff ch, JpegHuffmanTable ht)
     {
         int code = 0;
         for (int len = 1; len <= 16; len++)
@@ -87,6 +152,25 @@ public class JpegDecoder
             }
         }
         throw new Exception("霍夫曼码未匹配");
+    }
+
+    private int DecodeSymbol(BitReader br, CanonicalHuff ch, FastHuff fh, JpegHuffmanTable ht)
+    {
+        // 快速路径：预取 12 位
+        if (br.EnsureBits(fh.MaxFastBits))
+        {
+            int peek = br.PeekBits(fh.MaxFastBits);
+            int v = fh.Lookup[peek];
+            if (v >= 0)
+            {
+                int len = (v >> 8) & 0xFF;
+                int sym = v & 0xFF;
+                br.DropBits(len);
+                return sym;
+            }
+        }
+        // 慢速回退
+        return DecodeSymbolSlow(br, ch, ht);
     }
 
     public byte[] DecodeToRGB(string inputPath)
@@ -126,12 +210,16 @@ public class JpegDecoder
         // 构建每个使用表的canonical
         var dcCanon = new Dictionary<byte, CanonicalHuff>();
         var acCanon = new Dictionary<byte, CanonicalHuff>();
+        var dcFast = new Dictionary<byte, FastHuff>();
+        var acFast = new Dictionary<byte, FastHuff>();
         foreach (var c in scan.Components)
         {
             var dc = _parser.HuffmanTables[(0, c.dcTableId)];
             var ac = _parser.HuffmanTables[(1, c.acTableId)];
             dcCanon[c.dcTableId] = BuildCanonical(dc);
             acCanon[c.acTableId] = BuildCanonical(ac);
+            dcFast[c.dcTableId] = BuildFast(dc, dcCanon[c.dcTableId]);
+            acFast[c.acTableId] = BuildFast(ac, acCanon[c.acTableId]);
         }
 
         // 每个分量的反量化表（按自然顺序）
@@ -177,8 +265,9 @@ public class JpegDecoder
                     var dq = dequants[cid];
 
                     // 复用块与像素缓冲，避免频繁分配
-                    short[] block = new short[64];
-                    int[] pix = new int[64];
+                    // 使用 ArrayPool 复用块缓冲，降低分配与 GC 压力
+                    var block = System.Buffers.ArrayPool<short>.Shared.Rent(64);
+                    var pix = System.Buffers.ArrayPool<int>.Shared.Rent(64);
 
                     for (int vy = 0; vy < f.v; vy++)
                     {
@@ -187,7 +276,7 @@ public class JpegDecoder
                             Array.Clear(block, 0, 64);
 
                             // DC
-                            int ssss = DecodeSymbol(br, dcCanonRef, dcTable);
+                            int ssss = DecodeSymbol(br, dcCanonRef, dcFast[sc.dcTableId], dcTable);
                             int dcDiff = (ssss == 0) ? 0 : ExtendSign(br.GetBits(ssss), ssss);
                             int dc = prevDC[cid] + dcDiff;
                             prevDC[cid] = dc;
@@ -197,7 +286,7 @@ public class JpegDecoder
                             int k = 1;
                             while (k < 64)
                             {
-                                int rs = DecodeSymbol(br, acCanonRef, acTable);
+                                int rs = DecodeSymbol(br, acCanonRef, acFast[sc.acTableId], acTable);
                                 int r = rs >> 4;
                                 int s = rs & 0x0F;
                                 if (s == 0)
@@ -262,6 +351,9 @@ public class JpegDecoder
                             }
                         }
                     }
+                    // 归还缓冲（组件级作用域）
+                    System.Buffers.ArrayPool<short>.Shared.Return(block);
+                    System.Buffers.ArrayPool<int>.Shared.Return(pix);
                 }
 
                 mcusProcessed++;
@@ -275,37 +367,72 @@ public class JpegDecoder
 
         swEntropy.Stop();
 
-        // 最近邻上采样到全分辨率
+        // 最近邻上采样到全分辨率（4:4:4 专用快速路径 + 通用路径）
         var swUpsample = Stopwatch.StartNew();
         var Y_full = new int[width * height];
         var Cb_full = new int[width * height];
         var Cr_full = new int[width * height];
 
-        foreach (var f in _parser.FrameComponents)
+        bool is444 = _parser.MaxH == 1 && _parser.MaxV == 1;
+        if (is444)
         {
-            var (wComp, hComp, plane) = subPlanes[f.id];
-            int sx = _parser.MaxH / Math.Max(1, (int)f.h);
-            int sy = _parser.MaxV / Math.Max(1, (int)f.v);
-
-            for (int ySub = 0; ySub < hComp; ySub++)
+            foreach (var f in _parser.FrameComponents)
             {
-                int yFullBase = ySub * sy;
-                for (int xSub = 0; xSub < wComp; xSub++)
+                if (f.h != 1 || f.v != 1) { is444 = false; break; }
+            }
+        }
+
+        if (is444)
+        {
+            // 直接行拷贝 plane 的前 width 元素（顶部 height 行）
+            foreach (var f in _parser.FrameComponents)
+            {
+                var (wComp, hComp, plane) = subPlanes[f.id];
+                for (int y = 0; y < height; y++)
                 {
-                    int xFullBase = xSub * sx;
-                    int val = plane[ySub * wComp + xSub];
-                    for (int dy = 0; dy < sy; dy++)
+                    int srcRowBase = y * wComp;
+                    int dstRowBase = y * width;
+                    int len = width;
+                    // 手动拷贝以避免 int[] 到 int[] 的 BlockCopy 开销非对齐问题
+                    for (int x = 0; x < len; x++)
                     {
-                        int py = yFullBase + dy;
-                        if (py >= height) break;
-                        for (int dx = 0; dx < sx; dx++)
+                        int val = plane[srcRowBase + x];
+                        int dst = dstRowBase + x;
+                        if (f.id == 1) Y_full[dst] = val;
+                        else if (f.id == 2) Cb_full[dst] = val;
+                        else if (f.id == 3) Cr_full[dst] = val;
+                    }
+                }
+            }
+        }
+        else
+        {
+            foreach (var f in _parser.FrameComponents)
+            {
+                var (wComp, hComp, plane) = subPlanes[f.id];
+                int sx = _parser.MaxH / Math.Max(1, (int)f.h);
+                int sy = _parser.MaxV / Math.Max(1, (int)f.v);
+
+                for (int ySub = 0; ySub < hComp; ySub++)
+                {
+                    int yFullBase = ySub * sy;
+                    for (int xSub = 0; xSub < wComp; xSub++)
+                    {
+                        int xFullBase = xSub * sx;
+                        int val = plane[ySub * wComp + xSub];
+                        for (int dy = 0; dy < sy; dy++)
                         {
-                            int px = xFullBase + dx;
-                            if (px >= width) break;
-                            int dst = py * width + px;
-                            if (f.id == 1) Y_full[dst] = val;
-                            else if (f.id == 2) Cb_full[dst] = val;
-                            else if (f.id == 3) Cr_full[dst] = val;
+                            int py = yFullBase + dy;
+                            if (py >= height) break;
+                            for (int dx = 0; dx < sx; dx++)
+                            {
+                                int px = xFullBase + dx;
+                                if (px >= width) break;
+                                int dst = py * width + px;
+                                if (f.id == 1) Y_full[dst] = val;
+                                else if (f.id == 2) Cb_full[dst] = val;
+                                else if (f.id == 3) Cr_full[dst] = val;
+                            }
                         }
                     }
                 }
@@ -319,12 +446,11 @@ public class JpegDecoder
         for (int i = 0; i < width * height; i++)
         {
             int y = Y_full[i];
-            int cb = Cb_full[i] - 128;
-            int cr = Cr_full[i] - 128;
-            // 近似系数 *256：R = y + 1.402*cr → 359, G = y - 0.344136*cb - 0.714136*cr → -88, -183, B = y + 1.772*cb → 454
-            int R = y + ((359 * cr) >> 8);
-            int G = y - ((88 * cb + 183 * cr) >> 8);
-            int B = y + ((454 * cb) >> 8);
+            int cbv = Cb_full[i];
+            int crv = Cr_full[i];
+            int R = y + CrToR[crv];
+            int G = y - (CbToG[cbv] + CrToG[crv]);
+            int B = y + CbToB[cbv];
             if (R < 0) R = 0; if (R > 255) R = 255;
             if (G < 0) G = 0; if (G > 255) G = 255;
             if (B < 0) B = 0; if (B > 255) B = 255;
