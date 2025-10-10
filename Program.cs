@@ -56,9 +56,19 @@ class Program
         var swDecode = System.Diagnostics.Stopwatch.StartNew();
         byte[] rgb = decoder.DecodeToRGB(inputPath);
         swDecode.Stop();
+        // 根据 EXIF 方向进行旋转/翻转，保证与常见查看器显示一致
+        int outW = parser.Width, outH = parser.Height;
+        if (parser.ExifOrientation != 1)
+        {
+            Console.WriteLine($"✅ 检测到 EXIF 方向: {parser.ExifOrientation}，将应用对应的图像变换。");
+            var transformed = ApplyExifOrientation(rgb, parser.Width, parser.Height, parser.ExifOrientation);
+            rgb = transformed.pixels;
+            outW = transformed.width;
+            outH = transformed.height;
+        }
         string outPath = ResolveOutputPath(inputPath, outputPath);
         var swWrite = System.Diagnostics.Stopwatch.StartNew();
-        BmpWriter.Write24(outPath, parser.Width, parser.Height, rgb);
+        BmpWriter.Write24(outPath, outW, outH, rgb);
         swWrite.Stop();
         swTotal.Stop();
         Console.WriteLine($"✅ BMP 写入完成: {outPath}");
@@ -85,5 +95,63 @@ class Program
             idx++;
         } while (File.Exists(candidate));
         return candidate;
+    }
+
+    private static (byte[] pixels, int width, int height) ApplyExifOrientation(byte[] src, int width, int height, int orientation)
+    {
+        int newW = width;
+        int newH = height;
+        switch (orientation)
+        {
+            case 1: // 正常
+                return (src, width, height);
+            case 2: // 水平镜像
+                newW = width; newH = height; break;
+            case 3: // 旋转180
+                newW = width; newH = height; break;
+            case 4: // 垂直镜像
+                newW = width; newH = height; break;
+            case 5: // 水平镜像 + 旋转270（Transpose）
+            case 6: // 旋转90 CW
+            case 7: // 水平镜像 + 旋转90（Transverse）
+            case 8: // 旋转270 CW（90 CCW）
+                newW = height; newH = width; break;
+            default:
+                return (src, width, height);
+        }
+
+        byte[] dst = new byte[newW * newH * 3];
+        for (int y = 0; y < height; y++)
+        {
+            for (int x = 0; x < width; x++)
+            {
+                int dx, dy;
+                switch (orientation)
+                {
+                    case 2: // 水平镜像
+                        dx = (width - 1 - x); dy = y; break;
+                    case 3: // 旋转180
+                        dx = (width - 1 - x); dy = (height - 1 - y); break;
+                    case 4: // 垂直镜像
+                        dx = x; dy = (height - 1 - y); break;
+                    case 5: // Transpose（主对角线翻转）
+                        dx = y; dy = x; break;
+                    case 6: // Rotate 90 CW
+                        dx = (height - 1 - y); dy = x; break;
+                    case 7: // Transverse（副对角线翻转）
+                        dx = (height - 1 - y); dy = (width - 1 - x); break;
+                    case 8: // Rotate 270 CW (90 CCW)
+                        dx = y; dy = (width - 1 - x); break;
+                    default: // 1
+                        dx = x; dy = y; break;
+                }
+                int srcIdx = (y * width + x) * 3;
+                int dstIdx = (dy * newW + dx) * 3;
+                dst[dstIdx + 0] = src[srcIdx + 0];
+                dst[dstIdx + 1] = src[srcIdx + 1];
+                dst[dstIdx + 2] = src[srcIdx + 2];
+            }
+        }
+        return (dst, newW, newH);
     }
 }

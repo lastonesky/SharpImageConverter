@@ -15,6 +15,8 @@ public class JpegParser
     public int MaxH { get; private set; }
     public int MaxV { get; private set; }
     public ushort RestartInterval { get; private set; }
+    // EXIF 方向（1..8），默认 1 表示不旋转/翻转
+    public int ExifOrientation { get; private set; } = 1;
 
     public void Parse(string path)
     {
@@ -84,6 +86,13 @@ public class JpegParser
                         if (h > MaxH) MaxH = h;
                         if (v > MaxV) MaxV = v;
                     }
+                }
+                // =============== 解析 APP1 (EXIF) 段，提取方向 ===============
+                else if (marker == 0xFFE1)
+                {
+                    byte[] buf = new byte[segLen - 2];
+                    fs.ReadExactly(buf, 0, buf.Length);
+                    TryParseExifOrientation(buf);
                 }
                 // =============== 解析 DHT 段 ===============
                 else if (marker == 0xFFC4)
@@ -169,6 +178,70 @@ public class JpegParser
             Console.WriteLine("⚠️ 未找到 SOF0 段，无法确定图像尺寸。");
 
         T.Assert(QuantTables.Count > 0, "未找到任何量化表 (FFDB)。");
+    }
+
+    private void TryParseExifOrientation(byte[] app1)
+    {
+        // APP1 前缀应为 "Exif\0\0"，之后为 TIFF 结构
+        if (app1.Length < 8) return;
+        if (!(app1[0] == (byte)'E' && app1[1] == (byte)'x' && app1[2] == (byte)'i' && app1[3] == (byte)'f' && app1[4] == 0 && app1[5] == 0))
+            return;
+
+        int tiffBase = 6;
+        if (app1.Length < tiffBase + 8) return;
+        bool littleEndian;
+        if (app1[tiffBase + 0] == (byte)'I' && app1[tiffBase + 1] == (byte)'I') littleEndian = true;
+        else if (app1[tiffBase + 0] == (byte)'M' && app1[tiffBase + 1] == (byte)'M') littleEndian = false;
+        else return;
+
+        ushort ReadU16(int offset)
+        {
+            if (littleEndian) return (ushort)(app1[offset] | (app1[offset + 1] << 8));
+            else return (ushort)((app1[offset] << 8) | app1[offset + 1]);
+        }
+        uint ReadU32(int offset)
+        {
+            if (littleEndian) return (uint)(app1[offset] | (app1[offset + 1] << 8) | (app1[offset + 2] << 16) | (app1[offset + 3] << 24));
+            else return (uint)((app1[offset] << 24) | (app1[offset + 1] << 16) | (app1[offset + 2] << 8) | app1[offset + 3]);
+        }
+
+        ushort magic = ReadU16(tiffBase + 2);
+        if (magic != 42) return; // 0x2A
+        uint ifd0Offset = ReadU32(tiffBase + 4);
+        int ifd0 = tiffBase + (int)ifd0Offset;
+        if (ifd0 < 0 || ifd0 + 2 > app1.Length) return;
+        ushort numEntries = ReadU16(ifd0);
+        int entryBase = ifd0 + 2;
+        int entrySize = 12;
+        for (int i = 0; i < numEntries; i++)
+        {
+            int e = entryBase + i * entrySize;
+            if (e + entrySize > app1.Length) break;
+            ushort tag = ReadU16(e + 0);
+            ushort type = ReadU16(e + 2);
+            uint count = ReadU32(e + 4);
+            int valueOffset = e + 8;
+            if (tag == 0x0112) // Orientation
+            {
+                int orientation = 1;
+                if (type == 3 && count >= 1) // SHORT
+                {
+                    // 值可能直接在 4 字节中（count*2 <= 4），按端序读取前两个字节
+                    orientation = littleEndian ? (app1[valueOffset] | (app1[valueOffset + 1] << 8)) : ((app1[valueOffset] << 8) | app1[valueOffset + 1]);
+                }
+                else
+                {
+                    // 其他情况：值在偏移处（不常见于 Orientation），尝试读取
+                    uint valPtr = ReadU32(valueOffset);
+                    int p = tiffBase + (int)valPtr;
+                    if (p >= 0 && p + 2 <= app1.Length)
+                        orientation = ReadU16(p);
+                }
+                if (orientation >= 1 && orientation <= 8)
+                    ExifOrientation = orientation;
+                return; // 找到后返回
+            }
+        }
     }
 
     private void ParseQuantTables(byte[] buf)
