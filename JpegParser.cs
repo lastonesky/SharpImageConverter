@@ -17,6 +17,7 @@ public class JpegParser
     public ushort RestartInterval { get; private set; }
     // EXIF 方向（1..8），默认 1 表示不旋转/翻转
     public int ExifOrientation { get; private set; } = 1;
+    public bool IsProgressive { get; private set; } = false;
 
     public void Parse(string path)
     {
@@ -63,7 +64,7 @@ public class JpegParser
                     fs.ReadExactly(buf, 0, buf.Length);
                     ParseQuantTables(buf);
                 }
-                // =============== 解析 SOF0 段 ===============
+                // =============== 解析 SOF0 段（基线） ===============
                 else if (marker == 0xFFC0)
                 {
                     byte[] buf = new byte[segLen - 2];
@@ -86,6 +87,32 @@ public class JpegParser
                         if (h > MaxH) MaxH = h;
                         if (v > MaxV) MaxV = v;
                     }
+                    IsProgressive = false;
+                }
+                // =============== 解析 SOF2 段（渐进式） ===============
+                else if (marker == 0xFFC2)
+                {
+                    byte[] buf = new byte[segLen - 2];
+                    fs.ReadExactly(buf, 0, buf.Length);
+                    byte precision = buf[0];
+                    Height = (buf[1] << 8) | buf[2];
+                    Width = (buf[3] << 8) | buf[4];
+                    int nf = buf[5];
+                    FrameComponents.Clear();
+                    MaxH = 0; MaxV = 0;
+                    int pos = 6;
+                    for (int i = 0; i < nf; i++)
+                    {
+                        byte cid = buf[pos++];
+                        byte hv = buf[pos++];
+                        byte qid = buf[pos++];
+                        byte h = (byte)(hv >> 4);
+                        byte v = (byte)(hv & 0x0F);
+                        FrameComponents.Add((cid, h, v, qid));
+                        if (h > MaxH) MaxH = h;
+                        if (v > MaxV) MaxV = v;
+                    }
+                    IsProgressive = true;
                 }
                 // =============== 解析 APP1 (EXIF) 段，提取方向 ===============
                 else if (marker == 0xFFE1)
@@ -125,9 +152,13 @@ public class JpegParser
                         comps[i] = ((byte)cId, (byte)(table >> 4), (byte)(table & 0x0F));
                     }
 
-                    // 跳过 Ss, Se, Ah/Al 三个字节
-                    fs.Position += 3;
+                    // 读取 Ss, Se, Ah/Al 三个字节（渐进式必需；基线可忽略但仍保存）
+                    int Ss = fs.ReadByte();
+                    int Se = fs.ReadByte();
+                    int AhAl = fs.ReadByte();
                     remaining -= 3;
+                    byte Ah = (byte)((AhAl >> 4) & 0x0F);
+                    byte Al = (byte)(AhAl & 0x0F);
 
                     long scanDataOffset = fs.Position;
                     long scanDataLength;
@@ -159,7 +190,15 @@ public class JpegParser
                     }
                     scanDataLength = scanEnd - scanDataOffset;
 
-                    Scans.Add(new JpegScan(nbChannels, comps, (int)scanDataOffset) { DataLength = scanDataLength });
+                    var js = new JpegScan(nbChannels, comps, (int)scanDataOffset)
+                    {
+                        DataLength = scanDataLength,
+                        Ss = (byte)Ss,
+                        Se = (byte)Se,
+                        Ah = Ah,
+                        Al = Al
+                    };
+                    Scans.Add(js);
 
                     // 跳到扫描段末尾
                     fs.Position = scanEnd;
@@ -308,6 +347,10 @@ public class JpegScan
     public (byte channelId, byte dcTableId, byte acTableId)[] Components { get; }
     public long DataOffset { get; }
     public long DataLength { get; set; } // 在解析结束后计算
+    public byte Ss { get; set; }
+    public byte Se { get; set; }
+    public byte Ah { get; set; }
+    public byte Al { get; set; }
 
     public JpegScan(int nbChannels, (byte, byte, byte)[] comps, long dataOffset)
     {

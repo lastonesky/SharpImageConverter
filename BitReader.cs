@@ -67,6 +67,8 @@ public class BitReader
 
     public int GetBit() => GetBits(1);
 
+    public bool IsEOF => _eof;
+
     // 确保位缓冲中至少有 n 位（不消耗），用于快速霍夫曼查表
     public bool EnsureBits(int n)
     {

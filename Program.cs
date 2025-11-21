@@ -41,7 +41,7 @@ class Program
         Console.WriteLine($"✅ 扫描段数量: {parser.Scans.Count}");
         foreach (var scan in parser.Scans)
         {
-            Console.WriteLine($"Scan: NbChannels={scan.NbChannels}, DataOffset={scan.DataOffset}, DataLength={scan.DataLength}");
+            Console.WriteLine($"Scan: NbChannels={scan.NbChannels}, Ss={scan.Ss}, Se={scan.Se}, Ah={scan.Ah}, Al={scan.Al}, DataOffset={scan.DataOffset}, DataLength={scan.DataLength}");
             for (int i = 0; i < scan.NbChannels; i++)
             {
                 var c = scan.Components[i];
@@ -50,7 +50,7 @@ class Program
         }
         Console.WriteLine("Step 7 OK: SOS 段解析完成");
 
-        Console.WriteLine("Step 8: 基线JPEG解码到RGB并写BMP...");
+        Console.WriteLine(parser.IsProgressive ? "Step 8: 渐进式JPEG解码到RGB并写BMP..." : "Step 8: 基线JPEG解码到RGB并写BMP...");
         var decoder = new JpegDecoder(parser);
         var swTotal = System.Diagnostics.Stopwatch.StartNew();
         var swDecode = System.Diagnostics.Stopwatch.StartNew();

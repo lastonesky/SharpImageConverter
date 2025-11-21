@@ -169,29 +169,52 @@ public class JpegDecoder
                 return sym;
             }
         }
-        // 慢速回退
-        return DecodeSymbolSlow(br, ch, ht);
+        // 慢速回退：若位流已结束但仍有残留位导致未匹配，优雅视为扫描结束
+        try
+        {
+            return DecodeSymbolSlow(br, ch, ht);
+        }
+        catch (EndOfStreamException)
+        {
+            throw;
+        }
+        catch (Exception)
+        {
+            if (br.IsEOF) throw new EndOfStreamException("扫描结束");
+            throw;
+        }
     }
 
+    /// <summary>
+    /// 解码入口：根据帧类型路由到基线或渐进式解码
+    /// </summary>
     public byte[] DecodeToRGB(string inputPath)
+    {
+        if (_parser.IsProgressive)
+            return DecodeProgressiveToRGB(inputPath);
+        else
+            return DecodeBaselineToRGB(inputPath);
+    }
+
+    /// <summary>
+    /// 基线JPEG解码为RGB（单扫描，霍夫曼+反量化+IDCT）
+    /// </summary>
+    public byte[] DecodeBaselineToRGB(string inputPath)
     {
         T.Assert(_parser.Scans.Count > 0, "未找到扫描数据");
         T.Assert(_parser.FrameComponents.Count > 0, "未找到SOF0组件");
 
         int width = _parser.Width;
         int height = _parser.Height;
-        // 子采样分量的子平面（按各自采样分辨率），稍后上采样到全分辨率
         var compIndexById = new Dictionary<byte, int>();
         for (int i = 0; i < _parser.FrameComponents.Count; i++)
             compIndexById[_parser.FrameComponents[i].id] = i;
 
-        // MCU 尺寸取决于最大采样因子
         int mcuWidth = 8 * _parser.MaxH;
         int mcuHeight = 8 * _parser.MaxV;
         int mcusX = (width + mcuWidth - 1) / mcuWidth;
         int mcusY = (height + mcuHeight - 1) / mcuHeight;
 
-        // 为每个分量分配子平面
         var subPlanes = new Dictionary<byte, (int w, int h, int[] data)>();
         foreach (var (id, h, v, _) in _parser.FrameComponents)
         {
@@ -200,14 +223,11 @@ public class JpegDecoder
             subPlanes[id] = (wComp, hComp, new int[wComp * hComp]);
         }
 
-        // 上方已建立 compIndexById
-
         using var fs = new FileStream(inputPath, FileMode.Open, FileAccess.Read);
-        var scan = _parser.Scans[0]; // 基线假设：单扫描
+        var scan = _parser.Scans[0];
         fs.Position = scan.DataOffset;
         var br = new BitReader(fs);
 
-        // 构建每个使用表的canonical
         var dcCanon = new Dictionary<byte, CanonicalHuff>();
         var acCanon = new Dictionary<byte, CanonicalHuff>();
         var dcFast = new Dictionary<byte, FastHuff>();
@@ -222,24 +242,19 @@ public class JpegDecoder
             acFast[c.acTableId] = BuildFast(ac, acCanon[c.acTableId]);
         }
 
-        // 每个分量的反量化表（按自然顺序）
         var dequants = new Dictionary<byte, ushort[]>();
         foreach (var (id, h, v, quantId) in _parser.FrameComponents)
         {
             ushort[] dq = new ushort[64];
             var qt = _parser.QuantTables[quantId];
-            // qt.Values按读取顺序（JPEG标准为ZigZag），映射到自然顺序
             for (int j = 0; j < 64; j++) dq[j] = qt.Values[ZigZag[j]];
             dequants[id] = dq;
         }
-
-        // MCU 尺寸与数量已在上方计算
 
         int[] prevDC = new int[256];
         Array.Clear(prevDC, 0, prevDC.Length);
         int mcusProcessed = 0;
 
-        // 性能计时
         var swEntropy = Stopwatch.StartNew();
         long idctTicks = 0;
 
@@ -253,19 +268,15 @@ public class JpegDecoder
                     var f = _parser.FrameComponents[compIndexById[cid]];
                     var (wComp, hComp, plane) = subPlanes[cid];
 
-                    // 每个分量在一个 MCU 中有 h×v 个 8×8 块
                     int baseXSub = mx * (8 * f.h);
                     int baseYSub = my * (8 * f.v);
 
-                    // 预取该分量的表与反量化，减少字典查找
                     var dcTable = _parser.HuffmanTables[(0, sc.dcTableId)];
                     var acTable = _parser.HuffmanTables[(1, sc.acTableId)];
                     var dcCanonRef = dcCanon[sc.dcTableId];
                     var acCanonRef = acCanon[sc.acTableId];
                     var dq = dequants[cid];
 
-                    // 复用块与像素缓冲，避免频繁分配
-                    // 使用 ArrayPool 复用块缓冲，降低分配与 GC 压力
                     var block = System.Buffers.ArrayPool<short>.Shared.Rent(64);
                     var pix = System.Buffers.ArrayPool<int>.Shared.Rent(64);
 
@@ -275,14 +286,12 @@ public class JpegDecoder
                         {
                             Array.Clear(block, 0, 64);
 
-                            // DC
                             int ssss = DecodeSymbol(br, dcCanonRef, dcFast[sc.dcTableId], dcTable);
                             int dcDiff = (ssss == 0) ? 0 : ExtendSign(br.GetBits(ssss), ssss);
                             int dc = prevDC[cid] + dcDiff;
                             prevDC[cid] = dc;
                             block[0] = (short)dc;
 
-                            // AC
                             int k = 1;
                             while (k < 64)
                             {
@@ -291,39 +300,27 @@ public class JpegDecoder
                                 int s = rs & 0x0F;
                                 if (s == 0)
                                 {
-                                    if (r == 0) // EOB
-                                        break;
-                                    if (r == 15) // ZRL: 跳过 16 个零系数
-                                    {
-                                        k += 16;
-                                        continue;
-                                    }
-                                    k += r;
-                                    continue;
+                                    if (r == 0) break;
+                                    if (r == 15) { k += 16; continue; }
+                                    k += r; continue;
                                 }
                                 k += r;
-                                if (k >= 64) break; // 防越界
+                                if (k >= 64) break;
                                 int val = ExtendSign(br.GetBits(s), s);
                                 block[UnZigZag[k]] = (short)val;
                                 k++;
                             }
 
-                            // 反量化（自然顺序）
                             for (int i = 0; i < 64; i++)
                                 block[i] = (short)(block[i] * dq[i]);
 
-                            // IDCT
                             bool dcOnly = true;
-                            for (int i = 1; i < 64; i++)
-                            {
-                                if (block[i] != 0) { dcOnly = false; break; }
-                            }
+                            for (int i = 1; i < 64; i++) { if (block[i] != 0) { dcOnly = false; break; } }
 
                             if (dcOnly)
                             {
                                 int val = (block[0] / 8) + 128;
-                                if (val < 0) val = 0;
-                                if (val > 255) val = 255;
+                                if (val < 0) val = 0; if (val > 255) val = 255;
                                 for (int i = 0; i < 64; i++) pix[i] = val;
                             }
                             else
@@ -334,24 +331,19 @@ public class JpegDecoder
                                 idctTicks += swId.ElapsedTicks;
                             }
 
-                            // 放置到分量子平面
                             int blockBaseX = baseXSub + hx * 8;
                             int blockBaseY = baseYSub + vy * 8;
                             for (int yy = 0; yy < 8; yy++)
                             {
-                                int py = blockBaseY + yy;
-                                if (py >= hComp) break;
+                                int py = blockBaseY + yy; if (py >= hComp) break;
                                 for (int xx = 0; xx < 8; xx++)
                                 {
-                                    int px = blockBaseX + xx;
-                                    if (px >= wComp) break;
-                                    int dst = py * wComp + px;
-                                    plane[dst] = pix[yy * 8 + xx];
+                                    int px = blockBaseX + xx; if (px >= wComp) break;
+                                    plane[py * wComp + px] = pix[yy * 8 + xx];
                                 }
                             }
                         }
                     }
-                    // 归还缓冲（组件级作用域）
                     System.Buffers.ArrayPool<short>.Shared.Return(block);
                     System.Buffers.ArrayPool<int>.Shared.Return(pix);
                 }
@@ -365,10 +357,248 @@ public class JpegDecoder
             }
         }
 
-        swEntropy.Stop();
+        return ComposeRGBFromPlanes(width, height, subPlanes);
+    }
 
-        // 最近邻上采样到全分辨率（4:4:4 专用快速路径 + 通用路径）
-        var swUpsample = Stopwatch.StartNew();
+    /// <summary>
+    /// 渐进式JPEG解码为RGB（支持初始DC/AC扫描；不支持细化扫描）
+    /// </summary>
+    public byte[] DecodeProgressiveToRGB(string inputPath)
+    {
+        T.Assert(_parser.Scans.Count > 0, "未找到扫描数据");
+        T.Assert(_parser.FrameComponents.Count > 0, "未找到SOF2组件");
+
+        int width = _parser.Width;
+        int height = _parser.Height;
+
+        int mcuWidth = 8 * _parser.MaxH;
+        int mcuHeight = 8 * _parser.MaxV;
+        int mcusX = (width + mcuWidth - 1) / mcuWidth;
+        int mcusY = (height + mcuHeight - 1) / mcuHeight;
+
+        // 分量子平面与系数缓冲
+        var subPlanes = new Dictionary<byte, (int w, int h, int[] data)>();
+        var coeffs = new Dictionary<byte, (int wBlocks, int hBlocks, short[] data)>();
+        var dequants = new Dictionary<byte, ushort[]>();
+        var compIndexById = new Dictionary<byte, int>();
+        for (int i = 0; i < _parser.FrameComponents.Count; i++) compIndexById[_parser.FrameComponents[i].id] = i;
+        foreach (var (id, h, v, quantId) in _parser.FrameComponents)
+        {
+            int wComp = mcusX * h * 8;
+            int hComp = mcusY * v * 8;
+            subPlanes[id] = (wComp, hComp, new int[wComp * hComp]);
+            int wBlocks = wComp / 8;
+            int hBlocks = hComp / 8;
+            coeffs[id] = (wBlocks, hBlocks, new short[wBlocks * hBlocks * 64]);
+            ushort[] dq = new ushort[64];
+            var qt = _parser.QuantTables[quantId];
+            for (int j = 0; j < 64; j++) dq[j] = qt.Values[ZigZag[j]];
+            dequants[id] = dq;
+        }
+
+        int[] prevDC = new int[256];
+        Array.Clear(prevDC, 0, prevDC.Length);
+        int mcusProcessed = 0;
+
+        using var fs = new FileStream(inputPath, FileMode.Open, FileAccess.Read);
+
+        foreach (var scan in _parser.Scans)
+        {
+            fs.Position = scan.DataOffset;
+            var br = new BitReader(fs);
+
+            var dcCanon = new Dictionary<byte, CanonicalHuff>();
+            var acCanon = new Dictionary<byte, CanonicalHuff>();
+            var dcFast = new Dictionary<byte, FastHuff>();
+            var acFast = new Dictionary<byte, FastHuff>();
+            foreach (var c in scan.Components)
+            {
+                var dc = _parser.HuffmanTables[(0, c.dcTableId)];
+                var ac = _parser.HuffmanTables[(1, c.acTableId)];
+                dcCanon[c.dcTableId] = BuildCanonical(dc);
+                acCanon[c.acTableId] = BuildCanonical(ac);
+                dcFast[c.dcTableId] = BuildFast(dc, dcCanon[c.dcTableId]);
+                acFast[c.acTableId] = BuildFast(ac, acCanon[c.acTableId]);
+            }
+
+            if (scan.Ss == 0) // DC 扫描（可能多分量交错）
+            {
+                int mcuPerScanX = mcusX;
+                int mcuPerScanY = mcusY;
+                bool endScan = false;
+                for (int my = 0; my < mcuPerScanY; my++)
+                {
+                    for (int mx = 0; mx < mcuPerScanX; mx++)
+                    {
+                        foreach (var sc in scan.Components)
+                        {
+                            byte cid = sc.channelId;
+                            var f = _parser.FrameComponents[compIndexById[cid]];
+                            var (wBlocks, hBlocks, cbuf) = coeffs[cid];
+
+                            int baseXB = mx * f.h;
+                            int baseYB = my * f.v;
+
+                            for (int vy = 0; vy < f.v; vy++)
+                            {
+                                for (int hx = 0; hx < f.h; hx++)
+                                {
+                                    int bx = baseXB + hx;
+                                    int by = baseYB + vy;
+                                    if (bx >= wBlocks || by >= hBlocks) continue;
+                                    int bIndex = (by * wBlocks + bx) * 64;
+                                    if (br.IsEOF) { endScan = true; break; }
+                                    try
+                                    {
+                                        int ssss = DecodeSymbol(br, dcCanon[sc.dcTableId], dcFast[sc.dcTableId], _parser.HuffmanTables[(0, sc.dcTableId)]);
+                                        if (scan.Ah == 0)
+                                        {
+                                            int dcDiff = (ssss == 0) ? 0 : ExtendSign(br.GetBits(ssss), ssss);
+                                            int dc = prevDC[cid] + dcDiff;
+                                            prevDC[cid] = dc;
+                                            cbuf[bIndex + 0] = (short)(dc << scan.Al);
+                                        }
+                                        else
+                                        {
+                                            int bit = br.GetBit();
+                                            if (bit != 0)
+                                                cbuf[bIndex + 0] += (short)(1 << scan.Al);
+                                        }
+                                    }
+                                    catch (EndOfStreamException)
+                                    {
+                                        endScan = true;
+                                        break;
+                                    }
+                                    catch (Exception)
+                                    {
+                                        endScan = true;
+                                        break;
+                                    }
+                                }
+                                if (endScan) break;
+                            }
+                            if (endScan) break;
+                        }
+
+                        mcusProcessed++;
+                        if (_parser.RestartInterval > 0 && (mcusProcessed % _parser.RestartInterval) == 0)
+                        {
+                            Array.Clear(prevDC, 0, prevDC.Length);
+                            br.ResetBits();
+                        }
+                        if (endScan) break;
+                    }
+                    if (endScan) break;
+                }
+            }
+            else // AC 扫描（通常单分量）
+            {
+                T.Assert(scan.NbChannels == 1, "当前实现仅支持单分量AC扫描");
+                var sc = scan.Components[0];
+                byte cid = sc.channelId;
+                var (wBlocks, hBlocks, cbuf) = coeffs[cid];
+                int Ss = scan.Ss;
+                int Se = scan.Se;
+                bool endScan = false;
+
+                for (int by = 0; by < hBlocks; by++)
+                {
+                    for (int bx = 0; bx < wBlocks; bx++)
+                    {
+                        int bIndex = (by * wBlocks + bx) * 64;
+                        if (scan.Ah == 0)
+                        {
+                            int k = Ss;
+                            while (k <= Se)
+                            {
+                                if (br.IsEOF) { endScan = true; break; }
+                                try
+                                {
+                                    int rs = DecodeSymbol(br, acCanon[sc.acTableId], acFast[sc.acTableId], _parser.HuffmanTables[(1, sc.acTableId)]);
+                                    int r = rs >> 4;
+                                    int s = rs & 0x0F;
+                                    if (s == 0)
+                                    {
+                                        if (r == 0) break; // EOB
+                                        if (r == 15) { k += 16; continue; } // ZRL
+                                        k += r; continue;
+                                    }
+                                    k += r;
+                                    if (k > Se) break;
+                                    int val = ExtendSign(br.GetBits(s), s);
+                                    cbuf[bIndex + UnZigZag[k]] = (short)(val << scan.Al);
+                                    k++;
+                                }
+                                catch (EndOfStreamException)
+                                {
+                                    endScan = true;
+                                    break;
+                                }
+                                catch (Exception)
+                                {
+                                    endScan = true;
+                                    break;
+                                }
+                            }
+                        }
+                        else
+                        {
+                            throw new NotSupportedException("暂不支持AC细化扫描(Ah>0)");
+                        }
+                        mcusProcessed++;
+                        if (_parser.RestartInterval > 0 && (mcusProcessed % _parser.RestartInterval) == 0)
+                        {
+                            Array.Clear(prevDC, 0, prevDC.Length);
+                            br.ResetBits();
+                        }
+                        if (endScan) break;
+                    }
+                    if (endScan) break;
+                }
+            }
+        }
+
+        // 完整系数 -> 反量化 -> IDCT -> 填充子平面
+        foreach (var (id, h, v, _) in _parser.FrameComponents)
+        {
+            var (wComp, hComp, plane) = subPlanes[id];
+            var (wBlocks, hBlocks, cbuf) = coeffs[id];
+            var dq = dequants[id];
+            var pix = System.Buffers.ArrayPool<int>.Shared.Rent(64);
+            var blk = System.Buffers.ArrayPool<short>.Shared.Rent(64);
+            for (int by = 0; by < hBlocks; by++)
+            {
+                for (int bx = 0; bx < wBlocks; bx++)
+                {
+                    int bIndex = (by * wBlocks + bx) * 64;
+                    for (int i = 0; i < 64; i++) blk[i] = (short)(cbuf[bIndex + i] * dq[i]);
+                    Idct.IDCT8x8Fast(blk, 0, pix, 0);
+                    int baseX = bx * 8;
+                    int baseY = by * 8;
+                    for (int yy = 0; yy < 8; yy++)
+                    {
+                        int py = baseY + yy; if (py >= hComp) break;
+                        for (int xx = 0; xx < 8; xx++)
+                        {
+                            int px = baseX + xx; if (px >= wComp) break;
+                            plane[py * wComp + px] = pix[yy * 8 + xx];
+                        }
+                    }
+                }
+            }
+            System.Buffers.ArrayPool<int>.Shared.Return(pix);
+            System.Buffers.ArrayPool<short>.Shared.Return(blk);
+        }
+
+        return ComposeRGBFromPlanes(width, height, subPlanes);
+    }
+
+    /// <summary>
+    /// 将分量子平面组合为最终RGB像素
+    /// </summary>
+    private byte[] ComposeRGBFromPlanes(int width, int height, Dictionary<byte, (int w, int h, int[] data)> subPlanes)
+    {
         var Y_full = new int[width * height];
         var Cb_full = new int[width * height];
         var Cr_full = new int[width * height];
@@ -384,7 +614,6 @@ public class JpegDecoder
 
         if (is444)
         {
-            // 直接行拷贝 plane 的前 width 元素（顶部 height 行）
             foreach (var f in _parser.FrameComponents)
             {
                 var (wComp, hComp, plane) = subPlanes[f.id];
@@ -393,7 +622,6 @@ public class JpegDecoder
                     int srcRowBase = y * wComp;
                     int dstRowBase = y * width;
                     int len = width;
-                    // 手动拷贝以避免 int[] 到 int[] 的 BlockCopy 开销非对齐问题
                     for (int x = 0; x < len; x++)
                     {
                         int val = plane[srcRowBase + x];
@@ -412,7 +640,6 @@ public class JpegDecoder
                 var (wComp, hComp, plane) = subPlanes[f.id];
                 int sx = _parser.MaxH / Math.Max(1, (int)f.h);
                 int sy = _parser.MaxV / Math.Max(1, (int)f.v);
-
                 for (int ySub = 0; ySub < hComp; ySub++)
                 {
                     int yFullBase = ySub * sy;
@@ -422,12 +649,10 @@ public class JpegDecoder
                         int val = plane[ySub * wComp + xSub];
                         for (int dy = 0; dy < sy; dy++)
                         {
-                            int py = yFullBase + dy;
-                            if (py >= height) break;
+                            int py = yFullBase + dy; if (py >= height) break;
                             for (int dx = 0; dx < sx; dx++)
                             {
-                                int px = xFullBase + dx;
-                                if (px >= width) break;
+                                int px = xFullBase + dx; if (px >= width) break;
                                 int dst = py * width + px;
                                 if (f.id == 1) Y_full[dst] = val;
                                 else if (f.id == 2) Cb_full[dst] = val;
@@ -438,10 +663,7 @@ public class JpegDecoder
                 }
             }
         }
-        swUpsample.Stop();
 
-        // YCbCr -> RGB (BT.601) — 使用整数近似提升性能
-        var swColor = Stopwatch.StartNew();
         byte[] rgb = new byte[width * height * 3];
         for (int i = 0; i < width * height; i++)
         {
@@ -458,15 +680,6 @@ public class JpegDecoder
             rgb[i * 3 + 1] = (byte)G;
             rgb[i * 3 + 2] = (byte)R;
         }
-        swColor.Stop();
-
-        // 打印分阶段耗时（ms）
-        double toMs(long ticks) => (ticks * 1000.0) / Stopwatch.Frequency;
-        Console.WriteLine($"⏱️ 熵解码+反量化耗时: {swEntropy.ElapsedMilliseconds} ms");
-        Console.WriteLine($"⏱️ IDCT耗时: {toMs(idctTicks):F1} ms");
-        Console.WriteLine($"⏱️ 上采样耗时: {swUpsample.ElapsedMilliseconds} ms");
-        Console.WriteLine($"⏱️ 颜色转换耗时: {swColor.ElapsedMilliseconds} ms");
-
         return rgb;
     }
 }
