@@ -361,7 +361,7 @@ public class JpegDecoder
     }
 
     /// <summary>
-    /// 渐进式JPEG解码为RGB（支持初始DC/AC扫描；不支持细化扫描）
+    /// 渐进式JPEG解码为RGB（完整支持DC/AC初始扫描及细化扫描）
     /// </summary>
     public byte[] DecodeProgressiveToRGB(string inputPath)
     {
@@ -421,75 +421,122 @@ public class JpegDecoder
                 acFast[c.acTableId] = BuildFast(ac, acCanon[c.acTableId]);
             }
 
-            if (scan.Ss == 0) // DC 扫描（可能多分量交错）
+            if (scan.Ss == 0) // DC 扫描
             {
-                int mcuPerScanX = mcusX;
-                int mcuPerScanY = mcusY;
                 bool endScan = false;
-                for (int my = 0; my < mcuPerScanY; my++)
+                // 非交错 DC 扫描 (Single Component)
+                if (scan.NbChannels == 1)
                 {
-                    for (int mx = 0; mx < mcuPerScanX; mx++)
+                    var sc = scan.Components[0];
+                    byte cid = sc.channelId;
+                    var (wBlocks, hBlocks, cbuf) = coeffs[cid];
+                    
+                    for (int by = 0; by < hBlocks; by++)
                     {
-                        foreach (var sc in scan.Components)
+                        for (int bx = 0; bx < wBlocks; bx++)
                         {
-                            byte cid = sc.channelId;
-                            var f = _parser.FrameComponents[compIndexById[cid]];
-                            var (wBlocks, hBlocks, cbuf) = coeffs[cid];
-
-                            int baseXB = mx * f.h;
-                            int baseYB = my * f.v;
-
-                            for (int vy = 0; vy < f.v; vy++)
+                            int bIndex = (by * wBlocks + bx) * 64;
+                            if (br.IsEOF) { endScan = true; break; }
+                            try
                             {
-                                for (int hx = 0; hx < f.h; hx++)
+                                int ssss = DecodeSymbol(br, dcCanon[sc.dcTableId], dcFast[sc.dcTableId], _parser.HuffmanTables[(0, sc.dcTableId)]);
+                                if (scan.Ah == 0)
                                 {
-                                    int bx = baseXB + hx;
-                                    int by = baseYB + vy;
-                                    if (bx >= wBlocks || by >= hBlocks) continue;
-                                    int bIndex = (by * wBlocks + bx) * 64;
-                                    if (br.IsEOF) { endScan = true; break; }
-                                    try
-                                    {
-                                        int ssss = DecodeSymbol(br, dcCanon[sc.dcTableId], dcFast[sc.dcTableId], _parser.HuffmanTables[(0, sc.dcTableId)]);
-                                        if (scan.Ah == 0)
-                                        {
-                                            int dcDiff = (ssss == 0) ? 0 : ExtendSign(br.GetBits(ssss), ssss);
-                                            int dc = prevDC[cid] + dcDiff;
-                                            prevDC[cid] = dc;
-                                            cbuf[bIndex + 0] = (short)(dc << scan.Al);
-                                        }
-                                        else
-                                        {
-                                            int bit = br.GetBit();
-                                            if (bit != 0)
-                                                cbuf[bIndex + 0] += (short)(1 << scan.Al);
-                                        }
-                                    }
-                                    catch (EndOfStreamException)
-                                    {
-                                        endScan = true;
-                                        break;
-                                    }
-                                    catch (Exception)
-                                    {
-                                        endScan = true;
-                                        break;
-                                    }
+                                    int dcDiff = (ssss == 0) ? 0 : ExtendSign(br.GetBits(ssss), ssss);
+                                    int dc = prevDC[cid] + dcDiff;
+                                    prevDC[cid] = dc;
+                                    cbuf[bIndex + 0] = (short)(dc << scan.Al);
                                 }
-                                if (endScan) break;
+                                else
+                                {
+                                    int bit = br.GetBit();
+                                    if (bit != 0)
+                                        cbuf[bIndex + 0] += (short)(1 << scan.Al);
+                                }
                             }
-                            if (endScan) break;
-                        }
+                            catch (EndOfStreamException) { endScan = true; break; }
+                            catch (Exception) { endScan = true; break; }
 
-                        mcusProcessed++;
-                        if (_parser.RestartInterval > 0 && (mcusProcessed % _parser.RestartInterval) == 0)
-                        {
-                            Array.Clear(prevDC, 0, prevDC.Length);
-                            br.ResetBits();
+                            mcusProcessed++;
+                            if (_parser.RestartInterval > 0 && (mcusProcessed % _parser.RestartInterval) == 0)
+                            {
+                                Array.Clear(prevDC, 0, prevDC.Length);
+                                br.ResetBits();
+                            }
                         }
                         if (endScan) break;
                     }
-                    if (endScan) break;
+                }
+                // 交错 DC 扫描 (Multi Component)
+                else
+                {
+                    int mcuPerScanX = mcusX;
+                    int mcuPerScanY = mcusY;
+                    for (int my = 0; my < mcuPerScanY; my++)
+                    {
+                        for (int mx = 0; mx < mcuPerScanX; mx++)
+                        {
+                            foreach (var sc in scan.Components)
+                            {
+                                byte cid = sc.channelId;
+                                var f = _parser.FrameComponents[compIndexById[cid]];
+                                var (wBlocks, hBlocks, cbuf) = coeffs[cid];
+
+                                int baseXB = mx * f.h;
+                                int baseYB = my * f.v;
+
+                                for (int vy = 0; vy < f.v; vy++)
+                                {
+                                    for (int hx = 0; hx < f.h; hx++)
+                                    {
+                                        int bx = baseXB + hx;
+                                        int by = baseYB + vy;
+                                        if (bx >= wBlocks || by >= hBlocks) continue;
+                                        int bIndex = (by * wBlocks + bx) * 64;
+                                        if (br.IsEOF) { endScan = true; break; }
+                                        try
+                                        {
+                                            int ssss = DecodeSymbol(br, dcCanon[sc.dcTableId], dcFast[sc.dcTableId], _parser.HuffmanTables[(0, sc.dcTableId)]);
+                                            if (scan.Ah == 0)
+                                            {
+                                                int dcDiff = (ssss == 0) ? 0 : ExtendSign(br.GetBits(ssss), ssss);
+                                                int dc = prevDC[cid] + dcDiff;
+                                                prevDC[cid] = dc;
+                                                cbuf[bIndex + 0] = (short)(dc << scan.Al);
+                                            }
+                                            else
+                                            {
+                                                int bit = br.GetBit();
+                                                if (bit != 0)
+                                                    cbuf[bIndex + 0] += (short)(1 << scan.Al);
+                                            }
+                                        }
+                                        catch (EndOfStreamException)
+                                        {
+                                            endScan = true;
+                                            break;
+                                        }
+                                        catch (Exception)
+                                        {
+                                            endScan = true;
+                                            break;
+                                        }
+                                    }
+                                    if (endScan) break;
+                                }
+                                if (endScan) break;
+                            }
+
+                            mcusProcessed++;
+                            if (_parser.RestartInterval > 0 && (mcusProcessed % _parser.RestartInterval) == 0)
+                            {
+                                Array.Clear(prevDC, 0, prevDC.Length);
+                                br.ResetBits();
+                            }
+                            if (endScan) break;
+                        }
+                        if (endScan) break;
+                    }
                 }
             }
             else // AC 扫描（通常单分量）
@@ -502,6 +549,7 @@ public class JpegDecoder
                 int Se = scan.Se;
                 bool endScan = false;
 
+                int eob_run = 0;
                 for (int by = 0; by < hBlocks; by++)
                 {
                     for (int bx = 0; bx < wBlocks; bx++)
@@ -510,6 +558,12 @@ public class JpegDecoder
                         if (scan.Ah == 0)
                         {
                             int k = Ss;
+                            if (eob_run > 0)
+                            {
+                                eob_run--;
+                                k = Se + 1;
+                            }
+
                             while (k <= Se)
                             {
                                 if (br.IsEOF) { endScan = true; break; }
@@ -520,9 +574,14 @@ public class JpegDecoder
                                     int s = rs & 0x0F;
                                     if (s == 0)
                                     {
-                                        if (r == 0) break; // EOB
                                         if (r == 15) { k += 16; continue; } // ZRL
-                                        k += r; continue;
+                                        else 
+                                        {
+                                            eob_run = 1 << r;
+                                            if (r > 0) eob_run += br.GetBits(r);
+                                            eob_run--;
+                                            break; // EOB
+                                        }
                                     }
                                     k += r;
                                     if (k > Se) break;
@@ -544,7 +603,90 @@ public class JpegDecoder
                         }
                         else
                         {
-                            throw new NotSupportedException("暂不支持AC细化扫描(Ah>0)");
+                            int k = Ss;
+                            bool forceZero = eob_run > 0;
+                            if (forceZero) eob_run--;
+                            int zerosToSkip = 0;
+                            bool hasPendingVal = false;
+                            short pendingNewVal = 0;
+
+                            while (k <= Se)
+                            {
+                                if (br.IsEOF) { endScan = true; break; }
+                                int idx = UnZigZag[k];
+                                
+                                if (cbuf[bIndex + idx] != 0)
+                                {
+                                    if (!forceZero)
+                                    {
+                                        try
+                                        {
+                                            int bit = br.GetBit();
+                                            if (bit != 0)
+                                            {
+                                                if (cbuf[bIndex + idx] > 0) cbuf[bIndex + idx] += (short)(1 << scan.Al);
+                                                else cbuf[bIndex + idx] -= (short)(1 << scan.Al);
+                                            }
+                                        }
+                                        catch (EndOfStreamException) { endScan = true; break; }
+                                    }
+                                }
+                                else
+                                {
+                                    if (zerosToSkip > 0)
+                                    {
+                                        zerosToSkip--;
+                                    }
+                                    else if (hasPendingVal)
+                                    {
+                                        cbuf[bIndex + idx] = pendingNewVal;
+                                        hasPendingVal = false;
+                                        pendingNewVal = 0;
+                                    }
+                                    else
+                                    {
+                                        if (forceZero) { k++; continue; }
+                                        try
+                                        {
+                                            int rs = DecodeSymbol(br, acCanon[sc.acTableId], acFast[sc.acTableId], _parser.HuffmanTables[(1, sc.acTableId)]);
+                                            int r = rs >> 4;
+                                            int s = rs & 0x0F;
+                                            if (s == 0)
+                                            {
+                                                if (r == 15) zerosToSkip = 15; // ZRL
+                                                else
+                                                {
+                                                    eob_run = 1 << r;
+                                                    if (r > 0) eob_run += br.GetBits(r);
+                                                    eob_run--;
+                                                    forceZero = true;
+                                                }
+                                            }
+                                            else
+                                            {
+                                                zerosToSkip = r;
+                                                int sign = br.GetBit();
+                                                pendingNewVal = (short)((1 << scan.Al) * (sign != 0 ? 1 : -1));
+                                                hasPendingVal = true;
+                                                
+                                                if (zerosToSkip == 0)
+                                                {
+                                                    cbuf[bIndex + idx] = pendingNewVal;
+                                                    hasPendingVal = false;
+                                                    pendingNewVal = 0;
+                                                }
+                                                else
+                                                {
+                                                    zerosToSkip--;
+                                                }
+                                            }
+                                        }
+                                        catch (EndOfStreamException) { endScan = true; break; }
+                                        catch (Exception) { endScan = true; break; }
+                                    }
+                                }
+                                k++;
+                            }
                         }
                         mcusProcessed++;
                         if (_parser.RestartInterval > 0 && (mcusProcessed % _parser.RestartInterval) == 0)
