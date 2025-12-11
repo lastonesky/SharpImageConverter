@@ -14,6 +14,29 @@ class Program
         string inputPath = args[0];
         string? outputPath = args.Length >= 2 ? args[1] : null;
 
+        // Auto-detect format by extension or content
+        string ext = Path.GetExtension(inputPath).ToLower();
+        
+        if (ext == ".jpg" || ext == ".jpeg")
+        {
+            ProcessJpeg(inputPath, outputPath);
+        }
+        else if (ext == ".png")
+        {
+            ProcessPng(inputPath, outputPath);
+        }
+        else if (ext == ".bmp")
+        {
+            ProcessBmp(inputPath, outputPath);
+        }
+        else
+        {
+            Console.WriteLine("不支持的输入文件格式。仅支持 .jpg, .png, .bmp");
+        }
+    }
+
+    static void ProcessJpeg(string inputPath, string? outputPath)
+    {
         Console.WriteLine("Step 5: 解析 JPEG 量化表...");
 
         string path = inputPath;
@@ -50,13 +73,14 @@ class Program
         }
         Console.WriteLine("Step 7 OK: SOS 段解析完成");
 
-        Console.WriteLine(parser.IsProgressive ? "Step 8: 渐进式JPEG解码到RGB并写BMP..." : "Step 8: 基线JPEG解码到RGB并写BMP...");
+        Console.WriteLine(parser.IsProgressive ? "Step 8: 渐进式JPEG解码到RGB..." : "Step 8: 基线JPEG解码到RGB...");
         var decoder = new JpegDecoder(parser);
         var swTotal = System.Diagnostics.Stopwatch.StartNew();
         var swDecode = System.Diagnostics.Stopwatch.StartNew();
         byte[] rgb = decoder.DecodeToRGB(inputPath);
         swDecode.Stop();
-        // 根据 EXIF 方向进行旋转/翻转，保证与常见查看器显示一致
+        
+        // 根据 EXIF 方向进行旋转/翻转
         int outW = parser.Width, outH = parser.Height;
         if (parser.ExifOrientation != 1)
         {
@@ -66,21 +90,101 @@ class Program
             outW = transformed.width;
             outH = transformed.height;
         }
-        string outPath = ResolveOutputPath(inputPath, outputPath);
+
+        string outPath = ResolveOutputPath(inputPath, outputPath, ".bmp");
+        string outExt = Path.GetExtension(outPath).ToLower();
         var swWrite = System.Diagnostics.Stopwatch.StartNew();
-        BmpWriter.Write24(outPath, outW, outH, rgb);
+
+        if (outExt == ".bmp")
+        {
+            BmpWriter.Write24(outPath, outW, outH, rgb);
+            Console.WriteLine($"✅ BMP 写入完成: {outPath}");
+        }
+        else if (outExt == ".png")
+        {
+            PngWriter.Write(outPath, outW, outH, rgb);
+            Console.WriteLine($"✅ PNG 写入完成: {outPath}");
+        }
+        else
+        {
+             Console.WriteLine($"不支持的输出格式: {outExt}，默认写入 BMP");
+             outPath = Path.ChangeExtension(outPath, ".bmp");
+             BmpWriter.Write24(outPath, outW, outH, rgb);
+        }
+
         swWrite.Stop();
         swTotal.Stop();
-        Console.WriteLine($"✅ BMP 写入完成: {outPath}");
         Console.WriteLine($"⏱️ 解码耗时: {swDecode.ElapsedMilliseconds} ms, 写入耗时: {swWrite.ElapsedMilliseconds} ms, 总耗时: {swTotal.ElapsedMilliseconds} ms");
-
     }
 
-    private static string ResolveOutputPath(string inputPath, string? outputPath)
+    static void ProcessPng(string inputPath, string? outputPath)
     {
-        string desired = outputPath ?? Path.Combine(
-            Path.GetDirectoryName(inputPath) ?? ".",
-            Path.GetFileNameWithoutExtension(inputPath) + ".bmp");
+        Console.WriteLine($"正在处理 PNG: {inputPath}");
+        var swTotal = System.Diagnostics.Stopwatch.StartNew();
+        
+        var decoder = new PngDecoder();
+        byte[] rgb = decoder.DecodeToRGB(inputPath);
+        
+        Console.WriteLine($"✅ 图像尺寸: {decoder.Width} x {decoder.Height}");
+        Console.WriteLine($"✅ 色深: {decoder.BitDepth}, 颜色类型: {decoder.ColorType}");
+        Console.WriteLine($"✅ 隔行扫描: {decoder.InterlaceMethod == 1}");
+
+        string outPath = ResolveOutputPath(inputPath, outputPath, ".bmp");
+        string outExt = Path.GetExtension(outPath).ToLower();
+
+        if (outExt == ".bmp")
+        {
+            BmpWriter.Write24(outPath, decoder.Width, decoder.Height, rgb);
+            Console.WriteLine($"✅ BMP 写入完成: {outPath}");
+        }
+        else if (outExt == ".png")
+        {
+            // Re-encode
+             PngWriter.Write(outPath, decoder.Width, decoder.Height, rgb);
+             Console.WriteLine($"✅ PNG 重编码完成: {outPath}");
+        }
+        
+        swTotal.Stop();
+        Console.WriteLine($"⏱️ 总耗时: {swTotal.ElapsedMilliseconds} ms");
+    }
+
+    static void ProcessBmp(string inputPath, string? outputPath)
+    {
+        Console.WriteLine($"正在处理 BMP: {inputPath}");
+        var swTotal = System.Diagnostics.Stopwatch.StartNew();
+        
+        int width, height;
+        byte[] rgb = BmpReader.Read(inputPath, out width, out height);
+        
+        Console.WriteLine($"✅ 图像尺寸: {width} x {height}");
+
+        string outPath = ResolveOutputPath(inputPath, outputPath, ".png");
+        string outExt = Path.GetExtension(outPath).ToLower();
+
+        if (outExt == ".png")
+        {
+            PngWriter.Write(outPath, width, height, rgb);
+            Console.WriteLine($"✅ PNG 写入完成: {outPath}");
+        }
+        else if (outExt == ".bmp")
+        {
+             BmpWriter.Write24(outPath, width, height, rgb);
+             Console.WriteLine($"✅ BMP 重写完成: {outPath}");
+        }
+
+        swTotal.Stop();
+        Console.WriteLine($"⏱️ 总耗时: {swTotal.ElapsedMilliseconds} ms");
+    }
+
+    private static string ResolveOutputPath(string inputPath, string? outputPath, string defaultExtension)
+    {
+        string desired = outputPath;
+        if (string.IsNullOrEmpty(desired))
+        {
+            desired = Path.Combine(
+                Path.GetDirectoryName(inputPath) ?? ".",
+                Path.GetFileNameWithoutExtension(inputPath) + defaultExtension);
+        }
 
         if (!File.Exists(desired)) return desired;
 
