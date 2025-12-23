@@ -7,6 +7,10 @@ public class BitReader
     private int _bitBuf;
     private int _bitCount;
     private bool _eof;
+    private readonly byte[] _buf;
+    private int _bufPos;
+    private int _bufLen;
+    private long _bufEndPos;
 
     public BitReader(Stream s)
     {
@@ -14,6 +18,10 @@ public class BitReader
         _bitBuf = 0;
         _bitCount = 0;
         _eof = false;
+        _buf = new byte[16 * 1024];
+        _bufPos = 0;
+        _bufLen = 0;
+        _bufEndPos = _s.CanSeek ? _s.Position : 0;
     }
 
     public void ResetBits()
@@ -22,30 +30,54 @@ public class BitReader
         _bitCount = 0;
     }
 
+    private bool FillBuffer()
+    {
+        _bufLen = _s.Read(_buf, 0, _buf.Length);
+        _bufPos = 0;
+        if (_bufLen <= 0) return false;
+        if (_s.CanSeek) _bufEndPos = _s.Position;
+        return true;
+    }
+
+    private int ReadRawByte()
+    {
+        if (_bufPos >= _bufLen)
+        {
+            if (!FillBuffer()) return -1;
+        }
+        return _buf[_bufPos++];
+    }
+
+    private long LogicalPosition
+        => _s.CanSeek ? (_bufEndPos - (_bufLen - _bufPos)) : 0;
+
     private int ReadByteStuffed()
     {
-        int b = _s.ReadByte();
-        if (b == -1) { _eof = true; return -1; }
-        if (b == 0xFF)
+        while (true)
         {
-            int n = _s.ReadByte();
+            int b = ReadRawByte();
+            if (b == -1) { _eof = true; return -1; }
+            if (b != 0xFF) return b;
+
+            int n = ReadRawByte();
             if (n == -1) { _eof = true; return -1; }
-            if (n == 0x00)
-            {
-                // stuffed 0xFF00 => data 0xFF
-                return 0xFF;
-            }
+            if (n == 0x00) return 0xFF;
             if (n >= 0xD0 && n <= 0xD7)
             {
-                // RSTn: reset bit buffer and continue to next byte
                 ResetBits();
-                return ReadByteStuffed();
+                continue;
             }
-            // other marker: step back by 2 bytes for external logic
-            _s.Position -= 2;
-            return -2; // signal marker
+
+            if (_s.CanSeek)
+            {
+                long markerStartPos = LogicalPosition - 2;
+                _s.Position = markerStartPos;
+                _bufPos = 0;
+                _bufLen = 0;
+                _bufEndPos = markerStartPos;
+            }
+            return -2;
         }
-        return b;
     }
 
     public int GetBits(int n)
