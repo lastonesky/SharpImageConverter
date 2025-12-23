@@ -100,3 +100,7 @@ StyleCopReport.xml
 
 # Generated images
 *.bmp
+*.png
+*.jpg
+*.gif
+*.webp

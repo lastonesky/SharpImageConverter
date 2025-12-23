@@ -14,26 +14,33 @@ class Program
         }
         string inputPath = args[0];
         string? outputPath = args.Length >= 2 ? args[1] : null;
-
-        // Auto-detect format by extension or content
-        string ext = Path.GetExtension(inputPath).ToLower();
-        
-        if (ext == ".jpg" || ext == ".jpeg")
+        var swTotal = System.Diagnostics.Stopwatch.StartNew();
+        var image = Core.Image.Load(inputPath);
+        if (args.Length >= 3)
         {
-            ProcessJpeg(inputPath, outputPath);
+            string op = args[2].ToLower();
+            if (op.StartsWith("resize:"))
+            {
+                var parts = op.Substring(7).Split('x');
+                if (parts.Length == 2 && int.TryParse(parts[0], out int w) && int.TryParse(parts[1], out int h))
+                {
+                    Processing.ImageExtensions.Mutate(image, ctx => ctx.Resize(w, h));
+                }
+            }
+            else if (op == "grayscale")
+            {
+                Processing.ImageExtensions.Mutate(image, ctx => ctx.Grayscale());
+            }
         }
-        else if (ext == ".png")
+        if (outputPath == null)
         {
-            ProcessPng(inputPath, outputPath);
+            string defExt = ".bmp";
+            outputPath = Path.ChangeExtension(inputPath, defExt);
         }
-        else if (ext == ".bmp")
-        {
-            ProcessBmp(inputPath, outputPath);
-        }
-        else
-        {
-            Console.WriteLine("不支持的输入文件格式。仅支持 .jpg/.jpeg/.png/.bmp");
-        }
+        Core.Image.Save(image, outputPath);
+        swTotal.Stop();
+        Console.WriteLine($"✅ 写入完成: {outputPath}");
+        Console.WriteLine($"⏱️ 总耗时: {swTotal.ElapsedMilliseconds} ms");
     }
 
     static void ProcessJpeg(string inputPath, string? outputPath)
