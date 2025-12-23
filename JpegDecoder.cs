@@ -735,86 +735,61 @@ public class JpegDecoder
     /// </summary>
     private byte[] ComposeRGBFromPlanes(int width, int height, Dictionary<byte, (int w, int h, int[] data)> subPlanes)
     {
-        var Y_full = new int[width * height];
-        var Cb_full = new int[width * height];
-        var Cr_full = new int[width * height];
+        subPlanes.TryGetValue(1, out var yPlane);
+        subPlanes.TryGetValue(2, out var cbPlane);
+        subPlanes.TryGetValue(3, out var crPlane);
 
-        bool is444 = _parser.MaxH == 1 && _parser.MaxV == 1;
-        if (is444)
+        int yH = 1, yV = 1;
+        int cbH = 1, cbV = 1;
+        int crH = 1, crV = 1;
+
+        foreach (var f in _parser.FrameComponents)
         {
-            foreach (var f in _parser.FrameComponents)
-            {
-                if (f.h != 1 || f.v != 1) { is444 = false; break; }
-            }
+            if (f.id == 1) { yH = f.h; yV = f.v; }
+            else if (f.id == 2) { cbH = f.h; cbV = f.v; }
+            else if (f.id == 3) { crH = f.h; crV = f.v; }
         }
 
-        if (is444)
-        {
-            foreach (var f in _parser.FrameComponents)
-            {
-                var (wComp, hComp, plane) = subPlanes[f.id];
-                for (int y = 0; y < height; y++)
-                {
-                    int srcRowBase = y * wComp;
-                    int dstRowBase = y * width;
-                    int len = width;
-                    for (int x = 0; x < len; x++)
-                    {
-                        int val = plane[srcRowBase + x];
-                        int dst = dstRowBase + x;
-                        if (f.id == 1) Y_full[dst] = val;
-                        else if (f.id == 2) Cb_full[dst] = val;
-                        else if (f.id == 3) Cr_full[dst] = val;
-                    }
-                }
-            }
-        }
-        else
-        {
-            foreach (var f in _parser.FrameComponents)
-            {
-                var (wComp, hComp, plane) = subPlanes[f.id];
-                int sx = _parser.MaxH / Math.Max(1, (int)f.h);
-                int sy = _parser.MaxV / Math.Max(1, (int)f.v);
-                for (int ySub = 0; ySub < hComp; ySub++)
-                {
-                    int yFullBase = ySub * sy;
-                    for (int xSub = 0; xSub < wComp; xSub++)
-                    {
-                        int xFullBase = xSub * sx;
-                        int val = plane[ySub * wComp + xSub];
-                        for (int dy = 0; dy < sy; dy++)
-                        {
-                            int py = yFullBase + dy; if (py >= height) break;
-                            for (int dx = 0; dx < sx; dx++)
-                            {
-                                int px = xFullBase + dx; if (px >= width) break;
-                                int dst = py * width + px;
-                                if (f.id == 1) Y_full[dst] = val;
-                                else if (f.id == 2) Cb_full[dst] = val;
-                                else if (f.id == 3) Cr_full[dst] = val;
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        int maxH = Math.Max(1, _parser.MaxH);
+        int maxV = Math.Max(1, _parser.MaxV);
+
+        int sxY = maxH / Math.Max(1, yH);
+        int syY = maxV / Math.Max(1, yV);
+        int sxCb = maxH / Math.Max(1, cbH);
+        int syCb = maxV / Math.Max(1, cbV);
+        int sxCr = maxH / Math.Max(1, crH);
+        int syCr = maxV / Math.Max(1, crV);
 
         byte[] rgb = new byte[width * height * 3];
-        for (int i = 0; i < width * height; i++)
+        int dst = 0;
+        for (int y = 0; y < height; y++)
         {
-            int y = Y_full[i];
-            int cbv = Cb_full[i];
-            int crv = Cr_full[i];
-            int R = y + CrToR[crv];
-            int G = y - (CbToG[cbv] + CrToG[crv]);
-            int B = y + CbToB[cbv];
-            if (R < 0) R = 0; if (R > 255) R = 255;
-            if (G < 0) G = 0; if (G > 255) G = 255;
-            if (B < 0) B = 0; if (B > 255) B = 255;
-            rgb[i * 3 + 0] = (byte)B;
-            rgb[i * 3 + 1] = (byte)G;
-            rgb[i * 3 + 2] = (byte)R;
+            int yY = y / syY;
+            int yCb = y / syCb;
+            int yCr = y / syCr;
+
+            for (int x = 0; x < width; x++)
+            {
+                int xY = x / sxY;
+                int xCb = x / sxCb;
+                int xCr = x / sxCr;
+
+                int Y = (yPlane.data != null) ? yPlane.data[yY * yPlane.w + xY] : 0;
+                int Cb = (cbPlane.data != null) ? cbPlane.data[yCb * cbPlane.w + xCb] : 128;
+                int Cr = (crPlane.data != null) ? crPlane.data[yCr * crPlane.w + xCr] : 128;
+
+                int R = Y + CrToR[Cr];
+                int G = Y - (CbToG[Cb] + CrToG[Cr]);
+                int B = Y + CbToB[Cb];
+                if (R < 0) R = 0; if (R > 255) R = 255;
+                if (G < 0) G = 0; if (G > 255) G = 255;
+                if (B < 0) B = 0; if (B > 255) B = 255;
+
+                rgb[dst + 0] = (byte)R;
+                rgb[dst + 1] = (byte)G;
+                rgb[dst + 2] = (byte)B;
+                dst += 3;
+            }
         }
         return rgb;
     }

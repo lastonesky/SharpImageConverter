@@ -40,7 +40,14 @@ public static class BmpWriter
         {
             int src = y * srcRowSize;
             int dst = pixelOffset + rowIdx * rowStride;
-            Buffer.BlockCopy(rgb, src, file, dst, srcRowSize);
+            for (int x = 0; x < width; x++)
+            {
+                int si = src + x * 3;
+                int di = dst + x * 3;
+                file[di + 0] = rgb[si + 2];
+                file[di + 1] = rgb[si + 1];
+                file[di + 2] = rgb[si + 0];
+            }
             // 剩余的对齐填充字节保持为 0（数组默认初始化为0）
         }
 
