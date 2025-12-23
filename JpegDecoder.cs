@@ -322,7 +322,7 @@ public class JpegDecoder
                             }
                             else
                             {
-                                Idct.IDCT8x8Fast(block, 0, pix, 0);
+                                Idct.IDCT8x8Int(block, 0, pix, 0);
                             }
 
                             int blockBaseX = baseXSub + hx * 8;
@@ -709,7 +709,7 @@ public class JpegDecoder
                 {
                     int bIndex = (by * wBlocks + bx) * 64;
                     for (int i = 0; i < 64; i++) blk[i] = (short)(cbuf[bIndex + i] * dq[i]);
-                    Idct.IDCT8x8Fast(blk, 0, pix, 0);
+                    Idct.IDCT8x8Int(blk, 0, pix, 0);
                     int baseX = bx * 8;
                     int baseY = by * 8;
                     for (int yy = 0; yy < 8; yy++)
