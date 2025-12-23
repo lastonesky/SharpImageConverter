@@ -1,6 +1,6 @@
 # Jpeg2Bmp
 
-一个用 C# 编写的图像转换工具，不依赖第三方库（不使用 `System.Drawing`），支持 JPEG/PNG/BMP 格式的相互转换。
+一个用 C# 编写的图像转换工具，不依赖第三方库（不使用 `System.Drawing`），支持 JPEG/PNG/BMP 格式的相互转换（包含 JPEG 解码与 JPEG 编码输出）。
 
 ## 功能特性
 
@@ -8,6 +8,7 @@
 - 基线（Baseline）与渐进式（Progressive）解码
 - Huffman 解码、反量化、IDCT、YCbCr 转 RGB
 - 支持 EXIF Orientation 自动旋转/翻转
+- 支持将中间 RGB 图像编码输出为基线 JPEG（Baseline，quality 可调）
 
 ### PNG 支持
 - 读取：
@@ -23,16 +24,22 @@
 - 读写 24-bit RGB BMP
 - 支持自动填充对齐
 
+### 中间格式
+- 引入 `ImageFrame` 作为格式转换的中间数据结构（当前为 `Rgb24`）
+- 统一加载为 RGB，再根据输出扩展名选择编码器写回
+
 ## 目录结构
 
 ```
 Jpeg2Bmp/
 ├── JpegParser.cs      # JPEG 段解析
 ├── JpegDecoder.cs     # JPEG 解码核心
+├── JpegEncoder.cs     # JPEG 编码器（Baseline 输出）
 ├── PngDecoder.cs      # PNG 解码器
 ├── PngWriter.cs       # PNG 编码器
 ├── BmpReader.cs       # BMP 读取器
 ├── BmpWriter.cs       # BMP 写入器
+├── ImageFrame.cs      # 中间图像类型（RGB24）
 ├── ZlibHelper.cs      # Zlib/Deflate 封装
 ├── Crc32.cs/Adler32.cs# 校验算法
 ├── Program.cs         # 程序入口
@@ -51,11 +58,9 @@ dotnet run -- <输入文件> [输出文件]
 ```
 
 支持的转换：
-- JPEG -> BMP/PNG
-- PNG -> BMP/PNG (重编码)
-- BMP -> PNG/BMP (重写)
+- JPEG/PNG/BMP -> JPEG/PNG/BMP
 
-程序会自动根据输入文件扩展名（.jpg, .png, .bmp）识别格式，并根据输出文件扩展名选择保存格式。若未指定输出文件，默认转换为 BMP（对于 JPEG）或 PNG（对于 BMP）。
+程序会自动根据输入文件扩展名（.jpg/.jpeg/.png/.bmp）识别格式，并根据输出文件扩展名（.jpg/.jpeg/.png/.bmp）选择保存格式。
 
 示例：
 ```bash
@@ -67,12 +72,19 @@ dotnet run -- icon.png icon.bmp
 
 # BMP 转 PNG
 dotnet run -- screenshot.bmp screenshot.png
+
+# PNG 转 JPEG
+dotnet run -- icon.png icon.jpg
+
+# JPEG 转 JPEG（重编码）
+dotnet run -- image.jpg image_reencode.jpg
 ```
 
 ## 已知限制
 
 - JPEG 上采样目前使用最近邻插值。
 - PNG 写入目前仅支持 Truecolor 格式，不保留源文件的调色板或元数据。
+- JPEG 编码目前仅支持 Baseline（非 Progressive），且为 4:4:4（不做色度子采样），不写入 EXIF 等元数据。
 
 
 ## 下一步计划

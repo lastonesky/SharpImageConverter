@@ -255,9 +255,6 @@ public class JpegDecoder
         Array.Clear(prevDC, 0, prevDC.Length);
         int mcusProcessed = 0;
 
-        var swEntropy = Stopwatch.StartNew();
-        long idctTicks = 0;
-
         for (int my = 0; my < mcusY; my++)
         {
             for (int mx = 0; mx < mcusX; mx++)
@@ -325,10 +322,7 @@ public class JpegDecoder
                             }
                             else
                             {
-                                var swId = Stopwatch.StartNew();
                                 Idct.IDCT8x8Fast(block, 0, pix, 0);
-                                swId.Stop();
-                                idctTicks += swId.ElapsedTicks;
                             }
 
                             int blockBaseX = baseXSub + hx * 8;

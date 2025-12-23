@@ -7,8 +7,9 @@ class Program
     {
         if (args.Length < 1)
         {
-            Console.WriteLine("用法: dotnet run -- <输入JPEG路径> [输出BMP路径]");
-            Console.WriteLine("当未提供输出路径时，默认写入到与输入同目录同名的 .bmp，且不覆盖已存在文件。");
+            Console.WriteLine("用法: dotnet run -- <输入文件路径> [输出文件路径]");
+            Console.WriteLine("支持输入: .jpg/.jpeg/.png/.bmp");
+            Console.WriteLine("支持输出: .jpg/.jpeg/.png/.bmp");
             return;
         }
         string inputPath = args[0];
@@ -31,7 +32,7 @@ class Program
         }
         else
         {
-            Console.WriteLine("不支持的输入文件格式。仅支持 .jpg, .png, .bmp");
+            Console.WriteLine("不支持的输入文件格式。仅支持 .jpg/.jpeg/.png/.bmp");
         }
     }
 
@@ -80,37 +81,24 @@ class Program
         byte[] rgb = decoder.DecodeToRGB(inputPath);
         swDecode.Stop();
         
-        // 根据 EXIF 方向进行旋转/翻转
-        int outW = parser.Width, outH = parser.Height;
+        ImageFrame frame = new ImageFrame(parser.Width, parser.Height, rgb);
         if (parser.ExifOrientation != 1)
         {
             Console.WriteLine($"✅ 检测到 EXIF 方向: {parser.ExifOrientation}，将应用对应的图像变换。");
-            var transformed = ApplyExifOrientation(rgb, parser.Width, parser.Height, parser.ExifOrientation);
-            rgb = transformed.pixels;
-            outW = transformed.width;
-            outH = transformed.height;
+            frame = frame.ApplyExifOrientation(parser.ExifOrientation);
         }
 
         string outPath = ResolveOutputPath(inputPath, outputPath, ".bmp");
         string outExt = Path.GetExtension(outPath).ToLower();
         var swWrite = System.Diagnostics.Stopwatch.StartNew();
 
-        if (outExt == ".bmp")
+        if (outExt != ".bmp" && outExt != ".png" && outExt != ".jpg" && outExt != ".jpeg")
         {
-            BmpWriter.Write24(outPath, outW, outH, rgb);
-            Console.WriteLine($"✅ BMP 写入完成: {outPath}");
+            Console.WriteLine($"不支持的输出格式: {outExt}，默认写入 BMP");
+            outPath = Path.ChangeExtension(outPath, ".bmp");
         }
-        else if (outExt == ".png")
-        {
-            PngWriter.Write(outPath, outW, outH, rgb);
-            Console.WriteLine($"✅ PNG 写入完成: {outPath}");
-        }
-        else
-        {
-             Console.WriteLine($"不支持的输出格式: {outExt}，默认写入 BMP");
-             outPath = Path.ChangeExtension(outPath, ".bmp");
-             BmpWriter.Write24(outPath, outW, outH, rgb);
-        }
+        frame.Save(outPath);
+        Console.WriteLine($"✅ 写入完成: {outPath}");
 
         swWrite.Stop();
         swTotal.Stop();
@@ -129,20 +117,17 @@ class Program
         Console.WriteLine($"✅ 色深: {decoder.BitDepth}, 颜色类型: {decoder.ColorType}");
         Console.WriteLine($"✅ 隔行扫描: {decoder.InterlaceMethod == 1}");
 
+        ImageFrame frame = new ImageFrame(decoder.Width, decoder.Height, rgb);
         string outPath = ResolveOutputPath(inputPath, outputPath, ".bmp");
         string outExt = Path.GetExtension(outPath).ToLower();
 
-        if (outExt == ".bmp")
+        if (outExt != ".bmp" && outExt != ".png" && outExt != ".jpg" && outExt != ".jpeg")
         {
-            BmpWriter.Write24(outPath, decoder.Width, decoder.Height, rgb);
-            Console.WriteLine($"✅ BMP 写入完成: {outPath}");
+            Console.WriteLine($"不支持的输出格式: {outExt}，默认写入 BMP");
+            outPath = Path.ChangeExtension(outPath, ".bmp");
         }
-        else if (outExt == ".png")
-        {
-            // Re-encode
-             PngWriter.Write(outPath, decoder.Width, decoder.Height, rgb);
-             Console.WriteLine($"✅ PNG 重编码完成: {outPath}");
-        }
+        frame.Save(outPath);
+        Console.WriteLine($"✅ 写入完成: {outPath}");
         
         swTotal.Stop();
         Console.WriteLine($"⏱️ 总耗时: {swTotal.ElapsedMilliseconds} ms");
@@ -158,19 +143,17 @@ class Program
         
         Console.WriteLine($"✅ 图像尺寸: {width} x {height}");
 
+        ImageFrame frame = new ImageFrame(width, height, rgb);
         string outPath = ResolveOutputPath(inputPath, outputPath, ".png");
         string outExt = Path.GetExtension(outPath).ToLower();
 
-        if (outExt == ".png")
+        if (outExt != ".bmp" && outExt != ".png" && outExt != ".jpg" && outExt != ".jpeg")
         {
-            PngWriter.Write(outPath, width, height, rgb);
-            Console.WriteLine($"✅ PNG 写入完成: {outPath}");
+            Console.WriteLine($"不支持的输出格式: {outExt}，默认写入 PNG");
+            outPath = Path.ChangeExtension(outPath, ".png");
         }
-        else if (outExt == ".bmp")
-        {
-             BmpWriter.Write24(outPath, width, height, rgb);
-             Console.WriteLine($"✅ BMP 重写完成: {outPath}");
-        }
+        frame.Save(outPath);
+        Console.WriteLine($"✅ 写入完成: {outPath}");
 
         swTotal.Stop();
         Console.WriteLine($"⏱️ 总耗时: {swTotal.ElapsedMilliseconds} ms");
@@ -178,7 +161,7 @@ class Program
 
     private static string ResolveOutputPath(string inputPath, string? outputPath, string defaultExtension)
     {
-        string desired = outputPath;
+        string? desired = outputPath;
         if (string.IsNullOrEmpty(desired))
         {
             desired = Path.Combine(
@@ -201,61 +184,4 @@ class Program
         return candidate;
     }
 
-    private static (byte[] pixels, int width, int height) ApplyExifOrientation(byte[] src, int width, int height, int orientation)
-    {
-        int newW = width;
-        int newH = height;
-        switch (orientation)
-        {
-            case 1: // 正常
-                return (src, width, height);
-            case 2: // 水平镜像
-                newW = width; newH = height; break;
-            case 3: // 旋转180
-                newW = width; newH = height; break;
-            case 4: // 垂直镜像
-                newW = width; newH = height; break;
-            case 5: // 水平镜像 + 旋转270（Transpose）
-            case 6: // 旋转90 CW
-            case 7: // 水平镜像 + 旋转90（Transverse）
-            case 8: // 旋转270 CW（90 CCW）
-                newW = height; newH = width; break;
-            default:
-                return (src, width, height);
-        }
-
-        byte[] dst = new byte[newW * newH * 3];
-        for (int y = 0; y < height; y++)
-        {
-            for (int x = 0; x < width; x++)
-            {
-                int dx, dy;
-                switch (orientation)
-                {
-                    case 2: // 水平镜像
-                        dx = (width - 1 - x); dy = y; break;
-                    case 3: // 旋转180
-                        dx = (width - 1 - x); dy = (height - 1 - y); break;
-                    case 4: // 垂直镜像
-                        dx = x; dy = (height - 1 - y); break;
-                    case 5: // Transpose（主对角线翻转）
-                        dx = y; dy = x; break;
-                    case 6: // Rotate 90 CW
-                        dx = (height - 1 - y); dy = x; break;
-                    case 7: // Transverse（副对角线翻转）
-                        dx = (height - 1 - y); dy = (width - 1 - x); break;
-                    case 8: // Rotate 270 CW (90 CCW)
-                        dx = y; dy = (width - 1 - x); break;
-                    default: // 1
-                        dx = x; dy = y; break;
-                }
-                int srcIdx = (y * width + x) * 3;
-                int dstIdx = (dy * newW + dx) * 3;
-                dst[dstIdx + 0] = src[srcIdx + 0];
-                dst[dstIdx + 1] = src[srcIdx + 1];
-                dst[dstIdx + 2] = src[srcIdx + 2];
-            }
-        }
-        return (dst, newW, newH);
-    }
 }
