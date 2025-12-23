@@ -56,9 +56,9 @@ public static class BmpWriter
     }
 
     private static void WriteLe16(Stream s, int v)
-        => s.Write(new byte[] { (byte)(v & 0xFF), (byte)((v >> 8) & 0xFF) }, 0, 2);
+        => s.Write([(byte)(v & 0xFF), (byte)((v >> 8) & 0xFF)]);
     private static void WriteLe32(Stream s, int v)
-        => s.Write(new byte[] { (byte)(v & 0xFF), (byte)((v >> 8) & 0xFF), (byte)((v >> 16) & 0xFF), (byte)((v >> 24) & 0xFF) }, 0, 4);
+        => s.Write([(byte)(v & 0xFF), (byte)((v >> 8) & 0xFF), (byte)((v >> 16) & 0xFF), (byte)((v >> 24) & 0xFF)]);
 
     private static void WriteLe16ToBuffer(byte[] buf, int offset, int v)
     {
