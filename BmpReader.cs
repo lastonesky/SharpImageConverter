@@ -5,16 +5,22 @@ public static class BmpReader
 {
     public static byte[] Read(string path, out int width, out int height)
     {
-        byte[] file = File.ReadAllBytes(path);
+        using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 20, FileOptions.SequentialScan);
+        Span<byte> header = stackalloc byte[54];
+        int read = fs.Read(header);
+        if (read != header.Length) throw new EndOfStreamException("BMP header 不完整");
 
-        if (file[0] != 'B' || file[1] != 'M')
+        if (header[0] != (byte)'B' || header[1] != (byte)'M')
             throw new InvalidDataException("Not a BMP file");
 
-        int dataOffset = ReadLe32(file, 10);
-        width = ReadLe32(file, 18);
-        height = ReadLe32(file, 22);
-        short bpp = ReadLe16(file, 28);
-        int compression = ReadLe32(file, 30);
+        int dataOffset = ReadLe32(header, 10);
+        int dibSize = ReadLe32(header, 14);
+        if (dibSize < 40) throw new NotSupportedException($"Unsupported DIB header size: {dibSize}");
+
+        width = ReadLe32(header, 18);
+        height = ReadLe32(header, 22);
+        short bpp = ReadLe16(header, 28);
+        int compression = ReadLe32(header, 30);
 
         if (bpp != 24 && bpp != 32)
             throw new NotSupportedException($"Only 24/32-bit BMPs are supported. Found {bpp}-bit.");
@@ -31,21 +37,23 @@ public static class BmpReader
 
         int pixelSize = bpp / 8;
 
-        for (int y = 0; y < height; y++)
+        fs.Position = dataOffset;
+        byte[] row = new byte[rowStride];
+        for (int rowIndex = 0; rowIndex < height; rowIndex++)
         {
-            int srcY = bottomUp ? (height - 1 - y) : y;
-            int srcOffset = dataOffset + srcY * rowStride;
-            int dstOffset = y * width * 3;
+            fs.ReadExactly(row, 0, rowStride);
+            int dstY = bottomUp ? (height - 1 - rowIndex) : rowIndex;
+            int dstOffset = dstY * width * 3;
 
             for (int x = 0; x < width; x++)
             {
-                int src = srcOffset + x * pixelSize;
+                int src = x * pixelSize;
                 int dst = dstOffset + x * 3;
 
                 // BMP is BGR(A)
-                byte b = file[src];
-                byte g = file[src + 1];
-                byte r = file[src + 2];
+                byte b = row[src];
+                byte g = row[src + 1];
+                byte r = row[src + 2];
 
                 rgb[dst] = r;
                 rgb[dst + 1] = g;
@@ -56,12 +64,12 @@ public static class BmpReader
         return rgb;
     }
 
-    private static short ReadLe16(byte[] buf, int offset)
+    private static short ReadLe16(ReadOnlySpan<byte> buf, int offset)
     {
         return (short)(buf[offset] | (buf[offset + 1] << 8));
     }
 
-    private static int ReadLe32(byte[] buf, int offset)
+    private static int ReadLe32(ReadOnlySpan<byte> buf, int offset)
     {
         return buf[offset] | (buf[offset + 1] << 8) | (buf[offset + 2] << 16) | (buf[offset + 3] << 24);
     }

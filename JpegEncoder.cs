@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using System.Numerics;
 
 public static class JpegEncoder
 {
@@ -15,26 +16,26 @@ public static class JpegEncoder
        53,60,61,54,47,55,62,63
     };
 
-    private static readonly double[,] Cos = BuildCosTable();
-    private static readonly double[] C = BuildC();
+    private static readonly float[,] CosF = BuildCosTableF();
+    private static readonly float[] CF = BuildCF();
 
-    private static double[,] BuildCosTable()
+    private static float[,] BuildCosTableF()
     {
-        var t = new double[8, 8];
+        var t = new float[8, 8];
         for (int n = 0; n < 8; n++)
         {
             for (int k = 0; k < 8; k++)
             {
-                t[n, k] = Math.Cos(((2 * n + 1) * k * Math.PI) / 16.0);
+                t[n, k] = MathF.Cos(((2 * n + 1) * k * MathF.PI) / 16.0f);
             }
         }
         return t;
     }
 
-    private static double[] BuildC()
+    private static float[] BuildCF()
     {
-        var c = new double[8];
-        for (int k = 0; k < 8; k++) c[k] = (k == 0) ? 1.0 / Math.Sqrt(2) : 1.0;
+        var c = new float[8];
+        for (int k = 0; k < 8; k++) c[k] = (k == 0) ? (1.0f / MathF.Sqrt(2.0f)) : 1.0f;
         return c;
     }
 
@@ -49,10 +50,23 @@ public static class JpegEncoder
         private readonly Stream _stream;
         private uint _bitBuffer;
         private int _bitCount;
+        private readonly byte[] _out;
+        private int _outPos;
 
         public JpegBitWriter(Stream stream)
         {
             _stream = stream;
+            _out = new byte[64 * 1024];
+        }
+
+        private void WriteByteBuffered(byte b)
+        {
+            if (_outPos == _out.Length)
+            {
+                _stream.Write(_out, 0, _outPos);
+                _outPos = 0;
+            }
+            _out[_outPos++] = b;
         }
 
         public void WriteBits(uint bits, int count)
@@ -64,8 +78,8 @@ public static class JpegEncoder
             {
                 int shift = _bitCount - 8;
                 byte b = (byte)((_bitBuffer >> shift) & 0xFF);
-                _stream.WriteByte(b);
-                if (b == 0xFF) _stream.WriteByte(0x00);
+                WriteByteBuffered(b);
+                if (b == 0xFF) WriteByteBuffered(0x00);
                 _bitCount -= 8;
                 _bitBuffer &= (uint)((1 << _bitCount) - 1);
             }
@@ -78,9 +92,16 @@ public static class JpegEncoder
 
         public void FlushFinal()
         {
-            if (_bitCount == 0) return;
-            uint pad = (uint)((1 << (8 - _bitCount)) - 1);
-            WriteBits(pad, 8 - _bitCount);
+            if (_bitCount != 0)
+            {
+                uint pad = (uint)((1 << (8 - _bitCount)) - 1);
+                WriteBits(pad, 8 - _bitCount);
+            }
+            if (_outPos > 0)
+            {
+                _stream.Write(_out, 0, _outPos);
+                _outPos = 0;
+            }
         }
     }
 
@@ -153,20 +174,24 @@ public static class JpegEncoder
         if (quality < 1) quality = 1;
         if (quality > 100) quality = 100;
 
+        bool subsample420 = ((long)width * height) >= 1_000_000;
+
         byte[] qY = BuildQuantTable(StdLumaQuant, quality);
         byte[] qC = BuildQuantTable(StdChromaQuant, quality);
+        int[] qYRecip = BuildQuantRecip(qY);
+        int[] qCRecip = BuildQuantRecip(qC);
 
         HuffCode[] dcY = BuildHuffTable(DcLumaCounts, DcLumaSymbols);
         HuffCode[] acY = BuildHuffTable(AcLumaCounts, AcLumaSymbols);
         HuffCode[] dcC = BuildHuffTable(DcChromaCounts, DcChromaSymbols);
         HuffCode[] acC = BuildHuffTable(AcChromaCounts, AcChromaSymbols);
 
-        using var fs = new FileStream(path, FileMode.Create, FileAccess.Write);
+        using var fs = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None, 1 << 20, FileOptions.SequentialScan);
         WriteMarker(fs, 0xD8);
         WriteApp0Jfif(fs);
         WriteDqt(fs, 0, qY);
         WriteDqt(fs, 1, qC);
-        WriteSof0(fs, width, height);
+        WriteSof0(fs, width, height, subsample420);
         WriteDht(fs, 0, 0, DcLumaCounts, DcLumaSymbols);
         WriteDht(fs, 1, 0, AcLumaCounts, AcLumaSymbols);
         WriteDht(fs, 0, 1, DcChromaCounts, DcChromaSymbols);
@@ -175,25 +200,63 @@ public static class JpegEncoder
 
         var bw = new JpegBitWriter(fs);
 
-        int blocksX = (width + 7) / 8;
-        int blocksY = (height + 7) / 8;
-
         int prevYdc = 0, prevCbdc = 0, prevCrdc = 0;
 
-        Span<int> yBlock = stackalloc int[64];
-        Span<int> cbBlock = stackalloc int[64];
-        Span<int> crBlock = stackalloc int[64];
         Span<int> qcoeff = stackalloc int[64];
 
-        for (int by = 0; by < blocksY; by++)
+        if (subsample420)
         {
-            for (int bx = 0; bx < blocksX; bx++)
-            {
-                FillBlockRgbToYCbCr(rgb24, width, height, bx * 8, by * 8, yBlock, cbBlock, crBlock);
+            int mcusX = (width + 15) / 16;
+            int mcusY = (height + 15) / 16;
 
-                EncodeBlock(bw, yBlock, qY, dcY, acY, ref prevYdc, qcoeff);
-                EncodeBlock(bw, cbBlock, qC, dcC, acC, ref prevCbdc, qcoeff);
-                EncodeBlock(bw, crBlock, qC, dcC, acC, ref prevCrdc, qcoeff);
+            Span<int> yBlocks = stackalloc int[64 * 4];
+            Span<int> cbBlock = stackalloc int[64];
+            Span<int> crBlock = stackalloc int[64];
+
+            for (int my = 0; my < mcusY; my++)
+            {
+                for (int mx = 0; mx < mcusX; mx++)
+                {
+                    FillMcu420RgbToYCbCr(
+                        rgb24,
+                        width,
+                        height,
+                        mx * 16,
+                        my * 16,
+                        yBlocks.Slice(0, 64),
+                        yBlocks.Slice(64, 64),
+                        yBlocks.Slice(128, 64),
+                        yBlocks.Slice(192, 64),
+                        cbBlock,
+                        crBlock);
+
+                    EncodeBlock(bw, yBlocks.Slice(0, 64), qY, qYRecip, dcY, acY, ref prevYdc, qcoeff);
+                    EncodeBlock(bw, yBlocks.Slice(64, 64), qY, qYRecip, dcY, acY, ref prevYdc, qcoeff);
+                    EncodeBlock(bw, yBlocks.Slice(128, 64), qY, qYRecip, dcY, acY, ref prevYdc, qcoeff);
+                    EncodeBlock(bw, yBlocks.Slice(192, 64), qY, qYRecip, dcY, acY, ref prevYdc, qcoeff);
+                    EncodeBlock(bw, cbBlock, qC, qCRecip, dcC, acC, ref prevCbdc, qcoeff);
+                    EncodeBlock(bw, crBlock, qC, qCRecip, dcC, acC, ref prevCrdc, qcoeff);
+                }
+            }
+        }
+        else
+        {
+            int blocksX = (width + 7) / 8;
+            int blocksY = (height + 7) / 8;
+
+            Span<int> yBlock = stackalloc int[64];
+            Span<int> cbBlock = stackalloc int[64];
+            Span<int> crBlock = stackalloc int[64];
+
+            for (int by = 0; by < blocksY; by++)
+            {
+                for (int bx = 0; bx < blocksX; bx++)
+                {
+                    FillBlockRgbToYCbCr444(rgb24, width, height, bx * 8, by * 8, yBlock, cbBlock, crBlock);
+                    EncodeBlock(bw, yBlock, qY, qYRecip, dcY, acY, ref prevYdc, qcoeff);
+                    EncodeBlock(bw, cbBlock, qC, qCRecip, dcC, acC, ref prevCbdc, qcoeff);
+                    EncodeBlock(bw, crBlock, qC, qCRecip, dcC, acC, ref prevCrdc, qcoeff);
+                }
             }
         }
 
@@ -201,16 +264,14 @@ public static class JpegEncoder
         WriteMarker(fs, 0xD9);
     }
 
-    private static void EncodeBlock(JpegBitWriter bw, Span<int> spatial, byte[] quant, HuffCode[] dc, HuffCode[] ac, ref int prevDc, Span<int> qcoeffOut)
+    private static void EncodeBlock(JpegBitWriter bw, Span<int> spatial, byte[] quant, int[] quantRecip, HuffCode[] dc, HuffCode[] ac, ref int prevDc, Span<int> qcoeffOut)
     {
         FDCT8x8(spatial, qcoeffOut);
 
         for (int i = 0; i < 64; i++)
         {
-            int q = quant[i];
             int v = qcoeffOut[i];
-            int qq = (v >= 0) ? (v + (q >> 1)) / q : -(((-v) + (q >> 1)) / q);
-            qcoeffOut[i] = qq;
+            qcoeffOut[i] = QuantizeNearest(v, quantRecip[i]);
         }
 
         int dcCoeff = qcoeffOut[0];
@@ -253,7 +314,66 @@ public static class JpegEncoder
         if (run > 0) bw.WriteHuff(ac[0x00]);
     }
 
-    private static void FillBlockRgbToYCbCr(byte[] rgb, int width, int height, int baseX, int baseY, Span<int> y, Span<int> cb, Span<int> cr)
+    private static void FillMcu420RgbToYCbCr(
+        byte[] rgb,
+        int width,
+        int height,
+        int baseX,
+        int baseY,
+        Span<int> y00,
+        Span<int> y10,
+        Span<int> y01,
+        Span<int> y11,
+        Span<int> cb,
+        Span<int> cr)
+    {
+        FillLumaBlock(rgb, width, height, baseX + 0, baseY + 0, y00);
+        FillLumaBlock(rgb, width, height, baseX + 8, baseY + 0, y10);
+        FillLumaBlock(rgb, width, height, baseX + 0, baseY + 8, y01);
+        FillLumaBlock(rgb, width, height, baseX + 8, baseY + 8, y11);
+
+        for (int yy = 0; yy < 8; yy++)
+        {
+            for (int xx = 0; xx < 8; xx++)
+            {
+                int sx = baseX + xx * 2;
+                int sy = baseY + yy * 2;
+
+                int cbSum = 0;
+                int crSum = 0;
+                for (int dy = 0; dy < 2; dy++)
+                {
+                    int py = sy + dy;
+                    if (py >= height) py = height - 1;
+                    for (int dx = 0; dx < 2; dx++)
+                    {
+                        int px = sx + dx;
+                        if (px >= width) px = width - 1;
+
+                        int src = (py * width + px) * 3;
+                        int r = rgb[src + 0];
+                        int g = rgb[src + 1];
+                        int b = rgb[src + 2];
+
+                        cbSum += (((-43 * r - 85 * g + 128 * b) >> 8) + 128);
+                        crSum += (((128 * r - 107 * g - 21 * b) >> 8) + 128);
+                    }
+                }
+
+                int cbVal = (cbSum + 2) >> 2;
+                int crVal = (crSum + 2) >> 2;
+
+                if (cbVal < 0) cbVal = 0; else if (cbVal > 255) cbVal = 255;
+                if (crVal < 0) crVal = 0; else if (crVal > 255) crVal = 255;
+
+                int i = yy * 8 + xx;
+                cb[i] = cbVal - 128;
+                cr[i] = crVal - 128;
+            }
+        }
+    }
+
+    private static void FillBlockRgbToYCbCr444(byte[] rgb, int width, int height, int baseX, int baseY, Span<int> y, Span<int> cb, Span<int> cr)
     {
         for (int yy = 0; yy < 8; yy++)
         {
@@ -285,10 +405,34 @@ public static class JpegEncoder
         }
     }
 
+    private static void FillLumaBlock(byte[] rgb, int width, int height, int baseX, int baseY, Span<int> y)
+    {
+        for (int yy = 0; yy < 8; yy++)
+        {
+            int sy = baseY + yy;
+            if (sy >= height) sy = height - 1;
+            for (int xx = 0; xx < 8; xx++)
+            {
+                int sx = baseX + xx;
+                if (sx >= width) sx = width - 1;
+
+                int src = (sy * width + sx) * 3;
+                int r = rgb[src + 0];
+                int g = rgb[src + 1];
+                int b = rgb[src + 2];
+
+                int yyVal = ((77 * r + 150 * g + 29 * b) >> 8);
+                if (yyVal < 0) yyVal = 0; else if (yyVal > 255) yyVal = 255;
+
+                y[yy * 8 + xx] = yyVal - 128;
+            }
+        }
+    }
+
     private static void FDCT8x8(Span<int> spatial, Span<int> coeffOut)
     {
-        Span<double> tmp = stackalloc double[64];
-        Span<double> src = stackalloc double[64];
+        Span<float> tmp = stackalloc float[64];
+        Span<float> src = stackalloc float[64];
         for (int i = 0; i < 64; i++) src[i] = spatial[i];
 
         for (int y = 0; y < 8; y++)
@@ -296,10 +440,10 @@ public static class JpegEncoder
             int rowBase = y * 8;
             for (int u = 0; u < 8; u++)
             {
-                double s = 0.0;
+                float s = 0.0f;
                 for (int x = 0; x < 8; x++)
                 {
-                    s += src[rowBase + x] * Cos[x, u];
+                    s += src[rowBase + x] * CosF[x, u];
                 }
                 tmp[rowBase + u] = s;
             }
@@ -309,13 +453,13 @@ public static class JpegEncoder
         {
             for (int u = 0; u < 8; u++)
             {
-                double s = 0.0;
+                float s = 0.0f;
                 for (int y = 0; y < 8; y++)
                 {
-                    s += tmp[y * 8 + u] * Cos[y, v];
+                    s += tmp[y * 8 + u] * CosF[y, v];
                 }
-                s *= 0.25 * C[u] * C[v];
-                coeffOut[u + v * 8] = (int)Math.Round(s);
+                s *= 0.25f * CF[u] * CF[v];
+                coeffOut[u + v * 8] = (int)MathF.Round(s);
             }
         }
     }
@@ -323,10 +467,8 @@ public static class JpegEncoder
     private static int MagnitudeCategory(int v)
     {
         if (v == 0) return 0;
-        int a = v < 0 ? -v : v;
-        int n = 0;
-        while (a != 0) { a >>= 1; n++; }
-        return n;
+        uint a = (uint)(v < 0 ? -v : v);
+        return 32 - BitOperations.LeadingZeroCount(a);
     }
 
     private static uint EncodeMagnitudeBits(int v, int cat)
@@ -368,6 +510,149 @@ public static class JpegEncoder
         return outTable;
     }
 
+    private static int[] BuildQuantRecip(byte[] quant)
+    {
+        var recip = new int[64];
+        for (int i = 0; i < 64; i++)
+        {
+            recip[i] = (int)((1L << 20) / quant[i]);
+        }
+        return recip;
+    }
+
+    private static int QuantizeNearest(int v, int recip20)
+    {
+        if (v >= 0)
+        {
+            return (int)(((long)v * recip20 + (1L << 19)) >> 20);
+        }
+        int a = -v;
+        return -(int)(((long)a * recip20 + (1L << 19)) >> 20);
+    }
+
+    private const int FDCT_CONST_BITS = 13;
+    private const int FDCT_PASS1_BITS = 2;
+
+    private const int FDCT_FIX_0_298631336 = 2446;
+    private const int FDCT_FIX_0_390180644 = 3196;
+    private const int FDCT_FIX_0_541196100 = 4433;
+    private const int FDCT_FIX_0_765366865 = 6270;
+    private const int FDCT_FIX_0_899976223 = 7373;
+    private const int FDCT_FIX_1_175875602 = 9633;
+    private const int FDCT_FIX_1_501321110 = 12299;
+    private const int FDCT_FIX_1_847759065 = 15137;
+    private const int FDCT_FIX_1_961570560 = 16069;
+    private const int FDCT_FIX_2_053119869 = 16819;
+    private const int FDCT_FIX_2_562915447 = 20995;
+    private const int FDCT_FIX_3_072711026 = 25172;
+
+    private static int FDctDescale(int x, int n)
+    {
+        return (x + (1 << (n - 1))) >> n;
+    }
+
+    private static int FDctMultiply(int x, int c)
+    {
+        return x * c;
+    }
+
+    private static void FDCT8x8IntInPlace(Span<int> data)
+    {
+        for (int row = 0; row < 64; row += 8)
+        {
+            int tmp0 = data[row + 0] + data[row + 7];
+            int tmp7 = data[row + 0] - data[row + 7];
+            int tmp1 = data[row + 1] + data[row + 6];
+            int tmp6 = data[row + 1] - data[row + 6];
+            int tmp2 = data[row + 2] + data[row + 5];
+            int tmp5 = data[row + 2] - data[row + 5];
+            int tmp3 = data[row + 3] + data[row + 4];
+            int tmp4 = data[row + 3] - data[row + 4];
+
+            int tmp10 = tmp0 + tmp3;
+            int tmp13 = tmp0 - tmp3;
+            int tmp11 = tmp1 + tmp2;
+            int tmp12 = tmp1 - tmp2;
+
+            data[row + 0] = (tmp10 + tmp11) << FDCT_PASS1_BITS;
+            data[row + 4] = (tmp10 - tmp11) << FDCT_PASS1_BITS;
+
+            int z1 = FDctMultiply(tmp12 + tmp13, FDCT_FIX_0_541196100);
+            data[row + 2] = FDctDescale(z1 + FDctMultiply(tmp13, FDCT_FIX_0_765366865), FDCT_CONST_BITS - FDCT_PASS1_BITS);
+            data[row + 6] = FDctDescale(z1 + FDctMultiply(tmp12, -FDCT_FIX_1_847759065), FDCT_CONST_BITS - FDCT_PASS1_BITS);
+
+            int z11 = tmp4 + tmp7;
+            int z12 = tmp5 + tmp6;
+            int z13 = tmp4 + tmp6;
+            int z14 = tmp5 + tmp7;
+            int z15 = FDctMultiply(z13 + z14, FDCT_FIX_1_175875602);
+
+            tmp4 = FDctMultiply(tmp4, FDCT_FIX_0_298631336);
+            tmp5 = FDctMultiply(tmp5, FDCT_FIX_2_053119869);
+            tmp6 = FDctMultiply(tmp6, FDCT_FIX_3_072711026);
+            tmp7 = FDctMultiply(tmp7, FDCT_FIX_1_501321110);
+            z11 = FDctMultiply(z11, -FDCT_FIX_0_899976223);
+            z12 = FDctMultiply(z12, -FDCT_FIX_2_562915447);
+            z13 = FDctMultiply(z13, -FDCT_FIX_1_961570560);
+            z14 = FDctMultiply(z14, -FDCT_FIX_0_390180644);
+
+            z13 += z15;
+            z14 += z15;
+
+            data[row + 7] = FDctDescale(tmp4 + z11 + z13, FDCT_CONST_BITS - FDCT_PASS1_BITS);
+            data[row + 5] = FDctDescale(tmp5 + z12 + z14, FDCT_CONST_BITS - FDCT_PASS1_BITS);
+            data[row + 3] = FDctDescale(tmp6 + z12 + z13, FDCT_CONST_BITS - FDCT_PASS1_BITS);
+            data[row + 1] = FDctDescale(tmp7 + z11 + z14, FDCT_CONST_BITS - FDCT_PASS1_BITS);
+        }
+
+        for (int col = 0; col < 8; col++)
+        {
+            int tmp0 = data[col + 0 * 8] + data[col + 7 * 8];
+            int tmp7 = data[col + 0 * 8] - data[col + 7 * 8];
+            int tmp1 = data[col + 1 * 8] + data[col + 6 * 8];
+            int tmp6 = data[col + 1 * 8] - data[col + 6 * 8];
+            int tmp2 = data[col + 2 * 8] + data[col + 5 * 8];
+            int tmp5 = data[col + 2 * 8] - data[col + 5 * 8];
+            int tmp3 = data[col + 3 * 8] + data[col + 4 * 8];
+            int tmp4 = data[col + 3 * 8] - data[col + 4 * 8];
+
+            int tmp10 = tmp0 + tmp3;
+            int tmp13 = tmp0 - tmp3;
+            int tmp11 = tmp1 + tmp2;
+            int tmp12 = tmp1 - tmp2;
+
+            data[col + 0 * 8] = FDctDescale(tmp10 + tmp11, FDCT_PASS1_BITS);
+            data[col + 4 * 8] = FDctDescale(tmp10 - tmp11, FDCT_PASS1_BITS);
+
+            int z1 = FDctMultiply(tmp12 + tmp13, FDCT_FIX_0_541196100);
+            data[col + 2 * 8] = FDctDescale(z1 + FDctMultiply(tmp13, FDCT_FIX_0_765366865), FDCT_CONST_BITS + FDCT_PASS1_BITS);
+            data[col + 6 * 8] = FDctDescale(z1 + FDctMultiply(tmp12, -FDCT_FIX_1_847759065), FDCT_CONST_BITS + FDCT_PASS1_BITS);
+
+            int z11 = tmp4 + tmp7;
+            int z12 = tmp5 + tmp6;
+            int z13 = tmp4 + tmp6;
+            int z14 = tmp5 + tmp7;
+            int z15 = FDctMultiply(z13 + z14, FDCT_FIX_1_175875602);
+
+            tmp4 = FDctMultiply(tmp4, FDCT_FIX_0_298631336);
+            tmp5 = FDctMultiply(tmp5, FDCT_FIX_2_053119869);
+            tmp6 = FDctMultiply(tmp6, FDCT_FIX_3_072711026);
+            tmp7 = FDctMultiply(tmp7, FDCT_FIX_1_501321110);
+            z11 = FDctMultiply(z11, -FDCT_FIX_0_899976223);
+            z12 = FDctMultiply(z12, -FDCT_FIX_2_562915447);
+            z13 = FDctMultiply(z13, -FDCT_FIX_1_961570560);
+            z14 = FDctMultiply(z14, -FDCT_FIX_0_390180644);
+
+            z13 += z15;
+            z14 += z15;
+
+            data[col + 7 * 8] = FDctDescale(tmp4 + z11 + z13, FDCT_CONST_BITS + FDCT_PASS1_BITS);
+            data[col + 5 * 8] = FDctDescale(tmp5 + z12 + z14, FDCT_CONST_BITS + FDCT_PASS1_BITS);
+            data[col + 3 * 8] = FDctDescale(tmp6 + z12 + z13, FDCT_CONST_BITS + FDCT_PASS1_BITS);
+            data[col + 1 * 8] = FDctDescale(tmp7 + z11 + z14, FDCT_CONST_BITS + FDCT_PASS1_BITS);
+        }
+    }
+
     private static void WriteMarker(Stream s, byte markerLow)
     {
         s.WriteByte(0xFF);
@@ -404,7 +689,7 @@ public static class JpegEncoder
         }
     }
 
-    private static void WriteSof0(Stream s, int width, int height)
+    private static void WriteSof0(Stream s, int width, int height, bool subsample420)
     {
         WriteMarker(s, 0xC0);
         WriteBe16(s, 17);
@@ -414,7 +699,7 @@ public static class JpegEncoder
         s.WriteByte(3);
 
         s.WriteByte(1);
-        s.WriteByte(0x11);
+        s.WriteByte(subsample420 ? (byte)0x22 : (byte)0x11);
         s.WriteByte(0);
 
         s.WriteByte(2);
@@ -456,4 +741,3 @@ public static class JpegEncoder
         s.WriteByte(0);
     }
 }
-
