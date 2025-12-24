@@ -18,6 +18,26 @@ public static class JpegEncoder
 
     private static readonly float[,] CosF = BuildCosTableF();
     private static readonly float[] CF = BuildCF();
+    private static readonly double[] AAN = new double[]
+    {
+        1.0,
+        1.387039845,
+        1.306562965,
+        1.175875602,
+        1.0,
+        0.785694958,
+        0.541196100,
+        0.275899379
+    };
+    private static readonly int[] YR = BuildScale(77);
+    private static readonly int[] YG = BuildScale(150);
+    private static readonly int[] YB = BuildScale(29);
+    private static readonly int[] CbR = BuildScale(-43);
+    private static readonly int[] CbG = BuildScale(-85);
+    private static readonly int[] CbB = BuildScale(128);
+    private static readonly int[] CrR = BuildScale(128);
+    private static readonly int[] CrG = BuildScale(-107);
+    private static readonly int[] CrB = BuildScale(-21);
 
     private static float[,] BuildCosTableF()
     {
@@ -37,6 +57,12 @@ public static class JpegEncoder
         var c = new float[8];
         for (int k = 0; k < 8; k++) c[k] = (k == 0) ? (1.0f / MathF.Sqrt(2.0f)) : 1.0f;
         return c;
+    }
+    private static int[] BuildScale(int k)
+    {
+        var t = new int[256];
+        for (int i = 0; i < 256; i++) t[i] = k * i;
+        return t;
     }
 
     private struct HuffCode
@@ -175,11 +201,14 @@ public static class JpegEncoder
         if (quality > 100) quality = 100;
 
         bool subsample420 = ((long)width * height) >= 1_000_000;
+        bool useIntFdct = ((long)width * height) >= 1_000_000;
 
         byte[] qY = BuildQuantTable(StdLumaQuant, quality);
         byte[] qC = BuildQuantTable(StdChromaQuant, quality);
-        int[] qYRecip = BuildQuantRecip(qY);
-        int[] qCRecip = BuildQuantRecip(qC);
+        int[] qYRecipInt = BuildQuantRecipAAN(qY);
+        int[] qCRecipInt = BuildQuantRecipAAN(qC);
+        int[] qYRecipFloat = BuildQuantRecip(qY);
+        int[] qCRecipFloat = BuildQuantRecip(qC);
 
         HuffCode[] dcY = BuildHuffTable(DcLumaCounts, DcLumaSymbols);
         HuffCode[] acY = BuildHuffTable(AcLumaCounts, AcLumaSymbols);
@@ -230,12 +259,14 @@ public static class JpegEncoder
                         cbBlock,
                         crBlock);
 
-                    EncodeBlock(bw, yBlocks.Slice(0, 64), qY, qYRecip, dcY, acY, ref prevYdc, qcoeff);
-                    EncodeBlock(bw, yBlocks.Slice(64, 64), qY, qYRecip, dcY, acY, ref prevYdc, qcoeff);
-                    EncodeBlock(bw, yBlocks.Slice(128, 64), qY, qYRecip, dcY, acY, ref prevYdc, qcoeff);
-                    EncodeBlock(bw, yBlocks.Slice(192, 64), qY, qYRecip, dcY, acY, ref prevYdc, qcoeff);
-                    EncodeBlock(bw, cbBlock, qC, qCRecip, dcC, acC, ref prevCbdc, qcoeff);
-                    EncodeBlock(bw, crBlock, qC, qCRecip, dcC, acC, ref prevCrdc, qcoeff);
+                    var yRecip = useIntFdct ? qYRecipInt : qYRecipFloat;
+                    var cRecip = useIntFdct ? qCRecipInt : qCRecipFloat;
+                    EncodeBlock(bw, yBlocks.Slice(0, 64), qY, yRecip, dcY, acY, ref prevYdc, qcoeff, useIntFdct);
+                    EncodeBlock(bw, yBlocks.Slice(64, 64), qY, yRecip, dcY, acY, ref prevYdc, qcoeff, useIntFdct);
+                    EncodeBlock(bw, yBlocks.Slice(128, 64), qY, yRecip, dcY, acY, ref prevYdc, qcoeff, useIntFdct);
+                    EncodeBlock(bw, yBlocks.Slice(192, 64), qY, yRecip, dcY, acY, ref prevYdc, qcoeff, useIntFdct);
+                    EncodeBlock(bw, cbBlock, qC, cRecip, dcC, acC, ref prevCbdc, qcoeff, useIntFdct);
+                    EncodeBlock(bw, crBlock, qC, cRecip, dcC, acC, ref prevCrdc, qcoeff, useIntFdct);
                 }
             }
         }
@@ -253,9 +284,11 @@ public static class JpegEncoder
                 for (int bx = 0; bx < blocksX; bx++)
                 {
                     FillBlockRgbToYCbCr444(rgb24, width, height, bx * 8, by * 8, yBlock, cbBlock, crBlock);
-                    EncodeBlock(bw, yBlock, qY, qYRecip, dcY, acY, ref prevYdc, qcoeff);
-                    EncodeBlock(bw, cbBlock, qC, qCRecip, dcC, acC, ref prevCbdc, qcoeff);
-                    EncodeBlock(bw, crBlock, qC, qCRecip, dcC, acC, ref prevCrdc, qcoeff);
+                    var yRecip = useIntFdct ? qYRecipInt : qYRecipFloat;
+                    var cRecip = useIntFdct ? qCRecipInt : qCRecipFloat;
+                    EncodeBlock(bw, yBlock, qY, yRecip, dcY, acY, ref prevYdc, qcoeff, useIntFdct);
+                    EncodeBlock(bw, cbBlock, qC, cRecip, dcC, acC, ref prevCbdc, qcoeff, useIntFdct);
+                    EncodeBlock(bw, crBlock, qC, cRecip, dcC, acC, ref prevCrdc, qcoeff, useIntFdct);
                 }
             }
         }
@@ -264,9 +297,10 @@ public static class JpegEncoder
         WriteMarker(fs, 0xD9);
     }
 
-    private static void EncodeBlock(JpegBitWriter bw, Span<int> spatial, byte[] quant, int[] quantRecip, HuffCode[] dc, HuffCode[] ac, ref int prevDc, Span<int> qcoeffOut)
+    private static void EncodeBlock(JpegBitWriter bw, Span<int> spatial, byte[] quant, int[] quantRecip, HuffCode[] dc, HuffCode[] ac, ref int prevDc, Span<int> qcoeffOut, bool useIntFdct)
     {
-        FDCT8x8(spatial, qcoeffOut);
+        if (useIntFdct) FDCT8x8(spatial, qcoeffOut);
+        else FDCT8x8_Float(spatial, qcoeffOut);
 
         for (int i = 0; i < 64; i++)
         {
@@ -314,6 +348,39 @@ public static class JpegEncoder
         if (run > 0) bw.WriteHuff(ac[0x00]);
     }
 
+    private static void FDCT8x8_Float(Span<int> spatial, Span<int> coeffOut)
+    {
+        Span<float> tmp = stackalloc float[64];
+        Span<float> src = stackalloc float[64];
+        for (int i = 0; i < 64; i++) src[i] = spatial[i];
+        for (int y = 0; y < 8; y++)
+        {
+            int rowBase = y * 8;
+            for (int u = 0; u < 8; u++)
+            {
+                float s = 0.0f;
+                for (int x = 0; x < 8; x++)
+                {
+                    s += src[rowBase + x] * CosF[x, u];
+                }
+                tmp[rowBase + u] = s;
+            }
+        }
+        for (int v = 0; v < 8; v++)
+        {
+            for (int u = 0; u < 8; u++)
+            {
+                float s = 0.0f;
+                for (int y = 0; y < 8; y++)
+                {
+                    s += tmp[y * 8 + u] * CosF[y, v];
+                }
+                s *= 0.25f * CF[u] * CF[v];
+                coeffOut[u + v * 8] = (int)MathF.Round(s);
+            }
+        }
+    }
+
     private static void FillMcu420RgbToYCbCr(
         byte[] rgb,
         int width,
@@ -355,8 +422,8 @@ public static class JpegEncoder
                         int g = rgb[src + 1];
                         int b = rgb[src + 2];
 
-                        cbSum += (((-43 * r - 85 * g + 128 * b) >> 8) + 128);
-                        crSum += (((128 * r - 107 * g - 21 * b) >> 8) + 128);
+                        cbSum += ((CbR[r] + CbG[g] + CbB[b]) >> 8) + 128;
+                        crSum += ((CrR[r] + CrG[g] + CrB[b]) >> 8) + 128;
                     }
                 }
 
@@ -389,9 +456,9 @@ public static class JpegEncoder
                 int g = rgb[src + 1];
                 int b = rgb[src + 2];
 
-                int yyVal = ((77 * r + 150 * g + 29 * b) >> 8);
-                int cbVal = (((-43 * r - 85 * g + 128 * b) >> 8) + 128);
-                int crVal = (((128 * r - 107 * g - 21 * b) >> 8) + 128);
+                int yyVal = (YR[r] + YG[g] + YB[b]) >> 8;
+                int cbVal = ((CbR[r] + CbG[g] + CbB[b]) >> 8) + 128;
+                int crVal = ((CrR[r] + CrG[g] + CrB[b]) >> 8) + 128;
 
                 if (yyVal < 0) yyVal = 0; else if (yyVal > 255) yyVal = 255;
                 if (cbVal < 0) cbVal = 0; else if (cbVal > 255) cbVal = 255;
@@ -421,7 +488,7 @@ public static class JpegEncoder
                 int g = rgb[src + 1];
                 int b = rgb[src + 2];
 
-                int yyVal = ((77 * r + 150 * g + 29 * b) >> 8);
+                int yyVal = (YR[r] + YG[g] + YB[b]) >> 8;
                 if (yyVal < 0) yyVal = 0; else if (yyVal > 255) yyVal = 255;
 
                 y[yy * 8 + xx] = yyVal - 128;
@@ -431,37 +498,10 @@ public static class JpegEncoder
 
     private static void FDCT8x8(Span<int> spatial, Span<int> coeffOut)
     {
-        Span<float> tmp = stackalloc float[64];
-        Span<float> src = stackalloc float[64];
-        for (int i = 0; i < 64; i++) src[i] = spatial[i];
-
-        for (int y = 0; y < 8; y++)
-        {
-            int rowBase = y * 8;
-            for (int u = 0; u < 8; u++)
-            {
-                float s = 0.0f;
-                for (int x = 0; x < 8; x++)
-                {
-                    s += src[rowBase + x] * CosF[x, u];
-                }
-                tmp[rowBase + u] = s;
-            }
-        }
-
-        for (int v = 0; v < 8; v++)
-        {
-            for (int u = 0; u < 8; u++)
-            {
-                float s = 0.0f;
-                for (int y = 0; y < 8; y++)
-                {
-                    s += tmp[y * 8 + u] * CosF[y, v];
-                }
-                s *= 0.25f * CF[u] * CF[v];
-                coeffOut[u + v * 8] = (int)MathF.Round(s);
-            }
-        }
+        Span<int> data = stackalloc int[64];
+        for (int i = 0; i < 64; i++) data[i] = spatial[i];
+        FDCT8x8IntInPlace(data);
+        for (int i = 0; i < 64; i++) coeffOut[i] = data[i];
     }
 
     private static int MagnitudeCategory(int v)
@@ -528,6 +568,22 @@ public static class JpegEncoder
         }
         int a = -v;
         return -(int)(((long)a * recip20 + (1L << 19)) >> 20);
+    }
+
+    private static int[] BuildQuantRecipAAN(byte[] quant)
+    {
+        var recip = new int[64];
+        for (int i = 0; i < 64; i++)
+        {
+            int u = i & 7;
+            int v = i >> 3;
+            double scale = AAN[u] * AAN[v] * 8.0;
+            double denom = quant[i] * scale;
+            long r = (long)((1L << 20) / denom);
+            if (r <= 0) r = 1;
+            recip[i] = (int)r;
+        }
+        return recip;
     }
 
     private const int FDCT_CONST_BITS = 13;
