@@ -84,13 +84,12 @@ dotnet run -- image.jpg image_reencode.jpg
 
 - JPEG 上采样目前使用最近邻插值。
 - PNG 写入目前仅支持 Truecolor 格式，不保留源文件的调色板或元数据。
-- JPEG 编码目前仅支持 Baseline（非 Progressive），且为 4:4:4（不做色度子采样），不写入 EXIF 等元数据。
+- JPEG 编码目前仅支持 Baseline（非 Progressive），默认使用 4:2:0 子采样，不写入 EXIF 等元数据。
 
 
 ## 下一步计划
 
 - 优化上采样算法（实现双线性或双三次插值）。
-- 优化 IDCT（如 AAN 快速整数 IDCT）以提升性能。
 - 增强鲁棒性（容错、特殊 JPEG 变体）。
 - 增加单元测试与更多示例图片验证。
 
@@ -108,6 +107,4 @@ dotnet run -- image.jpg image_reencode.jpg
 
 ## 优化空间
 
-- 用 AAN/整数 IDCT 替换 double IDCT（通常是最大热点）
-- BitReader 目前使用 Stream.ReadByte() 逐字节读取，吞吐偏低；改成块读取缓冲通常收益很大： BitReader.cs:25-66
-- JPEG 编码端目前是 4:4:4 + double FDCT（ JpegEncoder.cs:149-202 ），若要进一步提速/减小体积：实现 4:2:0 子采样 + 整数 FDCT + 行级向量化是主要方向
+- JPEG 编码端已启用 4:2:0 子采样 + 整数 FDCT。若要进一步提速：行级向量化是主要方向

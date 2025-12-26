@@ -200,8 +200,10 @@ public static class JpegEncoder
         if (quality < 1) quality = 1;
         if (quality > 100) quality = 100;
 
-        bool subsample420 = ((long)width * height) >= 1_000_000;
-        bool useIntFdct = ((long)width * height) >= 1_000_000;
+        // 总是启用 4:2:0 子采样以减小体积（除非图像极小，这里暂不特殊处理）
+        // 总是启用整数 FDCT 以提速
+        bool subsample420 = true;
+        bool useIntFdct = true;
 
         byte[] qY = BuildQuantTable(StdLumaQuant, quality);
         byte[] qC = BuildQuantTable(StdChromaQuant, quality);
