@@ -7,10 +7,4 @@
     <Nullable>enable</Nullable>
   </PropertyGroup>
 
-  <ItemGroup>
-    <Compile Remove="Jpeg2Bmp.Tests\**\*.cs" />
-    <Compile Remove="Jpeg2Bmp.Tests\obj\**\*.cs" />
-    <Compile Remove="Jpeg2Bmp.Tests\bin\**\*.cs" />
-  </ItemGroup>
-
 </Project>

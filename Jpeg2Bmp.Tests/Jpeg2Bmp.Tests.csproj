@@ -13,4 +13,7 @@
     <Compile Include="..\\Metadata\\*.cs" />
     <Compile Include="..\\*.cs" Exclude="..\\Program.cs" />
   </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\src\Jpeg2Bmp.csproj" />
+  </ItemGroup>
 </Project>
