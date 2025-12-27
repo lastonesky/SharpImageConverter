@@ -24,9 +24,11 @@ namespace Jpeg2Bmp.Tests
             Run("FormatConversionTests.Bmp_Roundtrip_Exact", FormatConversionTests.Bmp_Roundtrip_Exact);
             Run("FormatConversionTests.Png_Roundtrip_Exact", FormatConversionTests.Png_Roundtrip_Exact);
             Run("FormatConversionTests.Jpeg_Roundtrip_WithTolerance", FormatConversionTests.Jpeg_Roundtrip_WithTolerance);
+            Run("FormatConversionTests.Jpeg_Roundtrip_DefaultSettings_NoSevereColorShift", FormatConversionTests.Jpeg_Roundtrip_DefaultSettings_NoSevereColorShift);
             Run("ProcessingTests.Resize_2x2_To_1x1_Picks_TopLeft", ProcessingTests.Resize_2x2_To_1x1_Picks_TopLeft);
             Run("ProcessingTests.Resize_3x3_To_6x6_NearestNeighborMapping", ProcessingTests.Resize_3x3_To_6x6_NearestNeighborMapping);
             Run("ProcessingTests.Grayscale_Formula_Matches", ProcessingTests.Grayscale_Formula_Matches);
+            Run("ProcessingTests.ResizeToFit_PreservesAspectRatio", ProcessingTests.ResizeToFit_PreservesAspectRatio);
             Run("ImageFrameTests.ImageFrame_Save_And_Load_Bmp_Png_Jpeg", ImageFrameTests.ImageFrame_Save_And_Load_Bmp_Png_Jpeg);
             Run("ImageFrameTests.ApplyExifOrientation_All_1_To_8", ImageFrameTests.ApplyExifOrientation_All_1_To_8);
             Run("BmpPaddingTests.Bmp_RowPadding_Roundtrip_Exact", BmpPaddingTests.Bmp_RowPadding_Roundtrip_Exact);

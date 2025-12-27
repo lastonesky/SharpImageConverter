@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 
 class Program
@@ -7,37 +8,130 @@ class Program
     {
         if (args.Length < 1)
         {
-            Console.WriteLine("用法: dotnet run -- <输入文件路径> [输出文件路径]");
+            Console.WriteLine("用法: dotnet run -- <输入文件路径> [输出文件路径] [操作] [--quality N]");
             Console.WriteLine("支持输入: .jpg/.jpeg/.png/.bmp");
             Console.WriteLine("支持输出: .jpg/.jpeg/.png/.bmp");
+            Console.WriteLine("操作: resize:WxH | resizefit:WxH | grayscale");
+            Console.WriteLine("参数: --quality N | --subsample 420/444 | --fdct int/float");
             return;
         }
         string inputPath = args[0];
-        string? outputPath = args.Length >= 2 ? args[1] : null;
-        var swTotal = System.Diagnostics.Stopwatch.StartNew();
-        var image = Core.Image.Load(inputPath);
-        if (args.Length >= 3)
+        string? outputPath = null;
+        int? jpegQuality = null;
+        bool? subsample420 = null;
+        bool? useIntFdct = null;
+        var ops = new List<Action<Processing.ImageProcessingContext>>();
+        for (int i = 1; i < args.Length; i++)
         {
-            string op = args[2].ToLower();
+            string a = args[i];
+            if (string.Equals(a, "--quality", StringComparison.OrdinalIgnoreCase) || string.Equals(a, "-q", StringComparison.OrdinalIgnoreCase))
+            {
+                if (i + 1 < args.Length && int.TryParse(args[i + 1], out int q))
+                {
+                    jpegQuality = q;
+                    i++;
+                }
+                continue;
+            }
+            if (a.StartsWith("--quality=", StringComparison.OrdinalIgnoreCase))
+            {
+                string v = a.Substring("--quality=".Length);
+                if (int.TryParse(v, out int q)) jpegQuality = q;
+                continue;
+            }
+            if (string.Equals(a, "--subsample", StringComparison.OrdinalIgnoreCase))
+            {
+                if (i + 1 < args.Length)
+                {
+                    string v = args[i + 1].Trim();
+                    if (string.Equals(v, "420", StringComparison.OrdinalIgnoreCase)) subsample420 = true;
+                    else if (string.Equals(v, "444", StringComparison.OrdinalIgnoreCase)) subsample420 = false;
+                    i++;
+                }
+                continue;
+            }
+            if (a.StartsWith("--subsample=", StringComparison.OrdinalIgnoreCase))
+            {
+                string v = a.Substring("--subsample=".Length).Trim();
+                if (string.Equals(v, "420", StringComparison.OrdinalIgnoreCase)) subsample420 = true;
+                else if (string.Equals(v, "444", StringComparison.OrdinalIgnoreCase)) subsample420 = false;
+                continue;
+            }
+            if (string.Equals(a, "--fdct", StringComparison.OrdinalIgnoreCase))
+            {
+                if (i + 1 < args.Length)
+                {
+                    string v = args[i + 1].Trim();
+                    if (string.Equals(v, "int", StringComparison.OrdinalIgnoreCase)) useIntFdct = true;
+                    else if (string.Equals(v, "float", StringComparison.OrdinalIgnoreCase)) useIntFdct = false;
+                    i++;
+                }
+                continue;
+            }
+            if (a.StartsWith("--fdct=", StringComparison.OrdinalIgnoreCase))
+            {
+                string v = a.Substring("--fdct=".Length).Trim();
+                if (string.Equals(v, "int", StringComparison.OrdinalIgnoreCase)) useIntFdct = true;
+                else if (string.Equals(v, "float", StringComparison.OrdinalIgnoreCase)) useIntFdct = false;
+                continue;
+            }
+            string op = a.ToLowerInvariant();
             if (op.StartsWith("resize:"))
             {
                 var parts = op.Substring(7).Split('x');
                 if (parts.Length == 2 && int.TryParse(parts[0], out int w) && int.TryParse(parts[1], out int h))
                 {
-                    Processing.ImageExtensions.Mutate(image, ctx => ctx.Resize(w, h));
+                    ops.Add(ctx => ctx.Resize(w, h));
                 }
+                continue;
             }
-            else if (op == "grayscale")
+            if (op.StartsWith("resizefit:"))
             {
-                Processing.ImageExtensions.Mutate(image, ctx => ctx.Grayscale());
+                var parts = op.Substring(10).Split('x');
+                if (parts.Length == 2 && int.TryParse(parts[0], out int w) && int.TryParse(parts[1], out int h))
+                {
+                    ops.Add(ctx => ctx.ResizeToFit(w, h));
+                }
+                continue;
             }
+            if (op == "grayscale")
+            {
+                ops.Add(ctx => ctx.Grayscale());
+                continue;
+            }
+
+            if (outputPath == null && !a.StartsWith("-", StringComparison.Ordinal))
+            {
+                outputPath = a;
+            }
+        }
+        var swTotal = System.Diagnostics.Stopwatch.StartNew();
+        var image = Core.Image.Load(inputPath);
+        if (ops.Count > 0)
+        {
+            Processing.ImageExtensions.Mutate(image, ctx =>
+            {
+                foreach (var a in ops) a(ctx);
+            });
         }
         if (outputPath == null)
         {
             string defExt = ".bmp";
             outputPath = Path.ChangeExtension(inputPath, defExt);
         }
-        Core.Image.Save(image, outputPath);
+        string outExt = Path.GetExtension(outputPath).ToLowerInvariant();
+        if (outExt is ".jpg" or ".jpeg")
+        {
+            int q = jpegQuality ?? 75;
+            var frame = new ImageFrame(image.Width, image.Height, image.Buffer);
+            if (subsample420.HasValue && useIntFdct.HasValue) frame.SaveAsJpeg(outputPath, q, subsample420.Value, useIntFdct.Value);
+            else if (subsample420.HasValue) frame.SaveAsJpeg(outputPath, q, subsample420.Value);
+            else frame.SaveAsJpeg(outputPath, q);
+        }
+        else
+        {
+            Core.Image.Save(image, outputPath);
+        }
         swTotal.Stop();
         Console.WriteLine($"✅ 写入完成: {outputPath}");
         Console.WriteLine($"⏱️ 总耗时: {swTotal.ElapsedMilliseconds} ms");

@@ -33,6 +33,22 @@ namespace Processing
             _image.Update(width, height, dst);
             return this;
         }
+
+        public ImageProcessingContext ResizeToFit(int maxWidth, int maxHeight)
+        {
+            int sw = _image.Width, sh = _image.Height;
+            if (sw <= 0 || sh <= 0) return this;
+            if (maxWidth <= 0 || maxHeight <= 0) return this;
+
+            double scaleW = (double)maxWidth / sw;
+            double scaleH = (double)maxHeight / sh;
+            double scale = Math.Min(scaleW, scaleH);
+
+            int w = Math.Max(1, (int)Math.Round(sw * scale));
+            int h = Math.Max(1, (int)Math.Round(sh * scale));
+
+            return Resize(w, h);
+        }
         public ImageProcessingContext Grayscale()
         {
             var buf = _image.Buffer;

@@ -103,6 +103,16 @@ public sealed class ImageFrame
         JpegEncoder.Write(path, Width, Height, Pixels, quality);
     }
 
+    public void SaveAsJpeg(string path, int quality, bool subsample420)
+    {
+        JpegEncoder.Write(path, Width, Height, Pixels, quality, subsample420);
+    }
+
+    public void SaveAsJpeg(string path, int quality, bool subsample420, bool useIntFdct)
+    {
+        JpegEncoder.Write(path, Width, Height, Pixels, quality, subsample420, useIntFdct);
+    }
+
     public ImageFrame ApplyExifOrientation(int orientation)
     {
         if (orientation == 1) return this;

@@ -53,5 +53,18 @@ namespace Jpeg2Bmp.Tests
             Assert.AreEqual((byte)y, img.Buffer[1]);
             Assert.AreEqual((byte)y, img.Buffer[2]);
         }
+
+        public static void ResizeToFit_PreservesAspectRatio()
+        {
+            var wide = TestImageFactory.CreateSolid(400, 200, 1, 2, 3);
+            ImageExtensions.Mutate(wide, ctx => ctx.ResizeToFit(320, 240));
+            Assert.AreEqual(320, wide.Width);
+            Assert.AreEqual(160, wide.Height);
+
+            var tall = TestImageFactory.CreateSolid(200, 400, 1, 2, 3);
+            ImageExtensions.Mutate(tall, ctx => ctx.ResizeToFit(320, 240));
+            Assert.AreEqual(120, tall.Width);
+            Assert.AreEqual(240, tall.Height);
+        }
     }
 }
