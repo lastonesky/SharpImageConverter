@@ -4,6 +4,8 @@ using System.Numerics;
 
 public static class JpegEncoder
 {
+    public static bool DebugPrintConfig { get; set; }
+
     private static readonly int[] ZigZag = new int[]
     {
         0, 1, 8,16, 9, 2, 3,10,
@@ -200,8 +202,8 @@ public static class JpegEncoder
         if (quality < 1) quality = 1;
         if (quality > 100) quality = 100;
 
-        bool subsample420 = quality < 95 && Math.Min(width, height) >= 64;
-        bool useIntFdct = quality < 95 && Math.Min(width, height) >= 64;
+        bool subsample420 = true;
+        bool useIntFdct = true;
         WriteInternal(path, width, height, rgb24, quality, subsample420, useIntFdct);
     }
 
@@ -212,7 +214,7 @@ public static class JpegEncoder
         if (quality < 1) quality = 1;
         if (quality > 100) quality = 100;
 
-        bool useIntFdct = quality < 95 && Math.Min(width, height) >= 64;
+        bool useIntFdct = true;
         WriteInternal(path, width, height, rgb24, quality, subsample420, useIntFdct);
     }
 
@@ -228,6 +230,11 @@ public static class JpegEncoder
 
     private static void WriteInternal(string path, int width, int height, byte[] rgb24, int quality, bool subsample420, bool useIntFdct)
     {
+        if (DebugPrintConfig)
+        {
+            Console.WriteLine($"[jpeg] quality={quality} subsample={(subsample420 ? "420" : "444")} fdct={(useIntFdct ? "int" : "float")}");
+        }
+
         byte[] qY = BuildQuantTable(StdLumaQuant, quality);
         byte[] qC = BuildQuantTable(StdChromaQuant, quality);
         int[] qYRecip = useIntFdct ? BuildQuantRecipIntDct(qY) : BuildQuantRecip(qY);

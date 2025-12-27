@@ -12,7 +12,7 @@ class Program
             Console.WriteLine("支持输入: .jpg/.jpeg/.png/.bmp");
             Console.WriteLine("支持输出: .jpg/.jpeg/.png/.bmp");
             Console.WriteLine("操作: resize:WxH | resizefit:WxH | grayscale");
-            Console.WriteLine("参数: --quality N | --subsample 420/444 | --fdct int/float");
+            Console.WriteLine("参数: --quality N | --subsample 420/444 | --fdct int/float | --jpeg-debug");
             return;
         }
         string inputPath = args[0];
@@ -20,10 +20,16 @@ class Program
         int? jpegQuality = null;
         bool? subsample420 = null;
         bool? useIntFdct = null;
+        bool jpegDebug = false;
         var ops = new List<Action<Processing.ImageProcessingContext>>();
         for (int i = 1; i < args.Length; i++)
         {
             string a = args[i];
+            if (string.Equals(a, "--jpeg-debug", StringComparison.OrdinalIgnoreCase) || string.Equals(a, "--debug-jpeg", StringComparison.OrdinalIgnoreCase))
+            {
+                jpegDebug = true;
+                continue;
+            }
             if (string.Equals(a, "--quality", StringComparison.OrdinalIgnoreCase) || string.Equals(a, "-q", StringComparison.OrdinalIgnoreCase))
             {
                 if (i + 1 < args.Length && int.TryParse(args[i + 1], out int q))
@@ -124,9 +130,10 @@ class Program
         {
             int q = jpegQuality ?? 75;
             var frame = new ImageFrame(image.Width, image.Height, image.Buffer);
-            if (subsample420.HasValue && useIntFdct.HasValue) frame.SaveAsJpeg(outputPath, q, subsample420.Value, useIntFdct.Value);
-            else if (subsample420.HasValue) frame.SaveAsJpeg(outputPath, q, subsample420.Value);
-            else frame.SaveAsJpeg(outputPath, q);
+            JpegEncoder.DebugPrintConfig = jpegDebug;
+            bool effectiveSubsample420 = subsample420 ?? true;
+            bool effectiveUseIntFdct = useIntFdct ?? true;
+            frame.SaveAsJpeg(outputPath, q, effectiveSubsample420, effectiveUseIntFdct);
         }
         else
         {
