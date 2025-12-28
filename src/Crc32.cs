@@ -1,5 +1,7 @@
 using System;
 
+namespace PictureSharp;
+
 public static class Crc32
 {
     private static readonly uint[] Table;

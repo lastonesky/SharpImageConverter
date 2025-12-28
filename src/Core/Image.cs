@@ -1,7 +1,7 @@
 using System;
 using System.IO;
 
-namespace Core
+namespace PictureSharp.Core
 {
     public sealed class Image<TPixel> where TPixel : struct, IPixel
     {

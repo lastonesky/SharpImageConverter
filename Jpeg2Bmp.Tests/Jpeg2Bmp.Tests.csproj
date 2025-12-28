@@ -14,6 +14,11 @@
     <Compile Include="..\\*.cs" Exclude="..\\Program.cs" />
   </ItemGroup>
   <ItemGroup>
-    <ProjectReference Include="..\src\Jpeg2Bmp.csproj" />
+    <ProjectReference Include="..\\src\\PictureSharp.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="..\\src\\runtimes\\**\\*.*">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
   </ItemGroup>
 </Project>

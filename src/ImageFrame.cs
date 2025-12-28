@@ -1,6 +1,8 @@
 using System;
 using System.IO;
 
+namespace PictureSharp;
+
 public enum ImagePixelFormat
 {
     Rgb24

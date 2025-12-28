@@ -1,5 +1,5 @@
-using Core;
-using Processing;
+using PictureSharp.Core;
+using PictureSharp.Processing;
 using Tests.Helpers;
 
 namespace Jpeg2Bmp.Tests

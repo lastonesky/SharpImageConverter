@@ -3,6 +3,8 @@ using System.Collections.Generic;
 using System.IO;
 using System.Diagnostics;
 
+namespace PictureSharp;
+
 public class JpegDecoder
 {
     private readonly JpegParser _parser;

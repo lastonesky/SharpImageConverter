@@ -1,6 +1,8 @@
 using System;
 using System.IO;
 
+namespace PictureSharp;
+
 public static class BmpReader
 {
     public static byte[] Read(string path, out int width, out int height)

@@ -1,5 +1,7 @@
 using System;
 
+namespace PictureSharp;
+
 public static class Idct
 {
     // 快速两阶段IDCT：预计算余弦表，行列分离，显著减少运算量

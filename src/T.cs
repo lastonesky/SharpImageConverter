@@ -1,5 +1,7 @@
 using System;
 
+namespace PictureSharp;
+
 public static class T
 {
     public static void Assert(bool cond, string msg)

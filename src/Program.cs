@@ -2,6 +2,11 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 
+using PictureSharp.Core;
+using PictureSharp.Processing;
+
+namespace PictureSharp;
+
 class Program
 {
     static void Main(string[] args)
@@ -10,7 +15,7 @@ class Program
         {
             Console.WriteLine("用法: dotnet run -- <输入文件路径> [输出文件路径] [操作] [--quality N]");
             Console.WriteLine("支持输入: .jpg/.jpeg/.png/.bmp");
-            Console.WriteLine("支持输出: .jpg/.jpeg/.png/.bmp");
+            Console.WriteLine("支持输出: .jpg/.jpeg/.png/.bmp/.webp");
             Console.WriteLine("操作: resize:WxH | resizefit:WxH | grayscale");
             Console.WriteLine("参数: --quality N | --subsample 420/444 | --fdct int/float | --jpeg-debug");
             return;
@@ -112,10 +117,10 @@ class Program
             }
         }
         var swTotal = System.Diagnostics.Stopwatch.StartNew();
-        var image = Core.Image.Load(inputPath);
+        var image = Image.Load(inputPath);
         if (ops.Count > 0)
         {
-            Processing.ImageExtensions.Mutate(image, ctx =>
+            ImageExtensions.Mutate(image, ctx =>
             {
                 foreach (var a in ops) a(ctx);
             });
@@ -137,7 +142,7 @@ class Program
         }
         else
         {
-            Core.Image.Save(image, outputPath);
+            Image.Save(image, outputPath);
         }
         swTotal.Stop();
         Console.WriteLine($"✅ 写入完成: {outputPath}");

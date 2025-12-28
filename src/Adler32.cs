@@ -1,5 +1,7 @@
 using System;
 
+namespace PictureSharp;
+
 public static class Adler32
 {
     public static uint Compute(byte[] buffer, int offset, int count)

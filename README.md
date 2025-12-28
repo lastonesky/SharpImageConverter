@@ -97,7 +97,6 @@ dotnet run -- image.jpg image_reencode.jpg
 
 - “文件不存在”：请检查 `Program.InputPath` 路径是否正确。
 - 解析/解码异常：请检查输入文件是否损坏。
-- .NET 预览提示：当前 `net10.0` 为预览，属于正常提示。若需稳定版，可调整 `TargetFramework`。
 - 警告 CA2022：与 `FileStream.Read` 的精确读取相关，不影响当前演示运行。
 
 ## 说明

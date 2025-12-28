@@ -2,6 +2,8 @@ using System;
 using System.IO;
 using System.IO.Compression;
 
+namespace PictureSharp;
+
 public static class ZlibHelper
 {
     // Decompress a Zlib stream (CMF+FLG ... Data ... Adler32)

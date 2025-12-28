@@ -1,6 +1,8 @@
 using System;
 using System.IO;
 
+namespace PictureSharp;
+
 public class BitReader
 {
     private readonly Stream _s;

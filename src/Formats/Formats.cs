@@ -1,8 +1,8 @@
 using System;
 using System.IO;
-using Core;
+using PictureSharp.Core;
 
-namespace Formats
+namespace PictureSharp.Formats
 {
     public sealed class JpegFormat : IImageFormat
     {
@@ -37,6 +37,19 @@ namespace Formats
             Span<byte> b = stackalloc byte[2];
             s.Read(b);
             return b[0] == (byte)'B' && b[1] == (byte)'M';
+        }
+    }
+
+    public sealed class WebpFormat : IImageFormat
+    {
+        public string Name => "WebP";
+        public string[] Extensions => new[] { ".webp" };
+        public bool IsMatch(Stream s)
+        {
+            Span<byte> b = stackalloc byte[12];
+            s.Read(b);
+            return b[0] == (byte)'R' && b[1] == (byte)'I' && b[2] == (byte)'F' && b[3] == (byte)'F'
+                && b[8] == (byte)'W' && b[9] == (byte)'E' && b[10] == (byte)'B' && b[11] == (byte)'P';
         }
     }
 }

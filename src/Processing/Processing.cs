@@ -1,7 +1,7 @@
 using System;
-using Core;
+using PictureSharp.Core;
 
-namespace Processing
+namespace PictureSharp.Processing
 {
     public interface IImageProcessor
     {

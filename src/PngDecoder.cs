@@ -3,6 +3,8 @@ using System.Collections.Generic;
 using System.IO;
 using System.Text;
 
+namespace PictureSharp;
+
 public class PngDecoder
 {
     public int Width { get; private set; }

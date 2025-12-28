@@ -2,6 +2,8 @@ using System;
 using System.IO;
 using System.Numerics;
 
+namespace PictureSharp;
+
 public static class JpegEncoder
 {
     public static bool DebugPrintConfig { get; set; }

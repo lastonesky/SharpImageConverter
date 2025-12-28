@@ -1,5 +1,7 @@
 using System;
 
+namespace PictureSharp;
+
 public class JpegQuantTable
 {
     public byte Id { get; }

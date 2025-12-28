@@ -1,5 +1,5 @@
 using System.IO;
-using Formats;
+using PictureSharp.Formats;
 using Tests.Helpers;
 
 namespace Jpeg2Bmp.Tests

@@ -1,6 +1,8 @@
 using System;
 using System.IO;
 
+namespace PictureSharp;
+
 public static class BmpWriter
 {
     public static void Write24(string path, int width, int height, byte[] rgb)

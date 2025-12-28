@@ -1,5 +1,7 @@
 using System;
 
+namespace PictureSharp;
+
 public class JpegSegment
 {
     public ushort Marker { get; }

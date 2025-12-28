@@ -1,7 +1,7 @@
 using System;
 using System.IO;
 
-namespace Core
+namespace PictureSharp.Core
 {
     public interface IImageFormat
     {

@@ -1,5 +1,7 @@
 using System;
 
+namespace PictureSharp;
+
 public class JpegHuffmanTable
 {
     public byte TableClass { get; }  // 0=DC, 1=AC

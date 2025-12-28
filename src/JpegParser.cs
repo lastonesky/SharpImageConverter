@@ -2,6 +2,8 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 
+namespace PictureSharp;
+
 public class JpegParser
 {
     public List<JpegSegment> Segments { get; } = new();

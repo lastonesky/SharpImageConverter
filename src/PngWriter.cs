@@ -2,6 +2,8 @@ using System;
 using System.IO;
 using System.Text;
 
+namespace PictureSharp;
+
 public static class PngWriter
 {
     public static void Write(string path, int width, int height, byte[] rgb)

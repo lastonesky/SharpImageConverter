@@ -1,6 +1,6 @@
 using System;
 using System.IO;
-using Core;
+using PictureSharp.Core;
 using Tests.Helpers;
 
 namespace Jpeg2Bmp.Tests
