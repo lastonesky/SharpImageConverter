@@ -1,3 +1,7 @@
 #!/bin/bash
 # 运行 PictureSharp
-dotnet src/bin/Debug/net9.0/PictureSharp.dll "$@"
+if [ -f src/bin/Debug/net10.0/PictureSharp.dll ]; then
+  dotnet src/bin/Debug/net10.0/PictureSharp.dll "$@"
+else
+  dotnet src/bin/Debug/net9.0/PictureSharp.dll "$@"
+fi

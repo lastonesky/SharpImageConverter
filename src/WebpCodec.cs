@@ -8,9 +8,9 @@ namespace PictureSharp.Formats
     {
         static WebpCodec()
         {
-            NativeLibrary.SetDllImportResolver(typeof(WebpCodec).Assembly, Resolve);
-            TryPreloadDependencies();
-            AddRuntimesToPath();
+            //NativeLibrary.SetDllImportResolver(typeof(WebpCodec).Assembly, Resolve);
+            //TryPreloadDependencies();
+            //AddRuntimesToPath();
         }
 
         private static void TryPreloadDependencies()
