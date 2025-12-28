@@ -17,12 +17,16 @@
     <None Include="runtimes/win-x64/libwebp.dll" CopyToOutputDirectory="PreserveNewest" TargetPath="libwebp.dll" />
     <None Include="runtimes/win-x64/libwebpdecoder.dll" CopyToOutputDirectory="PreserveNewest" TargetPath="libwebpdecoder.dll" />
     <None Include="runtimes/win-x64/libsharpyuv.dll" CopyToOutputDirectory="PreserveNewest" TargetPath="libsharpyuv.dll" />
+	<None Include="runtimes/win-x64/libwebpdemux.dll" CopyToOutputDirectory="PreserveNewest" TargetPath="libwebpdemux.dll" />
+	<None Include="runtimes/win-x64/libwebpmux.dll" CopyToOutputDirectory="PreserveNewest" TargetPath="libwebpmux.dll" />
   </ItemGroup>
 
   <ItemGroup Condition="$([System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform($([System.Runtime.InteropServices.OSPlatform]::Linux)))">
     <None Include="runtimes/linux-x64/libwebp.so.7.2.0" CopyToOutputDirectory="PreserveNewest" TargetPath="libwebp.so" />
-    <None Include="runtimes/linux-x64/libwebp.so.7.2.0" CopyToOutputDirectory="PreserveNewest" TargetPath="libwebpdecoder.so" />
+    <None Include="runtimes/linux-x64/libwebpdecoder.so.3.2.0" CopyToOutputDirectory="PreserveNewest" TargetPath="libwebpdecoder.so" />
     <None Include="runtimes/linux-x64/libsharpyuv.so.0.1.2" CopyToOutputDirectory="PreserveNewest" TargetPath="libsharpyuv.so" />
+	<None Include="runtimes/linux-x64/libwebpdemux.so.2.0.17" CopyToOutputDirectory="PreserveNewest" TargetPath="libwebpdemux.so" />
+	<None Include="runtimes/linux-x64/libwebpmux.so.3.1.2" CopyToOutputDirectory="PreserveNewest" TargetPath="libwebpmux.so" />
   </ItemGroup>
 
   <ItemGroup Condition="$([System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform($([System.Runtime.InteropServices.OSPlatform]::OSX)))">
@@ -37,9 +41,14 @@
     <None Include="runtimes/win-x64/libwebp.dll" Pack="true" PackagePath="runtimes/win-x64/native/libwebp.dll" />
     <None Include="runtimes/win-x64/libwebpdecoder.dll" Pack="true" PackagePath="runtimes/win-x64/native/libwebpdecoder.dll" />
     <None Include="runtimes/win-x64/libsharpyuv.dll" Pack="true" PackagePath="runtimes/win-x64/native/libsharpyuv.dll" />
+	<None Include="runtimes/win-x64/libwebpdemux.dll" Pack="true" PackagePath="runtimes/win-x64/native/libwebpdemux.dll" />
+	<None Include="runtimes/win-x64/libwebpmux.dll" Pack="true" PackagePath="runtimes/win-x64/native/libwebpmux.dll" />
 
     <None Include="runtimes/linux-x64/libwebp.so.7.2.0" Pack="true" PackagePath="runtimes/linux-x64/native/libwebp.so.7.2.0" />
     <None Include="runtimes/linux-x64/libsharpyuv.so.0.1.2" Pack="true" PackagePath="runtimes/linux-x64/native/libsharpyuv.so.0.1.2" />
+	<None Include="runtimes/linux-x64/libwebpdecoder.so.3.2.0" Pack="true" PackagePath="runtimes/linux-x64/native/libwebpdecoder.so.3.2.0" />
+	<None Include="runtimes/linux-x64/libwebpdemux.so.2.0.17" Pack="true" PackagePath="runtimes/linux-x64/native/libwebpdemux.so.2.0.17" />
+	<None Include="runtimes/linux-x64/libwebpmux.so.3.1.2" Pack="true" PackagePath="runtimes/linux-x64/native/libwebpmux.so.3.1.2" />
 
     <None Include="runtimes/osx-arm64/native/libwebp.dylib" Pack="true" PackagePath="runtimes/osx-arm64/native/libwebp.dylib" />
     <None Include="runtimes/osx-arm64/native/libwebpdecoder.dylib" Pack="true" PackagePath="runtimes/osx-arm64/native/libwebpdecoder.dylib" />
