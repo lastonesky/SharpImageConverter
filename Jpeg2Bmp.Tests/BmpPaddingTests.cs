@@ -1,3 +1,5 @@
+using Xunit;
+using Assert = Tests.Helpers.Assert;
 using System;
 using System.IO;
 using PictureSharp.Core;
@@ -12,6 +14,7 @@ namespace Jpeg2Bmp.Tests
             return Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString("N") + ext);
         }
 
+        [Fact]
         public static void Bmp_RowPadding_Roundtrip_Exact()
         {
             for (int w = 1; w <= 5; w++)

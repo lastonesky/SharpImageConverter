@@ -23,6 +23,13 @@ namespace PictureSharp.Formats
                 TryLoad(Path.Combine(dir, "libwebpdecoder.dll"));
                 TryLoad(Path.Combine(dir, "libwebp.dll"));
             }
+            else if (OperatingSystem.IsMacOS())
+            {
+                string dir = Path.Combine(baseDir, "runtimes", "osx-arm64", "native");
+                TryLoad(Path.Combine(dir, "libsharpyuv.0.1.2.dylib"));
+                TryLoad(Path.Combine(dir, "libwebp.7.2.0.dylib"));
+                TryLoad(Path.Combine(dir, "libwebpdecoder.3.2.0.dylib"));
+            }
             else
             {
                 string dir = Path.Combine(baseDir, "runtimes", "linux-x64");
@@ -42,15 +49,29 @@ namespace PictureSharp.Formats
             try
             {
                 string baseDir = AppContext.BaseDirectory;
-                string dir = OperatingSystem.IsWindows()
-                    ? Path.Combine(baseDir, "runtimes", "win-x64")
-                    : Path.Combine(baseDir, "runtimes", "linux-x64");
+                string dir;
+                string sep;
+                if (OperatingSystem.IsWindows())
+                {
+                    dir = Path.Combine(baseDir, "runtimes", "win-x64");
+                    sep = ";";
+                }
+                else if (OperatingSystem.IsMacOS())
+                {
+                    dir = Path.Combine(baseDir, "runtimes", "osx-arm64", "native");
+                    sep = ":";
+                }
+                else
+                {
+                    dir = Path.Combine(baseDir, "runtimes", "linux-x64");
+                    sep = ":";
+                }
+
                 if (Directory.Exists(dir))
                 {
                     string? old = Environment.GetEnvironmentVariable("PATH");
                     if (old == null || !old.Contains(dir, StringComparison.OrdinalIgnoreCase))
                     {
-                        string sep = OperatingSystem.IsWindows() ? ";" : ":";
                         Environment.SetEnvironmentVariable("PATH", dir + sep + (old ?? ""));
                     }
                 }
@@ -66,6 +87,13 @@ namespace PictureSharp.Formats
                 if (name == "libsharpyuv") return SafeLoad(Path.Combine(baseDir, "runtimes", "win-x64", "libsharpyuv.dll"));
                 if (name == "libwebp") return SafeLoad(Path.Combine(baseDir, "runtimes", "win-x64", "libwebp.dll"));
                 if (name == "libwebpdecoder") return SafeLoad(Path.Combine(baseDir, "runtimes", "win-x64", "libwebpdecoder.dll"));
+            }
+            else if (OperatingSystem.IsMacOS())
+            {
+                string dir = Path.Combine(baseDir, "runtimes", "osx-arm64", "native");
+                if (name == "libsharpyuv") return SafeLoad(Path.Combine(dir, "libsharpyuv.0.1.2.dylib"));
+                if (name == "libwebp") return SafeLoad(Path.Combine(dir, "libwebp.7.2.0.dylib"));
+                if (name == "libwebpdecoder") return SafeLoad(Path.Combine(dir, "libwebpdecoder.3.2.0.dylib"));
             }
             else
             {

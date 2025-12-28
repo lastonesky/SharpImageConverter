@@ -1,3 +1,5 @@
+using Xunit;
+using Assert = Tests.Helpers.Assert;
 using System;
 using System.IO;
 using PictureSharp;
@@ -12,6 +14,7 @@ namespace Jpeg2Bmp.Tests
             return Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString("N") + ext);
         }
 
+        [Fact]
         public static void ImageFrame_Save_And_Load_Bmp_Png_Jpeg()
         {
             int w = 4, h = 3;
@@ -65,6 +68,7 @@ namespace Jpeg2Bmp.Tests
             return (dx, dy, newW, newH);
         }
 
+        [Fact]
         public static void ApplyExifOrientation_All_1_To_8()
         {
             int w = 2, h = 3;

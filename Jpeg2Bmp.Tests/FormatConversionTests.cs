@@ -1,3 +1,5 @@
+using Xunit;
+using Assert = Tests.Helpers.Assert;
 using System;
 using System.IO;
 using PictureSharp;
@@ -13,6 +15,7 @@ namespace Jpeg2Bmp.Tests
             return Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString("N") + ext);
         }
 
+        [Fact]
         public static void Bmp_Roundtrip_Exact()
         {
             var img = TestImageFactory.CreateChecker(2, 2, (255, 0, 0), (0, 255, 0));
@@ -25,6 +28,7 @@ namespace Jpeg2Bmp.Tests
             File.Delete(path);
         }
 
+        [Fact]
         public static void Png_Roundtrip_Exact()
         {
             var img = TestImageFactory.CreateChecker(4, 4, (10, 20, 30), (200, 210, 220));
@@ -37,6 +41,7 @@ namespace Jpeg2Bmp.Tests
             File.Delete(path);
         }
 
+        [Fact]
         public static void Jpeg_Roundtrip_WithTolerance()
         {
             int w = 8, h = 8;
@@ -76,6 +81,7 @@ namespace Jpeg2Bmp.Tests
             File.Delete(path);
         }
 
+        [Fact]
         public static void Jpeg_Roundtrip_DefaultSettings_NoSevereColorShift()
         {
             int w = 64, h = 64;

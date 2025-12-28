@@ -1,3 +1,5 @@
+using Xunit;
+using Assert = Tests.Helpers.Assert;
 using System.IO;
 using PictureSharp.Formats;
 using Tests.Helpers;
@@ -6,6 +8,7 @@ namespace Jpeg2Bmp.Tests
 {
     public class SniffingTests
     {
+        [Fact]
         public static void Jpeg_IsMatch_By_Header()
         {
             var fmt = new JpegFormat();
@@ -13,6 +16,7 @@ namespace Jpeg2Bmp.Tests
             Assert.IsTrue(fmt.IsMatch(ms));
         }
 
+        [Fact]
         public static void Png_IsMatch_By_Header()
         {
             var fmt = new PngFormat();
@@ -20,6 +24,7 @@ namespace Jpeg2Bmp.Tests
             Assert.IsTrue(fmt.IsMatch(ms));
         }
 
+        [Fact]
         public static void Bmp_IsMatch_By_Header()
         {
             var fmt = new BmpFormat();
@@ -27,6 +32,7 @@ namespace Jpeg2Bmp.Tests
             Assert.IsTrue(fmt.IsMatch(ms));
         }
 
+        [Fact]
         public static void Random_Header_Is_Not_Match()
         {
             using var ms = new MemoryStream(new byte[] { 0x00, 0x11, 0x22, 0x33 });

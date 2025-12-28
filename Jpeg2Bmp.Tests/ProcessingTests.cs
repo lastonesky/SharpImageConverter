@@ -1,3 +1,5 @@
+using Xunit;
+using Assert = Tests.Helpers.Assert;
 using PictureSharp.Core;
 using PictureSharp.Processing;
 using Tests.Helpers;
@@ -6,6 +8,7 @@ namespace Jpeg2Bmp.Tests
 {
     public class ProcessingTests
     {
+        [Fact]
         public static void Resize_2x2_To_1x1_Picks_TopLeft()
         {
             var img = TestImageFactory.CreateChecker(2, 2, (100, 110, 120), (200, 210, 220));
@@ -17,6 +20,7 @@ namespace Jpeg2Bmp.Tests
             Assert.AreEqual(120, img.Buffer[2]);
         }
 
+        [Fact]
         public static void Resize_3x3_To_6x6_NearestNeighborMapping()
         {
             int sw = 3, sh = 3;
@@ -44,6 +48,7 @@ namespace Jpeg2Bmp.Tests
             }
         }
 
+        [Fact]
         public static void Grayscale_Formula_Matches()
         {
             var img = TestImageFactory.CreateSolid(1, 1, 10, 200, 50);
@@ -54,6 +59,7 @@ namespace Jpeg2Bmp.Tests
             Assert.AreEqual((byte)y, img.Buffer[2]);
         }
 
+        [Fact]
         public static void ResizeToFit_PreservesAspectRatio()
         {
             var wide = TestImageFactory.CreateSolid(400, 200, 1, 2, 3);
