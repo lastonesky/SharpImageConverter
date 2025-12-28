@@ -1,5 +1,4 @@
 using Xunit;
-using Assert = Tests.Helpers.Assert;
 using System;
 using System.IO;
 using PictureSharp;
@@ -15,7 +14,7 @@ namespace Jpeg2Bmp.Tests
         }
 
         [Fact]
-        public static void ImageFrame_Save_And_Load_Bmp_Png_Jpeg()
+        public void ImageFrame_Save_And_Load_Bmp_Png_Jpeg()
         {
             int w = 4, h = 3;
             var buf = new byte[w * h * 3];
@@ -39,10 +38,10 @@ namespace Jpeg2Bmp.Tests
             var fBmp = ImageFrame.Load(bmp);
             var fPng = ImageFrame.Load(png);
             var fJpg = ImageFrame.Load(jpg);
-            Assert.AreEqual(w, fBmp.Width);
-            Assert.AreEqual(h, fBmp.Height);
-            Assert.AreEqual(w, fPng.Width);
-            Assert.AreEqual(h, fPng.Height);
+            Assert.Equal(w, fBmp.Width);
+            Assert.Equal(h, fBmp.Height);
+            Assert.Equal(w, fPng.Width);
+            Assert.Equal(h, fPng.Height);
             File.Delete(bmp);
             File.Delete(png);
             File.Delete(jpg);
@@ -69,7 +68,7 @@ namespace Jpeg2Bmp.Tests
         }
 
         [Fact]
-        public static void ApplyExifOrientation_All_1_To_8()
+        public void ApplyExifOrientation_All_1_To_8()
         {
             int w = 2, h = 3;
             var buf = new byte[w * h * 3];
@@ -88,25 +87,25 @@ namespace Jpeg2Bmp.Tests
             {
                 var dst = src.ApplyExifOrientation(orientation);
                 var m = Map(0, 0, w, h, orientation);
-                Assert.AreEqual(m.newW, dst.Width);
-                Assert.AreEqual(m.newH, dst.Height);
+                Assert.Equal(m.newW, dst.Width);
+                Assert.Equal(m.newH, dst.Height);
                 int s00 = (0 * w + 0) * 3;
                 int d00 = (m.dy * m.newW + m.dx) * 3;
-                Assert.AreEqual(src.Pixels[s00 + 0], dst.Pixels[d00 + 0]);
-                Assert.AreEqual(src.Pixels[s00 + 1], dst.Pixels[d00 + 1]);
-                Assert.AreEqual(src.Pixels[s00 + 2], dst.Pixels[d00 + 2]);
+                Assert.Equal(src.Pixels[s00 + 0], dst.Pixels[d00 + 0]);
+                Assert.Equal(src.Pixels[s00 + 1], dst.Pixels[d00 + 1]);
+                Assert.Equal(src.Pixels[s00 + 2], dst.Pixels[d00 + 2]);
                 var m10 = Map(1, 0, w, h, orientation);
                 int s10 = (0 * w + 1) * 3;
                 int d10 = (m10.dy * m10.newW + m10.dx) * 3;
-                Assert.AreEqual(src.Pixels[s10 + 0], dst.Pixels[d10 + 0]);
-                Assert.AreEqual(src.Pixels[s10 + 1], dst.Pixels[d10 + 1]);
-                Assert.AreEqual(src.Pixels[s10 + 2], dst.Pixels[d10 + 2]);
+                Assert.Equal(src.Pixels[s10 + 0], dst.Pixels[d10 + 0]);
+                Assert.Equal(src.Pixels[s10 + 1], dst.Pixels[d10 + 1]);
+                Assert.Equal(src.Pixels[s10 + 2], dst.Pixels[d10 + 2]);
                 var m01 = Map(0, 1, w, h, orientation);
                 int s01 = (1 * w + 0) * 3;
                 int d01 = (m01.dy * m01.newW + m01.dx) * 3;
-                Assert.AreEqual(src.Pixels[s01 + 0], dst.Pixels[d01 + 0]);
-                Assert.AreEqual(src.Pixels[s01 + 1], dst.Pixels[d01 + 1]);
-                Assert.AreEqual(src.Pixels[s01 + 2], dst.Pixels[d01 + 2]);
+                Assert.Equal(src.Pixels[s01 + 0], dst.Pixels[d01 + 0]);
+                Assert.Equal(src.Pixels[s01 + 1], dst.Pixels[d01 + 1]);
+                Assert.Equal(src.Pixels[s01 + 2], dst.Pixels[d01 + 2]);
             }
         }
     }

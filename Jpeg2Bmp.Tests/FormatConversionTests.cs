@@ -1,10 +1,9 @@
-using Xunit;
-using Assert = Tests.Helpers.Assert;
 using System;
 using System.IO;
 using PictureSharp;
 using PictureSharp.Core;
 using Tests.Helpers;
+using Xunit;
 
 namespace Jpeg2Bmp.Tests
 {
@@ -16,33 +15,33 @@ namespace Jpeg2Bmp.Tests
         }
 
         [Fact]
-        public static void Bmp_Roundtrip_Exact()
+        public void Bmp_Roundtrip_Exact()
         {
             var img = TestImageFactory.CreateChecker(2, 2, (255, 0, 0), (0, 255, 0));
             string path = NewTemp(".bmp");
             Image.Save(img, path);
             var loaded = Image.Load(path);
-            Assert.AreEqual(img.Width, loaded.Width);
-            Assert.AreEqual(img.Height, loaded.Height);
+            Assert.Equal(img.Width, loaded.Width);
+            Assert.Equal(img.Height, loaded.Height);
             BufferAssert.EqualExact(img.Buffer, loaded.Buffer);
             File.Delete(path);
         }
 
         [Fact]
-        public static void Png_Roundtrip_Exact()
+        public void Png_Roundtrip_Exact()
         {
             var img = TestImageFactory.CreateChecker(4, 4, (10, 20, 30), (200, 210, 220));
             string path = NewTemp(".png");
             Image.Save(img, path);
             var loaded = Image.Load(path);
-            Assert.AreEqual(img.Width, loaded.Width);
-            Assert.AreEqual(img.Height, loaded.Height);
+            Assert.Equal(img.Width, loaded.Width);
+            Assert.Equal(img.Height, loaded.Height);
             BufferAssert.EqualExact(img.Buffer, loaded.Buffer);
             File.Delete(path);
         }
 
         [Fact]
-        public static void Jpeg_Roundtrip_WithTolerance()
+        public void Jpeg_Roundtrip_WithTolerance()
         {
             int w = 8, h = 8;
             var buf = new byte[w * h * 3];
@@ -62,8 +61,8 @@ namespace Jpeg2Bmp.Tests
             var frame = new ImageFrame(img.Width, img.Height, img.Buffer);
             frame.SaveAsJpeg(path, 99, false, false);
             var loaded = Image.Load(path);
-            Assert.AreEqual(img.Width, loaded.Width);
-            Assert.AreEqual(img.Height, loaded.Height);
+            Assert.Equal(img.Width, loaded.Width);
+            Assert.Equal(img.Height, loaded.Height);
             BufferAssert.AssertMseLessThan(img.Buffer, loaded.Buffer, 5000.0);
             for (int x = 0; x < w - 1; x++)
             {
@@ -76,13 +75,13 @@ namespace Jpeg2Bmp.Tests
                     sumA += loaded.Buffer[oa + 0];
                     sumB += loaded.Buffer[ob + 0];
                 }
-                Assert.IsTrue(sumA <= sumB + 5);
+                Assert.True(sumA <= sumB + 5);
             }
             File.Delete(path);
         }
 
         [Fact]
-        public static void Jpeg_Roundtrip_DefaultSettings_NoSevereColorShift()
+        public void Jpeg_Roundtrip_DefaultSettings_NoSevereColorShift()
         {
             int w = 64, h = 64;
             var buf = new byte[w * h * 3];
@@ -104,8 +103,8 @@ namespace Jpeg2Bmp.Tests
             string path = NewTemp(".jpg");
             JpegEncoder.Write(path, img.Width, img.Height, img.Buffer, 90);
             var loaded = Image.Load(path);
-            Assert.AreEqual(img.Width, loaded.Width);
-            Assert.AreEqual(img.Height, loaded.Height);
+            Assert.Equal(img.Width, loaded.Width);
+            Assert.Equal(img.Height, loaded.Height);
 
             BufferAssert.AssertMseLessThan(img.Buffer, loaded.Buffer, 15000.0);
 
@@ -128,9 +127,9 @@ namespace Jpeg2Bmp.Tests
             int meanG1 = (int)(sumG1 / pixels);
             int meanB1 = (int)(sumB1 / pixels);
 
-            Assert.IsTrue(Math.Abs(meanR0 - meanR1) <= 15, $"R 均值偏差过大: {meanR0} vs {meanR1}");
-            Assert.IsTrue(Math.Abs(meanG0 - meanG1) <= 15, $"G 均值偏差过大: {meanG0} vs {meanG1}");
-            Assert.IsTrue(Math.Abs(meanB0 - meanB1) <= 15, $"B 均值偏差过大: {meanB0} vs {meanB1}");
+            Assert.True(Math.Abs(meanR0 - meanR1) <= 15, $"R 均值偏差过大: {meanR0} vs {meanR1}");
+            Assert.True(Math.Abs(meanG0 - meanG1) <= 15, $"G 均值偏差过大: {meanG0} vs {meanG1}");
+            Assert.True(Math.Abs(meanB0 - meanB1) <= 15, $"B 均值偏差过大: {meanB0} vs {meanB1}");
 
             File.Delete(path);
         }

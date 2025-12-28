@@ -1,5 +1,4 @@
 using Xunit;
-using Assert = Tests.Helpers.Assert;
 using System;
 using System.IO;
 using PictureSharp.Core;
@@ -15,7 +14,7 @@ namespace Jpeg2Bmp.Tests
         }
 
         [Fact]
-        public static void Bmp_RowPadding_Roundtrip_Exact()
+        public void Bmp_RowPadding_Roundtrip_Exact()
         {
             for (int w = 1; w <= 5; w++)
             {
@@ -24,8 +23,8 @@ namespace Jpeg2Bmp.Tests
                 string path = NewTemp(".bmp");
                 Image.Save(img, path);
                 var loaded = Image.Load(path);
-                Assert.AreEqual(w, loaded.Width);
-                Assert.AreEqual(h, loaded.Height);
+                Assert.Equal(w, loaded.Width);
+                Assert.Equal(h, loaded.Height);
                 BufferAssert.EqualExact(img.Buffer, loaded.Buffer);
                 File.Delete(path);
             }
