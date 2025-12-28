@@ -46,7 +46,7 @@ class Program
             }
             if (a.StartsWith("--quality=", StringComparison.OrdinalIgnoreCase))
             {
-                string v = a.Substring("--quality=".Length);
+                string v = a["--quality=".Length..];
                 if (int.TryParse(v, out int q)) jpegQuality = q;
                 continue;
             }
@@ -63,7 +63,7 @@ class Program
             }
             if (a.StartsWith("--subsample=", StringComparison.OrdinalIgnoreCase))
             {
-                string v = a.Substring("--subsample=".Length).Trim();
+                string v = a["--subsample=".Length..].Trim();
                 if (string.Equals(v, "420", StringComparison.OrdinalIgnoreCase)) subsample420 = true;
                 else if (string.Equals(v, "444", StringComparison.OrdinalIgnoreCase)) subsample420 = false;
                 continue;
@@ -81,7 +81,7 @@ class Program
             }
             if (a.StartsWith("--fdct=", StringComparison.OrdinalIgnoreCase))
             {
-                string v = a.Substring("--fdct=".Length).Trim();
+                string v = a["--fdct=".Length..].Trim();
                 if (string.Equals(v, "int", StringComparison.OrdinalIgnoreCase)) useIntFdct = true;
                 else if (string.Equals(v, "float", StringComparison.OrdinalIgnoreCase)) useIntFdct = false;
                 continue;
@@ -98,7 +98,7 @@ class Program
             }
             if (op.StartsWith("resizefit:"))
             {
-                var parts = op.Substring(10).Split('x');
+                var parts = op[10..].Split('x');
                 if (parts.Length == 2 && int.TryParse(parts[0], out int w) && int.TryParse(parts[1], out int h))
                 {
                     ops.Add(ctx => ctx.ResizeToFit(w, h));

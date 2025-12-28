@@ -4,7 +4,7 @@ using System.Runtime.InteropServices;
 
 namespace PictureSharp.Formats
 {
-    internal static class WebpCodec
+    internal static partial class WebpCodec
     {
         static WebpCodec()
         {
@@ -109,17 +109,21 @@ namespace PictureSharp.Formats
             return NativeLibrary.Load(path);
         }
 
-        [DllImport("libwebpdecoder", CallingConvention = CallingConvention.Cdecl)]
-        private static extern int WebPGetInfo(IntPtr data, UIntPtr data_size, out int width, out int height);
+        [LibraryImport("libwebpdecoder")]
+        [UnmanagedCallConv(CallConvs = [typeof(System.Runtime.CompilerServices.CallConvCdecl)])]
+        private static partial int WebPGetInfo(IntPtr data, UIntPtr data_size, out int width, out int height);
 
-        [DllImport("libwebpdecoder", CallingConvention = CallingConvention.Cdecl)]
-        private static extern IntPtr WebPDecodeRGBAInto(IntPtr data, UIntPtr data_size, IntPtr output_buffer, int output_buffer_size, int output_stride);
+        [LibraryImport("libwebpdecoder")]
+        [UnmanagedCallConv(CallConvs = [typeof(System.Runtime.CompilerServices.CallConvCdecl)])]
+        private static partial IntPtr WebPDecodeRGBAInto(IntPtr data, UIntPtr data_size, IntPtr output_buffer, int output_buffer_size, int output_stride);
 
-        [DllImport("libwebp", CallingConvention = CallingConvention.Cdecl)]
-        private static extern UIntPtr WebPEncodeRGBA(IntPtr rgba, int width, int height, int stride, float quality_factor, out IntPtr output);
+        [LibraryImport("libwebp")]
+        [UnmanagedCallConv(CallConvs = [typeof(System.Runtime.CompilerServices.CallConvCdecl)])]
+        private static partial UIntPtr WebPEncodeRGBA(IntPtr rgba, int width, int height, int stride, float quality_factor, out IntPtr output);
 
-        [DllImport("libwebp", CallingConvention = CallingConvention.Cdecl)]
-        private static extern void WebPFree(IntPtr ptr);
+        [LibraryImport("libwebp")]
+        [UnmanagedCallConv(CallConvs = [typeof(System.Runtime.CompilerServices.CallConvCdecl)])]
+        private static partial void WebPFree(IntPtr ptr);
 
         public static byte[] DecodeRgba(byte[] data, out int width, out int height)
         {
@@ -155,8 +159,7 @@ namespace PictureSharp.Formats
             var hRgba = GCHandle.Alloc(rgba, GCHandleType.Pinned);
             try
             {
-                IntPtr output;
-                UIntPtr size = WebPEncodeRGBA(hRgba.AddrOfPinnedObject(), width, height, width * 4, quality, out output);
+                UIntPtr size = WebPEncodeRGBA(hRgba.AddrOfPinnedObject(), width, height, width * 4, quality, out IntPtr output);
                 int len = checked((int)size);
                 if (len <= 0 || output == IntPtr.Zero) throw new InvalidOperationException("WebP 编码失败");
                 var result = new byte[len];
