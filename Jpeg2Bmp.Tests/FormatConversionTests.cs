@@ -1,9 +1,12 @@
 using System;
+using System.Diagnostics;
 using System.IO;
+using System.Reflection;
 using PictureSharp;
 using PictureSharp.Core;
 using Tests.Helpers;
 using Xunit;
+using Xunit.Abstractions;
 
 namespace Jpeg2Bmp.Tests
 {
@@ -132,6 +135,98 @@ namespace Jpeg2Bmp.Tests
             Assert.True(Math.Abs(meanB0 - meanB1) <= 15, $"B 均值偏差过大: {meanB0} vs {meanB1}");
 
             File.Delete(path);
+        }
+
+        [Fact]
+        public void Webp_RepeatedEncode_NoUnboundedMemoryGrowth()
+        {
+            var asm = typeof(Configuration).Assembly;
+            var webpCodecType = asm.GetType("PictureSharp.Formats.WebpCodec", throwOnError: false);
+            if (webpCodecType is null) return;
+
+            var encodeMethod = webpCodecType.GetMethod("EncodeRgba", BindingFlags.Public | BindingFlags.Static);
+            if (encodeMethod is null) return;
+
+            Func<byte[], int, int, float, byte[]> encode;
+            try
+            {
+                encode = encodeMethod.CreateDelegate<Func<byte[], int, int, float, byte[]>>();
+            }
+            catch
+            {
+                return;
+            }
+
+            const int width = 128;
+            const int height = 128;
+            byte[] rgba = CreateNoiseRgba(width, height);
+
+            try
+            {
+                for (int i = 0; i < 10; i++)
+                {
+                    _ = encode(rgba, width, height, 75f);
+                }
+
+                ForceGc();
+                var p = Process.GetCurrentProcess();
+                p.Refresh();
+                long baseline = p.PrivateMemorySize64;
+
+                const int iterations = 800;
+                for (int i = 0; i < iterations; i++)
+                {
+                    _ = encode(rgba, width, height, 75f);
+                    if ((i % 50) == 0) ForceGc();
+                }
+
+                ForceGc();
+                p.Refresh();
+                long after = p.PrivateMemorySize64;
+                long delta = after - baseline;
+
+                Assert.True(delta < 80L * 1024 * 1024, $"WebP 重复编码后 PrivateMemory 增长过大: {delta} bytes");
+            }
+            catch (DllNotFoundException)
+            {
+                return;
+            }
+            catch (BadImageFormatException)
+            {
+                return;
+            }
+            catch (EntryPointNotFoundException)
+            {
+                return;
+            }
+            catch (TargetInvocationException ex) when (ex.InnerException is DllNotFoundException or BadImageFormatException or EntryPointNotFoundException)
+            {
+                return;
+            }
+        }
+
+        private static byte[] CreateNoiseRgba(int width, int height)
+        {
+            var rgba = new byte[width * height * 4];
+            uint x = 2463534242u;
+            for (int i = 0; i < rgba.Length; i += 4)
+            {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                rgba[i + 0] = (byte)x;
+                rgba[i + 1] = (byte)(x >> 8);
+                rgba[i + 2] = (byte)(x >> 16);
+                rgba[i + 3] = 255;
+            }
+            return rgba;
+        }
+
+        private static void ForceGc()
+        {
+            GC.Collect();
+            GC.WaitForPendingFinalizers();
+            GC.Collect();
         }
     }
 }
