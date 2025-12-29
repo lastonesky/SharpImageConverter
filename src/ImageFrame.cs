@@ -70,6 +70,13 @@ public sealed class ImageFrame
         return new ImageFrame(width, height, rgb);
     }
 
+    public static ImageFrame LoadGif(string path)
+    {
+        var dec = new PictureSharp.Formats.Gif.GifDecoder();
+        var img = dec.DecodeRgb24(path);
+        return new ImageFrame(img.Width, img.Height, img.Buffer);
+    }
+
     public void Save(string path)
     {
         string ext = Path.GetExtension(path).ToLowerInvariant();
@@ -84,6 +91,9 @@ public sealed class ImageFrame
             case ".jpg":
             case ".jpeg":
                 SaveAsJpeg(path);
+                break;
+            case ".gif":
+                SaveAsGif(path);
                 break;
             default:
                 throw new NotSupportedException($"不支持的输出文件格式: {ext}");
@@ -113,6 +123,13 @@ public sealed class ImageFrame
     public void SaveAsJpeg(string path, int quality, bool subsample420, bool useIntFdct)
     {
         JpegEncoder.Write(path, Width, Height, Pixels, quality, subsample420, useIntFdct);
+    }
+
+    public void SaveAsGif(string path)
+    {
+        var encoder = new PictureSharp.Formats.Gif.GifEncoder();
+        using var fs = File.Create(path);
+        encoder.Encode(this, fs);
     }
 
     public ImageFrame ApplyExifOrientation(int orientation)

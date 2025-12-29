@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using PictureSharp.Formats;
+using PictureSharp.Formats.Gif;
 
 namespace PictureSharp.Core
 {
@@ -20,18 +21,22 @@ namespace PictureSharp.Core
             var png = new PngFormat();
             var bmp = new BmpFormat();
             var webp = new WebpFormat();
+            var gif = new GifFormat();
             cfg._formats.Add(jpeg);
             cfg._formats.Add(png);
             cfg._formats.Add(bmp);
             cfg._formats.Add(webp);
+            cfg._formats.Add(gif);
             cfg._decoders[typeof(JpegFormat)] = new JpegDecoderAdapter();
             cfg._decoders[typeof(PngFormat)] = new PngDecoderAdapter();
             cfg._decoders[typeof(BmpFormat)] = new BmpDecoderAdapter();
             cfg._decoders[typeof(WebpFormat)] = new WebpDecoderAdapter();
+            cfg._decoders[typeof(GifFormat)] = new GifDecoder();
             cfg._encoders[typeof(JpegFormat)] = new JpegEncoderAdapter();
             cfg._encoders[typeof(PngFormat)] = new PngEncoderAdapter();
             cfg._encoders[typeof(BmpFormat)] = new BmpEncoderAdapter();
             cfg._encoders[typeof(WebpFormat)] = new WebpEncoderAdapter();
+            cfg._encoders[typeof(GifFormat)] = new GifEncoderAdapter();
             return cfg;
         }
 
@@ -58,6 +63,7 @@ namespace PictureSharp.Core
             else if (ext == ".png") enc = _encoders[typeof(PngFormat)];
             else if (ext == ".bmp") enc = _encoders[typeof(BmpFormat)];
             else if (ext == ".webp") enc = _encoders[typeof(WebpFormat)];
+            else if (ext == ".gif") enc = _encoders[typeof(GifFormat)];
             if (enc == null) throw new NotSupportedException("不支持的输出格式");
             enc.EncodeRgb24(path, image);
         }

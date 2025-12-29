@@ -1,6 +1,6 @@
 # PictureSharp
 
-一个用 C# 编写的图像转换工具，尽量减少第三方托管依赖（不使用 `System.Drawing`）。支持 JPEG/PNG/BMP/WebP 格式的相互转换（包含 JPEG 解码与 JPEG 编码输出）。
+一个用 C# 编写的图像转换工具，尽量减少第三方托管依赖（不使用 `System.Drawing`）。支持 JPEG/PNG/BMP/WebP/GIF 格式的相互转换（包含 JPEG 解码与 JPEG 编码输出）。
 
 ## 功能特性
 
@@ -24,6 +24,18 @@
 - 读写 24-bit RGB BMP
 - 支持自动填充对齐
 
+### GIF 支持
+- 读取：
+  - 支持 GIF87a/GIF89a 格式
+  - 支持 LZW 解码
+  - 支持全局/局部调色板
+  - 支持透明度处理
+  - 支持隔行扫描
+- 写入：
+  - 支持将 RGB 数据编码为 GIF89a
+  - 自动 Octree 颜色量化（24-bit RGB -> 8-bit Index）
+  - LZW 压缩
+
 ### WebP 支持
 - 读取/写入 WebP（通过 `runtimes/` 下的原生 `libwebp`）
 - 统一解码为 RGB24，再根据输出扩展名选择编码器写回
@@ -39,7 +51,7 @@
 PictureSharp/
 ├── src/
 │  ├── Core/           # Image/Configuration 等基础类型
-│  ├── Formats/        # 格式嗅探与 Adapter（JPEG/PNG/BMP/WebP）
+│  ├── Formats/        # 格式嗅探与 Adapter（JPEG/PNG/BMP/WebP/GIF）
 │  ├── Processing/     # Mutate/Resize/Grayscale 等处理管线
 │  ├── Metadata/       # 元数据结构（Orientation 等）
 │  ├── runtimes/       # WebP 原生库（win-x64/linux-x64）
@@ -60,9 +72,9 @@ dotnet run -- <输入文件路径> [输出文件路径] [操作] [--quality N]
 ```
 
 支持的转换：
-- JPEG/PNG/BMP/WebP -> JPEG/PNG/BMP/WebP
+- JPEG/PNG/BMP/WebP/GIF -> JPEG/PNG/BMP/WebP/GIF
 
-程序会自动根据输入文件扩展名（.jpg/.jpeg/.png/.bmp/.webp）识别格式，并根据输出文件扩展名（.jpg/.jpeg/.png/.bmp/.webp）选择保存格式。
+程序会自动根据输入文件扩展名（.jpg/.jpeg/.png/.bmp/.webp/.gif）识别格式，并根据输出文件扩展名（.jpg/.jpeg/.png/.bmp/.webp/.gif）选择保存格式。
 
 操作（可选）：
 - resize:WxH
@@ -97,6 +109,12 @@ dotnet run -- image.jpg image.webp
 
 # WebP 转 PNG
 dotnet run -- image.webp image.png
+
+# GIF 转 PNG
+dotnet run -- animation.gif frame_0.png
+
+# PNG 转 GIF
+dotnet run -- image.png image.gif
 
 # 转换并缩放到 320x240 内
 dotnet run -- image.jpg out.webp resizefit:320x240

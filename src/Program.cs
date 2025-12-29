@@ -14,8 +14,8 @@ class Program
         if (args.Length < 1)
         {
             Console.WriteLine("用法: dotnet run -- <输入文件路径> [输出文件路径] [操作] [--quality N]");
-            Console.WriteLine("支持输入: .jpg/.jpeg/.png/.bmp");
-            Console.WriteLine("支持输出: .jpg/.jpeg/.png/.bmp/.webp");
+            Console.WriteLine("支持输入: .jpg/.jpeg/.png/.bmp/.webp/.gif");
+            Console.WriteLine("支持输出: .jpg/.jpeg/.png/.bmp/.webp/.gif");
             Console.WriteLine("操作: resize:WxH | resizefit:WxH | grayscale");
             Console.WriteLine("参数: --quality N | --subsample 420/444 | --fdct int/float | --jpeg-debug");
             return;
@@ -205,7 +205,7 @@ class Program
         string outExt = Path.GetExtension(outPath).ToLower();
         var swWrite = System.Diagnostics.Stopwatch.StartNew();
 
-        if (outExt != ".bmp" && outExt != ".png" && outExt != ".jpg" && outExt != ".jpeg")
+        if (outExt != ".bmp" && outExt != ".png" && outExt != ".jpg" && outExt != ".jpeg" && outExt != ".gif")
         {
             Console.WriteLine($"不支持的输出格式: {outExt}，默认写入 BMP");
             outPath = Path.ChangeExtension(outPath, ".bmp");
@@ -234,7 +234,7 @@ class Program
         string outPath = ResolveOutputPath(inputPath, outputPath, ".bmp");
         string outExt = Path.GetExtension(outPath).ToLower();
 
-        if (outExt != ".bmp" && outExt != ".png" && outExt != ".jpg" && outExt != ".jpeg")
+        if (outExt != ".bmp" && outExt != ".png" && outExt != ".jpg" && outExt != ".jpeg" && outExt != ".gif")
         {
             Console.WriteLine($"不支持的输出格式: {outExt}，默认写入 BMP");
             outPath = Path.ChangeExtension(outPath, ".bmp");
@@ -260,7 +260,7 @@ class Program
         string outPath = ResolveOutputPath(inputPath, outputPath, ".png");
         string outExt = Path.GetExtension(outPath).ToLower();
 
-        if (outExt != ".bmp" && outExt != ".png" && outExt != ".jpg" && outExt != ".jpeg")
+        if (outExt != ".bmp" && outExt != ".png" && outExt != ".jpg" && outExt != ".jpeg" && outExt != ".gif")
         {
             Console.WriteLine($"不支持的输出格式: {outExt}，默认写入 PNG");
             outPath = Path.ChangeExtension(outPath, ".png");
