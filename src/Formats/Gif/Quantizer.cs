@@ -22,32 +22,6 @@ public class Quantizer
             Level = level;
         }
 
-        public int GetPaletteIndex(byte r, byte g, byte b, int level)
-        {
-            if (IsLeaf)
-            {
-                return PaletteIndex;
-            }
-            int index = GetIndex(r, g, b, level);
-            if (Children[index] != null)
-            {
-                return Children[index]!.GetPaletteIndex(r, g, b, level + 1);
-            }
-            
-            // Fallback: Find nearest child (simple heuristic: first available)
-            // This handles cases where quantization aggressively pruned the exact branch
-            for (int i = 0; i < 8; i++)
-            {
-                if (Children[i] != null)
-                {
-                    return Children[i]!.GetPaletteIndex(r, g, b, level + 1);
-                }
-            }
-            
-            // Should only happen if node is not leaf but has no children (Root with empty tree?)
-            return PaletteIndex;
-        }
-
         private static int GetIndex(byte r, byte g, byte b, int level)
         {
             int shift = 7 - level;
@@ -130,12 +104,40 @@ public class Quantizer
         // 4. Map Pixels
         byte[] indices = new byte[width * height];
         int pIdx = 0;
+        
+        // Use Nearest Neighbor search instead of Tree traversal for better quality and error handling
         for (int i = 0; i < pixels.Length; i += 3)
         {
-            indices[pIdx++] = (byte)_root.GetPaletteIndex(pixels[i], pixels[i + 1], pixels[i + 2], 0);
+            indices[pIdx++] = GetNearestColorIndex(palette, pixels[i], pixels[i + 1], pixels[i + 2], paletteSize);
         }
 
         return (palette, indices);
+    }
+
+    private static byte GetNearestColorIndex(byte[] palette, byte r, byte g, byte b, int paletteCount)
+    {
+        int minDist = int.MaxValue;
+        int bestIndex = 0;
+
+        for (int i = 0; i < paletteCount; i++)
+        {
+            int pr = palette[i * 3 + 0];
+            int pg = palette[i * 3 + 1];
+            int pb = palette[i * 3 + 2];
+
+            int dr = pr - r;
+            int dg = pg - g;
+            int db = pb - b;
+
+            int dist = dr * dr + dg * dg + db * db;
+            if (dist < minDist)
+            {
+                minDist = dist;
+                bestIndex = i;
+                if (minDist == 0) break; // Exact match
+            }
+        }
+        return (byte)bestIndex;
     }
 
     private int _leafCount = 0;
