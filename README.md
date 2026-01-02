@@ -9,16 +9,19 @@
 - Huffman 解码、反量化、IDCT、YCbCr 转 RGB
 - 支持 EXIF Orientation 自动旋转/翻转
 - 支持将中间 RGB 图像编码输出为基线 JPEG（Baseline，quality 可调）
+- 色度上采样优化：4:2:0/4:2:2 专用快速路径，通用 16.16 定点双线性回退
 
 ### PNG 支持
 - 读取：
-  - 支持关键块（IHDR, PLTE, IDAT, IEND）及透明度（tRNS）
+  - 支持关键块（IHDR, PLTE, IDAT, IEND）
+  - 透明度：解析 tRNS 与带 Alpha 的色彩类型（Grayscale+Alpha / Truecolor+Alpha），输出统一为 RGB24，不保留 Alpha
   - 支持所有过滤器（None, Sub, Up, Average, Paeth）
   - 支持 Adam7 隔行扫描
-  - 支持灰度、真彩色、索引色及带 Alpha 通道的格式
+  - 支持灰度、真彩色、索引色；位深覆盖 1/2/4/8/16（转换时缩放到 8-bit）
 - 写入：
-  - 支持将 RGB 数据保存为 Truecolor PNG
-  - 使用 Zlib 压缩（Deflate）
+  - 保存为 Truecolor PNG（RGB24）
+  - 使用 Zlib 压缩（Deflate），行过滤固定为 None
+  - 不写入调色板或其他元数据
 
 ### BMP 支持
 - 读写 24-bit RGB BMP
@@ -27,14 +30,12 @@
 ### GIF 支持
 - 读取：
   - 支持 GIF87a/GIF89a 格式
-  - 支持 LZW 解码
-  - 支持全局/局部调色板
-  - 支持透明度处理
-  - 支持隔行扫描
+  - LZW 解码、全局/局部调色板
+  - 透明度：解析透明索引（Graphic Control Extension），支持处置方法 Restore to Background/Restore to Previous 的帧合成
+  - 支持隔行扫描；可导出所有帧到 RGB
 - 写入：
-  - 支持将 RGB 数据编码为 GIF89a
-  - 自动 Octree 颜色量化（24-bit RGB -> 8-bit Index）
-  - LZW 压缩
+  - 单帧 GIF89a；Octree 颜色量化（24-bit RGB -> 8-bit Index）
+  - LZW 压缩；不写入透明度与动画元数据（延时、循环）
 
 ### WebP 支持
 - 读取/写入 WebP（通过 `runtimes/` 下的原生 `libwebp`）
@@ -116,24 +117,29 @@ dotnet run -- animation.gif frame_0.png
 # PNG 转 GIF
 dotnet run -- image.png image.gif
 
+# 导出 GIF 动画所有帧（输出扩展名决定每帧格式）
+dotnet run -- animation.gif frames_000.png --gif-frames
+
 # 转换并缩放到 320x240 内
 dotnet run -- image.jpg out.webp resizefit:320x240
 ```
 
 ## 已知限制
 
-- JPEG 上采样目前使用最近邻插值。
-- PNG 写入目前仅支持 Truecolor 格式，不保留源文件的调色板或元数据。
+- 非常规采样率（非 4:2:0 / 4:2:2 / 4:4:4）走通用定点双线性回退路径，性能相对较低。
+- PNG 写入仅支持 Truecolor（RGB24），不保留源文件的调色板、元数据与透明通道。
 - JPEG 编码目前仅支持 Baseline（非 Progressive），默认使用 4:2:0 子采样，不写入 EXIF 等元数据。
 - WebP 编码参数目前较少（质量固定），后续会补齐可配置项。
+- GIF 写入仅支持单帧；不写入透明通道、帧延时与循环信息。
 
 
 ## 下一步计划
 
-- 优化上采样算法（实现双线性或双三次插值）。
+- 进一步压榨 JPEG 颜色转换与上采样性能（SIMD/Vector 化，块级 2×2 处理）。
 - 增强鲁棒性（容错、特殊 JPEG 变体）。
 - 增加单元测试与更多示例图片验证。
 - 完善 WebP 编码参数（质量/无损/alpha 等）与跨平台运行时布局。
+
 
 ## 故障排查
 
