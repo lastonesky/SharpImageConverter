@@ -17,7 +17,7 @@ class Program
             Console.WriteLine("支持输入: .jpg/.jpeg/.png/.bmp/.webp/.gif");
             Console.WriteLine("支持输出: .jpg/.jpeg/.png/.bmp/.webp/.gif");
             Console.WriteLine("操作: resize:WxH | resizefit:WxH | grayscale");
-            Console.WriteLine("参数: --quality N | --subsample 420/444 | --fdct int/float | --jpeg-debug");
+            Console.WriteLine("参数: --quality N | --subsample 420/444 | --fdct int/float | --jpeg-debug | --gif-frames");
             return;
         }
         string inputPath = args[0];
@@ -26,6 +26,7 @@ class Program
         bool? subsample420 = null;
         bool? useIntFdct = null;
         bool jpegDebug = false;
+        bool gifFrames = false;
         var ops = new List<Action<Processing.ImageProcessingContext>>();
         for (int i = 1; i < args.Length; i++)
         {
@@ -33,6 +34,11 @@ class Program
             if (string.Equals(a, "--jpeg-debug", StringComparison.OrdinalIgnoreCase) || string.Equals(a, "--debug-jpeg", StringComparison.OrdinalIgnoreCase))
             {
                 jpegDebug = true;
+                continue;
+            }
+            if (string.Equals(a, "--gif-frames", StringComparison.OrdinalIgnoreCase))
+            {
+                gifFrames = true;
                 continue;
             }
             if (string.Equals(a, "--quality", StringComparison.OrdinalIgnoreCase) || string.Equals(a, "-q", StringComparison.OrdinalIgnoreCase))
@@ -117,6 +123,42 @@ class Program
             }
         }
         var swTotal = System.Diagnostics.Stopwatch.StartNew();
+        string inExt = Path.GetExtension(inputPath).ToLowerInvariant();
+        if (gifFrames && inExt == ".gif")
+        {
+            string baseOut = outputPath ?? Path.ChangeExtension(inputPath, ".png");
+            string dir = Path.GetDirectoryName(baseOut) ?? ".";
+            string nameNoExt = Path.GetFileNameWithoutExtension(baseOut);
+            string ext = Path.GetExtension(baseOut).ToLowerInvariant();
+            if (ext != ".bmp" && ext != ".png" && ext != ".jpg" && ext != ".jpeg" && ext != ".webp")
+            {
+                ext = ".png";
+            }
+            var gifDec = new PictureSharp.Formats.Gif.GifDecoder();
+            var frames = gifDec.DecodeAllFrames(inputPath);
+            int digits = Math.Max(3, frames.Count.ToString().Length);
+            for (int i = 0; i < frames.Count; i++)
+            {
+                string idx = i.ToString().PadLeft(digits, '0');
+                string path = Path.Combine(dir, $"{nameNoExt}_{idx}{ext}");
+                if (ext is ".jpg" or ".jpeg")
+                {
+                    int q = jpegQuality ?? 75;
+                    var frame = new ImageFrame(frames[i].Width, frames[i].Height, frames[i].Buffer);
+                    bool effectiveSubsample420 = subsample420 ?? true;
+                    bool effectiveUseIntFdct = useIntFdct ?? true;
+                    frame.SaveAsJpeg(path, q, effectiveSubsample420, effectiveUseIntFdct);
+                }
+                else
+                {
+                    Image.Save(frames[i], path);
+                }
+            }
+            swTotal.Stop();
+            Console.WriteLine($"✅ 导出 GIF 动画帧: 共 {frames.Count} 帧");
+            Console.WriteLine($"⏱️ 总耗时: {swTotal.ElapsedMilliseconds} ms");
+            return;
+        }
         var image = Image.Load(inputPath);
         if (ops.Count > 0)
         {

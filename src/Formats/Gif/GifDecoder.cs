@@ -6,6 +6,235 @@ namespace PictureSharp.Formats.Gif
 {
     public class GifDecoder : IImageDecoder
     {
+        public System.Collections.Generic.List<Image<Rgb24>> DecodeAllFrames(string path)
+        {
+            using var fs = File.OpenRead(path);
+            return DecodeAllFrames(fs);
+        }
+
+        public System.Collections.Generic.List<Image<Rgb24>> DecodeAllFrames(Stream stream)
+        {
+            byte[] sig = new byte[6];
+            if (stream.Read(sig, 0, 6) != 6) throw new InvalidDataException("Invalid GIF header");
+            if (sig[0] != 'G' || sig[1] != 'I' || sig[2] != 'F') throw new InvalidDataException("Not a GIF file");
+
+            byte[] lsd = new byte[7];
+            if (stream.Read(lsd, 0, 7) != 7) throw new InvalidDataException("Invalid LSD");
+            int width = lsd[0] | (lsd[1] << 8);
+            int height = lsd[2] | (lsd[3] << 8);
+            byte packed = lsd[4];
+            byte bgIndex = lsd[5];
+
+            bool hasGct = (packed & 0x80) != 0;
+            int gctSize = 1 << ((packed & 0x07) + 1);
+            byte[] gct = new byte[768];
+            int gctColors = 0;
+            if (hasGct)
+            {
+                gctColors = gctSize;
+                int read = 0;
+                int toRead = gctColors * 3;
+                while (read < toRead)
+                {
+                    var n = stream.Read(gct, read, toRead - read);
+                    if (n == 0) throw new EndOfStreamException();
+                    read += n;
+                }
+            }
+
+            byte[] canvas = new byte[width * height * 3];
+            byte bgR = 0, bgG = 0, bgB = 0;
+            if (hasGct && bgIndex < gctColors)
+            {
+                bgR = gct[bgIndex * 3];
+                bgG = gct[bgIndex * 3 + 1];
+                bgB = gct[bgIndex * 3 + 2];
+                for (int i = 0; i < canvas.Length; i += 3)
+                {
+                    canvas[i] = bgR;
+                    canvas[i + 1] = bgG;
+                    canvas[i + 2] = bgB;
+                }
+            }
+
+            int transIndex = -1;
+            int disposal = 0;
+            int delayCs = 0;
+            var frames = new System.Collections.Generic.List<Image<Rgb24>>();
+
+            byte[]? prevCanvas = null;
+            int lastIx = 0, lastIy = 0, lastIw = 0, lastIh = 0;
+
+            while (true)
+            {
+                int blockType = stream.ReadByte();
+                if (blockType == -1 || blockType == 0x3B) break;
+
+                if (blockType == 0x21)
+                {
+                    int label = stream.ReadByte();
+                    if (label == 0xF9)
+                    {
+                        int size = stream.ReadByte();
+                        if (size != 4)
+                        {
+                            if (size > 0) stream.Seek(size, SeekOrigin.Current);
+                            stream.ReadByte();
+                            continue;
+                        }
+                        byte[] gce = new byte[4];
+                        ReadExact(stream, gce, 4);
+                        disposal = (gce[0] >> 2) & 0x07;
+                        bool hasTrans = (gce[0] & 1) != 0;
+                        delayCs = gce[1] | (gce[2] << 8);
+                        transIndex = hasTrans ? gce[3] : -1;
+                        stream.ReadByte();
+                    }
+                    else
+                    {
+                        int size = stream.ReadByte();
+                        if (size > 0) stream.Seek(size, SeekOrigin.Current);
+                        SkipBlocks(stream);
+                    }
+                }
+                else if (blockType == 0x2C)
+                {
+                    byte[] desc = new byte[9];
+                    if (stream.Read(desc, 0, 9) != 9) throw new EndOfStreamException();
+                    int ix = desc[0] | (desc[1] << 8);
+                    int iy = desc[2] | (desc[3] << 8);
+                    int iw = desc[4] | (desc[5] << 8);
+                    int ih = desc[6] | (desc[7] << 8);
+                    byte imgPacked = desc[8];
+                    bool hasLct = (imgPacked & 0x80) != 0;
+                    bool interlace = (imgPacked & 0x40) != 0;
+                    int lctSize = 1 << ((imgPacked & 0x07) + 1);
+
+                    byte[] lct = new byte[768];
+                    int lctColors = 0;
+                    if (hasLct)
+                    {
+                        lctColors = lctSize;
+                        int read = 0;
+                        int toRead = lctColors * 3;
+                        while (read < toRead)
+                        {
+                            int n = stream.Read(lct, read, toRead - read);
+                            if (n == 0) throw new EndOfStreamException();
+                            read += n;
+                        }
+                    }
+                    byte[] palette = hasLct ? lct : gct;
+                    int paletteColors = hasLct ? lctColors : gctColors;
+
+                    int lzwMinCodeSize = stream.ReadByte();
+                    byte[] indices = new byte[iw * ih];
+                    var lzw = new LzwDecoder(stream);
+                    lzw.Decode(indices, iw, ih, lzwMinCodeSize);
+
+                    if (disposal == 3)
+                        prevCanvas = (byte[])canvas.Clone();
+
+                    if (interlace)
+                    {
+                        int[] start = { 0, 4, 2, 1 };
+                        int[] inc = { 8, 8, 4, 2 };
+                        int ptr = 0;
+                        for (int pass = 0; pass < 4; pass++)
+                        {
+                            for (int y = start[pass]; y < ih; y += inc[pass])
+                            {
+                                int rowOffset = (iy + y) * width * 3;
+                                int lineStart = ptr;
+                                for (int x = 0; x < iw; x++)
+                                {
+                                    int dstX = ix + x;
+                                    if (dstX < width && (iy + y) < height)
+                                    {
+                                        byte idx = indices[lineStart + x];
+                                        if (transIndex != -1 && idx == transIndex)
+                                        {
+                                        }
+                                        else if (idx < paletteColors)
+                                        {
+                                            int pIdx = idx * 3;
+                                            int dIdx = rowOffset + dstX * 3;
+                                            canvas[dIdx + 0] = palette[pIdx];
+                                            canvas[dIdx + 1] = palette[pIdx + 1];
+                                            canvas[dIdx + 2] = palette[pIdx + 2];
+                                        }
+                                    }
+                                }
+                                ptr += iw;
+                            }
+                        }
+                    }
+                    else
+                    {
+                        for (int y = 0; y < ih; y++)
+                        {
+                            int rowOffset = (iy + y) * width * 3;
+                            for (int x = 0; x < iw; x++)
+                            {
+                                int dstX = ix + x;
+                                if (dstX < width && (iy + y) < height)
+                                {
+                                    byte idx = indices[y * iw + x];
+                                    if (transIndex != -1 && idx == transIndex)
+                                    {
+                                    }
+                                    else if (idx < paletteColors)
+                                    {
+                                        int pIdx = idx * 3;
+                                        int dIdx = rowOffset + dstX * 3;
+                                        canvas[dIdx + 0] = palette[pIdx];
+                                        canvas[dIdx + 1] = palette[pIdx + 1];
+                                        canvas[dIdx + 2] = palette[pIdx + 2];
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    lastIx = ix; lastIy = iy; lastIw = iw; lastIh = ih;
+                    var frameBuf = new byte[canvas.Length];
+                    Buffer.BlockCopy(canvas, 0, frameBuf, 0, canvas.Length);
+                    frames.Add(new Image<Rgb24>(width, height, frameBuf));
+
+                    if (disposal == 2)
+                    {
+                        for (int y = 0; y < lastIh; y++)
+                        {
+                            int rowOffset = (lastIy + y) * width * 3;
+                            for (int x = 0; x < lastIw; x++)
+                            {
+                                int dstX = lastIx + x;
+                                if (dstX < width && (lastIy + y) < height)
+                                {
+                                    int dIdx = rowOffset + dstX * 3;
+                                    canvas[dIdx + 0] = bgR;
+                                    canvas[dIdx + 1] = bgG;
+                                    canvas[dIdx + 2] = bgB;
+                                }
+                            }
+                        }
+                    }
+                    else if (disposal == 3 && prevCanvas != null)
+                    {
+                        Buffer.BlockCopy(prevCanvas, 0, canvas, 0, canvas.Length);
+                        prevCanvas = null;
+                    }
+                }
+                else
+                {
+                }
+            }
+
+            if (frames.Count == 0)
+                frames.Add(new Image<Rgb24>(width, height, canvas));
+            return frames;
+        }
+
         public Image<Rgb24> DecodeRgb24(string path)
         {
             using var fs = File.OpenRead(path);
@@ -211,10 +440,10 @@ namespace PictureSharp.Formats.Gif
                                     }
                                 }
                             }
-                        }
                     }
+                }
 
-                    // For now, just return the first frame found
+                // For single-frame decode, return immediately
                     return new Image<Rgb24>(width, height, canvas);
                 }
                 else
