@@ -767,51 +767,156 @@ public class JpegDecoder
         int yW = yPlane.w, yHgt = yPlane.h;
         int cbW = cbPlane.w, cbHgt = cbPlane.h;
         int crW = crPlane.w, crHgt = crPlane.h;
-        double invSxY = 1.0 / Math.Max(1, sxY);
-        double invSyY = 1.0 / Math.Max(1, syY);
-        double invSxCb = 1.0 / Math.Max(1, sxCb);
-        double invSyCb = 1.0 / Math.Max(1, syCb);
-        double invSxCr = 1.0 / Math.Max(1, sxCr);
-        double invSyCr = 1.0 / Math.Max(1, syCr);
         int[] yData = yPlane.data;
         int[] cbData = cbPlane.data;
         int[] crData = crPlane.data;
-        int SampleBilinear(int[] data, int w, int h, double fx, double fy)
+
+        int Clamp01(int v)
+        {
+            if (v < 0) return 0;
+            if (v > 255) return 255;
+            return v;
+        }
+
+        int SampleBilinearInt(int[] data, int w, int h, int fx16, int fy16)
         {
             if (data == null || w == 0 || h == 0) return 0;
-            if (fx < 0) fx = 0; if (fy < 0) fy = 0;
-            if (fx > w - 1) fx = w - 1; if (fy > h - 1) fy = h - 1;
-            int x0 = (int)fx;
-            int y0 = (int)fy;
+            int x0 = fx16 >> 16;
+            int y0 = fy16 >> 16;
+            if (x0 < 0) x0 = 0; if (y0 < 0) y0 = 0;
+            if (x0 > w - 1) x0 = w - 1; if (y0 > h - 1) y0 = h - 1;
             int x1 = x0 + 1; if (x1 >= w) x1 = w - 1;
             int y1 = y0 + 1; if (y1 >= h) y1 = h - 1;
-            double tx = fx - x0;
-            double ty = fy - y0;
+            int tx = fx16 - (x0 << 16);
+            int ty = fy16 - (y0 << 16);
             int c00 = data[y0 * w + x0];
             int c10 = data[y0 * w + x1];
             int c01 = data[y1 * w + x0];
             int c11 = data[y1 * w + x1];
-            double v0 = c00 * (1 - tx) + c10 * tx;
-            double v1 = c01 * (1 - tx) + c11 * tx;
-            int v = (int)(v0 * (1 - ty) + v1 * ty + 0.5);
+            int v0 = ((c00 * (65536 - tx)) + (c10 * tx)) >> 16;
+            int v1 = ((c01 * (65536 - tx)) + (c11 * tx)) >> 16;
+            int v = ((v0 * (65536 - ty)) + (v1 * ty)) >> 16;
             if (v < 0) v = 0; if (v > 255) v = 255;
             return v;
         }
+
+        bool yIsFull = sxY == 1 && syY == 1;
+        bool is420 = sxCb == 2 && syCb == 2 && sxCr == 2 && syCr == 2;
+        bool is422 = sxCb == 2 && syCb == 1 && sxCr == 2 && syCr == 1;
+
+        if (yIsFull && is420)
+        {
+            for (int y = 0; y < height; y++)
+            {
+                int yOff = y * yW;
+                int rowCb = (y >> 1) * cbW;
+                int rowCr = (y >> 1) * crW;
+                int x = 0;
+                while (x + 1 < width)
+                {
+                    int cx = x >> 1;
+                    int Cb = cbData != null ? cbData[rowCb + cx] : 128;
+                    int Cr = crData != null ? crData[rowCr + cx] : 128;
+                    int Y0 = yData[yOff + x];
+                    int R0 = Clamp01(Y0 + CrToR[Cr]);
+                    int G0 = Clamp01(Y0 - (CbToG[Cb] + CrToG[Cr]));
+                    int B0 = Clamp01(Y0 + CbToB[Cb]);
+                    rgb[dst + 0] = (byte)R0;
+                    rgb[dst + 1] = (byte)G0;
+                    rgb[dst + 2] = (byte)B0;
+                    dst += 3;
+                    int Y1 = yData[yOff + x + 1];
+                    int R1 = Clamp01(Y1 + CrToR[Cr]);
+                    int G1 = Clamp01(Y1 - (CbToG[Cb] + CrToG[Cr]));
+                    int B1 = Clamp01(Y1 + CbToB[Cb]);
+                    rgb[dst + 0] = (byte)R1;
+                    rgb[dst + 1] = (byte)G1;
+                    rgb[dst + 2] = (byte)B1;
+                    dst += 3;
+                    x += 2;
+                }
+                if (x < width)
+                {
+                    int cx = x >> 1;
+                    int Cb = cbData != null ? cbData[rowCb + cx] : 128;
+                    int Cr = crData != null ? crData[rowCr + cx] : 128;
+                    int Y0 = yData[yOff + x];
+                    int R0 = Clamp01(Y0 + CrToR[Cr]);
+                    int G0 = Clamp01(Y0 - (CbToG[Cb] + CrToG[Cr]));
+                    int B0 = Clamp01(Y0 + CbToB[Cb]);
+                    rgb[dst + 0] = (byte)R0;
+                    rgb[dst + 1] = (byte)G0;
+                    rgb[dst + 2] = (byte)B0;
+                    dst += 3;
+                }
+            }
+            return rgb;
+        }
+
+        if (yIsFull && is422)
+        {
+            for (int y = 0; y < height; y++)
+            {
+                int yOff = y * yW;
+                int rowCb = y * cbW;
+                int rowCr = y * crW;
+                int x = 0;
+                while (x + 1 < width)
+                {
+                    int cx = x >> 1;
+                    int Cb = cbData != null ? cbData[rowCb + cx] : 128;
+                    int Cr = crData != null ? crData[rowCr + cx] : 128;
+                    int Y0 = yData[yOff + x];
+                    int R0 = Clamp01(Y0 + CrToR[Cr]);
+                    int G0 = Clamp01(Y0 - (CbToG[Cb] + CrToG[Cr]));
+                    int B0 = Clamp01(Y0 + CbToB[Cb]);
+                    rgb[dst + 0] = (byte)R0;
+                    rgb[dst + 1] = (byte)G0;
+                    rgb[dst + 2] = (byte)B0;
+                    dst += 3;
+                    int Y1 = yData[yOff + x + 1];
+                    int R1 = Clamp01(Y1 + CrToR[Cr]);
+                    int G1 = Clamp01(Y1 - (CbToG[Cb] + CrToG[Cr]));
+                    int B1 = Clamp01(Y1 + CbToB[Cb]);
+                    rgb[dst + 0] = (byte)R1;
+                    rgb[dst + 1] = (byte)G1;
+                    rgb[dst + 2] = (byte)B1;
+                    dst += 3;
+                    x += 2;
+                }
+                if (x < width)
+                {
+                    int cx = x >> 1;
+                    int Cb = cbData != null ? cbData[rowCb + cx] : 128;
+                    int Cr = crData != null ? crData[rowCr + cx] : 128;
+                    int Y0 = yData[yOff + x];
+                    int R0 = Clamp01(Y0 + CrToR[Cr]);
+                    int G0 = Clamp01(Y0 - (CbToG[Cb] + CrToG[Cr]));
+                    int B0 = Clamp01(Y0 + CbToB[Cb]);
+                    rgb[dst + 0] = (byte)R0;
+                    rgb[dst + 1] = (byte)G0;
+                    rgb[dst + 2] = (byte)B0;
+                    dst += 3;
+                }
+            }
+            return rgb;
+        }
+
         for (int y = 0; y < height; y++)
         {
-            double fyY = y * invSyY;
-            double fyCb = y * invSyCb;
-            double fyCr = y * invSyCr;
+            int fyY16 = (y << 16) / Math.Max(1, syY);
+            int fyCb16 = (y << 16) / Math.Max(1, syCb);
+            int fyCr16 = (y << 16) / Math.Max(1, syCr);
 
             for (int x = 0; x < width; x++)
             {
-                double fxY = x * invSxY;
-                double fxCb = x * invSxCb;
-                double fxCr = x * invSxCr;
+                int fxY16 = (x << 16) / Math.Max(1, sxY);
+                int fxCb16 = (x << 16) / Math.Max(1, sxCb);
+                int fxCr16 = (x << 16) / Math.Max(1, sxCr);
 
-                int Y = SampleBilinear(yData, yW, yHgt, fxY, fyY);
-                int Cb = cbData != null ? SampleBilinear(cbData, cbW, cbHgt, fxCb, fyCb) : 128;
-                int Cr = crData != null ? SampleBilinear(crData, crW, crHgt, fxCr, fyCr) : 128;
+                int Y = yIsFull ? yData[y * yW + x] : SampleBilinearInt(yData, yW, yHgt, fxY16, fyY16);
+                int Cb = cbData != null ? SampleBilinearInt(cbData, cbW, cbHgt, fxCb16, fyCb16) : 128;
+                int Cr = crData != null ? SampleBilinearInt(crData, crW, crHgt, fxCr16, fyCr16) : 128;
 
                 int R = Y + CrToR[Cr];
                 int G = Y - (CbToG[Cb] + CrToG[Cr]);
