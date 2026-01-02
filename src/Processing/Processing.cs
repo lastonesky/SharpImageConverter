@@ -34,6 +34,45 @@ namespace PictureSharp.Processing
             return this;
         }
 
+        public ImageProcessingContext ResizeBilinear(int width, int height)
+        {
+            var src = _image.Buffer;
+            var dst = new byte[width * height * 3];
+            int sw = _image.Width, sh = _image.Height;
+            double scaleX = sw <= 1 ? 0 : (double)(sw - 1) / Math.Max(1, width - 1);
+            double scaleY = sh <= 1 ? 0 : (double)(sh - 1) / Math.Max(1, height - 1);
+            for (int y = 0; y < height; y++)
+            {
+                double syf = y * scaleY;
+                int y0 = (int)syf;
+                int y1 = y0 + 1; if (y1 >= sh) y1 = sh - 1;
+                double ty = syf - y0;
+                for (int x = 0; x < width; x++)
+                {
+                    double sxf = x * scaleX;
+                    int x0 = (int)sxf;
+                    int x1 = x0 + 1; if (x1 >= sw) x1 = sw - 1;
+                    double tx = sxf - x0;
+                    int s00 = (y0 * sw + x0) * 3;
+                    int s10 = (y0 * sw + x1) * 3;
+                    int s01 = (y1 * sw + x0) * 3;
+                    int s11 = (y1 * sw + x1) * 3;
+                    int d = (y * width + x) * 3;
+                    double r0 = src[s00 + 0] * (1 - tx) + src[s10 + 0] * tx;
+                    double r1 = src[s01 + 0] * (1 - tx) + src[s11 + 0] * tx;
+                    dst[d + 0] = (byte)(r0 * (1 - ty) + r1 * ty + 0.5);
+                    double g0 = src[s00 + 1] * (1 - tx) + src[s10 + 1] * tx;
+                    double g1 = src[s01 + 1] * (1 - tx) + src[s11 + 1] * tx;
+                    dst[d + 1] = (byte)(g0 * (1 - ty) + g1 * ty + 0.5);
+                    double b0 = src[s00 + 2] * (1 - tx) + src[s10 + 2] * tx;
+                    double b1 = src[s01 + 2] * (1 - tx) + src[s11 + 2] * tx;
+                    dst[d + 2] = (byte)(b0 * (1 - ty) + b1 * ty + 0.5);
+                }
+            }
+            _image.Update(width, height, dst);
+            return this;
+        }
+
         public ImageProcessingContext ResizeToFit(int maxWidth, int maxHeight)
         {
             int sw = _image.Width, sh = _image.Height;

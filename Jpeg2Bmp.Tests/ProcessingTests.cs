@@ -48,6 +48,19 @@ namespace Jpeg2Bmp.Tests
         }
 
         [Fact]
+        public void ResizeBilinear_2x2_To_3x3_Center_Is_Average()
+        {
+            var img = TestImageFactory.CreateChecker(2, 2, (0, 0, 0), (255, 255, 255));
+            ImageExtensions.Mutate(img, ctx => ctx.ResizeBilinear(3, 3));
+            Assert.Equal(3, img.Width);
+            Assert.Equal(3, img.Height);
+            int d = (1 * img.Width + 1) * 3;
+            Assert.Equal(128, img.Buffer[d + 0]);
+            Assert.Equal(128, img.Buffer[d + 1]);
+            Assert.Equal(128, img.Buffer[d + 2]);
+        }
+
+        [Fact]
         public void Grayscale_Formula_Matches()
         {
             var img = TestImageFactory.CreateSolid(1, 1, 10, 200, 50);

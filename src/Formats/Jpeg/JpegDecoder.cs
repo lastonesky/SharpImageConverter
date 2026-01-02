@@ -764,21 +764,54 @@ public class JpegDecoder
 
         byte[] rgb = new byte[width * height * 3];
         int dst = 0;
+        int yW = yPlane.w, yHgt = yPlane.h;
+        int cbW = cbPlane.w, cbHgt = cbPlane.h;
+        int crW = crPlane.w, crHgt = crPlane.h;
+        double invSxY = 1.0 / Math.Max(1, sxY);
+        double invSyY = 1.0 / Math.Max(1, syY);
+        double invSxCb = 1.0 / Math.Max(1, sxCb);
+        double invSyCb = 1.0 / Math.Max(1, syCb);
+        double invSxCr = 1.0 / Math.Max(1, sxCr);
+        double invSyCr = 1.0 / Math.Max(1, syCr);
+        int[] yData = yPlane.data;
+        int[] cbData = cbPlane.data;
+        int[] crData = crPlane.data;
+        int SampleBilinear(int[] data, int w, int h, double fx, double fy)
+        {
+            if (data == null || w == 0 || h == 0) return 0;
+            if (fx < 0) fx = 0; if (fy < 0) fy = 0;
+            if (fx > w - 1) fx = w - 1; if (fy > h - 1) fy = h - 1;
+            int x0 = (int)fx;
+            int y0 = (int)fy;
+            int x1 = x0 + 1; if (x1 >= w) x1 = w - 1;
+            int y1 = y0 + 1; if (y1 >= h) y1 = h - 1;
+            double tx = fx - x0;
+            double ty = fy - y0;
+            int c00 = data[y0 * w + x0];
+            int c10 = data[y0 * w + x1];
+            int c01 = data[y1 * w + x0];
+            int c11 = data[y1 * w + x1];
+            double v0 = c00 * (1 - tx) + c10 * tx;
+            double v1 = c01 * (1 - tx) + c11 * tx;
+            int v = (int)(v0 * (1 - ty) + v1 * ty + 0.5);
+            if (v < 0) v = 0; if (v > 255) v = 255;
+            return v;
+        }
         for (int y = 0; y < height; y++)
         {
-            int yY = y / syY;
-            int yCb = y / syCb;
-            int yCr = y / syCr;
+            double fyY = y * invSyY;
+            double fyCb = y * invSyCb;
+            double fyCr = y * invSyCr;
 
             for (int x = 0; x < width; x++)
             {
-                int xY = x / sxY;
-                int xCb = x / sxCb;
-                int xCr = x / sxCr;
+                double fxY = x * invSxY;
+                double fxCb = x * invSxCb;
+                double fxCr = x * invSxCr;
 
-                int Y = (yPlane.data != null) ? yPlane.data[yY * yPlane.w + xY] : 0;
-                int Cb = (cbPlane.data != null) ? cbPlane.data[yCb * cbPlane.w + xCb] : 128;
-                int Cr = (crPlane.data != null) ? crPlane.data[yCr * crPlane.w + xCr] : 128;
+                int Y = SampleBilinear(yData, yW, yHgt, fxY, fyY);
+                int Cb = cbData != null ? SampleBilinear(cbData, cbW, cbHgt, fxCb, fyCb) : 128;
+                int Cr = crData != null ? SampleBilinear(crData, crW, crHgt, fxCr, fyCr) : 128;
 
                 int R = Y + CrToR[Cr];
                 int G = Y - (CbToG[Cb] + CrToG[Cr]);
