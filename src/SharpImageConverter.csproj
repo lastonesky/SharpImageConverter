@@ -9,10 +9,10 @@
     <RootNamespace>SharpImageConverter</RootNamespace>
     <IsPackable>true</IsPackable>
     <PackageId>SharpImageConverter</PackageId>
-    <Version>0.1.0-preview.1</Version>
+    <Version>0.1.0-preview.2</Version>
     <Authors>SharpImageConverter</Authors>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
-    <Description>Cross-platform image converter CLI with fast integer JPEG codec.</Description>
+    <Description>Pure C# cross-platform image conversion library (JPEG/PNG/BMP/WebP/GIF) with a fast integer JPEG codec and minimal dependencies.</Description>
     <PackageTags>image;jpeg;webp;converter;cli;codec</PackageTags>
     <RepositoryUrl>https://github.com/lastonesky/SharpImageConverter</RepositoryUrl>
     <RepositoryType>git</RepositoryType>

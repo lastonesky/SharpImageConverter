@@ -105,3 +105,7 @@ StyleCopReport.xml
 *.jpg
 *.gif
 *.webp
+
+# NuGet packages
+*.nupkg
+*.snupkg
