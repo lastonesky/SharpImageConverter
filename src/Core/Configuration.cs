@@ -1,10 +1,10 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
-using PictureSharp.Formats;
-using PictureSharp.Formats.Gif;
+using SharpImageConverter.Formats;
+using SharpImageConverter.Formats.Gif;
 
-namespace PictureSharp.Core
+namespace SharpImageConverter.Core
 {
     public sealed class Configuration
     {

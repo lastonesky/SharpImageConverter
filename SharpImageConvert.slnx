@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="SharpImageConverter.Tests/SharpImageConverter.Tests.csproj" />
+  <Project Path="src/SharpImageConverter.csproj" />
+</Solution>

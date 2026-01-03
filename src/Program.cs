@@ -2,10 +2,10 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 
-using PictureSharp.Core;
-using PictureSharp.Processing;
+using SharpImageConverter.Core;
+using SharpImageConverter.Processing;
 
-namespace PictureSharp;
+namespace SharpImageConverter;
 
 class Program
 {
@@ -134,7 +134,7 @@ class Program
             {
                 ext = ".png";
             }
-            var gifDec = new PictureSharp.Formats.Gif.GifDecoder();
+            var gifDec = new SharpImageConverter.Formats.Gif.GifDecoder();
             var frames = gifDec.DecodeAllFrames(inputPath);
             int digits = Math.Max(3, frames.Count.ToString().Length);
             for (int i = 0; i < frames.Count; i++)

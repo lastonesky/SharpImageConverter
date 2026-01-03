@@ -2,8 +2,8 @@ using System;
 using System.Diagnostics;
 using System.IO;
 using System.Reflection;
-using PictureSharp;
-using PictureSharp.Core;
+using SharpImageConverter;
+using SharpImageConverter.Core;
 using Tests.Helpers;
 using Xunit;
 using Xunit.Abstractions;
@@ -141,7 +141,7 @@ namespace Jpeg2Bmp.Tests
         public void Webp_RepeatedEncode_NoUnboundedMemoryGrowth()
         {
             var asm = typeof(Configuration).Assembly;
-            var webpCodecType = asm.GetType("PictureSharp.Formats.WebpCodec", throwOnError: false);
+            var webpCodecType = asm.GetType("SharpImageConverter.Formats.WebpCodec", throwOnError: false);
             if (webpCodecType is null) return;
 
             var encodeMethod = webpCodecType.GetMethod("EncodeRgba", BindingFlags.Public | BindingFlags.Static);

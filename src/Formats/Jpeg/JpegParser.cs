@@ -2,7 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 
-namespace PictureSharp;
+namespace SharpImageConverter;
 
 public class JpegParser
 {

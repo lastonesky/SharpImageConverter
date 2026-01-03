@@ -1,8 +1,8 @@
 using System;
 using System.IO;
-using PictureSharp.Core;
+using SharpImageConverter.Core;
 
-namespace PictureSharp.Formats
+namespace SharpImageConverter.Formats
 {
     public sealed class BmpFormat : IImageFormat
     {

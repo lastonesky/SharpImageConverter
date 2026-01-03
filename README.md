@@ -1,4 +1,4 @@
-# PictureSharp
+# SharpImageConverter
 
 一个用 C# 编写的图像转换工具，尽量减少第三方托管依赖（不使用 `System.Drawing`）。支持 JPEG/PNG/BMP/WebP/GIF 格式的相互转换（包含 JPEG 解码与 JPEG 编码输出）。
 
@@ -49,7 +49,7 @@
 ## 目录结构
 
 ```
-PictureSharp/
+SharpImageConverter/
 ├── src/
 │  ├── Core/           # Image/Configuration 等基础类型
 │  ├── Formats/        # 格式嗅探与 Adapter（JPEG/PNG/BMP/WebP/GIF）

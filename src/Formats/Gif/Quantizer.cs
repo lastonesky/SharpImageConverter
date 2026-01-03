@@ -2,7 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 
-namespace PictureSharp.Formats.Gif;
+namespace SharpImageConverter.Formats.Gif;
 
 public class Quantizer
 {

@@ -2,7 +2,7 @@ using System;
 using System.IO;
 using System.Text;
 
-namespace PictureSharp;
+namespace SharpImageConverter;
 
 public static class PngWriter
 {

@@ -1,7 +1,7 @@
 using System;
 using System.IO;
 
-namespace PictureSharp.Formats.Gif
+namespace SharpImageConverter.Formats.Gif
 {
     internal sealed class LzwDecoder
     {

@@ -1,9 +1,9 @@
 using System;
-using PictureSharp.Core;
-using PictureSharp;
+using SharpImageConverter.Core;
+using SharpImageConverter;
 using System.IO;
 
-namespace PictureSharp.Formats
+namespace SharpImageConverter.Formats
 {
     public sealed class PngDecoderAdapter : IImageDecoder
     {

@@ -1,7 +1,7 @@
 using System;
 using System.IO;
 
-namespace PictureSharp;
+namespace SharpImageConverter;
 
 public static class BmpWriter
 {

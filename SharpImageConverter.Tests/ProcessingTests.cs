@@ -1,6 +1,6 @@
 using Xunit;
-using PictureSharp.Core;
-using PictureSharp.Processing;
+using SharpImageConverter.Core;
+using SharpImageConverter.Processing;
 using Tests.Helpers;
 
 namespace Jpeg2Bmp.Tests

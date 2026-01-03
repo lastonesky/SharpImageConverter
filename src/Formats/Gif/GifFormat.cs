@@ -1,8 +1,8 @@
 using System;
 using System.IO;
-using PictureSharp.Core;
+using SharpImageConverter.Core;
 
-namespace PictureSharp.Formats.Gif
+namespace SharpImageConverter.Formats.Gif
 {
     public sealed class GifFormat : IImageFormat
     {

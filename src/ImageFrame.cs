@@ -1,7 +1,7 @@
 using System;
 using System.IO;
 
-namespace PictureSharp;
+namespace SharpImageConverter;
 
 public enum ImagePixelFormat
 {
@@ -72,7 +72,7 @@ public sealed class ImageFrame
 
     public static ImageFrame LoadGif(string path)
     {
-        var dec = new PictureSharp.Formats.Gif.GifDecoder();
+        var dec = new SharpImageConverter.Formats.Gif.GifDecoder();
         var img = dec.DecodeRgb24(path);
         return new ImageFrame(img.Width, img.Height, img.Buffer);
     }
@@ -127,7 +127,7 @@ public sealed class ImageFrame
 
     public void SaveAsGif(string path)
     {
-        var encoder = new PictureSharp.Formats.Gif.GifEncoder();
+        var encoder = new SharpImageConverter.Formats.Gif.GifEncoder();
         using var fs = File.Create(path);
         encoder.Encode(this, fs);
     }

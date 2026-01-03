@@ -1,4 +1,4 @@
-using PictureSharp.Core;
+using SharpImageConverter.Core;
 
 namespace Tests.Helpers
 {

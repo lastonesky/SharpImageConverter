@@ -3,7 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Text;
 
-namespace PictureSharp;
+namespace SharpImageConverter;
 
 public class PngDecoder
 {

@@ -1,7 +1,7 @@
 using Xunit;
 using System;
 using System.IO;
-using PictureSharp;
+using SharpImageConverter;
 using Tests.Helpers;
 
 namespace Jpeg2Bmp.Tests

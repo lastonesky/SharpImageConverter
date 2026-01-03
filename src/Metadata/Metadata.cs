@@ -1,4 +1,4 @@
-namespace PictureSharp.Metadata
+namespace SharpImageConverter.Metadata
 {
     public sealed class ImageMetadata
     {

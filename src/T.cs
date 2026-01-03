@@ -1,6 +1,6 @@
 using System;
 
-namespace PictureSharp;
+namespace SharpImageConverter;
 
 public static class T
 {

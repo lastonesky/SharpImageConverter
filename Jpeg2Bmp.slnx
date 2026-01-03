@@ -1,4 +1,0 @@
-<Solution>
-  <Project Path="Jpeg2Bmp.Tests/Jpeg2Bmp.Tests.csproj" />
-  <Project Path="src/PictureSharp.csproj" />
-</Solution>

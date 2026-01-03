@@ -2,7 +2,7 @@ using System;
 using System.IO;
 using System.IO.Compression;
 
-namespace PictureSharp;
+namespace SharpImageConverter;
 
 public static class ZlibHelper
 {

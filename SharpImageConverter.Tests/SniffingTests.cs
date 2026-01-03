@@ -1,6 +1,6 @@
 using Xunit;
 using System.IO;
-using PictureSharp.Formats;
+using SharpImageConverter.Formats;
 
 namespace Jpeg2Bmp.Tests
 {

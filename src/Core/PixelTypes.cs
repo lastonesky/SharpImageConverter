@@ -1,6 +1,6 @@
 using System;
 
-namespace PictureSharp.Core
+namespace SharpImageConverter.Core
 {
     public interface IPixel
     {

@@ -1,9 +1,9 @@
 using System;
-using PictureSharp.Core;
-using PictureSharp;
+using SharpImageConverter.Core;
+using SharpImageConverter;
 using System.IO;
 
-namespace PictureSharp.Formats.Gif
+namespace SharpImageConverter.Formats.Gif
 {
     public sealed class GifEncoderAdapter : IImageEncoder
     {
