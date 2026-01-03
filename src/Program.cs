@@ -24,7 +24,6 @@ class Program
         string? outputPath = null;
         int? jpegQuality = null;
         bool? subsample420 = null;
-        bool? useIntFdct = null;
         bool jpegDebug = false;
         bool gifFrames = false;
         var ops = new List<Action<Processing.ImageProcessingContext>>();
@@ -72,24 +71,6 @@ class Program
                 string v = a["--subsample=".Length..].Trim();
                 if (string.Equals(v, "420", StringComparison.OrdinalIgnoreCase)) subsample420 = true;
                 else if (string.Equals(v, "444", StringComparison.OrdinalIgnoreCase)) subsample420 = false;
-                continue;
-            }
-            if (string.Equals(a, "--fdct", StringComparison.OrdinalIgnoreCase))
-            {
-                if (i + 1 < args.Length)
-                {
-                    string v = args[i + 1].Trim();
-                    if (string.Equals(v, "int", StringComparison.OrdinalIgnoreCase)) useIntFdct = true;
-                    else if (string.Equals(v, "float", StringComparison.OrdinalIgnoreCase)) useIntFdct = false;
-                    i++;
-                }
-                continue;
-            }
-            if (a.StartsWith("--fdct=", StringComparison.OrdinalIgnoreCase))
-            {
-                string v = a["--fdct=".Length..].Trim();
-                if (string.Equals(v, "int", StringComparison.OrdinalIgnoreCase)) useIntFdct = true;
-                else if (string.Equals(v, "float", StringComparison.OrdinalIgnoreCase)) useIntFdct = false;
                 continue;
             }
             string op = a.ToLowerInvariant();
@@ -146,8 +127,7 @@ class Program
                     int q = jpegQuality ?? 75;
                     var frame = new ImageFrame(frames[i].Width, frames[i].Height, frames[i].Buffer);
                     bool effectiveSubsample420 = subsample420 ?? true;
-                    bool effectiveUseIntFdct = useIntFdct ?? true;
-                    frame.SaveAsJpeg(path, q, effectiveSubsample420, effectiveUseIntFdct);
+                    frame.SaveAsJpeg(path, q, effectiveSubsample420);
                 }
                 else
                 {
@@ -179,8 +159,7 @@ class Program
             var frame = new ImageFrame(image.Width, image.Height, image.Buffer);
             JpegEncoder.DebugPrintConfig = jpegDebug;
             bool effectiveSubsample420 = subsample420 ?? true;
-            bool effectiveUseIntFdct = useIntFdct ?? true;
-            frame.SaveAsJpeg(outputPath, q, effectiveSubsample420, effectiveUseIntFdct);
+            frame.SaveAsJpeg(outputPath, q, effectiveSubsample420);
         }
         else
         {

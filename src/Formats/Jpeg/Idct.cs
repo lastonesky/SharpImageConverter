@@ -276,42 +276,4 @@ public static class Idct
         if (val > 255) return 255;
         return val;
     }
-
-    public static void IDCT8x8Double(short[] coeffs, int coeffsOffset, int[] outBlock, int outOffset)
-    {
-        Span<double> tmp = stackalloc double[64];
-
-        for (int y = 0; y < 8; y++)
-        {
-            for (int u = 0; u < 8; u++)
-            {
-                double s = 0.0;
-                int baseCoeff = coeffsOffset + u;
-                for (int v = 0; v < 8; v++)
-                {
-                    double Fuv = coeffs[baseCoeff + v * 8];
-                    s += C[v] * Fuv * Cos[y, v];
-                }
-                tmp[y * 8 + u] = s;
-            }
-        }
-
-        for (int y = 0; y < 8; y++)
-        {
-            int rowBase = y * 8;
-            for (int x = 0; x < 8; x++)
-            {
-                double s = 0.0;
-                for (int u = 0; u < 8; u++)
-                {
-                    s += C[u] * tmp[rowBase + u] * Cos[x, u];
-                }
-                s *= 0.25;
-                int val = (int)Math.Round(s + 128.0);
-                if (val < 0) val = 0;
-                if (val > 255) val = 255;
-                outBlock[outOffset + y * 8 + x] = val;
-            }
-        }
-    }
 }

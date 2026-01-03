@@ -61,7 +61,7 @@ namespace Jpeg2Bmp.Tests
             var img = new Image<Rgb24>(w, h, buf);
             string path = NewTemp(".jpg");
             var frame = new ImageFrame(img.Width, img.Height, img.Buffer);
-            frame.SaveAsJpeg(path, 99, false, false);
+            frame.SaveAsJpeg(path, 99, false);
             var loaded = Image.Load(path);
             Assert.Equal(img.Width, loaded.Width);
             Assert.Equal(img.Height, loaded.Height);

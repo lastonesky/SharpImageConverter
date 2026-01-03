@@ -120,11 +120,6 @@ public sealed class ImageFrame
         JpegEncoder.Write(path, Width, Height, Pixels, quality, subsample420);
     }
 
-    public void SaveAsJpeg(string path, int quality, bool subsample420, bool useIntFdct)
-    {
-        JpegEncoder.Write(path, Width, Height, Pixels, quality, subsample420, useIntFdct);
-    }
-
     public void SaveAsGif(string path)
     {
         var encoder = new SharpImageConverter.Formats.Gif.GifEncoder();

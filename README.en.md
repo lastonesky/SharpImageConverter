@@ -86,7 +86,6 @@ Operations (optional):
 JPEG options (optional):
 - `--quality N`
 - `--subsample 420/444`
-- `--fdct int/float`
 - `--jpeg-debug`
 
 Examples:

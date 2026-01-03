@@ -85,7 +85,6 @@ dotnet run -- <输入文件路径> [输出文件路径] [操作] [--quality N]
 JPEG 相关参数（可选）：
 - --quality N
 - --subsample 420/444
-- --fdct int/float
 - --jpeg-debug
 
 示例：
