@@ -101,6 +101,23 @@ var rgba = Image.LoadRgba32("input.png");
 Image.Save(rgba, "output.webp");
 ```
 
+- 通过 Stream 加载（自动嗅探文件头）
+
+```csharp
+using var fs = File.OpenRead("input.jpg");
+var frame = SharpImageConverter.ImageFrame.Load(fs); // 入口 [ImageFrame.Load(Stream)](file:///d:/Project/jpeg2bmp/src/ImageFrame.cs#L69-L114)
+var imageFromStream = new Image<Rgb24>(frame.Width, frame.Height, frame.Pixels);
+```
+
+- 克隆并缩放用法
+
+```csharp
+var original = Image.Load("input.jpg");
+var clone = new Image<Rgb24>(original.Width, original.Height, (byte[])original.Buffer.Clone());
+clone.Mutate(ctx => ctx.Resize(640, 480));
+Image.Save(clone, "resized.png");
+```
+
 说明：
 - API 入口位于 [Image](file:///d:/Project/jpeg2bmp/src/Core/Image.cs#L51-L95)，其内部通过 [Configuration](file:///d:/Project/jpeg2bmp/src/Core/Configuration.cs#L20-L55) 进行格式嗅探与编码器路由。
 - RGB24 与 RGBA32 的保存会根据扩展名选择具体编码器，详见 [Configuration.SaveRgb24](file:///d:/Project/jpeg2bmp/src/Core/Configuration.cs#L77-L93) 与 [Configuration.SaveRgba32](file:///d:/Project/jpeg2bmp/src/Core/Configuration.cs#L127-L146)。

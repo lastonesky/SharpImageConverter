@@ -102,6 +102,23 @@ var rgba = Image.LoadRgba32("input.png");
 Image.Save(rgba, "output.webp");
 ```
 
+- Load from Stream (auto-sniff header)
+
+```csharp
+using var fs = File.OpenRead("input.jpg");
+var frame = SharpImageConverter.ImageFrame.Load(fs); // entry [ImageFrame.Load(Stream)](file:///d:/Project/jpeg2bmp/src/ImageFrame.cs#L69-L114)
+var imageFromStream = new Image<Rgb24>(frame.Width, frame.Height, frame.Pixels);
+```
+
+- clone and resize usage
+
+```csharp
+var original = Image.Load("input.jpg");
+var clone = new Image<Rgb24>(original.Width, original.Height, (byte[])original.Buffer.Clone());
+clone.Mutate(ctx => ctx.Resize(640, 480));
+Image.Save(clone, "resized.png");
+```
+
 Notes:
 - API entry is [Image](file:///d:/Project/jpeg2bmp/src/Core/Image.cs#L51-L95), which uses [Configuration](file:///d:/Project/jpeg2bmp/src/Core/Configuration.cs#L20-L55) for format sniffing and encoder routing.
 - Saving for RGB24 and RGBA32 selects the encoder by extension, see [Configuration.SaveRgb24](file:///d:/Project/jpeg2bmp/src/Core/Configuration.cs#L77-L93) and [Configuration.SaveRgba32](file:///d:/Project/jpeg2bmp/src/Core/Configuration.cs#L127-L146).
