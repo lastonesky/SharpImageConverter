@@ -6,12 +6,25 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <AssemblyName>SharpImageConverter</AssemblyName>
-    <RootNamespace>PictureConvert</RootNamespace>
+    <RootNamespace>SharpImageConverter</RootNamespace>
     <IsPackable>true</IsPackable>
     <PackageId>SharpImageConverter</PackageId>
-    <Version>0.0.0-local</Version>
+    <Version>0.1.0-preview.1</Version>
     <Authors>SharpImageConverter</Authors>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <Description>Cross-platform image converter CLI with fast integer JPEG codec.</Description>
+    <PackageTags>image;jpeg;webp;converter;cli;codec</PackageTags>
+    <RepositoryUrl>https://github.com/lastonesky/SharpImageConverter</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageProjectUrl>https://github.com/lastonesky/SharpImageConverter</PackageProjectUrl>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <PublishRepositoryUrl>true</PublishRepositoryUrl>
+    <EmbedUntrackedSources>true</EmbedUntrackedSources>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+    <PackAsTool>true</PackAsTool>
+    <ToolCommandName>sharpimageconverter</ToolCommandName>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
   </PropertyGroup>
 
   <ItemGroup Condition="$([System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform($([System.Runtime.InteropServices.OSPlatform]::Windows)))">
@@ -56,6 +69,14 @@
     <None Include="runtimes/osx-arm64/native/libsharpyuv.dylib" Pack="true" PackagePath="runtimes/osx-arm64/native/libsharpyuv.dylib" />
     <None Include="runtimes/osx-arm64/native/libwebpdemux.dylib" Pack="true" PackagePath="runtimes/osx-arm64/native/libwebpdemux.dylib" />
     <None Include="runtimes/osx-arm64/native/libwebpmux.dylib" Pack="true" PackagePath="runtimes/osx-arm64/native/libwebpmux.dylib" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="..\README.md" Pack="true" PackagePath="README.md" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.SourceLink.GitHub" Version="8.0.0" PrivateAssets="All" />
   </ItemGroup>
 
 </Project>
