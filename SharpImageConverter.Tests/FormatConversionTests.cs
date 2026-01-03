@@ -6,7 +6,6 @@ using SharpImageConverter;
 using SharpImageConverter.Core;
 using Tests.Helpers;
 using Xunit;
-using Xunit.Abstractions;
 
 namespace Jpeg2Bmp.Tests
 {
