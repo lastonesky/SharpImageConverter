@@ -2,7 +2,9 @@
 
   <PropertyGroup>
     <OutputType>Library</OutputType>
-    <TargetFrameworks>net8.0;net10.0</TargetFrameworks>
+    <SdkVersion>$(NETCoreSdkVersion)</SdkVersion>
+    <TargetFramework Condition="'$(SdkVersion)' != '' and $([System.String]::Copy('$(SdkVersion)').StartsWith('10.'))">net10.0</TargetFramework>
+    <TargetFramework Condition="'$(TargetFramework)' == ''">net8.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <AssemblyName>SharpImageConverter</AssemblyName>
