@@ -1,7 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <OutputType>Exe</OutputType>
+    <OutputType>Library</OutputType>
     <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
@@ -18,12 +18,13 @@
     <RepositoryType>git</RepositoryType>
     <PackageProjectUrl>https://github.com/lastonesky/SharpImageConverter</PackageProjectUrl>
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
-    <PublishRepositoryUrl>true</PublishRepositoryUrl>
-    <EmbedUntrackedSources>true</EmbedUntrackedSources>
+    <PublishRepositoryUrl Condition="'$(Configuration)' == 'Release'">true</PublishRepositoryUrl>
+    <EmbedUntrackedSources Condition="'$(Configuration)' == 'Release'">true</EmbedUntrackedSources>
+    <EnableSourceLink Condition="'$(Configuration)' != 'Release'">false</EnableSourceLink>
+    <EnableSourceControlManagerQueries Condition="'$(Configuration)' != 'Release'">false</EnableSourceControlManagerQueries>
     <IncludeSymbols>true</IncludeSymbols>
     <SymbolPackageFormat>snupkg</SymbolPackageFormat>
-    <PackAsTool>true</PackAsTool>
-    <ToolCommandName>sharpimageconverter</ToolCommandName>
+    
     <PackageReadmeFile>README.md</PackageReadmeFile>
   </PropertyGroup>
 

@@ -5,6 +5,9 @@ using System.Diagnostics;
 
 namespace SharpImageConverter;
 
+/// <summary>
+/// JPEG 解码器，支持基线与渐进式 JPEG 解码为 RGB24。
+/// </summary>
 public class JpegDecoder
 {
     private readonly JpegParser _parser;
@@ -31,6 +34,10 @@ public class JpegDecoder
         return inv;
     }
 
+    /// <summary>
+    /// 使用解析结果创建解码器
+    /// </summary>
+    /// <param name="parser">JPEG 解析器（包含帧与扫描信息）</param>
     public JpegDecoder(JpegParser parser)
     {
         _parser = parser;

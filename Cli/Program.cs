@@ -139,158 +139,74 @@ class Program
             Console.WriteLine($"⏱️ 总耗时: {swTotal.ElapsedMilliseconds} ms");
             return;
         }
-        var image = Image.Load(inputPath);
-        if (ops.Count > 0)
+        bool noOps = ops.Count == 0;
+        if (noOps)
         {
+            if (outputPath == null)
+            {
+                string defExt = ".png";
+                outputPath = Path.ChangeExtension(inputPath, defExt);
+            }
+            var rgbaImage = Image.LoadRgba32(inputPath);
+            string outExt2 = Path.GetExtension(outputPath).ToLowerInvariant();
+            if (outExt2 is ".jpg" or ".jpeg")
+            {
+                int q = jpegQuality ?? 75;
+                var frame = new ImageFrame(rgbaImage.Width, rgbaImage.Height, RgbaToRgb(rgbaImage.Buffer));
+                JpegEncoder.DebugPrintConfig = jpegDebug;
+                bool effectiveSubsample420 = subsample420 ?? true;
+                frame.SaveAsJpeg(outputPath, q, effectiveSubsample420);
+            }
+            else
+            {
+                Image.Save(rgbaImage, outputPath);
+            }
+            swTotal.Stop();
+            Console.WriteLine($"✅ 写入完成: {outputPath}");
+            Console.WriteLine($"⏱️ 总耗时: {swTotal.ElapsedMilliseconds} ms");
+            return;
+        }
+        else
+        {
+            var image = Image.Load(inputPath);
             ImageExtensions.Mutate(image, ctx =>
             {
                 foreach (var a in ops) a(ctx);
             });
-        }
-        if (outputPath == null)
-        {
-            string defExt = ".bmp";
-            outputPath = Path.ChangeExtension(inputPath, defExt);
-        }
-        string outExt = Path.GetExtension(outputPath).ToLowerInvariant();
-        if (outExt is ".jpg" or ".jpeg")
-        {
-            int q = jpegQuality ?? 75;
-            var frame = new ImageFrame(image.Width, image.Height, image.Buffer);
-            JpegEncoder.DebugPrintConfig = jpegDebug;
-            bool effectiveSubsample420 = subsample420 ?? true;
-            frame.SaveAsJpeg(outputPath, q, effectiveSubsample420);
-        }
-        else
-        {
-            Image.Save(image, outputPath);
-        }
-        swTotal.Stop();
-        Console.WriteLine($"✅ 写入完成: {outputPath}");
-        Console.WriteLine($"⏱️ 总耗时: {swTotal.ElapsedMilliseconds} ms");
-    }
-
-    static void ProcessJpeg(string inputPath, string? outputPath)
-    {
-        Console.WriteLine("Step 5: 解析 JPEG 量化表...");
-
-        string path = inputPath;
-        JpegParser parser = new JpegParser();
-        parser.Parse(path);
-
-        Console.WriteLine($"解析到 {parser.Segments.Count} 个段。");
-        Console.WriteLine($"✅ 图像尺寸: {parser.Width} x {parser.Height}");
-        Console.WriteLine($"✅ 量化表数量: {parser.QuantTables.Count}");
-
-        foreach (var kv in parser.QuantTables)
-        {
-            kv.Value.Print();
-            Console.WriteLine();
-        }
-
-        Console.WriteLine("Step 5 OK: DQT 段解析完成");
-        Console.WriteLine($"✅ Huffman 表数量: {parser.HuffmanTables.Count}");
-        foreach (var kv in parser.HuffmanTables)
-        {
-            kv.Value.Print();
-            Console.WriteLine();
-        }
-        Console.WriteLine("Step 6 OK: DHT 段解析完成");
-        Console.WriteLine($"✅ 扫描段数量: {parser.Scans.Count}");
-        foreach (var scan in parser.Scans)
-        {
-            Console.WriteLine($"Scan: NbChannels={scan.NbChannels}, Ss={scan.Ss}, Se={scan.Se}, Ah={scan.Ah}, Al={scan.Al}, DataOffset={scan.DataOffset}, DataLength={scan.DataLength}");
-            for (int i = 0; i < scan.NbChannels; i++)
+            if (outputPath == null)
             {
-                var c = scan.Components[i];
-                Console.WriteLine($"  Channel {c.channelId}: DC={c.dcTableId}, AC={c.acTableId}");
+                string defExt = ".bmp";
+                outputPath = Path.ChangeExtension(inputPath, defExt);
             }
+            string outExt = Path.GetExtension(outputPath).ToLowerInvariant();
+            if (outExt is ".jpg" or ".jpeg")
+            {
+                int q = jpegQuality ?? 75;
+                var frame = new ImageFrame(image.Width, image.Height, image.Buffer);
+                JpegEncoder.DebugPrintConfig = jpegDebug;
+                bool effectiveSubsample420 = subsample420 ?? true;
+                frame.SaveAsJpeg(outputPath, q, effectiveSubsample420);
+            }
+            else
+            {
+                Image.Save(image, outputPath);
+            }
+            swTotal.Stop();
+            Console.WriteLine($"✅ 写入完成: {outputPath}");
+            Console.WriteLine($"⏱️ 总耗时: {swTotal.ElapsedMilliseconds} ms");
         }
-        Console.WriteLine("Step 7 OK: SOS 段解析完成");
-
-        Console.WriteLine(parser.IsProgressive ? "Step 8: 渐进式JPEG解码到RGB..." : "Step 8: 基线JPEG解码到RGB...");
-        var decoder = new JpegDecoder(parser);
-        var swTotal = System.Diagnostics.Stopwatch.StartNew();
-        var swDecode = System.Diagnostics.Stopwatch.StartNew();
-        byte[] rgb = decoder.DecodeToRGB(inputPath);
-        swDecode.Stop();
-        
-        ImageFrame frame = new ImageFrame(parser.Width, parser.Height, rgb);
-        if (parser.ExifOrientation != 1)
-        {
-            Console.WriteLine($"✅ 检测到 EXIF 方向: {parser.ExifOrientation}，将应用对应的图像变换。");
-            frame = frame.ApplyExifOrientation(parser.ExifOrientation);
-        }
-
-        string outPath = ResolveOutputPath(inputPath, outputPath, ".bmp");
-        string outExt = Path.GetExtension(outPath).ToLower();
-        var swWrite = System.Diagnostics.Stopwatch.StartNew();
-
-        if (outExt != ".bmp" && outExt != ".png" && outExt != ".jpg" && outExt != ".jpeg" && outExt != ".gif")
-        {
-            Console.WriteLine($"不支持的输出格式: {outExt}，默认写入 BMP");
-            outPath = Path.ChangeExtension(outPath, ".bmp");
-        }
-        frame.Save(outPath);
-        Console.WriteLine($"✅ 写入完成: {outPath}");
-
-        swWrite.Stop();
-        swTotal.Stop();
-        Console.WriteLine($"⏱️ 解码耗时: {swDecode.ElapsedMilliseconds} ms, 写入耗时: {swWrite.ElapsedMilliseconds} ms, 总耗时: {swTotal.ElapsedMilliseconds} ms");
     }
 
-    static void ProcessPng(string inputPath, string? outputPath)
+    static byte[] RgbaToRgb(byte[] rgba)
     {
-        Console.WriteLine($"正在处理 PNG: {inputPath}");
-        var swTotal = System.Diagnostics.Stopwatch.StartNew();
-        
-        var decoder = new PngDecoder();
-        byte[] rgb = decoder.DecodeToRGB(inputPath);
-        
-        Console.WriteLine($"✅ 图像尺寸: {decoder.Width} x {decoder.Height}");
-        Console.WriteLine($"✅ 色深: {decoder.BitDepth}, 颜色类型: {decoder.ColorType}");
-        Console.WriteLine($"✅ 隔行扫描: {decoder.InterlaceMethod == 1}");
-
-        ImageFrame frame = new ImageFrame(decoder.Width, decoder.Height, rgb);
-        string outPath = ResolveOutputPath(inputPath, outputPath, ".bmp");
-        string outExt = Path.GetExtension(outPath).ToLower();
-
-        if (outExt != ".bmp" && outExt != ".png" && outExt != ".jpg" && outExt != ".jpeg" && outExt != ".gif")
+        var rgb = new byte[(rgba.Length / 4) * 3];
+        for (int i = 0, j = 0; i < rgba.Length; i += 4, j += 3)
         {
-            Console.WriteLine($"不支持的输出格式: {outExt}，默认写入 BMP");
-            outPath = Path.ChangeExtension(outPath, ".bmp");
+            rgb[j + 0] = rgba[i + 0];
+            rgb[j + 1] = rgba[i + 1];
+            rgb[j + 2] = rgba[i + 2];
         }
-        frame.Save(outPath);
-        Console.WriteLine($"✅ 写入完成: {outPath}");
-        
-        swTotal.Stop();
-        Console.WriteLine($"⏱️ 总耗时: {swTotal.ElapsedMilliseconds} ms");
-    }
-
-    static void ProcessBmp(string inputPath, string? outputPath)
-    {
-        Console.WriteLine($"正在处理 BMP: {inputPath}");
-        var swTotal = System.Diagnostics.Stopwatch.StartNew();
-        
-        int width, height;
-        byte[] rgb = BmpReader.Read(inputPath, out width, out height);
-        
-        Console.WriteLine($"✅ 图像尺寸: {width} x {height}");
-
-        ImageFrame frame = new ImageFrame(width, height, rgb);
-        string outPath = ResolveOutputPath(inputPath, outputPath, ".png");
-        string outExt = Path.GetExtension(outPath).ToLower();
-
-        if (outExt != ".bmp" && outExt != ".png" && outExt != ".jpg" && outExt != ".jpeg" && outExt != ".gif")
-        {
-            Console.WriteLine($"不支持的输出格式: {outExt}，默认写入 PNG");
-            outPath = Path.ChangeExtension(outPath, ".png");
-        }
-        frame.Save(outPath);
-        Console.WriteLine($"✅ 写入完成: {outPath}");
-
-        swTotal.Stop();
-        Console.WriteLine($"⏱️ 总耗时: {swTotal.ElapsedMilliseconds} ms");
+        return rgb;
     }
 
     private static string ResolveOutputPath(string inputPath, string? outputPath, string defaultExtension)
@@ -317,5 +233,4 @@ class Program
         } while (File.Exists(candidate));
         return candidate;
     }
-
 }

@@ -3,6 +3,9 @@ using System.IO;
 
 namespace SharpImageConverter.Formats.Gif;
 
+/// <summary>
+/// LZW 编码器，用于 GIF 图像数据压缩。
+/// </summary>
 public class LzwEncoder
 {
     private readonly Stream _stream;
@@ -26,11 +29,22 @@ public class LzwEncoder
     private readonly byte[] _packet = new byte[256];
     private int _packetSize = 0;
 
+    /// <summary>
+    /// 初始化 LZW 编码器
+    /// </summary>
+    /// <param name="stream">输出流</param>
     public LzwEncoder(Stream stream)
     {
         _stream = stream;
     }
 
+    /// <summary>
+    /// 对像素索引数据进行 LZW 编码
+    /// </summary>
+    /// <param name="pixels">像素索引数组</param>
+    /// <param name="width">图像宽度</param>
+    /// <param name="height">图像高度</param>
+    /// <param name="colorDepth">颜色深度（位数）</param>
     public void Encode(byte[] pixels, int width, int height, int colorDepth)
     {
         _initCodeSize = Math.Max(2, colorDepth);

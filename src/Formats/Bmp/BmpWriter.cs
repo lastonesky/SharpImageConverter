@@ -3,8 +3,18 @@ using System.IO;
 
 namespace SharpImageConverter;
 
+/// <summary>
+/// 简单的 BMP 写入器，支持将 RGB24 写出为 24 位 BMP。
+/// </summary>
 public static class BmpWriter
 {
+    /// <summary>
+    /// 以 24 位 BMP 格式写出 RGB24 像素数据
+    /// </summary>
+    /// <param name="path">输出路径</param>
+    /// <param name="width">图像宽度</param>
+    /// <param name="height">图像高度</param>
+    /// <param name="rgb">RGB24 像素数据</param>
     public static void Write24(string path, int width, int height, byte[] rgb)
     {
         int rowStride = ((width * 3 + 3) / 4) * 4; // 4字节对齐

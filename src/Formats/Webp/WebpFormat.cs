@@ -4,10 +4,24 @@ using SharpImageConverter.Core;
 
 namespace SharpImageConverter.Formats
 {
+    /// <summary>
+    /// WebP 格式探测器与元信息
+    /// </summary>
     public sealed class WebpFormat : IImageFormat
     {
+        /// <summary>
+        /// 格式名称
+        /// </summary>
         public string Name => "WebP";
+        /// <summary>
+        /// 支持的文件扩展名
+        /// </summary>
         public string[] Extensions => new[] { ".webp" };
+        /// <summary>
+        /// 判断流是否为 WebP 文件（RIFF/WEBP 头）
+        /// </summary>
+        /// <param name="s">输入流</param>
+        /// <returns>是 WebP 则为 true，否则为 false</returns>
         public bool IsMatch(Stream s)
         {
             Span<byte> b = stackalloc byte[12];

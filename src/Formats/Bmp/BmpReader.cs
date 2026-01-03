@@ -3,8 +3,18 @@ using System.IO;
 
 namespace SharpImageConverter;
 
+/// <summary>
+/// 简单的 BMP 读取器，支持 24/32 位非压缩 BMP，输出 RGB24。
+/// </summary>
 public static class BmpReader
 {
+    /// <summary>
+    /// 读取 BMP 文件并返回 RGB24 像素数据
+    /// </summary>
+    /// <param name="path">输入文件路径</param>
+    /// <param name="width">输出图像宽度</param>
+    /// <param name="height">输出图像高度</param>
+    /// <returns>按 RGB 顺序排列的字节数组</returns>
     public static byte[] Read(string path, out int width, out int height)
     {
         using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 20, FileOptions.SequentialScan);

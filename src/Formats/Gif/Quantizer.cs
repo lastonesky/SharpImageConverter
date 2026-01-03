@@ -4,6 +4,9 @@ using System.Linq;
 
 namespace SharpImageConverter.Formats.Gif;
 
+/// <summary>
+/// 颜色量化器，使用八叉树算法将真彩色图像减少到指定数量的颜色。
+/// </summary>
 public class Quantizer
 {
     private class Node
@@ -58,6 +61,9 @@ public class Quantizer
     private List<Node>[] _levels;
     private const int MaxColors = 256;
 
+    /// <summary>
+    /// 初始化量化器
+    /// </summary>
     public Quantizer()
     {
         _root = new Node(0);
@@ -65,6 +71,13 @@ public class Quantizer
         for (int i = 0; i < 8; i++) _levels[i] = new List<Node>();
     }
 
+    /// <summary>
+    /// 对图像像素进行量化，生成调色板与索引数据
+    /// </summary>
+    /// <param name="pixels">RGB 像素数据</param>
+    /// <param name="width">宽度</param>
+    /// <param name="height">高度</param>
+    /// <returns>调色板与索引数组</returns>
     public (byte[] Palette, byte[] Indices) Quantize(byte[] pixels, int width, int height)
     {
         // 1. Build Octree

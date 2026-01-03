@@ -4,8 +4,14 @@ using System.Numerics;
 
 namespace SharpImageConverter;
 
+/// <summary>
+/// JPEG 编码器，支持 4:2:0 与 4:4:4 采样，将 RGB24 编码为 JPEG。
+/// </summary>
 public static class JpegEncoder
 {
+    /// <summary>
+    /// 是否在编码时打印配置（质量、采样）
+    /// </summary>
     public static bool DebugPrintConfig { get; set; }
 
     private static readonly int[] ZigZag = new int[]
@@ -176,6 +182,14 @@ public static class JpegEncoder
         0xF9,0xFA
     };
 
+    /// <summary>
+    /// 将 RGB24 编码为 JPEG 文件（默认使用 4:2:0 采样）
+    /// </summary>
+    /// <param name="path">输出路径</param>
+    /// <param name="width">图像宽度</param>
+    /// <param name="height">图像高度</param>
+    /// <param name="rgb24">RGB24 像素数据</param>
+    /// <param name="quality">JPEG 质量（1-100）</param>
     public static void Write(string path, int width, int height, byte[] rgb24, int quality = 75)
     {
         if (rgb24 == null) throw new ArgumentNullException(nameof(rgb24));
@@ -187,6 +201,15 @@ public static class JpegEncoder
         WriteInternal(path, width, height, rgb24, quality, subsample420);
     }
 
+    /// <summary>
+    /// 将 RGB24 编码为 JPEG 文件，可选择 4:2:0 或 4:4:4 采样
+    /// </summary>
+    /// <param name="path">输出路径</param>
+    /// <param name="width">图像宽度</param>
+    /// <param name="height">图像高度</param>
+    /// <param name="rgb24">RGB24 像素数据</param>
+    /// <param name="quality">JPEG 质量（1-100）</param>
+    /// <param name="subsample420">是否使用 4:2:0 子采样（否则为 4:4:4）</param>
     public static void Write(string path, int width, int height, byte[] rgb24, int quality, bool subsample420)
     {
         if (rgb24 == null) throw new ArgumentNullException(nameof(rgb24));

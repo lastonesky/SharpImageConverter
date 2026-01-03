@@ -4,9 +4,17 @@ using System.IO.Compression;
 
 namespace SharpImageConverter;
 
+/// <summary>
+/// Zlib 格式的压缩/解压辅助。
+/// </summary>
 public static class ZlibHelper
 {
     // Decompress a Zlib stream (CMF+FLG ... Data ... Adler32)
+    /// <summary>
+    /// 解压 Zlib 数据（跳过头部与 Adler32 尾部，并校验校验值）
+    /// </summary>
+    /// <param name="data">Zlib 数据</param>
+    /// <returns>解压后的原始数据</returns>
     public static byte[] Decompress(byte[] data)
     {
         if (data == null || data.Length < 6)
@@ -45,6 +53,11 @@ public static class ZlibHelper
     }
 
     // Compress data to Zlib format
+    /// <summary>
+    /// 压缩为 Zlib 格式（写入头部与 Adler32 尾部）
+    /// </summary>
+    /// <param name="data">原始数据</param>
+    /// <returns>Zlib 数据</returns>
     public static byte[] Compress(byte[] data)
     {
         using (var outMs = new MemoryStream())

@@ -3,15 +3,35 @@ using SharpImageConverter.Core;
 
 namespace SharpImageConverter.Processing
 {
+    /// <summary>
+    /// 图像处理器接口，用于对图像执行处理操作。
+    /// </summary>
     public interface IImageProcessor
     {
+        /// <summary>
+        /// 执行处理操作
+        /// </summary>
+        /// <param name="image">输入图像（Rgb24）</param>
         void Execute(Image<Rgb24> image);
     }
 
+    /// <summary>
+    /// 图像处理上下文，提供 resize、灰度等处理方法。
+    /// </summary>
     public sealed class ImageProcessingContext
     {
         private readonly Image<Rgb24> _image;
+        /// <summary>
+        /// 使用指定图像创建处理上下文
+        /// </summary>
+        /// <param name="image">输入图像（Rgb24）</param>
         public ImageProcessingContext(Image<Rgb24> image) { _image = image; }
+        /// <summary>
+        /// 最近邻缩放到指定尺寸
+        /// </summary>
+        /// <param name="width">目标宽度</param>
+        /// <param name="height">目标高度</param>
+        /// <returns>上下文自身</returns>
         public ImageProcessingContext Resize(int width, int height)
         {
             var src = _image.Buffer;
@@ -34,6 +54,12 @@ namespace SharpImageConverter.Processing
             return this;
         }
 
+        /// <summary>
+        /// 双线性插值缩放到指定尺寸
+        /// </summary>
+        /// <param name="width">目标宽度</param>
+        /// <param name="height">目标高度</param>
+        /// <returns>上下文自身</returns>
         public ImageProcessingContext ResizeBilinear(int width, int height)
         {
             var src = _image.Buffer;
@@ -73,6 +99,12 @@ namespace SharpImageConverter.Processing
             return this;
         }
 
+        /// <summary>
+        /// 将图像缩放到不超过指定最大宽高（保持宽高比）
+        /// </summary>
+        /// <param name="maxWidth">最大宽度</param>
+        /// <param name="maxHeight">最大高度</param>
+        /// <returns>上下文自身</returns>
         public ImageProcessingContext ResizeToFit(int maxWidth, int maxHeight)
         {
             int sw = _image.Width, sh = _image.Height;
@@ -88,6 +120,10 @@ namespace SharpImageConverter.Processing
 
             return Resize(w, h);
         }
+        /// <summary>
+        /// 转换为灰度图（简单加权平均）
+        /// </summary>
+        /// <returns>上下文自身</returns>
         public ImageProcessingContext Grayscale()
         {
             var buf = _image.Buffer;
@@ -106,8 +142,16 @@ namespace SharpImageConverter.Processing
         }
     }
 
+    /// <summary>
+    /// 图像扩展方法
+    /// </summary>
     public static class ImageExtensions
     {
+        /// <summary>
+        /// 对图像应用处理上下文并执行指定操作
+        /// </summary>
+        /// <param name="image">输入图像（Rgb24）</param>
+        /// <param name="action">处理操作</param>
         public static void Mutate(this Image<Rgb24> image, Action<ImageProcessingContext> action)
         {
             var ctx = new ImageProcessingContext(image);

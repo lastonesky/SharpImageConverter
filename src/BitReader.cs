@@ -3,6 +3,9 @@ using System.IO;
 
 namespace SharpImageConverter;
 
+/// <summary>
+/// 位流读取器，支持按位读取与 JPEG 的字节填充处理。
+/// </summary>
 public class BitReader
 {
     private readonly Stream _s;
@@ -14,6 +17,10 @@ public class BitReader
     private int _bufLen;
     private long _bufEndPos;
 
+    /// <summary>
+    /// 使用输入流创建位读取器
+    /// </summary>
+    /// <param name="s">输入数据流</param>
     public BitReader(Stream s)
     {
         _s = s;
@@ -26,6 +33,9 @@ public class BitReader
         _bufEndPos = _s.CanSeek ? _s.Position : 0;
     }
 
+    /// <summary>
+    /// 重置位缓冲（清空已缓存的位）
+    /// </summary>
     public void ResetBits()
     {
         _bitBuf = 0;
@@ -82,6 +92,11 @@ public class BitReader
         }
     }
 
+    /// <summary>
+    /// 读取 n 位并消耗它们
+    /// </summary>
+    /// <param name="n">位数</param>
+    /// <returns>读取到的值</returns>
     public int GetBits(int n)
     {
         while (_bitCount < n && !_eof)
@@ -99,11 +114,22 @@ public class BitReader
         return res;
     }
 
+    /// <summary>
+    /// 读取 1 位并消耗
+    /// </summary>
     public int GetBit() => GetBits(1);
 
+    /// <summary>
+    /// 是否已到位流末尾
+    /// </summary>
     public bool IsEOF => _eof;
 
     // 确保位缓冲中至少有 n 位（不消耗），用于快速霍夫曼查表
+    /// <summary>
+    /// 确保位缓冲中至少有 n 位（不消耗）
+    /// </summary>
+    /// <param name="n">需要的位数</param>
+    /// <returns>缓冲足够则为 true</returns>
     public bool EnsureBits(int n)
     {
         while (_bitCount < n && !_eof)
@@ -117,6 +143,11 @@ public class BitReader
     }
 
     // 查看高位的 n 位，不消耗
+    /// <summary>
+    /// 查看高位的 n 位（不消耗）
+    /// </summary>
+    /// <param name="n">位数</param>
+    /// <returns>读取的值</returns>
     public int PeekBits(int n)
     {
         if (!EnsureBits(n)) throw new EndOfStreamException("位流不足");
@@ -124,6 +155,10 @@ public class BitReader
     }
 
     // 丢弃高位的 n 位
+    /// <summary>
+    /// 丢弃高位的 n 位
+    /// </summary>
+    /// <param name="n">位数</param>
     public void DropBits(int n)
     {
         if (n > _bitCount) throw new ArgumentOutOfRangeException(nameof(n), "丢弃位数超过缓冲");

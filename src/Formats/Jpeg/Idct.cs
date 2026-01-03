@@ -2,6 +2,9 @@ using System;
 
 namespace SharpImageConverter;
 
+/// <summary>
+/// 整数 IDCT（8x8）实现与相关辅助方法。
+/// </summary>
 public static class Idct
 {
     // 快速两阶段IDCT：预计算余弦表，行列分离，显著减少运算量
@@ -45,6 +48,13 @@ public static class Idct
     private const int FIX_2_562915447 = 20995;
     private const int FIX_3_072711026 = 25172;
 
+    /// <summary>
+    /// 对 8x8 频域系数块执行整数 IDCT，输出范围 0..255
+    /// </summary>
+    /// <param name="coeffs">输入 DCT 系数（ZigZag 逆映射后，反量化后）</param>
+    /// <param name="coeffsOffset">系数偏移</param>
+    /// <param name="outBlock">输出像素块（长度至少 64）</param>
+    /// <param name="outOffset">输出偏移</param>
     public static void IDCT8x8Int(short[] coeffs, int coeffsOffset, int[] outBlock, int outOffset)
     {
         Span<int> ws = stackalloc int[64];

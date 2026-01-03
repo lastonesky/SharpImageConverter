@@ -4,23 +4,65 @@ using System.IO;
 
 namespace SharpImageConverter;
 
+/// <summary>
+/// JPEG 解析器，读取段结构、帧参数、霍夫曼/量化表与扫描信息。
+/// </summary>
 public class JpegParser
 {
+    /// <summary>
+    /// JPEG 解析器，读取段结构、帧参数、霍夫曼/量化表与扫描信息。
+    /// </summary>
     public List<JpegSegment> Segments { get; } = new();
+    /// <summary>
+    /// 量化表集合（按表 ID 索引）
+    /// </summary>
     public Dictionary<byte, JpegQuantTable> QuantTables { get; } = new();
+    /// <summary>
+    /// 霍夫曼表集合（按 (class,id) 索引）
+    /// </summary>
     public Dictionary<(byte, byte), JpegHuffmanTable> HuffmanTables { get; } = new();
+    /// <summary>
+    /// 扫描列表（按出现顺序）
+    /// </summary>
     public List<JpegScan> Scans { get; } = new();
 
+    /// <summary>
+    /// 图像宽度（像素）
+    /// </summary>
     public int Width { get; private set; }
+    /// <summary>
+    /// 图像高度（像素）
+    /// </summary>
     public int Height { get; private set; }
+    /// <summary>
+    /// 帧分量参数（每个分量的采样 H/V 与量化表 ID）
+    /// </summary>
     public List<(byte id, byte h, byte v, byte quantId)> FrameComponents { get; } = new();
+    /// <summary>
+    /// 最大水平采样因子
+    /// </summary>
     public int MaxH { get; private set; }
+    /// <summary>
+    /// 最大垂直采样因子
+    /// </summary>
     public int MaxV { get; private set; }
+    /// <summary>
+    /// 重启间隔（RSTn 间隔，MCU 数量）
+    /// </summary>
     public ushort RestartInterval { get; private set; }
-    // EXIF 方向（1..8），默认 1 表示不旋转/翻转
+    /// <summary>
+    /// EXIF 方向（1..8），1 表示不旋转/翻转
+    /// </summary>
     public int ExifOrientation { get; private set; } = 1;
+    /// <summary>
+    /// 是否为渐进式 JPEG
+    /// </summary>
     public bool IsProgressive { get; private set; } = false;
 
+    /// <summary>
+    /// 解析指定 JPEG 文件，填充段与帧信息
+    /// </summary>
+    /// <param name="path">输入文件路径</param>
     public void Parse(string path)
     {
         T.Assert(File.Exists(path), $"文件不存在: {path}");
@@ -343,17 +385,50 @@ public class JpegParser
 
 
 }
+/// <summary>
+/// 表示一次 JPEG 扫描（SOS 段后的熵编码数据范围）。
+/// </summary>
 public class JpegScan
 {
+    /// <summary>
+    /// 通道数量
+    /// </summary>
     public int NbChannels { get; }
+    /// <summary>
+    /// 扫描的通道与其 DC/AC 表编号
+    /// </summary>
     public (byte channelId, byte dcTableId, byte acTableId)[] Components { get; }
+    /// <summary>
+    /// 扫描数据在文件中的起始偏移（字节）
+    /// </summary>
     public long DataOffset { get; }
+    /// <summary>
+    /// 扫描数据长度（在解析结束时计算）
+    /// </summary>
     public long DataLength { get; set; } // 在解析结束后计算
+    /// <summary>
+    /// 渐进式参数：起始谱（或 DC=0）
+    /// </summary>
     public byte Ss { get; set; }
+    /// <summary>
+    /// 渐进式参数：结束谱
+    /// </summary>
     public byte Se { get; set; }
+    /// <summary>
+    /// 渐进式参数：高位细化
+    /// </summary>
     public byte Ah { get; set; }
+    /// <summary>
+    /// 渐进式参数：低位细化
+    /// </summary>
     public byte Al { get; set; }
 
+    /// <summary>
+    /// 创建扫描描述
+    /// </summary>
+    /// <param name="nbChannels">通道数量</param>
+    /// <param name="comps">各通道及其 DC/AC 表</param>
+    /// <param name="dataOffset">扫描数据起始偏移</param>
     public JpegScan(int nbChannels, (byte, byte, byte)[] comps, long dataOffset)
     {
         NbChannels = nbChannels;

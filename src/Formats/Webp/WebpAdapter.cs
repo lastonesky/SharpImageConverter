@@ -5,8 +5,16 @@ using System.IO;
 
 namespace SharpImageConverter.Formats
 {
+    /// <summary>
+    /// WebP 解码器适配器（RGB24）
+    /// </summary>
     public sealed class WebpDecoderAdapter : IImageDecoder
     {
+        /// <summary>
+        /// 解码 WebP 文件为 RGB24 图像
+        /// </summary>
+        /// <param name="path">文件路径</param>
+        /// <returns>RGB24 图像</returns>
         public Image<Rgb24> DecodeRgb24(string path)
         {
             var rgba = WebpCodec.DecodeRgba(File.ReadAllBytes(path), out int width, out int height);
@@ -21,8 +29,33 @@ namespace SharpImageConverter.Formats
         }
     }
 
+    /// <summary>
+    /// WebP 解码器适配器（RGBA32）
+    /// </summary>
+    public sealed class WebpDecoderAdapterRgba : IImageDecoderRgba
+    {
+        /// <summary>
+        /// 解码 WebP 文件为 RGBA32 图像
+        /// </summary>
+        /// <param name="path">文件路径</param>
+        /// <returns>RGBA32 图像</returns>
+        public Image<Rgba32> DecodeRgba32(string path)
+        {
+            var rgba = WebpCodec.DecodeRgba(File.ReadAllBytes(path), out int width, out int height);
+            return new Image<Rgba32>(width, height, rgba);
+        }
+    }
+
+    /// <summary>
+    /// WebP 编码器适配器（RGB24）
+    /// </summary>
     public sealed class WebpEncoderAdapter : IImageEncoder
     {
+        /// <summary>
+        /// 将 RGB24 图像编码为 WebP 文件
+        /// </summary>
+        /// <param name="path">输出路径</param>
+        /// <param name="image">输入图像</param>
         public void EncodeRgb24(string path, Image<Rgb24> image)
         {
             var rgba = new byte[image.Width * image.Height * 4];
@@ -34,6 +67,23 @@ namespace SharpImageConverter.Formats
                 rgba[i + 3] = 255;
             }
             var webp = WebpCodec.EncodeRgba(rgba, image.Width, image.Height, 75f);
+            File.WriteAllBytes(path, webp);
+        }
+    }
+
+    /// <summary>
+    /// WebP 编码器适配器（RGBA32）
+    /// </summary>
+    public sealed class WebpEncoderAdapterRgba : IImageEncoderRgba
+    {
+        /// <summary>
+        /// 将 RGBA32 图像编码为 WebP 文件
+        /// </summary>
+        /// <param name="path">输出路径</param>
+        /// <param name="image">输入图像</param>
+        public void EncodeRgba32(string path, Image<Rgba32> image)
+        {
+            var webp = WebpCodec.EncodeRgba(image.Buffer, image.Width, image.Height, 75f);
             File.WriteAllBytes(path, webp);
         }
     }
