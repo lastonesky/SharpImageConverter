@@ -1,6 +1,6 @@
 # SharpImageConverter
 
-Pure C# image conversion tool with minimal external dependencies (does not use System.Drawing). Supports conversion among JPEG/PNG/BMP/WebP/GIF, including a JPEG decoder and a Baseline JPEG encoder.
+ Pure C# image processing and format conversion library with minimal external dependencies (does not use System.Drawing). Supports JPEG/PNG/BMP/WebP/GIF conversions (including JPEG decoding and Baseline JPEG encoding). The primary usage is via the library API; the CLI has been split into a separate project.
 
 ## Features
 
@@ -50,18 +50,67 @@ Pure C# image conversion tool with minimal external dependencies (does not use S
 
 ```
 SharpImageConverter/
-├── src/
-│  ├── Core/           # Core types like Image/Configuration
-│  ├── Formats/        # Format sniffing and adapters (JPEG/PNG/BMP/WebP/GIF)
-│  ├── Processing/     # Mutate/Resize/Grayscale pipelines
-│  ├── Metadata/       # Metadata structures (Orientation, etc.)
-│  ├── runtimes/       # WebP native libraries (win-x64/linux-x64/osx-arm64)
-│  ├── Program.cs      # CLI entry
-│  └── ...
-└── SharpImageConverter.Tests/  # Test project
+├── src/                         # Library (public API)
+│  ├── Core/                     # Core types like Image/Configuration
+│  ├── Formats/                  # Format sniffing and adapters (JPEG/PNG/BMP/WebP/GIF)
+│  ├── Processing/               # Mutate/Resize/Grayscale pipelines
+│  ├── Metadata/                 # Metadata structures (Orientation, etc.)
+│  ├── runtimes/                 # WebP native libraries (win-x64/linux-x64/osx-arm64)
+│  └── SharpImageConverter.csproj
+├── Cli/                         # Standalone CLI project
+│  ├── Program.cs
+│  └── SharpImageConverter.Cli.csproj
+├── SharpImageConverter.Tests/   # Test project
+└── README.md / README.en.md
 ```
 
-## Getting Started
+## Usage (API)
+
+Requirements:
+- .NET SDK 8.0 or newer (library target frameworks: `net8.0;net10.0`)
+- Windows/Linux/macOS (WebP requires loading the native libraries under `runtimes/` for your platform)
+
+Namespaces:
+
+```csharp
+using SharpImageConverter.Core;
+using SharpImageConverter.Processing;
+```
+
+Common examples:
+- Load, process, and save (auto-sniff input format; choose encoder by output extension)
+
+```csharp
+// Load as RGB24
+var image = Image.Load("input.jpg"); // API entry [Image](file:///d:/Project/jpeg2bmp/src/Core/Image.cs#L51-L95)
+
+// Process: fit within 320x240, then grayscale
+image.Mutate(ctx => ctx
+    .ResizeToFit(320, 240)       // choose nearest-neighbor or bilinear via dedicated APIs
+    .Grayscale());               // processing pipeline [Processing](file:///d:/Project/jpeg2bmp/src/Processing/Processing.cs#L18-L143)
+
+// Save (encoder is selected by output extension)
+Image.Save(image, "output.png");
+```
+
+- RGBA mode (preserve alpha for load/save; unsupported targets automatically fall back to RGB saving)
+
+```csharp
+// Load RGBA32 (prefer native RGBA decoders when available)
+var rgba = Image.LoadRgba32("input.png");
+// Save to an alpha-supporting format (PNG/WebP/GIF); falls back to RGB if not supported
+Image.Save(rgba, "output.webp");
+```
+
+Notes:
+- API entry is [Image](file:///d:/Project/jpeg2bmp/src/Core/Image.cs#L51-L95), which uses [Configuration](file:///d:/Project/jpeg2bmp/src/Core/Configuration.cs#L20-L55) for format sniffing and encoder routing.
+- Saving for RGB24 and RGBA32 selects the encoder by extension, see [Configuration.SaveRgb24](file:///d:/Project/jpeg2bmp/src/Core/Configuration.cs#L77-L93) and [Configuration.SaveRgba32](file:///d:/Project/jpeg2bmp/src/Core/Configuration.cs#L127-L146).
+- The processing pipeline uses the `Mutate` extension to build a context; see [ImageExtensions.Mutate](file:///d:/Project/jpeg2bmp/src/Processing/Processing.cs#L148-L160).
+
+<details>
+<summary>CLI Usage (collapsed; click to expand)</summary>
+
+## CLI
 
 Requirements:
 - .NET SDK (net10.0 preview)
@@ -124,6 +173,7 @@ dotnet run -- animation.gif frames_000.png --gif-frames
 # Convert and fit into 320x240
 dotnet run -- image.jpg out.webp resizefit:320x240
 ```
+</details>
 
 ## Known Limitations
 
