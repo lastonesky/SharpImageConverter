@@ -62,14 +62,52 @@ public sealed class ImageFrame
     /// <returns>加载后的图像帧</returns>
     public static ImageFrame Load(string path)
     {
-        string ext = Path.GetExtension(path).ToLowerInvariant();
-        return ext switch
+        using var fs = File.OpenRead(path);
+        return Load(fs);
+    }
+
+    /// <summary>
+    /// 从流加载图像（自动根据文件头识别格式）
+    /// </summary>
+    /// <param name="stream">输入数据流</param>
+    /// <returns>加载后的图像帧</returns>
+    public static ImageFrame Load(Stream stream)
+    {
+        if (!stream.CanSeek)
         {
-            ".jpg" or ".jpeg" => LoadJpeg(path),
-            ".png" => LoadPng(path),
-            ".bmp" => LoadBmp(path),
-            _ => throw new NotSupportedException($"不支持的输入文件格式: {ext}")
-        };
+            // 如果流不支持 Seek，我们需要预读一部分数据来检测格式，但这比较麻烦。
+            // 简单的做法是要求流支持 Seek，或者包装在一个 MemoryStream 中（但这会消耗内存）。
+            // 考虑到大多数图像库的实现，我们假设流支持 Seek 或者用户提供的是 FileStream/MemoryStream。
+            // 如果不支持，我们可以抛出异常或者尝试复制到 MemoryStream。
+            // 为了“科学”的实现，如果不支持 Seek，我们先复制到 MemoryStream。
+            var ms = new MemoryStream();
+            stream.CopyTo(ms);
+            ms.Position = 0;
+            stream = ms;
+        }
+
+        long startPos = stream.Position;
+        byte[] header = new byte[8];
+        int read = stream.Read(header, 0, 8);
+        stream.Position = startPos; // 回退
+
+        if (read < 2) throw new InvalidDataException("流数据过短");
+
+        // Magic Number Detection
+        if (header[0] == 0xFF && header[1] == 0xD8)
+            return LoadJpeg(stream);
+        
+        if (header[0] == 0x89 && header[1] == 0x50 && header[2] == 0x4E && header[3] == 0x47 &&
+            header[4] == 0x0D && header[5] == 0x0A && header[6] == 0x1A && header[7] == 0x0A)
+            return LoadPng(stream);
+            
+        if (header[0] == 'B' && header[1] == 'M')
+            return LoadBmp(stream);
+            
+        if (header[0] == 'G' && header[1] == 'I' && header[2] == 'F')
+            return LoadGif(stream);
+
+        throw new NotSupportedException("无法识别的图像格式");
     }
 
     /// <summary>
@@ -80,10 +118,20 @@ public sealed class ImageFrame
     public static ImageFrame LoadJpeg(string path)
     {
         using var fs = File.OpenRead(path);
+        return LoadJpeg(fs);
+    }
+
+    /// <summary>
+    /// 从 JPEG 流加载图像帧，并根据 EXIF 方向进行必要的旋转/翻转
+    /// </summary>
+    /// <param name="stream">JPEG 数据流</param>
+    /// <returns>图像帧</returns>
+    public static ImageFrame LoadJpeg(Stream stream)
+    {
         var parser = new JpegParser();
-        parser.Parse(fs);
+        parser.Parse(stream);
         var decoder = new JpegDecoder(parser);
-        byte[] rgb = decoder.DecodeToRGB(fs);
+        byte[] rgb = decoder.DecodeToRGB(stream);
 
         if (parser.ExifOrientation != 1)
         {
@@ -101,8 +149,19 @@ public sealed class ImageFrame
     /// <returns>图像帧</returns>
     public static ImageFrame LoadPng(string path)
     {
+        using var fs = File.OpenRead(path);
+        return LoadPng(fs);
+    }
+
+    /// <summary>
+    /// 从 PNG 流加载图像帧
+    /// </summary>
+    /// <param name="stream">PNG 数据流</param>
+    /// <returns>图像帧</returns>
+    public static ImageFrame LoadPng(Stream stream)
+    {
         var decoder = new PngDecoder();
-        byte[] rgb = decoder.DecodeToRGB(path);
+        byte[] rgb = decoder.DecodeToRGB(stream);
         return new ImageFrame(decoder.Width, decoder.Height, rgb);
     }
 
@@ -113,8 +172,19 @@ public sealed class ImageFrame
     /// <returns>图像帧</returns>
     public static ImageFrame LoadBmp(string path)
     {
+        using var fs = File.OpenRead(path);
+        return LoadBmp(fs);
+    }
+
+    /// <summary>
+    /// 从 BMP 流加载图像帧
+    /// </summary>
+    /// <param name="stream">BMP 数据流</param>
+    /// <returns>图像帧</returns>
+    public static ImageFrame LoadBmp(Stream stream)
+    {
         int width, height;
-        byte[] rgb = BmpReader.Read(path, out width, out height);
+        byte[] rgb = BmpReader.Read(stream, out width, out height);
         return new ImageFrame(width, height, rgb);
     }
 
@@ -125,8 +195,19 @@ public sealed class ImageFrame
     /// <returns>图像帧</returns>
     public static ImageFrame LoadGif(string path)
     {
+        using var fs = File.OpenRead(path);
+        return LoadGif(fs);
+    }
+
+    /// <summary>
+    /// 从 GIF 流加载首帧为图像帧（RGB24）
+    /// </summary>
+    /// <param name="stream">GIF 数据流</param>
+    /// <returns>图像帧</returns>
+    public static ImageFrame LoadGif(Stream stream)
+    {
         var dec = new SharpImageConverter.Formats.Gif.GifDecoder();
-        var img = dec.DecodeRgb24(path);
+        var img = dec.DecodeRgb24(stream);
         return new ImageFrame(img.Width, img.Height, img.Buffer);
     }
 
@@ -163,7 +244,17 @@ public sealed class ImageFrame
     /// <param name="path">输出路径</param>
     public void SaveAsBmp(string path)
     {
-        BmpWriter.Write24(path, Width, Height, Pixels);
+        using var fs = File.Create(path);
+        SaveAsBmp(fs);
+    }
+
+    /// <summary>
+    /// 以 BMP 格式保存图像
+    /// </summary>
+    /// <param name="stream">输出流</param>
+    public void SaveAsBmp(Stream stream)
+    {
+        BmpWriter.Write24(stream, Width, Height, Pixels);
     }
 
     /// <summary>
@@ -172,7 +263,17 @@ public sealed class ImageFrame
     /// <param name="path">输出路径</param>
     public void SaveAsPng(string path)
     {
-        PngWriter.Write(path, Width, Height, Pixels);
+        using var fs = File.Create(path);
+        SaveAsPng(fs);
+    }
+
+    /// <summary>
+    /// 以 PNG 格式保存图像
+    /// </summary>
+    /// <param name="stream">输出流</param>
+    public void SaveAsPng(Stream stream)
+    {
+        PngWriter.Write(stream, Width, Height, Pixels);
     }
 
     /// <summary>
@@ -182,7 +283,18 @@ public sealed class ImageFrame
     /// <param name="quality">JPEG 质量（1-100）</param>
     public void SaveAsJpeg(string path, int quality = 75)
     {
-        JpegEncoder.Write(path, Width, Height, Pixels, quality);
+        using var fs = File.Create(path);
+        SaveAsJpeg(fs, quality);
+    }
+
+    /// <summary>
+    /// 以 JPEG 格式保存图像（默认质量 75）
+    /// </summary>
+    /// <param name="stream">输出流</param>
+    /// <param name="quality">JPEG 质量（1-100）</param>
+    public void SaveAsJpeg(Stream stream, int quality = 75)
+    {
+        JpegEncoder.Write(stream, Width, Height, Pixels, quality);
     }
 
     /// <summary>
@@ -193,7 +305,19 @@ public sealed class ImageFrame
     /// <param name="subsample420">是否使用 4:2:0 子采样</param>
     public void SaveAsJpeg(string path, int quality, bool subsample420)
     {
-        JpegEncoder.Write(path, Width, Height, Pixels, quality, subsample420);
+        using var fs = File.Create(path);
+        SaveAsJpeg(fs, quality, subsample420);
+    }
+
+    /// <summary>
+    /// 以 JPEG 格式保存图像（指定质量与采样方式）
+    /// </summary>
+    /// <param name="stream">输出流</param>
+    /// <param name="quality">JPEG 质量（1-100）</param>
+    /// <param name="subsample420">是否使用 4:2:0 子采样</param>
+    public void SaveAsJpeg(Stream stream, int quality, bool subsample420)
+    {
+        JpegEncoder.Write(stream, Width, Height, Pixels, quality, subsample420);
     }
 
     /// <summary>
@@ -202,9 +326,18 @@ public sealed class ImageFrame
     /// <param name="path">输出路径</param>
     public void SaveAsGif(string path)
     {
-        var encoder = new SharpImageConverter.Formats.Gif.GifEncoder();
         using var fs = File.Create(path);
-        encoder.Encode(this, fs);
+        SaveAsGif(fs);
+    }
+
+    /// <summary>
+    /// 以 GIF 格式保存图像
+    /// </summary>
+    /// <param name="stream">输出流</param>
+    public void SaveAsGif(Stream stream)
+    {
+        var encoder = new SharpImageConverter.Formats.Gif.GifEncoder();
+        encoder.Encode(this, stream);
     }
 
     /// <summary>
