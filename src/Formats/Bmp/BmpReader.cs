@@ -18,8 +18,20 @@ public static class BmpReader
     public static byte[] Read(string path, out int width, out int height)
     {
         using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 20, FileOptions.SequentialScan);
+        return Read(fs, out width, out height);
+    }
+
+    /// <summary>
+    /// 读取 BMP 数据流并返回 RGB24 像素数据
+    /// </summary>
+    /// <param name="stream">输入数据流</param>
+    /// <param name="width">输出图像宽度</param>
+    /// <param name="height">输出图像高度</param>
+    /// <returns>按 RGB 顺序排列的字节数组</returns>
+    public static byte[] Read(Stream stream, out int width, out int height)
+    {
         Span<byte> header = stackalloc byte[54];
-        int read = fs.Read(header);
+        int read = stream.Read(header);
         if (read != header.Length) throw new EndOfStreamException("BMP header 不完整");
 
         if (header[0] != (byte)'B' || header[1] != (byte)'M')
@@ -49,11 +61,55 @@ public static class BmpReader
 
         int pixelSize = bpp / 8;
 
-        fs.Position = dataOffset;
+        // 如果 stream 支持 Seek，则跳转到 dataOffset。
+        // 注意：dataOffset 是相对于文件开头的。
+        // 如果 stream 是部分流，可能需要考虑偏移。但通常 BMP 是整个文件。
+        // 假设 stream 当前位置是 header 之后。
+        // dataOffset 通常大于 54。
+        if (stream.CanSeek)
+        {
+            // 这里假设 dataOffset 是相对于 stream 起始位置的绝对偏移
+            // 但如果 stream 是从中间开始的（例如 MemoryStream 的 slice），Position 可能不是 0
+            // 简单起见，假设 stream 是完整的文件流，或者 dataOffset 是相对于当前 stream 起始位置的。
+            // 实际上 BMP 格式的 dataOffset 是绝对偏移。
+            // 如果传入的是 FileStream，Position = dataOffset 是对的。
+            // 如果传入的是包含其他数据的流，我们需要知道 BMP 在流中的起始位置。
+            // 但 Read 方法无法知道 BMP 在流中的起始位置，除非我们传递它，或者假设当前 Position - 54 就是起始位置。
+            // 让我们假设 stream 刚开始读取 header 时的位置是 BMP 的起始位置。
+            // 也就是 currentPos - 54。
+            // 更好的做法是，不要 Seek 到绝对位置，而是 skip 掉中间的数据。
+            long currentPos = stream.Position;
+            // 已经读了 54 字节。
+            // 需要跳过 dataOffset - 54 字节。
+            int skip = dataOffset - 54;
+            if (skip > 0)
+            {
+                if (stream.CanSeek)
+                {
+                    stream.Seek(skip, SeekOrigin.Current);
+                }
+                else
+                {
+                    byte[] temp = new byte[skip];
+                    stream.ReadExactly(temp, 0, skip);
+                }
+            }
+        }
+        else
+        {
+             // 无法 Seek，必须读取并丢弃
+            int skip = dataOffset - 54;
+            if (skip > 0)
+            {
+                byte[] temp = new byte[skip];
+                stream.ReadExactly(temp, 0, skip);
+            }
+        }
+
         byte[] row = new byte[rowStride];
         for (int rowIndex = 0; rowIndex < height; rowIndex++)
         {
-            fs.ReadExactly(row, 0, rowStride);
+            stream.ReadExactly(row, 0, rowStride);
             int dstY = bottomUp ? (height - 1 - rowIndex) : rowIndex;
             int dstOffset = dstY * width * 3;
 

@@ -35,6 +35,13 @@ namespace SharpImageConverter.Core
         /// <param name="path">输入文件路径</param>
         /// <returns>Rgb24 图像</returns>
         Image<Rgb24> DecodeRgb24(string path);
+
+        /// <summary>
+        /// 解码为 Rgb24 图像
+        /// </summary>
+        /// <param name="stream">输入数据流</param>
+        /// <returns>Rgb24 图像</returns>
+        Image<Rgb24> DecodeRgb24(Stream stream);
     }
 
     /// <summary>
@@ -48,6 +55,13 @@ namespace SharpImageConverter.Core
         /// <param name="path">输入文件路径</param>
         /// <returns>Rgba32 图像</returns>
         Image<Rgba32> DecodeRgba32(string path);
+
+        /// <summary>
+        /// 解码为 Rgba32 图像
+        /// </summary>
+        /// <param name="stream">输入数据流</param>
+        /// <returns>Rgba32 图像</returns>
+        Image<Rgba32> DecodeRgba32(Stream stream);
     }
 
     /// <summary>
@@ -61,6 +75,13 @@ namespace SharpImageConverter.Core
         /// <param name="path">输出文件路径</param>
         /// <param name="image">Rgb24 图像</param>
         void EncodeRgb24(string path, Image<Rgb24> image);
+
+        /// <summary>
+        /// 保存 Rgb24 图像到指定流
+        /// </summary>
+        /// <param name="stream">输出数据流</param>
+        /// <param name="image">Rgb24 图像</param>
+        void EncodeRgb24(Stream stream, Image<Rgb24> image);
     }
 
     /// <summary>
@@ -74,6 +95,13 @@ namespace SharpImageConverter.Core
         /// <param name="path">输出文件路径</param>
         /// <param name="image">Rgba32 图像</param>
         void EncodeRgba32(string path, Image<Rgba32> image);
+
+        /// <summary>
+        /// 保存 Rgba32 图像到指定流
+        /// </summary>
+        /// <param name="stream">输出数据流</param>
+        /// <param name="image">Rgba32 图像</param>
+        void EncodeRgba32(Stream stream, Image<Rgba32> image);
     }
 
     /// <summary>

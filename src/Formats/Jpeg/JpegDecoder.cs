@@ -197,18 +197,18 @@ public class JpegDecoder
     /// <summary>
     /// 解码入口：根据帧类型路由到基线或渐进式解码
     /// </summary>
-    public byte[] DecodeToRGB(string inputPath)
+    public byte[] DecodeToRGB(Stream stream)
     {
         if (_parser.IsProgressive)
-            return DecodeProgressiveToRGB(inputPath);
+            return DecodeProgressiveToRGB(stream);
         else
-            return DecodeBaselineToRGB(inputPath);
+            return DecodeBaselineToRGB(stream);
     }
 
     /// <summary>
     /// 基线JPEG解码为RGB（单扫描，霍夫曼+反量化+IDCT）
     /// </summary>
-    public byte[] DecodeBaselineToRGB(string inputPath)
+    public byte[] DecodeBaselineToRGB(Stream stream)
     {
         T.Assert(_parser.Scans.Count > 0, "未找到扫描数据");
         T.Assert(_parser.FrameComponents.Count > 0, "未找到SOF0组件");
@@ -232,10 +232,9 @@ public class JpegDecoder
             subPlanes[id] = (wComp, hComp, new int[wComp * hComp]);
         }
 
-        using var fs = new FileStream(inputPath, FileMode.Open, FileAccess.Read);
         var scan = _parser.Scans[0];
-        fs.Position = scan.DataOffset;
-        var br = new BitReader(fs);
+        stream.Position = scan.DataOffset;
+        var br = new BitReader(stream);
 
         var dcCanon = new Dictionary<byte, CanonicalHuff>();
         var acCanon = new Dictionary<byte, CanonicalHuff>();
@@ -366,7 +365,7 @@ public class JpegDecoder
     /// <summary>
     /// 渐进式JPEG解码为RGB（完整支持DC/AC初始扫描及细化扫描）
     /// </summary>
-    public byte[] DecodeProgressiveToRGB(string inputPath)
+    public byte[] DecodeProgressiveToRGB(Stream stream)
     {
         T.Assert(_parser.Scans.Count > 0, "未找到扫描数据");
         T.Assert(_parser.FrameComponents.Count > 0, "未找到SOF2组件");
@@ -403,12 +402,10 @@ public class JpegDecoder
         Array.Clear(prevDC, 0, prevDC.Length);
         int mcusProcessed = 0;
 
-        using var fs = new FileStream(inputPath, FileMode.Open, FileAccess.Read);
-
         foreach (var scan in _parser.Scans)
         {
-            fs.Position = scan.DataOffset;
-            var br = new BitReader(fs);
+            stream.Position = scan.DataOffset;
+            var br = new BitReader(stream);
 
             var dcCanon = new Dictionary<byte, CanonicalHuff>();
             var acCanon = new Dictionary<byte, CanonicalHuff>();

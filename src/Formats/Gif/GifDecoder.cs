@@ -256,7 +256,7 @@ namespace SharpImageConverter.Formats.Gif
         public Image<Rgb24> DecodeRgb24(string path)
         {
             using var fs = File.OpenRead(path);
-            return Decode(fs);
+            return DecodeRgb24(fs);
         }
 
         /// <summary>
@@ -264,7 +264,7 @@ namespace SharpImageConverter.Formats.Gif
         /// </summary>
         /// <param name="stream">输入流</param>
         /// <returns>Rgb24 图像</returns>
-        public Image<Rgb24> Decode(Stream stream)
+        public Image<Rgb24> DecodeRgb24(Stream stream)
         {
             // Header
             byte[] sig = new byte[6];
@@ -488,6 +488,16 @@ namespace SharpImageConverter.Formats.Gif
     public Image<Rgba32> DecodeRgba32(string path)
     {
         using var stream = File.OpenRead(path);
+        return DecodeRgba32(stream);
+    }
+
+    /// <summary>
+    /// 解码 GIF 流为 RGBA32 图像
+    /// </summary>
+    /// <param name="stream">输入流</param>
+    /// <returns>RGBA32 图像</returns>
+    public Image<Rgba32> DecodeRgba32(Stream stream)
+    {
             byte[] sig = new byte[6];
             if (stream.Read(sig, 0, 6) != 6) throw new InvalidDataException("Invalid GIF header");
             if (sig[0] != 'G' || sig[1] != 'I' || sig[2] != 'F') throw new InvalidDataException("Not a GIF file");
@@ -663,7 +673,7 @@ namespace SharpImageConverter.Formats.Gif
                 }
             }
             return new Image<Rgba32>(width, height, canvas);
-        }
+    }
 
         private void ReadExact(Stream s, byte[] buf, int count)
         {

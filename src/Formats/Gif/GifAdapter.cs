@@ -22,6 +22,18 @@ namespace SharpImageConverter.Formats.Gif
             var frame = new ImageFrame(image.Width, image.Height, image.Buffer);
             encoder.Encode(frame, fs);
         }
+
+        /// <summary>
+        /// 将 RGB24 图像编码为 GIF 流
+        /// </summary>
+        /// <param name="stream">输出流</param>
+        /// <param name="image">输入图像</param>
+        public void EncodeRgb24(Stream stream, Image<Rgb24> image)
+        {
+            var encoder = new GifEncoder();
+            var frame = new ImageFrame(image.Width, image.Height, image.Buffer);
+            encoder.Encode(frame, stream);
+        }
     }
 
     /// <summary>
@@ -40,6 +52,17 @@ namespace SharpImageConverter.Formats.Gif
             using var fs = File.Create(path);
             encoder.EncodeRgba(image.Width, image.Height, image.Buffer, fs);
         }
+
+        /// <summary>
+        /// 将 RGBA32 图像编码为 GIF 流
+        /// </summary>
+        /// <param name="stream">输出流</param>
+        /// <param name="image">输入图像</param>
+        public void EncodeRgba32(Stream stream, Image<Rgba32> image)
+        {
+            var encoder = new GifEncoder();
+            encoder.EncodeRgba(image.Width, image.Height, image.Buffer, stream);
+        }
     }
 
     /// <summary>
@@ -56,6 +79,17 @@ namespace SharpImageConverter.Formats.Gif
         {
             var dec = new GifDecoder();
             return dec.DecodeRgba32(path);
+        }
+
+        /// <summary>
+        /// 解码 GIF 流为 RGBA32 图像
+        /// </summary>
+        /// <param name="stream">输入流</param>
+        /// <returns>RGBA32 图像</returns>
+        public Image<Rgba32> DecodeRgba32(Stream stream)
+        {
+            var dec = new GifDecoder();
+            return dec.DecodeRgba32(stream);
         }
     }
 }

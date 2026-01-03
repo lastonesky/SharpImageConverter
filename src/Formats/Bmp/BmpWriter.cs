@@ -17,6 +17,19 @@ public static class BmpWriter
     /// <param name="rgb">RGB24 像素数据</param>
     public static void Write24(string path, int width, int height, byte[] rgb)
     {
+        using var fs = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None);
+        Write24(fs, width, height, rgb);
+    }
+
+    /// <summary>
+    /// 以 24 位 BMP 格式写出 RGB24 像素数据
+    /// </summary>
+    /// <param name="stream">输出流</param>
+    /// <param name="width">图像宽度</param>
+    /// <param name="height">图像高度</param>
+    /// <param name="rgb">RGB24 像素数据</param>
+    public static void Write24(Stream stream, int width, int height, byte[] rgb)
+    {
         int rowStride = ((width * 3 + 3) / 4) * 4; // 4字节对齐
         int imageSize = rowStride * height;
         int fileSize = 14 + 40 + imageSize;
@@ -64,7 +77,7 @@ public static class BmpWriter
         }
 
         // 单次写出
-        File.WriteAllBytes(path, file);
+        stream.Write(file, 0, file.Length);
     }
 
     private static void WriteLe16(Stream s, int v)

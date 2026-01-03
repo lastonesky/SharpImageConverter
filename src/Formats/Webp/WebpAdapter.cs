@@ -17,7 +17,31 @@ namespace SharpImageConverter.Formats
         /// <returns>RGB24 图像</returns>
         public Image<Rgb24> DecodeRgb24(string path)
         {
-            var rgba = WebpCodec.DecodeRgba(File.ReadAllBytes(path), out int width, out int height);
+            using var fs = new FileStream(path, FileMode.Open, FileAccess.Read);
+            return DecodeRgb24(fs);
+        }
+
+        /// <summary>
+        /// 解码 WebP 流为 RGB24 图像
+        /// </summary>
+        /// <param name="stream">输入流</param>
+        /// <returns>RGB24 图像</returns>
+        public Image<Rgb24> DecodeRgb24(Stream stream)
+        {
+            // WebP 解码需要完整的数据 buffer
+            byte[] data;
+            if (stream is MemoryStream ms)
+            {
+                data = ms.ToArray();
+            }
+            else
+            {
+                using var tempMs = new MemoryStream();
+                stream.CopyTo(tempMs);
+                data = tempMs.ToArray();
+            }
+
+            var rgba = WebpCodec.DecodeRgba(data, out int width, out int height);
             var rgb = new byte[width * height * 3];
             for (int i = 0, j = 0; i < rgba.Length; i += 4, j += 3)
             {
@@ -41,7 +65,30 @@ namespace SharpImageConverter.Formats
         /// <returns>RGBA32 图像</returns>
         public Image<Rgba32> DecodeRgba32(string path)
         {
-            var rgba = WebpCodec.DecodeRgba(File.ReadAllBytes(path), out int width, out int height);
+            using var fs = new FileStream(path, FileMode.Open, FileAccess.Read);
+            return DecodeRgba32(fs);
+        }
+
+        /// <summary>
+        /// 解码 WebP 流为 RGBA32 图像
+        /// </summary>
+        /// <param name="stream">输入流</param>
+        /// <returns>RGBA32 图像</returns>
+        public Image<Rgba32> DecodeRgba32(Stream stream)
+        {
+            byte[] data;
+            if (stream is MemoryStream ms)
+            {
+                data = ms.ToArray();
+            }
+            else
+            {
+                using var tempMs = new MemoryStream();
+                stream.CopyTo(tempMs);
+                data = tempMs.ToArray();
+            }
+
+            var rgba = WebpCodec.DecodeRgba(data, out int width, out int height);
             return new Image<Rgba32>(width, height, rgba);
         }
     }
@@ -58,6 +105,17 @@ namespace SharpImageConverter.Formats
         /// <param name="image">输入图像</param>
         public void EncodeRgb24(string path, Image<Rgb24> image)
         {
+            using var fs = new FileStream(path, FileMode.Create, FileAccess.Write);
+            EncodeRgb24(fs, image);
+        }
+
+        /// <summary>
+        /// 将 RGB24 图像编码为 WebP 流
+        /// </summary>
+        /// <param name="stream">输出流</param>
+        /// <param name="image">输入图像</param>
+        public void EncodeRgb24(Stream stream, Image<Rgb24> image)
+        {
             var rgba = new byte[image.Width * image.Height * 4];
             for (int i = 0, j = 0; j < image.Buffer.Length; i += 4, j += 3)
             {
@@ -67,7 +125,7 @@ namespace SharpImageConverter.Formats
                 rgba[i + 3] = 255;
             }
             var webp = WebpCodec.EncodeRgba(rgba, image.Width, image.Height, 75f);
-            File.WriteAllBytes(path, webp);
+            stream.Write(webp, 0, webp.Length);
         }
     }
 
@@ -83,8 +141,19 @@ namespace SharpImageConverter.Formats
         /// <param name="image">输入图像</param>
         public void EncodeRgba32(string path, Image<Rgba32> image)
         {
+            using var fs = new FileStream(path, FileMode.Create, FileAccess.Write);
+            EncodeRgba32(fs, image);
+        }
+
+        /// <summary>
+        /// 将 RGBA32 图像编码为 WebP 流
+        /// </summary>
+        /// <param name="stream">输出流</param>
+        /// <param name="image">输入图像</param>
+        public void EncodeRgba32(Stream stream, Image<Rgba32> image)
+        {
             var webp = WebpCodec.EncodeRgba(image.Buffer, image.Width, image.Height, 75f);
-            File.WriteAllBytes(path, webp);
+            stream.Write(webp, 0, webp.Length);
         }
     }
 }

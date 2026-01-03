@@ -192,13 +192,22 @@ public static class JpegEncoder
     /// <param name="quality">JPEG 质量（1-100）</param>
     public static void Write(string path, int width, int height, byte[] rgb24, int quality = 75)
     {
+        using var fs = new FileStream(path, FileMode.Create, FileAccess.Write);
+        Write(fs, width, height, rgb24, quality);
+    }
+
+    /// <summary>
+    /// 将 RGB24 编码为 JPEG 流（默认使用 4:2:0 采样）
+    /// </summary>
+    public static void Write(Stream stream, int width, int height, byte[] rgb24, int quality = 75)
+    {
         if (rgb24 == null) throw new ArgumentNullException(nameof(rgb24));
         if (rgb24.Length != checked(width * height * 3)) throw new ArgumentException("RGB24 像素长度不匹配", nameof(rgb24));
         if (quality < 1) quality = 1;
         if (quality > 100) quality = 100;
 
         bool subsample420 = true;
-        WriteInternal(path, width, height, rgb24, quality, subsample420);
+        WriteInternal(stream, width, height, rgb24, quality, subsample420);
     }
 
     /// <summary>
@@ -212,15 +221,24 @@ public static class JpegEncoder
     /// <param name="subsample420">是否使用 4:2:0 子采样（否则为 4:4:4）</param>
     public static void Write(string path, int width, int height, byte[] rgb24, int quality, bool subsample420)
     {
+        using var fs = new FileStream(path, FileMode.Create, FileAccess.Write);
+        Write(fs, width, height, rgb24, quality, subsample420);
+    }
+
+    /// <summary>
+    /// 将 RGB24 编码为 JPEG 流，可选择 4:2:0 或 4:4:4 采样
+    /// </summary>
+    public static void Write(Stream stream, int width, int height, byte[] rgb24, int quality, bool subsample420)
+    {
         if (rgb24 == null) throw new ArgumentNullException(nameof(rgb24));
         if (rgb24.Length != checked(width * height * 3)) throw new ArgumentException("RGB24 像素长度不匹配", nameof(rgb24));
         if (quality < 1) quality = 1;
         if (quality > 100) quality = 100;
 
-        WriteInternal(path, width, height, rgb24, quality, subsample420);
+        WriteInternal(stream, width, height, rgb24, quality, subsample420);
     }
 
-    private static void WriteInternal(string path, int width, int height, byte[] rgb24, int quality, bool subsample420)
+    private static void WriteInternal(Stream stream, int width, int height, byte[] rgb24, int quality, bool subsample420)
     {
         if (DebugPrintConfig)
         {
@@ -237,19 +255,18 @@ public static class JpegEncoder
         HuffCode[] dcC = BuildHuffTable(DcChromaCounts, DcChromaSymbols);
         HuffCode[] acC = BuildHuffTable(AcChromaCounts, AcChromaSymbols);
 
-        using var fs = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None, 1 << 20, FileOptions.SequentialScan);
-        WriteMarker(fs, 0xD8);
-        WriteApp0Jfif(fs);
-        WriteDqt(fs, 0, qY);
-        WriteDqt(fs, 1, qC);
-        WriteSof0(fs, width, height, subsample420);
-        WriteDht(fs, 0, 0, DcLumaCounts, DcLumaSymbols);
-        WriteDht(fs, 1, 0, AcLumaCounts, AcLumaSymbols);
-        WriteDht(fs, 0, 1, DcChromaCounts, DcChromaSymbols);
-        WriteDht(fs, 1, 1, AcChromaCounts, AcChromaSymbols);
-        WriteSos(fs);
+        WriteMarker(stream, 0xD8);
+        WriteApp0Jfif(stream);
+        WriteDqt(stream, 0, qY);
+        WriteDqt(stream, 1, qC);
+        WriteSof0(stream, width, height, subsample420);
+        WriteDht(stream, 0, 0, DcLumaCounts, DcLumaSymbols);
+        WriteDht(stream, 1, 0, AcLumaCounts, AcLumaSymbols);
+        WriteDht(stream, 0, 1, DcChromaCounts, DcChromaSymbols);
+        WriteDht(stream, 1, 1, AcChromaCounts, AcChromaSymbols);
+        WriteSos(stream);
 
-        var bw = new JpegBitWriter(fs);
+        var bw = new JpegBitWriter(stream);
 
         int prevYdc = 0, prevCbdc = 0, prevCrdc = 0;
 
@@ -312,7 +329,7 @@ public static class JpegEncoder
         }
 
         bw.FlushFinal();
-        WriteMarker(fs, 0xD9);
+        WriteMarker(stream, 0xD9);
     }
 
     private static void EncodeBlock(JpegBitWriter bw, Span<int> spatial, byte[] quant, int[] quantRecip, HuffCode[] dc, HuffCode[] ac, ref int prevDc, Span<int> qcoeffOut)

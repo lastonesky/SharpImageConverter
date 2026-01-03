@@ -66,194 +66,203 @@ public class JpegParser
     public void Parse(string path)
     {
         T.Assert(File.Exists(path), $"文件不存在: {path}");
-
-        using (FileStream fs = new (path, FileMode.Open, FileAccess.Read))
+        using (FileStream fs = new(path, FileMode.Open, FileAccess.Read))
         {
-            int b1 = fs.ReadByte();
-            int b2 = fs.ReadByte();
-            T.Assert(b1 == 0xFF && b2 == 0xD8, "不是 JPEG 文件头（FF D8）");
+            Parse(fs);
+        }
+    }
 
-            Segments.Add(new JpegSegment(0xFFD8, 0, 0));
+    /// <summary>
+    /// 解析指定 JPEG 数据流，填充段与帧信息
+    /// </summary>
+    /// <param name="stream">输入数据流</param>
+    public void Parse(Stream stream)
+    {
+        long startPosition = stream.Position;
+        int b1 = stream.ReadByte();
+        int b2 = stream.ReadByte();
+        T.Assert(b1 == 0xFF && b2 == 0xD8, "不是 JPEG 文件头（FF D8）");
 
-            while (fs.Position < fs.Length)
+        Segments.Add(new JpegSegment(0xFFD8, (int)startPosition, 0));
+
+        while (stream.Position < stream.Length)
+        {
+            b1 = stream.ReadByte();
+            if (b1 == -1) break;
+            if (b1 != 0xFF) continue;
+
+            // 跳过连续的 FF
+            do { b2 = stream.ReadByte(); } while (b2 == 0xFF);
+            if (b2 == -1) break;
+
+            ushort marker = (ushort)((0xFF << 8) | b2);
+
+            if (marker == 0xFFD9)
             {
-                b1 = fs.ReadByte();
-                if (b1 == -1) break;
-                if (b1 != 0xFF) continue;
-
-                // 跳过连续的 FF
-                do { b2 = fs.ReadByte(); } while (b2 == 0xFF);
-                if (b2 == -1) break;
-
-                ushort marker = (ushort)((0xFF << 8) | b2);
-
-                if (marker == 0xFFD9)
-                {
-                    Segments.Add(new JpegSegment(marker, (int)fs.Position - 2, 0));
-                    break;
-                }
-
-                int lenHi = fs.ReadByte();
-                int lenLo = fs.ReadByte();
-                if (lenHi == -1 || lenLo == -1) break;
-                int segLen = (lenHi << 8) | lenLo;
-
-                long segStart = fs.Position - 4;
-                Segments.Add(new JpegSegment(marker, (int)segStart, segLen));
-
-                // =============== 解析 DQT 段 ===============
-                if (marker == 0xFFDB)
-                {
-                    byte[] buf = new byte[segLen - 2];
-                    fs.ReadExactly(buf, 0, buf.Length);
-                    ParseQuantTables(buf);
-                }
-                // =============== 解析 SOF0 段（基线） ===============
-                else if (marker == 0xFFC0)
-                {
-                    byte[] buf = new byte[segLen - 2];
-                    fs.ReadExactly(buf, 0, buf.Length);
-                    byte precision = buf[0];
-                    Height = (buf[1] << 8) | buf[2];
-                    Width = (buf[3] << 8) | buf[4];
-                    int nf = buf[5];
-                    FrameComponents.Clear();
-                    MaxH = 0; MaxV = 0;
-                    int pos = 6;
-                    for (int i = 0; i < nf; i++)
-                    {
-                        byte cid = buf[pos++];
-                        byte hv = buf[pos++];
-                        byte qid = buf[pos++];
-                        byte h = (byte)(hv >> 4);
-                        byte v = (byte)(hv & 0x0F);
-                        FrameComponents.Add((cid, h, v, qid));
-                        if (h > MaxH) MaxH = h;
-                        if (v > MaxV) MaxV = v;
-                    }
-                    IsProgressive = false;
-                }
-                // =============== 解析 SOF2 段（渐进式） ===============
-                else if (marker == 0xFFC2)
-                {
-                    byte[] buf = new byte[segLen - 2];
-                    fs.ReadExactly(buf, 0, buf.Length);
-                    byte precision = buf[0];
-                    Height = (buf[1] << 8) | buf[2];
-                    Width = (buf[3] << 8) | buf[4];
-                    int nf = buf[5];
-                    FrameComponents.Clear();
-                    MaxH = 0; MaxV = 0;
-                    int pos = 6;
-                    for (int i = 0; i < nf; i++)
-                    {
-                        byte cid = buf[pos++];
-                        byte hv = buf[pos++];
-                        byte qid = buf[pos++];
-                        byte h = (byte)(hv >> 4);
-                        byte v = (byte)(hv & 0x0F);
-                        FrameComponents.Add((cid, h, v, qid));
-                        if (h > MaxH) MaxH = h;
-                        if (v > MaxV) MaxV = v;
-                    }
-                    IsProgressive = true;
-                }
-                // =============== 解析 APP1 (EXIF) 段，提取方向 ===============
-                else if (marker == 0xFFE1)
-                {
-                    byte[] buf = new byte[segLen - 2];
-                    fs.ReadExactly(buf, 0, buf.Length);
-                    TryParseExifOrientation(buf);
-                }
-                // =============== 解析 DHT 段 ===============
-                else if (marker == 0xFFC4)
-                {
-                    ParseHuffmanTables(fs, segLen);
-                }
-                // =============== 解析 DRI 段 ===============
-                else if (marker == 0xFFDD)
-                {
-                    // Restart Interval, 2 字节无符号
-                    int rhi = fs.ReadByte();
-                    int rlo = fs.ReadByte();
-                    if (rhi == -1 || rlo == -1) throw new Exception("DRI 段不完整");
-                    RestartInterval = (ushort)((rhi << 8) | rlo);
-                }
-                else if (marker == 0xFFDA) // SOS
-                {
-                    // 注意：segLen 已在上方统一读取，这里不应再次读取。
-                    int remaining = segLen - 2;        // 段内容长度（不含长度字节）
-
-                    int nbChannels = fs.ReadByte();
-                    remaining--;
-
-                    var comps = new (byte channelId, byte dcTableId, byte acTableId)[nbChannels];
-                    for (int i = 0; i < nbChannels; i++)
-                    {
-                        int cId = fs.ReadByte();
-                        int table = fs.ReadByte();
-                        remaining -= 2;
-                        comps[i] = ((byte)cId, (byte)(table >> 4), (byte)(table & 0x0F));
-                    }
-
-                    // 读取 Ss, Se, Ah/Al 三个字节（渐进式必需；基线可忽略但仍保存）
-                    int Ss = fs.ReadByte();
-                    int Se = fs.ReadByte();
-                    int AhAl = fs.ReadByte();
-                    remaining -= 3;
-                    byte Ah = (byte)((AhAl >> 4) & 0x0F);
-                    byte Al = (byte)(AhAl & 0x0F);
-
-                    long scanDataOffset = fs.Position;
-                    long scanDataLength;
-
-                    // 搜索下一个 marker (0xFF) 或文件结尾
-                    long scanEnd = fs.Length;
-                    while (fs.Position < fs.Length)
-                    {
-                        int b = fs.ReadByte();
-                        if (b == 0xFF)
-                        {
-                            int next = fs.ReadByte();
-                            if (next == -1) break;
-                            if (next == 0x00)
-                            {
-                                // 0xFF00 表示字节填充，实际数据中的 0xFF
-                                continue;
-                            }
-                            // RSTn 重启标记 (FFD0-FFD7) 出现在熵编码数据中，不能作为扫描结束
-                            if (next >= 0xD0 && next <= 0xD7)
-                            {
-                                continue;
-                            }
-                            // 其他非填充的 0xFFxx 视为下一个段的标记
-                            fs.Position -= 2; // 回到 marker 起始
-                            scanEnd = fs.Position;
-                            break;
-                        }
-                    }
-                    scanDataLength = scanEnd - scanDataOffset;
-
-                    var js = new JpegScan(nbChannels, comps, (int)scanDataOffset)
-                    {
-                        DataLength = scanDataLength,
-                        Ss = (byte)Ss,
-                        Se = (byte)Se,
-                        Ah = Ah,
-                        Al = Al
-                    };
-                    Scans.Add(js);
-
-                    // 跳到扫描段末尾
-                    fs.Position = scanEnd;
-                }
-                else
-                {
-                    fs.Position += segLen - 2;
-                }
-                
-
+                Segments.Add(new JpegSegment(marker, (int)stream.Position - 2, 0));
+                break;
             }
+
+            int lenHi = stream.ReadByte();
+            int lenLo = stream.ReadByte();
+            if (lenHi == -1 || lenLo == -1) break;
+            int segLen = (lenHi << 8) | lenLo;
+
+            long segStart = stream.Position - 4;
+            Segments.Add(new JpegSegment(marker, (int)segStart, segLen));
+
+            // =============== 解析 DQT 段 ===============
+            if (marker == 0xFFDB)
+            {
+                byte[] buf = new byte[segLen - 2];
+                stream.ReadExactly(buf, 0, buf.Length);
+                ParseQuantTables(buf);
+            }
+            // =============== 解析 SOF0 段（基线） ===============
+            else if (marker == 0xFFC0)
+            {
+                byte[] buf = new byte[segLen - 2];
+                stream.ReadExactly(buf, 0, buf.Length);
+                byte precision = buf[0];
+                Height = (buf[1] << 8) | buf[2];
+                Width = (buf[3] << 8) | buf[4];
+                int nf = buf[5];
+                FrameComponents.Clear();
+                MaxH = 0; MaxV = 0;
+                int pos = 6;
+                for (int i = 0; i < nf; i++)
+                {
+                    byte cid = buf[pos++];
+                    byte hv = buf[pos++];
+                    byte qid = buf[pos++];
+                    byte h = (byte)(hv >> 4);
+                    byte v = (byte)(hv & 0x0F);
+                    FrameComponents.Add((cid, h, v, qid));
+                    if (h > MaxH) MaxH = h;
+                    if (v > MaxV) MaxV = v;
+                }
+                IsProgressive = false;
+            }
+            // =============== 解析 SOF2 段（渐进式） ===============
+            else if (marker == 0xFFC2)
+            {
+                byte[] buf = new byte[segLen - 2];
+                stream.ReadExactly(buf, 0, buf.Length);
+                byte precision = buf[0];
+                Height = (buf[1] << 8) | buf[2];
+                Width = (buf[3] << 8) | buf[4];
+                int nf = buf[5];
+                FrameComponents.Clear();
+                MaxH = 0; MaxV = 0;
+                int pos = 6;
+                for (int i = 0; i < nf; i++)
+                {
+                    byte cid = buf[pos++];
+                    byte hv = buf[pos++];
+                    byte qid = buf[pos++];
+                    byte h = (byte)(hv >> 4);
+                    byte v = (byte)(hv & 0x0F);
+                    FrameComponents.Add((cid, h, v, qid));
+                    if (h > MaxH) MaxH = h;
+                    if (v > MaxV) MaxV = v;
+                }
+                IsProgressive = true;
+            }
+            // =============== 解析 APP1 (EXIF) 段，提取方向 ===============
+            else if (marker == 0xFFE1)
+            {
+                byte[] buf = new byte[segLen - 2];
+                stream.ReadExactly(buf, 0, buf.Length);
+                TryParseExifOrientation(buf);
+            }
+            // =============== 解析 DHT 段 ===============
+            else if (marker == 0xFFC4)
+            {
+                ParseHuffmanTables(stream, segLen);
+            }
+            // =============== 解析 DRI 段 ===============
+            else if (marker == 0xFFDD)
+            {
+                // Restart Interval, 2 字节无符号
+                int rhi = stream.ReadByte();
+                int rlo = stream.ReadByte();
+                if (rhi == -1 || rlo == -1) throw new Exception("DRI 段不完整");
+                RestartInterval = (ushort)((rhi << 8) | rlo);
+            }
+            else if (marker == 0xFFDA) // SOS
+            {
+                // 注意：segLen 已在上方统一读取，这里不应再次读取。
+                int remaining = segLen - 2;        // 段内容长度（不含长度字节）
+
+                int nbChannels = stream.ReadByte();
+                remaining--;
+
+                var comps = new (byte channelId, byte dcTableId, byte acTableId)[nbChannels];
+                for (int i = 0; i < nbChannels; i++)
+                {
+                    int cId = stream.ReadByte();
+                    int table = stream.ReadByte();
+                    remaining -= 2;
+                    comps[i] = ((byte)cId, (byte)(table >> 4), (byte)(table & 0x0F));
+                }
+
+                // 读取 Ss, Se, Ah/Al 三个字节（渐进式必需；基线可忽略但仍保存）
+                int Ss = stream.ReadByte();
+                int Se = stream.ReadByte();
+                int AhAl = stream.ReadByte();
+                remaining -= 3;
+                byte Ah = (byte)((AhAl >> 4) & 0x0F);
+                byte Al = (byte)(AhAl & 0x0F);
+
+                long scanDataOffset = stream.Position;
+                long scanDataLength;
+
+                // 搜索下一个 marker (0xFF) 或文件结尾
+                long scanEnd = stream.Length;
+                while (stream.Position < stream.Length)
+                {
+                    int b = stream.ReadByte();
+                    if (b == 0xFF)
+                    {
+                        int next = stream.ReadByte();
+                        if (next == -1) break;
+                        if (next == 0x00)
+                        {
+                            // 0xFF00 表示字节填充，实际数据中的 0xFF
+                            continue;
+                        }
+                        // RSTn 重启标记 (FFD0-FFD7) 出现在熵编码数据中，不能作为扫描结束
+                        if (next >= 0xD0 && next <= 0xD7)
+                        {
+                            continue;
+                        }
+                        // 其他非填充的 0xFFxx 视为下一个段的标记
+                        stream.Position -= 2; // 回到 marker 起始
+                        scanEnd = stream.Position;
+                        break;
+                    }
+                }
+                scanDataLength = scanEnd - scanDataOffset;
+
+                var js = new JpegScan(nbChannels, comps, (int)scanDataOffset)
+                {
+                    DataLength = scanDataLength,
+                    Ss = (byte)Ss,
+                    Se = (byte)Se,
+                    Ah = Ah,
+                    Al = Al
+                };
+                Scans.Add(js);
+
+                // 跳到扫描段末尾
+                stream.Position = scanEnd;
+            }
+            else
+            {
+                stream.Position += segLen - 2;
+            }
+            
+
         }
 
         T.Assert(Segments.Count > 0, "未解析出任何段");
@@ -352,7 +361,7 @@ public class JpegParser
             QuantTables[id] = new JpegQuantTable(id, precision, values);
         }
     }
-    private void ParseHuffmanTables(FileStream fs, int segLen)
+    private void ParseHuffmanTables(Stream fs, int segLen)
     {
         int bytesRead = 0;
         while (bytesRead < segLen - 2)

@@ -17,10 +17,21 @@ namespace SharpImageConverter.Formats
         /// <returns>Rgb24 图像</returns>
         public Image<Rgb24> DecodeRgb24(string path)
         {
+            using var fs = new FileStream(path, FileMode.Open, FileAccess.Read);
+            return DecodeRgb24(fs);
+        }
+
+        /// <summary>
+        /// 解码 JPEG 为 Rgb24 图像
+        /// </summary>
+        /// <param name="stream">输入数据流</param>
+        /// <returns>Rgb24 图像</returns>
+        public Image<Rgb24> DecodeRgb24(Stream stream)
+        {
             var parser = new JpegParser();
-            parser.Parse(path);
+            parser.Parse(stream);
             var dec = new JpegDecoder(parser);
-            var rgb = dec.DecodeToRGB(path);
+            var rgb = dec.DecodeToRGB(stream);
             var img = new Image<Rgb24>(parser.Width, parser.Height, rgb);
             if (parser.ExifOrientation != 1)
             {
@@ -45,6 +56,16 @@ namespace SharpImageConverter.Formats
         public void EncodeRgb24(string path, Image<Rgb24> image)
         {
             JpegEncoder.Write(path, image.Width, image.Height, image.Buffer, 75);
+        }
+
+        /// <summary>
+        /// 保存 Rgb24 图像为 JPEG 流（默认质量 75）
+        /// </summary>
+        /// <param name="stream">输出流</param>
+        /// <param name="image">Rgb24 图像</param>
+        public void EncodeRgb24(Stream stream, Image<Rgb24> image)
+        {
+            JpegEncoder.Write(stream, image.Width, image.Height, image.Buffer, 75);
         }
     }
 }

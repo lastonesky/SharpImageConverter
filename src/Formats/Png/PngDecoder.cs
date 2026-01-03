@@ -52,66 +52,76 @@ public class PngDecoder
     {
         using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read))
         {
-            // Check Signature
-            byte[] sig = new byte[8];
-            if (fs.Read(sig, 0, 8) != 8) throw new InvalidDataException("File too short");
-            if (!IsPngSignature(sig)) throw new InvalidDataException("Not a PNG file");
+            return DecodeToRGB(fs);
+        }
+    }
 
-            bool endChunkFound = false;
-            while (!endChunkFound && fs.Position < fs.Length)
+    /// <summary>
+    /// 解码 PNG 流为 RGB24 像素数据
+    /// </summary>
+    /// <param name="stream">PNG 数据流</param>
+    /// <returns>按 RGB 顺序排列的字节数组（长度为 Width*Height*3）</returns>
+    public byte[] DecodeToRGB(Stream stream)
+    {
+        // Check Signature
+        byte[] sig = new byte[8];
+        if (stream.Read(sig, 0, 8) != 8) throw new InvalidDataException("File too short");
+        if (!IsPngSignature(sig)) throw new InvalidDataException("Not a PNG file");
+
+        bool endChunkFound = false;
+        while (!endChunkFound && stream.Position < stream.Length)
+        {
+            // Read Length
+            byte[] lenBytes = new byte[4];
+            if (stream.Read(lenBytes, 0, 4) != 4) break;
+            uint length = ReadBigEndianUint32(lenBytes, 0);
+
+            // Read Type
+            byte[] typeBytes = new byte[4];
+            if (stream.Read(typeBytes, 0, 4) != 4) break;
+            string type = Encoding.ASCII.GetString(typeBytes);
+
+            // Read Data
+            byte[] data = new byte[length];
+            if (length > 0)
             {
-                // Read Length
-                byte[] lenBytes = new byte[4];
-                if (fs.Read(lenBytes, 0, 4) != 4) break;
-                uint length = ReadBigEndianUint32(lenBytes, 0);
+                if (stream.Read(data, 0, (int)length) != length) throw new InvalidDataException("Unexpected EOF in chunk data");
+            }
 
-                // Read Type
-                byte[] typeBytes = new byte[4];
-                if (fs.Read(typeBytes, 0, 4) != 4) break;
-                string type = Encoding.ASCII.GetString(typeBytes);
+            // Read CRC
+            byte[] crcBytes = new byte[4];
+            if (stream.Read(crcBytes, 0, 4) != 4) break;
+            uint fileCrc = ReadBigEndianUint32(crcBytes, 0);
 
-                // Read Data
-                byte[] data = new byte[length];
-                if (length > 0)
-                {
-                    if (fs.Read(data, 0, (int)length) != length) throw new InvalidDataException("Unexpected EOF in chunk data");
-                }
+            // Verify CRC
+            // CRC covers Type + Data
+            uint calcCrc = Crc32.Compute(typeBytes);
+            calcCrc = Crc32.Update(calcCrc, data, 0, (int)length);
+            if (calcCrc != fileCrc)
+            {
+                Console.WriteLine($"Warning: CRC mismatch in chunk {type}. Expected {fileCrc:X8}, got {calcCrc:X8}");
+            }
 
-                // Read CRC
-                byte[] crcBytes = new byte[4];
-                if (fs.Read(crcBytes, 0, 4) != 4) break;
-                uint fileCrc = ReadBigEndianUint32(crcBytes, 0);
-
-                // Verify CRC
-                // CRC covers Type + Data
-                uint calcCrc = Crc32.Compute(typeBytes);
-                calcCrc = Crc32.Update(calcCrc, data, 0, (int)length);
-                if (calcCrc != fileCrc)
-                {
-                    Console.WriteLine($"Warning: CRC mismatch in chunk {type}. Expected {fileCrc:X8}, got {calcCrc:X8}");
-                }
-
-                switch (type)
-                {
-                    case "IHDR":
-                        ParseIHDR(data);
-                        break;
-                    case "PLTE":
-                        _palette = data;
-                        break;
-                    case "IDAT":
-                        _idatData.AddRange(data);
-                        break;
-                    case "tRNS":
-                        _transparency = data;
-                        break;
-                    case "IEND":
-                        endChunkFound = true;
-                        break;
-                    default:
-                        // Skip ancillary chunks
-                        break;
-                }
+            switch (type)
+            {
+                case "IHDR":
+                    ParseIHDR(data);
+                    break;
+                case "PLTE":
+                    _palette = data;
+                    break;
+                case "IDAT":
+                    _idatData.AddRange(data);
+                    break;
+                case "tRNS":
+                    _transparency = data;
+                    break;
+                case "IEND":
+                    endChunkFound = true;
+                    break;
+                default:
+                    // Skip ancillary chunks
+                    break;
             }
         }
 
@@ -131,45 +141,55 @@ public class PngDecoder
     {
         using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read))
         {
-            byte[] sig = new byte[8];
-            if (fs.Read(sig, 0, 8) != 8) throw new InvalidDataException("File too short");
-            if (!IsPngSignature(sig)) throw new InvalidDataException("Not a PNG file");
-            bool endChunkFound = false;
-            while (!endChunkFound && fs.Position < fs.Length)
+            return DecodeToRGBA(fs);
+        }
+    }
+
+    /// <summary>
+    /// 解码 PNG 流为 RGBA32 像素数据
+    /// </summary>
+    /// <param name="stream">PNG 数据流</param>
+    /// <returns>按 RGBA 顺序排列的字节数组（长度为 Width*Height*4）</returns>
+    public byte[] DecodeToRGBA(Stream stream)
+    {
+        byte[] sig = new byte[8];
+        if (stream.Read(sig, 0, 8) != 8) throw new InvalidDataException("File too short");
+        if (!IsPngSignature(sig)) throw new InvalidDataException("Not a PNG file");
+        bool endChunkFound = false;
+        while (!endChunkFound && stream.Position < stream.Length)
+        {
+            byte[] lenBytes = new byte[4];
+            if (stream.Read(lenBytes, 0, 4) != 4) break;
+            uint length = ReadBigEndianUint32(lenBytes, 0);
+            byte[] typeBytes = new byte[4];
+            if (stream.Read(typeBytes, 0, 4) != 4) break;
+            string type = Encoding.ASCII.GetString(typeBytes);
+            byte[] data = new byte[length];
+            if (length > 0)
             {
-                byte[] lenBytes = new byte[4];
-                if (fs.Read(lenBytes, 0, 4) != 4) break;
-                uint length = ReadBigEndianUint32(lenBytes, 0);
-                byte[] typeBytes = new byte[4];
-                if (fs.Read(typeBytes, 0, 4) != 4) break;
-                string type = Encoding.ASCII.GetString(typeBytes);
-                byte[] data = new byte[length];
-                if (length > 0)
-                {
-                    if (fs.Read(data, 0, (int)length) != length) throw new InvalidDataException("Unexpected EOF in chunk data");
-                }
-                byte[] crcBytes = new byte[4];
-                if (fs.Read(crcBytes, 0, 4) != 4) break;
-                switch (type)
-                {
-                    case "IHDR":
-                        ParseIHDR(data);
-                        break;
-                    case "PLTE":
-                        _palette = data;
-                        break;
-                    case "IDAT":
-                        _idatData.AddRange(data);
-                        break;
-                    case "tRNS":
-                        _transparency = data;
-                        break;
-                    case "IEND":
-                        endChunkFound = true;
-                        break;
-                    default:
-                        break;
-                }
+                if (stream.Read(data, 0, (int)length) != length) throw new InvalidDataException("Unexpected EOF in chunk data");
+            }
+            byte[] crcBytes = new byte[4];
+            if (stream.Read(crcBytes, 0, 4) != 4) break;
+            switch (type)
+            {
+                case "IHDR":
+                    ParseIHDR(data);
+                    break;
+                case "PLTE":
+                    _palette = data;
+                    break;
+                case "IDAT":
+                    _idatData.AddRange(data);
+                    break;
+                case "tRNS":
+                    _transparency = data;
+                    break;
+                case "IEND":
+                    endChunkFound = true;
+                    break;
+                default:
+                    break;
             }
         }
         byte[] decompressed = ZlibHelper.Decompress(_idatData.ToArray());

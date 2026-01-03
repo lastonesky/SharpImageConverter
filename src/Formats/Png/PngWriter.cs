@@ -20,19 +20,31 @@ public static class PngWriter
     {
         using (var fs = new FileStream(path, FileMode.Create, FileAccess.Write))
         {
-            // PNG Signature
-            fs.Write(new byte[] { 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A }, 0, 8);
-
-            // IHDR
-            WriteChunk(fs, "IHDR", CreateIHDR(width, height));
-
-            // IDAT
-            byte[] idatData = CreateIDAT(width, height, rgb);
-            WriteChunk(fs, "IDAT", idatData);
-
-            // IEND
-            WriteChunk(fs, "IEND", new byte[0]);
+            Write(fs, width, height, rgb);
         }
+    }
+
+    /// <summary>
+    /// 写入 RGB24 PNG 流（颜色类型 2）
+    /// </summary>
+    /// <param name="stream">输出流</param>
+    /// <param name="width">宽度</param>
+    /// <param name="height">高度</param>
+    /// <param name="rgb">RGB24 像素数据</param>
+    public static void Write(Stream stream, int width, int height, byte[] rgb)
+    {
+        // PNG Signature
+        stream.Write(new byte[] { 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A }, 0, 8);
+
+        // IHDR
+        WriteChunk(stream, "IHDR", CreateIHDR(width, height));
+
+        // IDAT
+        byte[] idatData = CreateIDAT(width, height, rgb);
+        WriteChunk(stream, "IDAT", idatData);
+
+        // IEND
+        WriteChunk(stream, "IEND", new byte[0]);
     }
 
     /// <summary>
@@ -46,12 +58,24 @@ public static class PngWriter
     {
         using (var fs = new FileStream(path, FileMode.Create, FileAccess.Write))
         {
-            fs.Write(new byte[] { 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A }, 0, 8);
-            WriteChunk(fs, "IHDR", CreateIHDRRgba(width, height));
-            byte[] idatData = CreateIDATRgba(width, height, rgba);
-            WriteChunk(fs, "IDAT", idatData);
-            WriteChunk(fs, "IEND", new byte[0]);
+            WriteRgba(fs, width, height, rgba);
         }
+    }
+
+    /// <summary>
+    /// 写入 RGBA32 PNG 流（颜色类型 6）
+    /// </summary>
+    /// <param name="stream">输出流</param>
+    /// <param name="width">宽度</param>
+    /// <param name="height">高度</param>
+    /// <param name="rgba">RGBA32 像素数据</param>
+    public static void WriteRgba(Stream stream, int width, int height, byte[] rgba)
+    {
+        stream.Write(new byte[] { 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A }, 0, 8);
+        WriteChunk(stream, "IHDR", CreateIHDRRgba(width, height));
+        byte[] idatData = CreateIDATRgba(width, height, rgba);
+        WriteChunk(stream, "IDAT", idatData);
+        WriteChunk(stream, "IEND", new byte[0]);
     }
 
     private static void WriteChunk(Stream s, string type, byte[] data)

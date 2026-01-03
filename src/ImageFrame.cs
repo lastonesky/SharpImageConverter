@@ -79,10 +79,11 @@ public sealed class ImageFrame
     /// <returns>图像帧</returns>
     public static ImageFrame LoadJpeg(string path)
     {
+        using var fs = File.OpenRead(path);
         var parser = new JpegParser();
-        parser.Parse(path);
+        parser.Parse(fs);
         var decoder = new JpegDecoder(parser);
-        byte[] rgb = decoder.DecodeToRGB(path);
+        byte[] rgb = decoder.DecodeToRGB(fs);
 
         if (parser.ExifOrientation != 1)
         {
