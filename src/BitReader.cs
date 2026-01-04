@@ -12,6 +12,7 @@ public class BitReader
     private int _bitBuf;
     private int _bitCount;
     private bool _eof;
+    private bool _sawRestart;
     private readonly byte[] _buf;
     private int _bufPos;
     private int _bufLen;
@@ -40,6 +41,13 @@ public class BitReader
     {
         _bitBuf = 0;
         _bitCount = 0;
+    }
+
+    internal bool TakeRestartMarker()
+    {
+        bool v = _sawRestart;
+        _sawRestart = false;
+        return v;
     }
 
     private bool FillBuffer()
@@ -76,6 +84,7 @@ public class BitReader
             if (n == 0x00) return 0xFF;
             if (n >= 0xD0 && n <= 0xD7)
             {
+                _sawRestart = true;
                 ResetBits();
                 continue;
             }
