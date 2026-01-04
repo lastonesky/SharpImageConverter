@@ -519,20 +519,22 @@ public class JpegDecoder
         {
             var sc = scan.Components[0];
             var comp = _frame.Components.First(c => c.Id == sc.ComponentId);
-            int totalBlocks = comp.WidthInBlocks * comp.HeightInBlocks;
-
-            for (int b = 0; b < totalBlocks; b++)
+            for (int blockY = 0; blockY < comp.HeightInBlocks; blockY++)
             {
-                CheckRestart(ref restartsLeft, reader);
-
-                int[] block = comp.Coeffs[b];
-                if (Ss == 0)
+                for (int blockX = 0; blockX < comp.WidthInBlocks; blockX++)
                 {
-                    DecodeDCProgressive(reader, block, sc.DcTableId, Ah, Al, ref comp.DcPred);
-                }
-                else
-                {
-                    DecodeACProgressive(reader, block, sc.AcTableId, Ss, Se, Ah, Al, ref eobRun);
+                    CheckRestart(ref restartsLeft, reader);
+                    
+                    int blockIndex = blockY * comp.WidthInBlocks + blockX;
+                    int[] block = comp.Coeffs[blockIndex];
+                    if (Ss == 0)
+                    {
+                        DecodeDCProgressive(reader, block, sc.DcTableId, Ah, Al, ref comp.DcPred);
+                    }
+                    else
+                    {
+                        DecodeACProgressive(reader, block, sc.AcTableId, Ss, Se, Ah, Al, ref eobRun);
+                    }
                 }
             }
         }
@@ -555,7 +557,12 @@ public class JpegDecoder
         {
             int bit = reader.ReadBit();
             if (bit == -1) throw new Exception("Bit read error (DC refinement)");
-            block[0] |= bit << Al;
+            if (bit == 1)
+            {
+                int delta = 1 << Al;
+                if (block[0] >= 0) block[0] += delta;
+                else block[0] -= delta;
+            }
         }
     }
 
@@ -665,15 +672,20 @@ public class JpegDecoder
                     }
                     else
                     {
-                        int zerosToSkip = 15;
-                        while (zerosToSkip > 0 || block[JpegUtils.ZigZag[k]] != 0)
-                        {
-                            int idx = JpegUtils.ZigZag[k];
-                            if (block[idx] != 0) RefineNonZero(reader, block, idx, Al);
-                            else zerosToSkip--;
-                            k++;
-                            if (k > 63) break;
-                        }
+                        int zerosToSkip = 16;
+                           while (k <= Se && zerosToSkip > 0)
+                           {
+                               int idx = JpegUtils.ZigZag[k];
+                               if (block[idx] != 0)
+                               {
+                                   RefineNonZero(reader, block, idx, Al);
+                               }
+                               else
+                               {
+                                   zerosToSkip--;
+                               }
+                               k++;
+                           }
                     }
                 }
             }
