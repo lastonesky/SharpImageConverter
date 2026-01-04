@@ -1,1018 +1,1354 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
-using System.Diagnostics;
+using System.Collections.Generic;
+using System.Linq;
 
 namespace SharpImageConverter;
 
-/// <summary>
-/// JPEG 解码器，支持基线与渐进式 JPEG 解码为 RGB24。
-/// </summary>
 public class JpegDecoder
 {
-    private readonly JpegParser _parser;
+    private byte[] _data;
+    private int _pos;
+    private FrameHeader _frame;
+    private readonly List<QuantizationTable> _qtables = new List<QuantizationTable>();
+    private readonly List<HuffmanTable> _htables = new List<HuffmanTable>();
+    private int _restartInterval;
+    private int _warningCount;
 
-    private static readonly int[] ZigZag = new int[]
-    {
-        0, 1, 5, 6,14,15,27,28,
-        2, 4, 7,13,16,26,29,42,
-        3, 8,12,17,25,30,41,43,
-        9,11,18,24,31,40,44,53,
-       10,19,23,32,39,45,52,54,
-       20,22,33,38,46,51,55,60,
-       21,34,37,47,50,56,59,61,
-       35,36,48,49,57,58,62,63
-    };
+    public int Width => _frame != null ? _frame.Width : 0;
+    public int Height => _frame != null ? _frame.Height : 0;
+    public int ExifOrientation { get; private set; } = 1;
 
-    // 逆映射：ZigZag 索引 -> 自然序索引
-    private static readonly int[] UnZigZag = BuildInverse(ZigZag);
-
-    private static int[] BuildInverse(int[] map)
-    {
-        var inv = new int[64];
-        for (int i = 0; i < 64; i++) inv[map[i]] = i;
-        return inv;
-    }
-
-    /// <summary>
-    /// 使用解析结果创建解码器
-    /// </summary>
-    /// <param name="parser">JPEG 解析器（包含帧与扫描信息）</param>
-    public JpegDecoder(JpegParser parser)
-    {
-        _parser = parser;
-    }
-
-    private struct CanonicalHuff
-    {
-        public int[] FirstCode;  // 1..16
-        public int[] CodeCount;  // 1..16
-        public int[] SymbolOffset; // 1..16
-    }
-
-    // 颜色转换查表，减少每像素乘法
-    private static readonly int[] CrToR = BuildCrToR();
-    private static readonly int[] CbToB = BuildCbToB();
-    private static readonly int[] CrToG = BuildCrToG();
-    private static readonly int[] CbToG = BuildCbToG();
-
-    private static int[] BuildCrToR()
-    {
-        var t = new int[256];
-        for (int i = 0; i < 256; i++) t[i] = (359 * (i - 128)) >> 8; // 1.402*256≈359
-        return t;
-    }
-    private static int[] BuildCbToB()
-    {
-        var t = new int[256];
-        for (int i = 0; i < 256; i++) t[i] = (454 * (i - 128)) >> 8; // 1.772*256≈454
-        return t;
-    }
-    private static int[] BuildCrToG()
-    {
-        var t = new int[256];
-        for (int i = 0; i < 256; i++) t[i] = (183 * (i - 128)) >> 8; // 0.714136*256≈183
-        return t;
-    }
-    private static int[] BuildCbToG()
-    {
-        var t = new int[256];
-        for (int i = 0; i < 256; i++) t[i] = (88 * (i - 128)) >> 8; // 0.344136*256≈88
-        return t;
-    }
-
-    // 快速霍夫曼：派生表，包含最大 12 位前缀查找（常用）
-    private class FastHuff
-    {
-        public int[] Lookup = new int[1 << 12]; // 值: (len<<8) | symbol, 若为 -1 则需慢速路径
-        public int MaxFastBits = 12;
-    }
-
-    private static CanonicalHuff BuildCanonical(JpegHuffmanTable ht)
-    {
-        var first = new int[17];
-        var count = new int[17];
-        var off = new int[17];
-        int sum = 0;
-        for (int L = 1; L <= 16; L++)
-        {
-            count[L] = ht.CodeLengths[L - 1];
-        }
-        int code = 0;
-        for (int L = 1; L <= 16; L++)
-        {
-            first[L] = code;
-            off[L] = sum;
-            code = (code + count[L]) << 1;
-            sum += count[L];
-        }
-        return new CanonicalHuff { FirstCode = first, CodeCount = count, SymbolOffset = off };
-    }
-
-    private static FastHuff BuildFast(JpegHuffmanTable ht, CanonicalHuff ch)
-    {
-        var fh = new FastHuff();
-        for (int i = 0; i < fh.Lookup.Length; i++) fh.Lookup[i] = -1;
-        for (int len = 1; len <= Math.Min(12, 16); len++)
-        {
-            int fc = ch.FirstCode[len];
-            int cnt = ch.CodeCount[len];
-            if (cnt == 0) continue;
-            for (int r = 0; r < cnt; r++)
-            {
-                int code = fc + r;
-                int idx = ch.SymbolOffset[len] + r;
-                int sym = ht.Symbols[idx];
-                // 扩展到 12 位前缀空间
-                int fill = fh.MaxFastBits - len;
-                int baseCode = code << fill;
-                int end = baseCode | ((1 << fill) - 1);
-                for (int x = baseCode; x <= end; x++)
-                {
-                    fh.Lookup[x] = (len << 8) | sym;
-                }
-            }
-        }
-        return fh;
-    }
-
-    private static int ExtendSign(int v, int t)
-    {
-        int vt = 1 << (t - 1);
-        if (v < vt)
-            v -= (1 << t) - 1;
-        return v;
-    }
-
-    private static int DecodeSymbolSlow(BitReader br, CanonicalHuff ch, JpegHuffmanTable ht)
-    {
-        int code = 0;
-        for (int len = 1; len <= 16; len++)
-        {
-            code = (code << 1) | br.GetBit();
-            int fc = ch.FirstCode[len];
-            int cnt = ch.CodeCount[len];
-            if (cnt == 0) continue;
-            int rel = code - fc;
-            if (rel >= 0 && rel < cnt)
-            {
-                int idx = ch.SymbolOffset[len] + rel;
-                return ht.Symbols[idx];
-            }
-        }
-        throw new Exception("霍夫曼码未匹配");
-    }
-
-    private static int DecodeSymbol(BitReader br, CanonicalHuff ch, FastHuff fh, JpegHuffmanTable ht)
-    {
-        // 快速路径：预取 12 位
-        if (br.EnsureBits(fh.MaxFastBits))
-        {
-            int peek = br.PeekBits(fh.MaxFastBits);
-            int v = fh.Lookup[peek];
-            if (v >= 0)
-            {
-                int len = (v >> 8) & 0xFF;
-                int sym = v & 0xFF;
-                br.DropBits(len);
-                return sym;
-            }
-        }
-        // 慢速回退：若位流已结束但仍有残留位导致未匹配，优雅视为扫描结束
-        try
-        {
-            return DecodeSymbolSlow(br, ch, ht);
-        }
-        catch (EndOfStreamException)
-        {
-            throw;
-        }
-        catch (Exception)
-        {
-            if (br.IsEOF) throw new EndOfStreamException("扫描结束");
-            throw;
-        }
-    }
-
-    /// <summary>
-    /// 解码入口：根据帧类型路由到基线或渐进式解码
-    /// </summary>
     public byte[] DecodeToRGB(Stream stream)
     {
-        if (_parser.IsProgressive)
-            return DecodeProgressiveToRGB(stream);
-        else
-            return DecodeBaselineToRGB(stream);
-    }
-
-    /// <summary>
-    /// 基线JPEG解码为RGB（单扫描，霍夫曼+反量化+IDCT）
-    /// </summary>
-    public byte[] DecodeBaselineToRGB(Stream stream)
-    {
-        T.Assert(_parser.Scans.Count > 0, "未找到扫描数据");
-        T.Assert(_parser.FrameComponents.Count > 0, "未找到SOF0组件");
-
-        int width = _parser.Width;
-        int height = _parser.Height;
-        var compIndexById = new Dictionary<byte, int>();
-        for (int i = 0; i < _parser.FrameComponents.Count; i++)
-            compIndexById[_parser.FrameComponents[i].id] = i;
-
-        int mcuWidth = 8 * _parser.MaxH;
-        int mcuHeight = 8 * _parser.MaxV;
-        int mcusX = (width + mcuWidth - 1) / mcuWidth;
-        int mcusY = (height + mcuHeight - 1) / mcuHeight;
-
-        var subPlanes = new Dictionary<byte, (int w, int h, int[] data)>();
-        foreach (var (id, h, v, _) in _parser.FrameComponents)
+        using (var ms = new MemoryStream())
         {
-            int wComp = mcusX * h * 8;
-            int hComp = mcusY * v * 8;
-            subPlanes[id] = (wComp, hComp, new int[wComp * hComp]);
+            stream.CopyTo(ms);
+            _data = ms.ToArray();
         }
 
-        var scan = _parser.Scans[0];
-        stream.Position = scan.DataOffset;
-        var br = new BitReader(stream);
+        _pos = 0;
+        _frame = null;
+        _qtables.Clear();
+        _htables.Clear();
+        _restartInterval = 0;
+        _warningCount = 0;
+        ExifOrientation = 1;
 
-        var dcCanon = new Dictionary<byte, CanonicalHuff>();
-        var acCanon = new Dictionary<byte, CanonicalHuff>();
-        var dcFast = new Dictionary<byte, FastHuff>();
-        var acFast = new Dictionary<byte, FastHuff>();
-        foreach (var c in scan.Components)
+        if (_data.Length < 2 || _data[_pos++] != 0xFF || _data[_pos++] != JpegMarkers.SOI)
         {
-            var dc = _parser.HuffmanTables[(0, c.dcTableId)];
-            var ac = _parser.HuffmanTables[(1, c.acTableId)];
-            dcCanon[c.dcTableId] = BuildCanonical(dc);
-            acCanon[c.acTableId] = BuildCanonical(ac);
-            dcFast[c.dcTableId] = BuildFast(dc, dcCanon[c.dcTableId]);
-            acFast[c.acTableId] = BuildFast(ac, acCanon[c.acTableId]);
+            throw new Exception("Not a valid JPEG file (missing SOI)");
         }
 
-        var dequants = new Dictionary<byte, ushort[]>();
-        foreach (var (id, h, v, quantId) in _parser.FrameComponents)
-        {
-            ushort[] dq = new ushort[64];
-            var qt = _parser.QuantTables[quantId];
-            for (int j = 0; j < 64; j++) dq[j] = qt.Values[ZigZag[j]];
-            dequants[id] = dq;
-        }
+        ParseHeaders();
 
-        int[] prevDC = new int[256];
-        Array.Clear(prevDC, 0, prevDC.Length);
-        int mcusProcessed = 0;
-
-        for (int my = 0; my < mcusY; my++)
+        while (true)
         {
-            for (int mx = 0; mx < mcusX; mx++)
+            if (_pos >= _data.Length - 1) break;
+
+            while (_pos < _data.Length && _data[_pos] != 0xFF)
             {
-                foreach (var sc in scan.Components)
-                {
-                    byte cid = sc.channelId;
-                    var f = _parser.FrameComponents[compIndexById[cid]];
-                    var (wComp, hComp, plane) = subPlanes[cid];
-
-                    int baseXSub = mx * (8 * f.h);
-                    int baseYSub = my * (8 * f.v);
-
-                    var dcTable = _parser.HuffmanTables[(0, sc.dcTableId)];
-                    var acTable = _parser.HuffmanTables[(1, sc.acTableId)];
-                    var dcCanonRef = dcCanon[sc.dcTableId];
-                    var acCanonRef = acCanon[sc.acTableId];
-                    var dq = dequants[cid];
-
-                    var block = System.Buffers.ArrayPool<short>.Shared.Rent(64);
-                    var pix = System.Buffers.ArrayPool<int>.Shared.Rent(64);
-
-                    for (int vy = 0; vy < f.v; vy++)
-                    {
-                        for (int hx = 0; hx < f.h; hx++)
-                        {
-                            Array.Clear(block, 0, 64);
-
-                            int ssss = DecodeSymbol(br, dcCanonRef, dcFast[sc.dcTableId], dcTable);
-                            int dcDiff = (ssss == 0) ? 0 : ExtendSign(br.GetBits(ssss), ssss);
-                            int dc = prevDC[cid] + dcDiff;
-                            prevDC[cid] = dc;
-                            block[0] = (short)dc;
-
-                            int k = 1;
-                            while (k < 64)
-                            {
-                                int rs = DecodeSymbol(br, acCanonRef, acFast[sc.acTableId], acTable);
-                                int r = rs >> 4;
-                                int s = rs & 0x0F;
-                                if (s == 0)
-                                {
-                                    if (r == 0) break;
-                                    if (r == 15) { k += 16; continue; }
-                                    k += r; continue;
-                                }
-                                k += r;
-                                if (k >= 64) break;
-                                int val = ExtendSign(br.GetBits(s), s);
-                                block[UnZigZag[k]] = (short)val;
-                                k++;
-                            }
-
-                            for (int i = 0; i < 64; i++)
-                                block[i] = (short)(block[i] * dq[i]);
-
-                            bool dcOnly = true;
-                            for (int i = 1; i < 64; i++) { if (block[i] != 0) { dcOnly = false; break; } }
-
-                            if (dcOnly)
-                            {
-                                int val = (block[0] / 8) + 128;
-                                if (val < 0) val = 0; if (val > 255) val = 255;
-                                for (int i = 0; i < 64; i++) pix[i] = val;
-                            }
-                            else
-                            {
-                                Idct.IDCT8x8Int(block, 0, pix, 0);
-                            }
-
-                            int blockBaseX = baseXSub + hx * 8;
-                            int blockBaseY = baseYSub + vy * 8;
-                            for (int yy = 0; yy < 8; yy++)
-                            {
-                                int py = blockBaseY + yy; if (py >= hComp) break;
-                                for (int xx = 0; xx < 8; xx++)
-                                {
-                                    int px = blockBaseX + xx; if (px >= wComp) break;
-                                    plane[py * wComp + px] = pix[yy * 8 + xx];
-                                }
-                            }
-                        }
-                    }
-                    System.Buffers.ArrayPool<short>.Shared.Return(block);
-                    System.Buffers.ArrayPool<int>.Shared.Return(pix);
-                }
-
-                mcusProcessed++;
-                if (_parser.RestartInterval > 0 && (mcusProcessed % _parser.RestartInterval) == 0)
-                {
-                    Array.Clear(prevDC, 0, prevDC.Length);
-                    br.ResetBits();
-                }
-            }
-        }
-
-        return ComposeRGBFromPlanes(width, height, subPlanes);
-    }
-
-    /// <summary>
-    /// 渐进式JPEG解码为RGB（完整支持DC/AC初始扫描及细化扫描）
-    /// </summary>
-    public byte[] DecodeProgressiveToRGB(Stream stream)
-    {
-        // Progressive 三条铁律：
-        // 1) 所有 scan 只负责填充 coeffs（系数缓冲）
-        // 2) scan 过程中不得反量化/IDCT/写入子平面；除熵解码必需的局部状态外，不修改其他状态
-        // 3) IDCT 只能在所有 scan 完成后执行
-        T.Assert(_parser.Scans.Count > 0, "未找到扫描数据");
-        T.Assert(_parser.FrameComponents.Count > 0, "未找到SOF2组件");
-
-        int width = _parser.Width;
-        int height = _parser.Height;
-
-        int mcuWidth = 8 * _parser.MaxH;
-        int mcuHeight = 8 * _parser.MaxV;
-        int mcusX = (width + mcuWidth - 1) / mcuWidth;
-        int mcusY = (height + mcuHeight - 1) / mcuHeight;
-
-        // 分量子平面与系数缓冲
-        var subPlanes = new Dictionary<byte, (int w, int h, int[] data)>();
-        var coeffs = new Dictionary<byte, (int wBlocks, int hBlocks, short[] data)>();
-        var dequants = new Dictionary<byte, ushort[]>();
-        var compIndexById = new Dictionary<byte, int>();
-        for (int i = 0; i < _parser.FrameComponents.Count; i++) compIndexById[_parser.FrameComponents[i].id] = i;
-        foreach (var (id, h, v, quantId) in _parser.FrameComponents)
-        {
-            int wComp = mcusX * h * 8;
-            int hComp = mcusY * v * 8;
-            subPlanes[id] = (wComp, hComp, new int[wComp * hComp]);
-            int wBlocks = wComp / 8;
-            int hBlocks = hComp / 8;
-            coeffs[id] = (wBlocks, hBlocks, new short[wBlocks * hBlocks * 64]);
-            ushort[] dq = new ushort[64];
-            var qt = _parser.QuantTables[quantId];
-            for (int j = 0; j < 64; j++) dq[j] = qt.Values[ZigZag[j]];
-            dequants[id] = dq;
-        }
-
-        var dcPredGlobal = new int[256];
-
-        foreach (var scan in _parser.Scans)
-        {
-            stream.Position = scan.DataOffset;
-            var br = new BitReader(stream);
-
-            var dcCanon = new Dictionary<byte, CanonicalHuff>();
-            var acCanon = new Dictionary<byte, CanonicalHuff>();
-            var dcFast = new Dictionary<byte, FastHuff>();
-            var acFast = new Dictionary<byte, FastHuff>();
-            foreach (var c in scan.Components)
-            {
-                var dc = _parser.HuffmanTables[(0, c.dcTableId)];
-                var ac = _parser.HuffmanTables[(1, c.acTableId)];
-                dcCanon[c.dcTableId] = BuildCanonical(dc);
-                acCanon[c.acTableId] = BuildCanonical(ac);
-                dcFast[c.dcTableId] = BuildFast(dc, dcCanon[c.dcTableId]);
-                acFast[c.acTableId] = BuildFast(ac, acCanon[c.acTableId]);
+                _pos++;
             }
 
-            bool isDcScan = scan.Ss == 0 && scan.Se == 0;
-            bool isInterleaved = scan.NbChannels > 1;
+            if (_pos >= _data.Length) break;
 
-            int scanMcusX;
-            int scanMcusY;
-            if (isInterleaved)
+            if (_pos + 1 >= _data.Length) break;
+            byte marker = _data[_pos + 1];
+
+            if (marker == JpegMarkers.EOI)
             {
-                scanMcusX = mcusX;
-                scanMcusY = mcusY;
+                break;
+            }
+            else if (marker == JpegMarkers.SOS)
+            {
+                _pos += 2;
+                ProcessScan();
+            }
+            else if (JpegMarkers.IsSOF(marker) || marker == JpegMarkers.DHT || marker == JpegMarkers.DQT || marker == JpegMarkers.DRI)
+            {
+                _pos += 2;
+                ParseMarker(marker);
+            }
+            else if (marker >= JpegMarkers.APP0 && marker <= JpegMarkers.APP15)
+            {
+                _pos += 2;
+                ParseMarker(marker);
+            }
+            else if (marker == JpegMarkers.COM)
+            {
+                _pos += 2;
+                ParseMarker(marker);
+            }
+            else if (marker == JpegMarkers.DNL)
+            {
+                _pos += 2;
+                ParseMarker(marker);
             }
             else
             {
-                byte onlyCid = scan.Components[0].channelId;
-                var (wBlocks, hBlocks, _) = coeffs[onlyCid];
-                scanMcusX = wBlocks;
-                scanMcusY = hBlocks;
-            }
-
-            void ApplyRefineBit(short[] cbuf, int baseIndex, int idx, int al)
-            {
-                int bit = br.GetBit();
-                if (bit == 0) return;
-                short cur = cbuf[baseIndex + idx];
-                if (cur >= 0) cur = (short)(cur + (1 << al));
-                else cur = (short)(cur - (1 << al));
-                cbuf[baseIndex + idx] = cur;
-            }
-
-            void DecodeDcBlockFirst(byte cid, byte dcTableId, short[] cbuf, int bIndex, int al, int[] dcPred)
-            {
-                var ht = _parser.HuffmanTables[(0, dcTableId)];
-                int ssss = DecodeSymbol(br, dcCanon[dcTableId], dcFast[dcTableId], ht);
-                int dcDiff = (ssss == 0) ? 0 : ExtendSign(br.GetBits(ssss), ssss);
-                int dc = dcPred[cid] + dcDiff;
-                dcPred[cid] = dc;
-                cbuf[bIndex + 0] = (short)(dc << al);
-            }
-
-            void DecodeAcBlockFirst(byte acTableId, short[] cbuf, int bIndex, int ss, int se, int al, ref int eobRun)
-            {
-                if (eobRun > 0)
+                if (_warningCount < 10)
                 {
-                    eobRun--;
-                    return;
+                    Console.WriteLine($"Warning: Unexpected marker {marker:X2} between scans at {_pos}");
                 }
-
-                var ht = _parser.HuffmanTables[(1, acTableId)];
-                int k = ss;
-                while (k <= se)
+                else if (_warningCount == 10)
                 {
-                    int rs = DecodeSymbol(br, acCanon[acTableId], acFast[acTableId], ht);
-                    int r = rs >> 4;
-                    int s = rs & 0x0F;
-                    if (s == 0)
-                    {
-                        if (r == 15)
-                        {
-                            k += 16;
-                            continue;
-                        }
-
-                        if (r == 0)
-                        {
-                            eobRun = 0;
-                            return;
-                        }
-
-                        int run = (1 << r) + br.GetBits(r);
-                        eobRun = run - 1;
-                        return;
-                    }
-
-                    k += r;
-                    if (k > se) return;
-                    int val = ExtendSign(br.GetBits(s), s);
-                    cbuf[bIndex + UnZigZag[k]] = (short)(val << al);
-                    k++;
+                    Console.WriteLine("Warning: Too many unexpected markers, suppressing...");
                 }
-            }
-
-            void DecodeAcBlockRefine(byte acTableId, short[] cbuf, int bIndex, int ss, int se, int al, ref int eobRun)
-            {
-                if (eobRun > 0)
-                {
-                    for (int k = ss; k <= se; k++)
-                    {
-                        int idx = UnZigZag[k];
-                        if (cbuf[bIndex + idx] != 0) ApplyRefineBit(cbuf, bIndex, idx, al);
-                    }
-                    eobRun--;
-                    return;
-                }
-
-                var ht = _parser.HuffmanTables[(1, acTableId)];
-                int kPos = ss;
-                int zerosToSkip = 0;
-                bool hasPendingNew = false;
-                short pendingNewVal = 0;
-
-                while (kPos <= se)
-                {
-                    int idx = UnZigZag[kPos];
-                    if (cbuf[bIndex + idx] != 0)
-                    {
-                        ApplyRefineBit(cbuf, bIndex, idx, al);
-                        kPos++;
-                        continue;
-                    }
-
-                    if (zerosToSkip > 0)
-                    {
-                        zerosToSkip--;
-                        kPos++;
-                        continue;
-                    }
-
-                    if (hasPendingNew)
-                    {
-                        if (zerosToSkip == 0 && cbuf[bIndex + idx] == 0)
-                        {
-                            cbuf[bIndex + idx] = pendingNewVal;
-                            hasPendingNew = false;
-                            pendingNewVal = 0;
-                            kPos++;
-                            continue;
-                        }
-                    }
-
-                    int rs = DecodeSymbol(br, acCanon[acTableId], acFast[acTableId], ht);
-                    int r = rs >> 4;
-                    int s = rs & 0x0F;
-
-                    if (s == 0)
-                    {
-                        if (r == 15)
-                        {
-                            zerosToSkip = 16;
-                            continue;
-                        }
-
-                        if (r == 0)
-                        {
-                            eobRun = 0;
-                        }
-                        else
-                        {
-                            eobRun = ((1 << r) + br.GetBits(r)) - 1;
-                        }
-
-                        for (; kPos <= se; kPos++)
-                        {
-                            idx = UnZigZag[kPos];
-                            if (cbuf[bIndex + idx] != 0) ApplyRefineBit(cbuf, bIndex, idx, al);
-                        }
-                        return;
-                    }
-
-                    if (s == 1)
-                    {
-                        zerosToSkip = r;
-                        int sign = br.GetBit();
-                        pendingNewVal = (short)((sign != 0 ? 1 : -1) << al);
-                        hasPendingNew = true;
-                        continue;
-                    }
-
-                    throw new Exception("AC 细化扫描出现非法符号");
-                }
-            }
-
-            if (isDcScan) // DC 扫描
-            {
-                bool endScan = false;
-
-                for (int my = 0; my < scanMcusY; my++)
-                {
-                    for (int mx = 0; mx < scanMcusX; mx++)
-                    {
-                        br.EnsureBits(1);
-                        if (br.TakeRestartMarker())
-                        {
-                            Array.Clear(dcPredGlobal, 0, dcPredGlobal.Length);
-                        }
-
-                        if (isInterleaved)
-                        {
-                            foreach (var sc in scan.Components)
-                            {
-                                byte cid = sc.channelId;
-                                var f = _parser.FrameComponents[compIndexById[cid]];
-                                var (wBlocks, hBlocks, cbuf) = coeffs[cid];
-
-                                int baseXB = mx * f.h;
-                                int baseYB = my * f.v;
-                                for (int vy = 0; vy < f.v; vy++)
-                                {
-                                    for (int hx = 0; hx < f.h; hx++)
-                                    {
-                                        int bx = baseXB + hx;
-                                        int by = baseYB + vy;
-                                        if (bx >= wBlocks || by >= hBlocks) continue;
-                                        int bIndex = (by * wBlocks + bx) * 64;
-                                        try
-                                        {
-                                            if (scan.Ah == 0)
-                                            {
-                                                DecodeDcBlockFirst(cid, sc.dcTableId, cbuf, bIndex, scan.Al, dcPredGlobal);
-                                            }
-                                            else
-                                            {
-                                                ApplyRefineBit(cbuf, bIndex, 0, scan.Al);
-                                            }
-                                        }
-                                        catch
-                                        {
-                                            endScan = true;
-                                            break;
-                                        }
-                                    }
-                                    if (endScan) break;
-                                }
-                                if (endScan) break;
-                            }
-                        }
-                        else
-                        {
-                            var sc = scan.Components[0];
-                            byte cid = sc.channelId;
-                            var (wBlocks, hBlocks, cbuf) = coeffs[cid];
-                            int bIndex = (my * wBlocks + mx) * 64;
-                            try
-                            {
-                                if (scan.Ah == 0)
-                                {
-                                    DecodeDcBlockFirst(cid, sc.dcTableId, cbuf, bIndex, scan.Al, dcPredGlobal);
-                                }
-                                else
-                                {
-                                    ApplyRefineBit(cbuf, bIndex, 0, scan.Al);
-                                }
-                            }
-                            catch
-                            {
-                                endScan = true;
-                            }
-                        }
-
-                        if (endScan) break;
-                    }
-                    if (endScan) break;
-                }
-            }
-            else // AC 扫描（通常单分量）
-            {
-                int eobRun = 0;
-                bool endScan = false;
-
-                for (int my = 0; my < scanMcusY; my++)
-                {
-                    for (int mx = 0; mx < scanMcusX; mx++)
-                    {
-                        br.EnsureBits(1);
-                        if (br.TakeRestartMarker())
-                        {
-                            eobRun = 0;
-                        }
-
-                        if (isInterleaved)
-                        {
-                            foreach (var sc in scan.Components)
-                            {
-                                byte cid = sc.channelId;
-                                var f = _parser.FrameComponents[compIndexById[cid]];
-                                var (wBlocks, hBlocks, cbuf) = coeffs[cid];
-
-                                int baseXB = mx * f.h;
-                                int baseYB = my * f.v;
-                                for (int vy = 0; vy < f.v; vy++)
-                                {
-                                    for (int hx = 0; hx < f.h; hx++)
-                                    {
-                                        int bx = baseXB + hx;
-                                        int by = baseYB + vy;
-                                        if (bx >= wBlocks || by >= hBlocks) continue;
-                                        int bIndex = (by * wBlocks + bx) * 64;
-                                        try
-                                        {
-                                            if (scan.Ah == 0)
-                                            {
-                                                DecodeAcBlockFirst(sc.acTableId, cbuf, bIndex, scan.Ss, scan.Se, scan.Al, ref eobRun);
-                                            }
-                                            else
-                                            {
-                                                DecodeAcBlockRefine(sc.acTableId, cbuf, bIndex, scan.Ss, scan.Se, scan.Al, ref eobRun);
-                                            }
-                                        }
-                                        catch
-                                        {
-                                            endScan = true;
-                                            break;
-                                        }
-                                    }
-                                    if (endScan) break;
-                                }
-                                if (endScan) break;
-                            }
-                        }
-                        else
-                        {
-                            var sc = scan.Components[0];
-                            byte cid = sc.channelId;
-                            var (wBlocks, hBlocks, cbuf) = coeffs[cid];
-                            int bIndex = (my * wBlocks + mx) * 64;
-                            try
-                            {
-                                if (scan.Ah == 0)
-                                {
-                                    DecodeAcBlockFirst(sc.acTableId, cbuf, bIndex, scan.Ss, scan.Se, scan.Al, ref eobRun);
-                                }
-                                else
-                                {
-                                    DecodeAcBlockRefine(sc.acTableId, cbuf, bIndex, scan.Ss, scan.Se, scan.Al, ref eobRun);
-                                }
-                            }
-                            catch
-                            {
-                                endScan = true;
-                            }
-                        }
-
-                        if (endScan) break;
-                    }
-                    if (endScan) break;
-                }
+                _warningCount++;
+                _pos += 2;
             }
         }
 
-        // 完整系数 -> 反量化 -> IDCT -> 填充子平面
-        foreach (var (id, h, v, _) in _parser.FrameComponents)
+        return PerformIDCTAndOutput();
+    }
+
+    private void ParseHeaders()
+    {
+        while (_pos < _data.Length)
         {
-            var (wComp, hComp, plane) = subPlanes[id];
-            var (wBlocks, hBlocks, cbuf) = coeffs[id];
-            var dq = dequants[id];
-            var pix = System.Buffers.ArrayPool<int>.Shared.Rent(64);
-            var blk = System.Buffers.ArrayPool<short>.Shared.Rent(64);
-            for (int by = 0; by < hBlocks; by++)
+            if (_data[_pos] != 0xFF)
             {
-                for (int bx = 0; bx < wBlocks; bx++)
+                _pos++;
+                continue;
+            }
+
+            if (_pos + 1 >= _data.Length) return;
+            byte marker = _data[_pos + 1];
+
+            if (marker == JpegMarkers.SOS || marker == JpegMarkers.EOI)
+            {
+                return;
+            }
+
+            _pos += 2;
+            ParseMarker(marker);
+        }
+    }
+
+    private void ParseMarker(byte marker)
+    {
+        if (marker == 0x00) return;
+
+        if (_pos + 1 >= _data.Length) return;
+        int length = (_data[_pos] << 8) | _data[_pos + 1];
+        int endPos = _pos + length;
+        if (endPos > _data.Length) endPos = _data.Length;
+
+        switch (marker)
+        {
+            case JpegMarkers.SOF0:
+            case JpegMarkers.SOF2:
+                ParseSOF(length, marker == JpegMarkers.SOF2);
+                break;
+            case JpegMarkers.DQT:
+                ParseDQT(length);
+                break;
+            case JpegMarkers.DHT:
+                ParseDHT(length);
+                break;
+            case JpegMarkers.DRI:
+                if (_pos + 3 < _data.Length)
                 {
-                    int bIndex = (by * wBlocks + bx) * 64;
-                    for (int i = 0; i < 64; i++) blk[i] = (short)(cbuf[bIndex + i] * dq[i]);
-                    bool dcOnly = true;
-                    for (int i = 1; i < 64; i++) { if (blk[i] != 0) { dcOnly = false; break; } }
-                    if (dcOnly)
+                    _restartInterval = (_data[_pos + 2] << 8) | _data[_pos + 3];
+                    Console.WriteLine($"Restart Interval: {_restartInterval}");
+                }
+                break;
+            case JpegMarkers.APP1:
+                {
+                    int contentLen = length - 2;
+                    int p = _pos + 2;
+                    if (contentLen > 0 && p + contentLen <= _data.Length)
                     {
-                        int val = (blk[0] / 8) + 128;
-                        if (val < 0) val = 0; if (val > 255) val = 255;
-                        for (int i = 0; i < 64; i++) pix[i] = val;
+                        byte[] buf = new byte[contentLen];
+                        Buffer.BlockCopy(_data, p, buf, 0, contentLen);
+                        TryParseExifOrientation(buf);
+                    }
+                    break;
+                }
+            case JpegMarkers.APP0:
+            case JpegMarkers.APP2:
+            case JpegMarkers.APP3:
+            case JpegMarkers.APP4:
+            case JpegMarkers.APP5:
+            case JpegMarkers.APP6:
+            case JpegMarkers.APP7:
+            case JpegMarkers.APP8:
+            case JpegMarkers.APP9:
+            case JpegMarkers.APP10:
+            case JpegMarkers.APP11:
+            case JpegMarkers.APP12:
+            case JpegMarkers.APP13:
+            case JpegMarkers.APP14:
+            case JpegMarkers.APP15:
+            case JpegMarkers.COM:
+                break;
+            default:
+                Console.WriteLine($"Skipping marker {marker:X2} length {length}");
+                break;
+        }
+
+        _pos = endPos;
+    }
+
+    private void ParseSOF(int length, bool isProgressive)
+    {
+        Console.WriteLine($"Parsing SOF{(isProgressive ? "2 (Progressive)" : "0 (Baseline)")}");
+        int p = _pos + 2;
+        if (p + 6 > _data.Length) throw new Exception("SOF truncated");
+
+        FrameHeader frame = new FrameHeader();
+        frame.IsProgressive = isProgressive;
+        frame.Precision = _data[p++];
+        frame.Height = (_data[p++] << 8) | _data[p++];
+        frame.Width = (_data[p++] << 8) | _data[p++];
+        frame.ComponentsCount = _data[p++];
+        frame.Components = new Component[frame.ComponentsCount];
+
+        int maxH = 0, maxV = 0;
+
+        for (int i = 0; i < frame.ComponentsCount; i++)
+        {
+            if (p + 3 > _data.Length) throw new Exception("SOF components truncated");
+            var comp = new Component();
+            comp.Id = _data[p++];
+            int hv = _data[p++];
+            comp.HFactor = hv >> 4;
+            comp.VFactor = hv & 0xF;
+            comp.QuantTableId = _data[p++];
+            frame.Components[i] = comp;
+
+            if (comp.HFactor > maxH) maxH = comp.HFactor;
+            if (comp.VFactor > maxV) maxV = comp.VFactor;
+        }
+
+        frame.McuWidth = maxH * 8;
+        frame.McuHeight = maxV * 8;
+        frame.McuCols = (frame.Width + frame.McuWidth - 1) / frame.McuWidth;
+        frame.McuRows = (frame.Height + frame.McuHeight - 1) / frame.McuHeight;
+
+        Console.WriteLine($"Image: {frame.Width}x{frame.Height}, Components: {frame.ComponentsCount}, MCU: {frame.McuCols}x{frame.McuRows}");
+
+        foreach (var comp in frame.Components)
+        {
+            comp.WidthInBlocks = frame.McuCols * comp.HFactor;
+            comp.HeightInBlocks = frame.McuRows * comp.VFactor;
+            comp.Width = comp.WidthInBlocks * 8;
+            comp.Height = comp.HeightInBlocks * 8;
+
+            int totalBlocks = comp.WidthInBlocks * comp.HeightInBlocks;
+            comp.Coeffs = new int[totalBlocks][];
+            for (int b = 0; b < totalBlocks; b++)
+            {
+                comp.Coeffs[b] = new int[64];
+            }
+            Console.WriteLine($"Component {comp.Id}: {comp.WidthInBlocks}x{comp.HeightInBlocks} blocks allocated.");
+        }
+
+        _frame = frame;
+    }
+
+    private void ParseDQT(int length)
+    {
+        int p = _pos + 2;
+        int end = _pos + length;
+        if (end > _data.Length) end = _data.Length;
+
+        while (p < end)
+        {
+            if (p >= _data.Length) break;
+            int info = _data[p++];
+            int id = info & 0xF;
+            int precision = info >> 4;
+            int[] t = new int[64];
+
+            for (int i = 0; i < 64; i++)
+            {
+                if (p >= _data.Length) throw new Exception("DQT truncated");
+                int val;
+                if (precision == 0) val = _data[p++];
+                else
+                {
+                    if (p + 1 >= _data.Length) throw new Exception("DQT truncated");
+                    val = (_data[p++] << 8) | _data[p++];
+                }
+
+                t[JpegUtils.ZigZag[i]] = val;
+            }
+
+            var qt = _qtables.FirstOrDefault(x => x.Id == id);
+            if (qt == null)
+            {
+                qt = new QuantizationTable { Id = id };
+                _qtables.Add(qt);
+            }
+            qt.Precision = precision;
+            qt.Table = t;
+            Console.WriteLine($"DQT Id: {id}, Precision: {precision}");
+        }
+    }
+
+    private void ParseDHT(int length)
+    {
+        int p = _pos + 2;
+        int end = _pos + length;
+        if (end > _data.Length) end = _data.Length;
+
+        while (p < end)
+        {
+            if (p + 17 > end)
+            {
+                Console.WriteLine("Warning: DHT truncated or padding bytes?");
+                break;
+            }
+
+            int info = _data[p++];
+            int tc = info >> 4;
+            int id = info & 0xF;
+
+            byte[] counts = new byte[16];
+            int total = 0;
+            for (int i = 0; i < 16; i++)
+            {
+                if (p >= end) break;
+                counts[i] = _data[p++];
+                total += counts[i];
+            }
+
+            byte[] symbols = new byte[total];
+            for (int i = 0; i < total; i++)
+            {
+                if (p >= end)
+                {
+                    Console.WriteLine("Warning: DHT truncated reading symbols");
+                    return;
+                }
+                symbols[i] = _data[p++];
+            }
+
+            var ht = _htables.FirstOrDefault(x => x.Class == tc && x.Id == id);
+            if (ht == null)
+            {
+                ht = new HuffmanTable { Class = tc, Id = id };
+                _htables.Add(ht);
+            }
+            ht.Counts = counts;
+            ht.Symbols = symbols;
+
+            if (!GenerateHuffmanTables(ht))
+            {
+                Console.WriteLine("Error: Failed to generate Huffman table (overflow or invalid). Skipping rest of DHT.");
+                return;
+            }
+            Console.WriteLine($"DHT Class: {tc}, Id: {id}, Total Symbols: {total}");
+        }
+    }
+
+    private bool GenerateHuffmanTables(HuffmanTable ht)
+    {
+        int p = 0;
+        int[] huffsize = new int[257];
+        int[] huffcode = new int[257];
+
+        for (int i = 1; i <= 16; i++)
+        {
+            for (int j = 1; j <= ht.Counts[i - 1]; j++)
+            {
+                if (p >= 256)
+                {
+                    Console.WriteLine($"Error: Huffman table overflow. p={p}, i={i}");
+                    return false;
+                }
+                huffsize[p++] = i;
+            }
+        }
+        huffsize[p] = 0;
+
+        int code = 0;
+        int si = huffsize[0];
+        p = 0;
+        while (huffsize[p] != 0)
+        {
+            while (huffsize[p] == si)
+            {
+                huffcode[p++] = code;
+                code++;
+            }
+            code <<= 1;
+            si++;
+        }
+
+        int jIdx = 0;
+        for (int i = 0; i < 17; i++) ht.MaxCode[i] = -1;
+
+        for (int i = 1; i <= 16; i++)
+        {
+            if (ht.Counts[i - 1] == 0)
+            {
+                ht.MaxCode[i] = -1;
+            }
+            else
+            {
+                ht.ValPtr[i] = jIdx;
+                ht.MinCode[i] = huffcode[jIdx];
+                ht.MaxCode[i] = huffcode[jIdx + ht.Counts[i - 1] - 1];
+                jIdx += ht.Counts[i - 1];
+            }
+        }
+        return true;
+    }
+
+    private void ProcessScan()
+    {
+        if (_frame == null) throw new Exception("Frame not parsed before scan");
+
+        if (_pos + 1 >= _data.Length) throw new Exception("SOS length truncated");
+        int length = (_data[_pos] << 8) | _data[_pos + 1];
+        int p = _pos + 2;
+
+        ScanHeader scan = new ScanHeader();
+        if (p >= _data.Length) throw new Exception("SOS truncated");
+        scan.ComponentsCount = _data[p++];
+        scan.Components = new ScanComponent[scan.ComponentsCount];
+
+        for (int i = 0; i < scan.ComponentsCount; i++)
+        {
+            if (p + 1 >= _data.Length) throw new Exception("SOS components truncated");
+            var sc = new ScanComponent();
+            sc.ComponentId = _data[p++];
+            int tableInfo = _data[p++];
+            sc.DcTableId = tableInfo >> 4;
+            sc.AcTableId = tableInfo & 0xF;
+            scan.Components[i] = sc;
+        }
+
+        if (p + 3 > _data.Length) throw new Exception("SOS spectral selection truncated");
+        scan.StartSpectralSelection = _data[p++];
+        scan.EndSpectralSelection = _data[p++];
+        int approx = _data[p++];
+        scan.SuccessiveApproximationBitHigh = approx >> 4;
+        scan.SuccessiveApproximationBitLow = approx & 0xF;
+
+        _pos += length;
+
+        Console.WriteLine($"Scan: Ss={scan.StartSpectralSelection}, Se={scan.EndSpectralSelection}, Ah={scan.SuccessiveApproximationBitHigh}, Al={scan.SuccessiveApproximationBitLow}, Comps={scan.ComponentsCount}");
+
+        var reader = new JpegBitReader(_data);
+        reader.SetPosition(_pos);
+
+        try
+        {
+            if (_frame.IsProgressive)
+            {
+                DecodeProgressiveScan(scan, reader);
+            }
+            else
+            {
+                DecodeBaselineScan(scan, reader);
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Warning: Scan decoding interrupted: {ex.Message}");
+        }
+
+        if (reader.HitMarker)
+        {
+            _pos = reader.BytePosition - 1;
+        }
+        else
+        {
+            _pos = reader.BytePosition;
+
+            while (_pos < _data.Length && _data[_pos] != 0xFF)
+            {
+                _pos++;
+            }
+        }
+
+        if (_pos + 1 < _data.Length && _data[_pos] == 0xFF && _data[_pos + 1] == 0x00)
+        {
+            Console.WriteLine("Warning: Landed on FF 00 after scan. Skipping...");
+            _pos += 2;
+            while (_pos < _data.Length && _data[_pos] != 0xFF) _pos++;
+        }
+    }
+
+    private void DecodeProgressiveScan(ScanHeader scan, JpegBitReader reader)
+    {
+        int Ss = scan.StartSpectralSelection;
+        int Se = scan.EndSpectralSelection;
+        int Ah = scan.SuccessiveApproximationBitHigh;
+        int Al = scan.SuccessiveApproximationBitLow;
+        int compsInScan = scan.ComponentsCount;
+
+        int restartsLeft = _restartInterval;
+        int eobRun = 0;
+
+        foreach (var c in _frame.Components) c.DcPred = 0;
+
+        if (compsInScan > 1)
+        {
+            for (int mcuY = 0; mcuY < _frame.McuRows; mcuY++)
+            {
+                for (int mcuX = 0; mcuX < _frame.McuCols; mcuX++)
+                {
+                    CheckRestart(ref restartsLeft, reader);
+
+                    foreach (var sc in scan.Components)
+                    {
+                        var comp = _frame.Components.First(c => c.Id == sc.ComponentId);
+                        int baseX = mcuX * comp.HFactor;
+                        int baseY = mcuY * comp.VFactor;
+
+                        for (int v = 0; v < comp.VFactor; v++)
+                        {
+                            for (int h = 0; h < comp.HFactor; h++)
+                            {
+                                int blockIndex = (baseY + v) * comp.WidthInBlocks + (baseX + h);
+                                int[] block = comp.Coeffs[blockIndex];
+                                DecodeDCProgressive(reader, block, sc.DcTableId, Ah, Al, ref comp.DcPred);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        else
+        {
+            var sc = scan.Components[0];
+            var comp = _frame.Components.First(c => c.Id == sc.ComponentId);
+            int totalBlocks = comp.WidthInBlocks * comp.HeightInBlocks;
+
+            for (int b = 0; b < totalBlocks; b++)
+            {
+                CheckRestart(ref restartsLeft, reader);
+
+                int[] block = comp.Coeffs[b];
+                if (Ss == 0)
+                {
+                    DecodeDCProgressive(reader, block, sc.DcTableId, Ah, Al, ref comp.DcPred);
+                }
+                else
+                {
+                    DecodeACProgressive(reader, block, sc.AcTableId, Ss, Se, Ah, Al, ref eobRun);
+                }
+            }
+        }
+    }
+
+    private void DecodeDCProgressive(JpegBitReader reader, int[] block, int dcTableId, int Ah, int Al, ref int dcPred)
+    {
+        if (Ah == 0)
+        {
+            var ht = _htables.First(t => t.Class == 0 && t.Id == dcTableId);
+            int s = DecodeHuffman(ht, reader);
+            if (s < 0) throw new Exception("Huffman decode error (DC)");
+
+            int diff = Receive(s, reader);
+            diff = Extend(diff, s);
+            dcPred += diff;
+            block[0] = dcPred << Al;
+        }
+        else
+        {
+            int bit = reader.ReadBit();
+            if (bit == -1) throw new Exception("Bit read error (DC refinement)");
+            block[0] |= bit << Al;
+        }
+    }
+
+    private void DecodeACProgressive(JpegBitReader reader, int[] block, int acTableId, int Ss, int Se, int Ah, int Al, ref int eobRun)
+    {
+        if (Ah == 0)
+        {
+            if (eobRun > 0)
+            {
+                eobRun--;
+                return;
+            }
+
+            var ht = _htables.First(t => t.Class == 1 && t.Id == acTableId);
+
+            for (int k = Ss; k <= Se; k++)
+            {
+                int s = DecodeHuffman(ht, reader);
+                if (s < 0) throw new Exception("Huffman decode error (AC)");
+
+                int r = s >> 4;
+                int n = s & 0xF;
+
+                if (n != 0)
+                {
+                    k += r;
+                    int val = Receive(n, reader);
+                    val = Extend(val, n);
+                    if (k <= 63)
+                        block[JpegUtils.ZigZag[k]] = val << Al;
+                }
+                else
+                {
+                    if (r != 15)
+                    {
+                        eobRun = (1 << r) + Receive(r, reader) - 1;
+                        break;
+                    }
+                    k += 15;
+                }
+            }
+        }
+        else
+        {
+            int k = Ss;
+            if (eobRun > 0)
+            {
+                while (k <= Se)
+                {
+                    int idx = JpegUtils.ZigZag[k];
+                    if (block[idx] != 0) RefineNonZero(reader, block, idx, Al);
+                    k++;
+                }
+                eobRun--;
+                return;
+            }
+
+            var ht = _htables.First(t => t.Class == 1 && t.Id == acTableId);
+
+            while (k <= Se)
+            {
+                int s = DecodeHuffman(ht, reader);
+                if (s < 0) throw new Exception("Huffman decode error (AC Refinement)");
+
+                int r = s >> 4;
+                int n = s & 0xF;
+
+                if (n != 0)
+                {
+                    int zerosToSkip = r;
+                    while (k <= Se)
+                    {
+                        int idx = JpegUtils.ZigZag[k];
+                        if (block[idx] != 0)
+                        {
+                            RefineNonZero(reader, block, idx, Al);
+                        }
+                        else
+                        {
+                            if (zerosToSkip == 0) break;
+                            zerosToSkip--;
+                        }
+                        k++;
+                    }
+
+                    if (k > Se) break;
+
+                    int val = 1;
+                    int sign = reader.ReadBit();
+                    if (sign == 0) val = -1;
+
+                    block[JpegUtils.ZigZag[k]] = val << Al;
+                    k++;
+                }
+                else
+                {
+                    if (r != 15)
+                    {
+                        eobRun = (1 << r) + Receive(r, reader) - 1;
+                        while (k <= Se)
+                        {
+                            int idx = JpegUtils.ZigZag[k];
+                            if (block[idx] != 0) RefineNonZero(reader, block, idx, Al);
+                            k++;
+                        }
+                        break;
                     }
                     else
                     {
-                        Idct.IDCT8x8Int(blk, 0, pix, 0);
-                    }
-                    int baseX = bx * 8;
-                    int baseY = by * 8;
-                    for (int yy = 0; yy < 8; yy++)
-                    {
-                        int py = baseY + yy; if (py >= hComp) break;
-                        for (int xx = 0; xx < 8; xx++)
+                        int zerosToSkip = 15;
+                        while (zerosToSkip > 0 || block[JpegUtils.ZigZag[k]] != 0)
                         {
-                            int px = baseX + xx; if (px >= wComp) break;
-                            plane[py * wComp + px] = pix[yy * 8 + xx];
+                            int idx = JpegUtils.ZigZag[k];
+                            if (block[idx] != 0) RefineNonZero(reader, block, idx, Al);
+                            else zerosToSkip--;
+                            k++;
+                            if (k > 63) break;
                         }
                     }
                 }
             }
-            System.Buffers.ArrayPool<int>.Shared.Return(pix);
-            System.Buffers.ArrayPool<short>.Shared.Return(blk);
         }
-
-        return ComposeRGBFromPlanes(width, height, subPlanes);
     }
 
-    /// <summary>
-    /// 将分量子平面组合为最终RGB像素
-    /// </summary>
-    private byte[] ComposeRGBFromPlanes(int width, int height, Dictionary<byte, (int w, int h, int[] data)> subPlanes)
+    private void RefineNonZero(JpegBitReader reader, int[] block, int idx, int Al)
     {
-        byte yId = 1, cbId = 2, crId = 3;
-        if (_parser.FrameComponents.Count > 0)
+        int bit = reader.ReadBit();
+        if (bit == 1)
         {
-            yId = _parser.FrameComponents[0].id;
-            if (_parser.FrameComponents.Count > 1) cbId = _parser.FrameComponents[1].id;
-            if (_parser.FrameComponents.Count > 2) crId = _parser.FrameComponents[2].id;
+            if (block[idx] > 0) block[idx] += (1 << Al);
+            else block[idx] -= (1 << Al);
         }
+    }
 
-        subPlanes.TryGetValue(yId, out var yPlane);
-        subPlanes.TryGetValue(cbId, out var cbPlane);
-        subPlanes.TryGetValue(crId, out var crPlane);
+    private void DecodeBaselineScan(ScanHeader scan, JpegBitReader reader)
+    {
+        int restartsLeft = _restartInterval;
+        foreach (var c in _frame.Components) c.DcPred = 0;
 
-        int yH = 1, yV = 1;
-        int cbH = 1, cbV = 1;
-        int crH = 1, crV = 1;
-
-        foreach (var f in _parser.FrameComponents)
+        for (int mcuY = 0; mcuY < _frame.McuRows; mcuY++)
         {
-            if (f.id == yId) { yH = f.h; yV = f.v; }
-            else if (f.id == cbId) { cbH = f.h; cbV = f.v; }
-            else if (f.id == crId) { crH = f.h; crV = f.v; }
+            for (int mcuX = 0; mcuX < _frame.McuCols; mcuX++)
+            {
+                CheckRestart(ref restartsLeft, reader);
+
+                foreach (var sc in scan.Components)
+                {
+                    var comp = _frame.Components.First(c => c.Id == sc.ComponentId);
+                    int baseX = mcuX * comp.HFactor;
+                    int baseY = mcuY * comp.VFactor;
+
+                    for (int v = 0; v < comp.VFactor; v++)
+                    {
+                        for (int h = 0; h < comp.HFactor; h++)
+                        {
+                            int blockIndex = (baseY + v) * comp.WidthInBlocks + (baseX + h);
+                            int[] block = comp.Coeffs[blockIndex];
+
+                            DecodeDCProgressive(reader, block, sc.DcTableId, 0, 0, ref comp.DcPred);
+
+                            int dummyEob = 0;
+                            DecodeACProgressive(reader, block, sc.AcTableId, 1, 63, 0, 0, ref dummyEob);
+                        }
+                    }
+                }
+            }
         }
+    }
 
-        int maxH = Math.Max(1, _parser.MaxH);
-        int maxV = Math.Max(1, _parser.MaxV);
+    private int Receive(int n, JpegBitReader reader)
+    {
+        if (n == 0) return 0;
+        return reader.ReadBits(n);
+    }
 
-        int sxY = maxH / Math.Max(1, yH);
-        int syY = maxV / Math.Max(1, yV);
-        int sxCb = maxH / Math.Max(1, cbH);
-        int syCb = maxV / Math.Max(1, cbV);
-        int sxCr = maxH / Math.Max(1, crH);
-        int syCr = maxV / Math.Max(1, crV);
+    private byte[] PerformIDCTAndOutput()
+    {
+        if (_frame == null) throw new Exception("Frame not initialized");
 
+        Console.WriteLine("Performing IDCT and Output...");
+
+        int width = _frame.Width;
+        int height = _frame.Height;
         byte[] rgb = new byte[width * height * 3];
-        int dst = 0;
-        int yW = yPlane.w, yHgt = yPlane.h;
-        int cbW = cbPlane.w, cbHgt = cbPlane.h;
-        int crW = crPlane.w, crHgt = crPlane.h;
-        int[] yData = yPlane.data;
-        int[] cbData = cbPlane.data;
-        int[] crData = crPlane.data;
 
-        int Clamp01(int v)
+        Component compY = _frame.Components[0];
+        Component compCb = _frame.Components.Length > 1 ? _frame.Components[1] : null;
+        Component compCr = _frame.Components.Length > 2 ? _frame.Components[2] : null;
+
+        int mcuW = _frame.McuWidth;
+        int mcuH = _frame.McuHeight;
+
+        byte[][] yBuffer = new byte[compY.HFactor * compY.VFactor][];
+        for (int i = 0; i < yBuffer.Length; i++) yBuffer[i] = new byte[64];
+
+        byte[][] cbBuffer = null;
+        if (compCb != null)
         {
-            if (v < 0) return 0;
-            if (v > 255) return 255;
-            return v;
+            cbBuffer = new byte[compCb.HFactor * compCb.VFactor][];
+            for (int i = 0; i < cbBuffer.Length; i++) cbBuffer[i] = new byte[64];
         }
 
-        int SampleBilinearInt(int[] data, int w, int h, int fx16, int fy16)
+        byte[][] crBuffer = null;
+        if (compCr != null)
         {
-            if (data == null || w == 0 || h == 0) return 0;
-            int x0 = fx16 >> 16;
-            int y0 = fy16 >> 16;
-            if (x0 < 0) x0 = 0; if (y0 < 0) y0 = 0;
-            if (x0 > w - 1) x0 = w - 1; if (y0 > h - 1) y0 = h - 1;
-            int x1 = x0 + 1; if (x1 >= w) x1 = w - 1;
-            int y1 = y0 + 1; if (y1 >= h) y1 = h - 1;
-            int tx = fx16 - (x0 << 16);
-            int ty = fy16 - (y0 << 16);
-            int c00 = data[y0 * w + x0];
-            int c10 = data[y0 * w + x1];
-            int c01 = data[y1 * w + x0];
-            int c11 = data[y1 * w + x1];
-            int v0 = ((c00 * (65536 - tx)) + (c10 * tx)) >> 16;
-            int v1 = ((c01 * (65536 - tx)) + (c11 * tx)) >> 16;
-            int v = ((v0 * (65536 - ty)) + (v1 * ty)) >> 16;
-            if (v < 0) v = 0; if (v > 255) v = 255;
-            return v;
+            crBuffer = new byte[compCr.HFactor * compCr.VFactor][];
+            for (int i = 0; i < crBuffer.Length; i++) crBuffer[i] = new byte[64];
         }
 
-        bool yIsFull = sxY == 1 && syY == 1;
-        bool is420 = sxCb == 2 && syCb == 2 && sxCr == 2 && syCr == 2;
-        bool is422 = sxCb == 2 && syCb == 1 && sxCr == 2 && syCr == 1;
-
-        if (yIsFull && is420)
+        for (int mcuY = 0; mcuY < _frame.McuRows; mcuY++)
         {
-            for (int y = 0; y < height; y++)
+            for (int mcuX = 0; mcuX < _frame.McuCols; mcuX++)
             {
-                int yOff = y * yW;
-                int rowCb = (y >> 1) * cbW;
-                int rowCr = (y >> 1) * crW;
-                int x = 0;
-                while (x + 1 < width)
+                int yBlockBaseX = mcuX * compY.HFactor;
+                int yBlockBaseY = mcuY * compY.VFactor;
+
+                for (int v = 0; v < compY.VFactor; v++)
                 {
-                    int cx = x >> 1;
-                    int Cb = cbData != null ? cbData[rowCb + cx] : 128;
-                    int Cr = crData != null ? crData[rowCr + cx] : 128;
-                    int Y0 = yData[yOff + x];
-                    int R0 = Clamp01(Y0 + CrToR[Cr]);
-                    int G0 = Clamp01(Y0 - (CbToG[Cb] + CrToG[Cr]));
-                    int B0 = Clamp01(Y0 + CbToB[Cb]);
-                    rgb[dst + 0] = (byte)R0;
-                    rgb[dst + 1] = (byte)G0;
-                    rgb[dst + 2] = (byte)B0;
-                    dst += 3;
-                    int Y1 = yData[yOff + x + 1];
-                    int R1 = Clamp01(Y1 + CrToR[Cr]);
-                    int G1 = Clamp01(Y1 - (CbToG[Cb] + CrToG[Cr]));
-                    int B1 = Clamp01(Y1 + CbToB[Cb]);
-                    rgb[dst + 0] = (byte)R1;
-                    rgb[dst + 1] = (byte)G1;
-                    rgb[dst + 2] = (byte)B1;
-                    dst += 3;
-                    x += 2;
+                    for (int h = 0; h < compY.HFactor; h++)
+                    {
+                        int blockIdx = (yBlockBaseY + v) * compY.WidthInBlocks + (yBlockBaseX + h);
+                        int[] coeffs = compY.Coeffs[blockIdx];
+                        int qId = compY.QuantTableId;
+                        var qt = _qtables.First(q => q.Id == qId);
+
+                        int[] dequantized = new int[64];
+                        for (int i = 0; i < 64; i++) dequantized[i] = coeffs[i] * qt.Table[i];
+
+                        JpegIDCT.BlockIDCT(dequantized, yBuffer[v * compY.HFactor + h]);
+                    }
                 }
-                if (x < width)
+
+                if (compCb != null)
                 {
-                    int cx = x >> 1;
-                    int Cb = cbData != null ? cbData[rowCb + cx] : 128;
-                    int Cr = crData != null ? crData[rowCr + cx] : 128;
-                    int Y0 = yData[yOff + x];
-                    int R0 = Clamp01(Y0 + CrToR[Cr]);
-                    int G0 = Clamp01(Y0 - (CbToG[Cb] + CrToG[Cr]));
-                    int B0 = Clamp01(Y0 + CbToB[Cb]);
-                    rgb[dst + 0] = (byte)R0;
-                    rgb[dst + 1] = (byte)G0;
-                    rgb[dst + 2] = (byte)B0;
-                    dst += 3;
+                    int cbBlockBaseX = mcuX * compCb.HFactor;
+                    int cbBlockBaseY = mcuY * compCb.VFactor;
+
+                    for (int v = 0; v < compCb.VFactor; v++)
+                    {
+                        for (int h = 0; h < compCb.HFactor; h++)
+                        {
+                            int cbIdx = (cbBlockBaseY + v) * compCb.WidthInBlocks + (cbBlockBaseX + h);
+                            var qtCb = _qtables.First(q => q.Id == compCb.QuantTableId);
+                            int[] deqCb = new int[64];
+                            for (int i = 0; i < 64; i++) deqCb[i] = compCb.Coeffs[cbIdx][i] * qtCb.Table[i];
+                            JpegIDCT.BlockIDCT(deqCb, cbBuffer[v * compCb.HFactor + h]);
+                        }
+                    }
+                }
+
+                if (compCr != null)
+                {
+                    int crBlockBaseX = mcuX * compCr.HFactor;
+                    int crBlockBaseY = mcuY * compCr.VFactor;
+
+                    for (int v = 0; v < compCr.VFactor; v++)
+                    {
+                        for (int h = 0; h < compCr.HFactor; h++)
+                        {
+                            int crIdx = (crBlockBaseY + v) * compCr.WidthInBlocks + (crBlockBaseX + h);
+                            var qtCr = _qtables.First(q => q.Id == compCr.QuantTableId);
+                            int[] deqCr = new int[64];
+                            for (int i = 0; i < 64; i++) deqCr[i] = compCr.Coeffs[crIdx][i] * qtCr.Table[i];
+                            JpegIDCT.BlockIDCT(deqCr, crBuffer[v * compCr.HFactor + h]);
+                        }
+                    }
+                }
+
+                int pixelBaseX = mcuX * mcuW;
+                int pixelBaseY = mcuY * mcuH;
+
+                for (int py = 0; py < mcuH; py++)
+                {
+                    for (int px = 0; px < mcuW; px++)
+                    {
+                        int globalX = pixelBaseX + px;
+                        int globalY = pixelBaseY + py;
+
+                        if (globalX >= width || globalY >= height) continue;
+
+                        int yBlockX = px / 8;
+                        int yBlockY = py / 8;
+                        int yBlockIdx = yBlockY * compY.HFactor + yBlockX;
+                        int yInnerX = px % 8;
+                        int yInnerY = py % 8;
+
+                        byte Y = yBuffer[yBlockIdx][yInnerY * 8 + yInnerX];
+
+                        byte Cb = 128;
+                        byte Cr = 128;
+
+                        if (compCb != null)
+                        {
+                            int cbX = (px * compCb.HFactor) / compY.HFactor;
+                            int cbY = (py * compCb.VFactor) / compY.VFactor;
+
+                            int cbBlockX = cbX / 8;
+                            int cbBlockY = cbY / 8;
+                            int cbInnerX = cbX % 8;
+                            int cbInnerY = cbY % 8;
+
+                            int cbBlockIdx = cbBlockY * compCb.HFactor + cbBlockX;
+
+                            if (cbBlockIdx < cbBuffer.Length)
+                            {
+                                Cb = cbBuffer[cbBlockIdx][cbInnerY * 8 + cbInnerX];
+                            }
+                        }
+
+                        if (compCr != null)
+                        {
+                            int crX = (px * compCr.HFactor) / compY.HFactor;
+                            int crY = (py * compCr.VFactor) / compY.VFactor;
+
+                            int crBlockX = crX / 8;
+                            int crBlockY = crY / 8;
+                            int crInnerX = crX % 8;
+                            int crInnerY = crY % 8;
+
+                            int crBlockIdx = crBlockY * compCr.HFactor + crBlockX;
+
+                            if (crBlockIdx < crBuffer.Length)
+                            {
+                                Cr = crBuffer[crBlockIdx][crInnerY * 8 + crInnerX];
+                            }
+                        }
+
+                        double cCb = Cb - 128;
+                        double cCr = Cr - 128;
+
+                        int r = (int)(Y + 1.402 * cCr);
+                        int g = (int)(Y - 0.344136 * cCb - 0.714136 * cCr);
+                        int b = (int)(Y + 1.772 * cCb);
+
+                        int idx = (globalY * width + globalX) * 3;
+                        rgb[idx] = (byte)JpegUtils.Clamp(r);
+                        rgb[idx + 1] = (byte)JpegUtils.Clamp(g);
+                        rgb[idx + 2] = (byte)JpegUtils.Clamp(b);
+                    }
                 }
             }
-            return rgb;
         }
 
-        if (yIsFull && is422)
-        {
-            for (int y = 0; y < height; y++)
-            {
-                int yOff = y * yW;
-                int rowCb = y * cbW;
-                int rowCr = y * crW;
-                int x = 0;
-                while (x + 1 < width)
-                {
-                    int cx = x >> 1;
-                    int Cb = cbData != null ? cbData[rowCb + cx] : 128;
-                    int Cr = crData != null ? crData[rowCr + cx] : 128;
-                    int Y0 = yData[yOff + x];
-                    int R0 = Clamp01(Y0 + CrToR[Cr]);
-                    int G0 = Clamp01(Y0 - (CbToG[Cb] + CrToG[Cr]));
-                    int B0 = Clamp01(Y0 + CbToB[Cb]);
-                    rgb[dst + 0] = (byte)R0;
-                    rgb[dst + 1] = (byte)G0;
-                    rgb[dst + 2] = (byte)B0;
-                    dst += 3;
-                    int Y1 = yData[yOff + x + 1];
-                    int R1 = Clamp01(Y1 + CrToR[Cr]);
-                    int G1 = Clamp01(Y1 - (CbToG[Cb] + CrToG[Cr]));
-                    int B1 = Clamp01(Y1 + CbToB[Cb]);
-                    rgb[dst + 0] = (byte)R1;
-                    rgb[dst + 1] = (byte)G1;
-                    rgb[dst + 2] = (byte)B1;
-                    dst += 3;
-                    x += 2;
-                }
-                if (x < width)
-                {
-                    int cx = x >> 1;
-                    int Cb = cbData != null ? cbData[rowCb + cx] : 128;
-                    int Cr = crData != null ? crData[rowCr + cx] : 128;
-                    int Y0 = yData[yOff + x];
-                    int R0 = Clamp01(Y0 + CrToR[Cr]);
-                    int G0 = Clamp01(Y0 - (CbToG[Cb] + CrToG[Cr]));
-                    int B0 = Clamp01(Y0 + CbToB[Cb]);
-                    rgb[dst + 0] = (byte)R0;
-                    rgb[dst + 1] = (byte)G0;
-                    rgb[dst + 2] = (byte)B0;
-                    dst += 3;
-                }
-            }
-            return rgb;
-        }
-
-        for (int y = 0; y < height; y++)
-        {
-            int fyY16 = (y << 16) / Math.Max(1, syY);
-            int fyCb16 = (y << 16) / Math.Max(1, syCb);
-            int fyCr16 = (y << 16) / Math.Max(1, syCr);
-
-            for (int x = 0; x < width; x++)
-            {
-                int fxY16 = (x << 16) / Math.Max(1, sxY);
-                int fxCb16 = (x << 16) / Math.Max(1, sxCb);
-                int fxCr16 = (x << 16) / Math.Max(1, sxCr);
-
-                int Y = yIsFull ? yData[y * yW + x] : SampleBilinearInt(yData, yW, yHgt, fxY16, fyY16);
-                int Cb = cbData != null ? SampleBilinearInt(cbData, cbW, cbHgt, fxCb16, fyCb16) : 128;
-                int Cr = crData != null ? SampleBilinearInt(crData, crW, crHgt, fxCr16, fyCr16) : 128;
-
-                int R = Y + CrToR[Cr];
-                int G = Y - (CbToG[Cb] + CrToG[Cr]);
-                int B = Y + CbToB[Cb];
-                if (R < 0) R = 0; if (R > 255) R = 255;
-                if (G < 0) G = 0; if (G > 255) G = 255;
-                if (B < 0) B = 0; if (B > 255) B = 255;
-
-                rgb[dst + 0] = (byte)R;
-                rgb[dst + 1] = (byte)G;
-                rgb[dst + 2] = (byte)B;
-                dst += 3;
-            }
-        }
         return rgb;
+    }
+
+    private int DecodeHuffman(HuffmanTable ht, JpegBitReader reader)
+    {
+        int code = reader.ReadBit();
+        int i = 1;
+        if (code == -1) return -1;
+
+        while (code > ht.MaxCode[i])
+        {
+            int bit = reader.ReadBit();
+            if (bit == -1) return -1;
+            code = (code << 1) | bit;
+            i++;
+            if (i > 16) return -1;
+        }
+
+        int j = ht.ValPtr[i];
+        int j2 = j + code - ht.MinCode[i];
+        return ht.Symbols[j2];
+    }
+
+    private int Extend(int v, int t)
+    {
+        int vt = 1 << (t - 1);
+        if (v < vt)
+        {
+            vt = (-1) << t;
+            return v + vt + 1;
+        }
+        return v;
+    }
+
+    private void CheckRestart(ref int restartsLeft, JpegBitReader reader)
+    {
+        if (_restartInterval == 0) return;
+
+        restartsLeft--;
+        if (restartsLeft == 0)
+        {
+            reader.AlignToByte();
+            if (!reader.ConsumeRestartMarker())
+            {
+                Console.WriteLine("Warning: Expected restart marker but didn't find one.");
+            }
+            restartsLeft = _restartInterval;
+
+            foreach (var c in _frame.Components) c.DcPred = 0;
+        }
+    }
+
+    private void TryParseExifOrientation(byte[] app1)
+    {
+        if (app1.Length < 8) return;
+        if (!(app1[0] == (byte)'E' && app1[1] == (byte)'x' && app1[2] == (byte)'i' && app1[3] == (byte)'f' && app1[4] == 0 && app1[5] == 0))
+            return;
+
+        int tiffBase = 6;
+        if (app1.Length < tiffBase + 8) return;
+        bool littleEndian;
+        if (app1[tiffBase + 0] == (byte)'I' && app1[tiffBase + 1] == (byte)'I') littleEndian = true;
+        else if (app1[tiffBase + 0] == (byte)'M' && app1[tiffBase + 1] == (byte)'M') littleEndian = false;
+        else return;
+
+        ushort ReadU16(int offset)
+        {
+            if (littleEndian) return (ushort)(app1[offset] | (app1[offset + 1] << 8));
+            else return (ushort)((app1[offset] << 8) | app1[offset + 1]);
+        }
+        uint ReadU32(int offset)
+        {
+            if (littleEndian) return (uint)(app1[offset] | (app1[offset + 1] << 8) | (app1[offset + 2] << 16) | (app1[offset + 3] << 24));
+            else return (uint)((app1[offset] << 24) | (app1[offset + 1] << 16) | (app1[offset + 2] << 8) | app1[offset + 3]);
+        }
+
+        ushort magic = ReadU16(tiffBase + 2);
+        if (magic != 42) return;
+        uint ifd0Offset = ReadU32(tiffBase + 4);
+        int ifd0 = tiffBase + (int)ifd0Offset;
+        if (ifd0 < 0 || ifd0 + 2 > app1.Length) return;
+        ushort numEntries = ReadU16(ifd0);
+        int entryBase = ifd0 + 2;
+        int entrySize = 12;
+        for (int i = 0; i < numEntries; i++)
+        {
+            int e = entryBase + i * entrySize;
+            if (e + entrySize > app1.Length) break;
+            ushort tag = ReadU16(e + 0);
+            ushort type = ReadU16(e + 2);
+            uint count = ReadU32(e + 4);
+            int valueOffset = e + 8;
+            if (tag == 0x0112)
+            {
+                int orientation = 1;
+                if (type == 3 && count >= 1)
+                {
+                    orientation = littleEndian ? (app1[valueOffset] | (app1[valueOffset + 1] << 8)) : ((app1[valueOffset] << 8) | app1[valueOffset + 1]);
+                }
+                else
+                {
+                    uint valPtr = ReadU32(valueOffset);
+                    int p = tiffBase + (int)valPtr;
+                    if (p >= 0 && p + 2 <= app1.Length)
+                        orientation = ReadU16(p);
+                }
+                if (orientation >= 1 && orientation <= 8)
+                    ExifOrientation = orientation;
+                return;
+            }
+        }
+    }
+}
+
+class QuantizationTable
+{
+    public int Id { get; set; }
+    public int Precision { get; set; }
+    public int[] Table { get; set; } = new int[64];
+}
+
+class HuffmanTable
+{
+    public int Class { get; set; }
+    public int Id { get; set; }
+    public byte[] Counts { get; set; } = new byte[16];
+    public byte[] Symbols { get; set; }
+    public int[] MaxCode { get; set; } = new int[17];
+    public int[] MinCode { get; set; } = new int[17];
+    public int[] ValPtr { get; set; } = new int[17];
+}
+
+class Component
+{
+    public int Id { get; set; }
+    public int HFactor { get; set; }
+    public int VFactor { get; set; }
+    public int QuantTableId { get; set; }
+    public int DcTableId { get; set; }
+    public int AcTableId { get; set; }
+    public int Width { get; set; }
+    public int Height { get; set; }
+    public int WidthInBlocks { get; set; }
+    public int HeightInBlocks { get; set; }
+    public int[][] Coeffs { get; set; }
+    public int DcPred;
+}
+
+class FrameHeader
+{
+    public int Precision { get; set; }
+    public int Height { get; set; }
+    public int Width { get; set; }
+    public int ComponentsCount { get; set; }
+    public Component[] Components { get; set; }
+    public bool IsProgressive { get; set; }
+    public int McuWidth { get; set; }
+    public int McuHeight { get; set; }
+    public int McuCols { get; set; }
+    public int McuRows { get; set; }
+}
+
+class ScanHeader
+{
+    public int ComponentsCount { get; set; }
+    public ScanComponent[] Components { get; set; }
+    public int StartSpectralSelection { get; set; }
+    public int EndSpectralSelection { get; set; }
+    public int SuccessiveApproximationBitHigh { get; set; }
+    public int SuccessiveApproximationBitLow { get; set; }
+}
+
+class ScanComponent
+{
+    public int ComponentId { get; set; }
+    public int DcTableId { get; set; }
+    public int AcTableId { get; set; }
+}
+
+static class JpegMarkers
+{
+    public const byte SOI = 0xD8;
+    public const byte EOI = 0xD9;
+    public const byte SOS = 0xDA;
+    public const byte DQT = 0xDB;
+    public const byte DNL = 0xDC;
+    public const byte DRI = 0xDD;
+    public const byte DHP = 0xDE;
+    public const byte EXP = 0xDF;
+
+    public const byte APP0 = 0xE0;
+    public const byte APP1 = 0xE1;
+    public const byte APP2 = 0xE2;
+    public const byte APP3 = 0xE3;
+    public const byte APP4 = 0xE4;
+    public const byte APP5 = 0xE5;
+    public const byte APP6 = 0xE6;
+    public const byte APP7 = 0xE7;
+    public const byte APP8 = 0xE8;
+    public const byte APP9 = 0xE9;
+    public const byte APP10 = 0xEA;
+    public const byte APP11 = 0xEB;
+    public const byte APP12 = 0xEC;
+    public const byte APP13 = 0xED;
+    public const byte APP14 = 0xEE;
+    public const byte APP15 = 0xEF;
+
+    public const byte JPG0 = 0xF0;
+    public const byte JPG13 = 0xFD;
+    public const byte COM = 0xFE;
+    public const byte TEM = 0x01;
+
+    public const byte SOF0 = 0xC0;
+    public const byte SOF1 = 0xC1;
+    public const byte SOF2 = 0xC2;
+    public const byte SOF3 = 0xC3;
+
+    public const byte SOF5 = 0xC5;
+    public const byte SOF6 = 0xC6;
+    public const byte SOF7 = 0xC7;
+
+    public const byte SOF9 = 0xC9;
+    public const byte SOF10 = 0xCA;
+    public const byte SOF11 = 0xCB;
+
+    public const byte SOF13 = 0xCD;
+    public const byte SOF14 = 0xCE;
+    public const byte SOF15 = 0xCF;
+
+    public const byte DHT = 0xC4;
+    public const byte DAC = 0xCC;
+
+    public const byte RST0 = 0xD0;
+    public const byte RST1 = 0xD1;
+    public const byte RST2 = 0xD2;
+    public const byte RST3 = 0xD3;
+    public const byte RST4 = 0xD4;
+    public const byte RST5 = 0xD5;
+    public const byte RST6 = 0xD6;
+    public const byte RST7 = 0xD7;
+
+    public static bool IsRST(byte marker) => marker >= RST0 && marker <= RST7;
+    public static bool IsSOF(byte marker) => marker == SOF0 || marker == SOF1 || marker == SOF2 || marker == SOF3 ||
+                                             marker == SOF9 || marker == SOF10 || marker == SOF11 ||
+                                             marker == SOF5 || marker == SOF6 || marker == SOF7 ||
+                                             marker == SOF13 || marker == SOF14 || marker == SOF15;
+}
+
+static class JpegUtils
+{
+    public static readonly int[] ZigZag = new int[64]
+    {
+         0,  1,  8, 16,  9,  2,  3, 10,
+        17, 24, 32, 25, 18, 11,  4,  5,
+        12, 19, 26, 33, 40, 48, 41, 34,
+        27, 20, 13,  6,  7, 14, 21, 28,
+        35, 42, 49, 56, 57, 50, 43, 36,
+        29, 22, 15, 23, 30, 37, 44, 51,
+        58, 59, 52, 45, 38, 31, 39, 46,
+        53, 60, 61, 54, 47, 55, 62, 63
+    };
+
+    public static int Clamp(int val)
+    {
+        if (val < 0) return 0;
+        if (val > 255) return 255;
+        return val;
+    }
+}
+
+static class JpegIDCT
+{
+    private static readonly float[] C = new float[8];
+
+    static JpegIDCT()
+    {
+        for (int i = 0; i < 8; i++)
+        {
+            C[i] = (i == 0) ? (float)(1.0 / Math.Sqrt(2.0)) : 1.0f;
+        }
+    }
+
+    public static void BlockIDCT(int[] block, byte[] dest)
+    {
+        float[] temp = new float[64];
+
+        for (int y = 0; y < 8; y++)
+        {
+            for (int x = 0; x < 8; x++)
+            {
+                float sum = 0;
+                for (int u = 0; u < 8; u++)
+                {
+                    sum += C[u] * block[y * 8 + u] * (float)Math.Cos((2 * x + 1) * u * Math.PI / 16.0);
+                }
+                temp[y * 8 + x] = sum * 0.5f;
+            }
+        }
+
+        for (int x = 0; x < 8; x++)
+        {
+            for (int y = 0; y < 8; y++)
+            {
+                float sum = 0;
+                for (int v = 0; v < 8; v++)
+                {
+                    sum += C[v] * temp[v * 8 + x] * (float)Math.Cos((2 * y + 1) * v * Math.PI / 16.0);
+                }
+                sum *= 0.5f;
+                int val = (int)(sum + 128.5f);
+                if (val < 0) val = 0;
+                if (val > 255) val = 255;
+                dest[y * 8 + x] = (byte)val;
+            }
+        }
+    }
+}
+
+class JpegBitReader
+{
+    private readonly byte[] _data;
+    private int _bytePos;
+    private int _bitPos;
+    private int _currentByte;
+    private bool _hitMarker;
+    private byte _marker;
+
+    public JpegBitReader(byte[] data)
+    {
+        _data = data;
+        _bytePos = 0;
+        _bitPos = 0;
+        _currentByte = 0;
+        _hitMarker = false;
+        _marker = 0;
+    }
+
+    public int BytePosition => _bytePos;
+
+    public void ResetBits()
+    {
+        _bitPos = 0;
+    }
+
+    public void SetPosition(int pos)
+    {
+        _bytePos = pos;
+        _bitPos = 0;
+    }
+
+    public int ReadBit()
+    {
+        if (_bitPos == 0)
+        {
+            NextByte();
+            if (_hitMarker) return -1;
+        }
+
+        int bit = (_currentByte >> (--_bitPos)) & 1;
+        return bit;
+    }
+
+    public int ReadBits(int n)
+    {
+        int result = 0;
+        for (int i = 0; i < n; i++)
+        {
+            int bit = ReadBit();
+            if (bit == -1) return -1;
+            result = (result << 1) | bit;
+        }
+        return result;
+    }
+
+    private void NextByte()
+    {
+        if (_bytePos >= _data.Length)
+        {
+            _currentByte = 0xFF;
+            _bitPos = 8;
+            return;
+        }
+
+        int b = _data[_bytePos++];
+
+        if (b == 0xFF)
+        {
+            if (_bytePos >= _data.Length)
+            {
+                _currentByte = 0xFF;
+                _bitPos = 8;
+                return;
+            }
+
+            int b2 = _data[_bytePos];
+            if (b2 == 0x00)
+            {
+                _bytePos++;
+                _currentByte = 0xFF;
+            }
+            else
+            {
+                _hitMarker = true;
+                _marker = (byte)b2;
+                _currentByte = 0;
+                _bitPos = 0;
+                return;
+            }
+        }
+        else
+        {
+            _currentByte = b;
+        }
+
+        _bitPos = 8;
+    }
+
+    public int PeekByte()
+    {
+        if (_bytePos >= _data.Length) return -1;
+        return _data[_bytePos];
+    }
+
+    public void AlignToByte()
+    {
+        _bitPos = 0;
+    }
+
+    public bool HitMarker => _hitMarker;
+    public byte Marker => _marker;
+
+    public bool ConsumeRestartMarker()
+    {
+        if (!_hitMarker)
+        {
+            if (_bitPos != 0 && _bitPos != 8)
+            {
+            }
+
+            NextByte();
+        }
+
+        if (_hitMarker && JpegMarkers.IsRST(_marker))
+        {
+            _hitMarker = false;
+            _marker = 0;
+            _bytePos++;
+            _bitPos = 0;
+            return true;
+        }
+        return false;
     }
 }
