@@ -402,6 +402,8 @@ public class JpegDecoder
             dequants[id] = dq;
         }
 
+        var dcPredGlobal = new int[256];
+
         foreach (var scan in _parser.Scans)
         {
             stream.Position = scan.DataOffset;
@@ -482,8 +484,13 @@ public class JpegDecoder
                             continue;
                         }
 
-                        int run = 1 << r;
-                        if (r > 0) run += br.GetBits(r);
+                        if (r == 0)
+                        {
+                            eobRun = 0;
+                            return;
+                        }
+
+                        int run = (1 << r) + br.GetBits(r);
                         eobRun = run - 1;
                         return;
                     }
@@ -534,11 +541,14 @@ public class JpegDecoder
 
                     if (hasPendingNew)
                     {
-                        cbuf[bIndex + idx] = pendingNewVal;
-                        hasPendingNew = false;
-                        pendingNewVal = 0;
-                        kPos++;
-                        continue;
+                        if (zerosToSkip == 0 && cbuf[bIndex + idx] == 0)
+                        {
+                            cbuf[bIndex + idx] = pendingNewVal;
+                            hasPendingNew = false;
+                            pendingNewVal = 0;
+                            kPos++;
+                            continue;
+                        }
                     }
 
                     int rs = DecodeSymbol(br, acCanon[acTableId], acFast[acTableId], ht);
@@ -553,16 +563,20 @@ public class JpegDecoder
                             continue;
                         }
 
-                        int run = 1 << r;
-                        if (r > 0) run += br.GetBits(r);
-                        eobRun = run;
+                        if (r == 0)
+                        {
+                            eobRun = 0;
+                        }
+                        else
+                        {
+                            eobRun = ((1 << r) + br.GetBits(r)) - 1;
+                        }
 
                         for (; kPos <= se; kPos++)
                         {
                             idx = UnZigZag[kPos];
                             if (cbuf[bIndex + idx] != 0) ApplyRefineBit(cbuf, bIndex, idx, al);
                         }
-                        eobRun--;
                         return;
                     }
 
@@ -581,7 +595,6 @@ public class JpegDecoder
 
             if (isDcScan) // DC 扫描
             {
-                var dcPred = new int[256];
                 bool endScan = false;
 
                 for (int my = 0; my < scanMcusY; my++)
@@ -591,7 +604,7 @@ public class JpegDecoder
                         br.EnsureBits(1);
                         if (br.TakeRestartMarker())
                         {
-                            Array.Clear(dcPred, 0, dcPred.Length);
+                            Array.Clear(dcPredGlobal, 0, dcPredGlobal.Length);
                         }
 
                         if (isInterleaved)
@@ -616,7 +629,7 @@ public class JpegDecoder
                                         {
                                             if (scan.Ah == 0)
                                             {
-                                                DecodeDcBlockFirst(cid, sc.dcTableId, cbuf, bIndex, scan.Al, dcPred);
+                                                DecodeDcBlockFirst(cid, sc.dcTableId, cbuf, bIndex, scan.Al, dcPredGlobal);
                                             }
                                             else
                                             {
@@ -644,7 +657,7 @@ public class JpegDecoder
                             {
                                 if (scan.Ah == 0)
                                 {
-                                    DecodeDcBlockFirst(cid, sc.dcTableId, cbuf, bIndex, scan.Al, dcPred);
+                                    DecodeDcBlockFirst(cid, sc.dcTableId, cbuf, bIndex, scan.Al, dcPredGlobal);
                                 }
                                 else
                                 {
@@ -672,7 +685,10 @@ public class JpegDecoder
                     for (int mx = 0; mx < scanMcusX; mx++)
                     {
                         br.EnsureBits(1);
-                        if (br.TakeRestartMarker()) eobRun = 0;
+                        if (br.TakeRestartMarker())
+                        {
+                            eobRun = 0;
+                        }
 
                         if (isInterleaved)
                         {
