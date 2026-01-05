@@ -29,11 +29,10 @@ namespace SharpImageConverter.Formats
         public Image<Rgb24> DecodeRgb24(Stream stream)
         {
             var decoder = new JpegDecoder();
-            var rgb = decoder.DecodeToRGB(stream);
-            var img = new Image<Rgb24>(decoder.Width, decoder.Height, rgb);
+            var img = decoder.Decode(stream);
             if (decoder.ExifOrientation != 1)
             {
-                var frame = new ImageFrame(decoder.Width, decoder.Height, rgb);
+                var frame = new ImageFrame(img.Width, img.Height, img.Buffer);
                 frame = frame.ApplyExifOrientation(decoder.ExifOrientation);
                 img.Update(frame.Width, frame.Height, frame.Pixels);
             }

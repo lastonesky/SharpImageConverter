@@ -129,7 +129,8 @@ public sealed class ImageFrame
     public static ImageFrame LoadJpeg(Stream stream)
     {
         var decoder = new JpegDecoder();
-        byte[] rgb = decoder.DecodeToRGB(stream);
+        var img = decoder.Decode(stream);
+        byte[] rgb = img.Buffer;
 
         if (decoder.ExifOrientation != 1)
         {
