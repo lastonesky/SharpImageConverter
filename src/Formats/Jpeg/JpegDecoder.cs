@@ -6,20 +6,31 @@ using System.Linq;
 
 namespace SharpImageConverter;
 
+/// <summary>
+/// JPEG 解码器，用于将 JPEG 图像数据解码为 RGB 字节数组。
+/// </summary>
 public class JpegDecoder
 {
     private byte[] _data;
     private int _pos;
     private FrameHeader _frame;
-    private readonly List<QuantizationTable> _qtables = new List<QuantizationTable>();
-    private readonly List<HuffmanTable> _htables = new List<HuffmanTable>();
+    private readonly List<QuantizationTable> _qtables = [];
+    private readonly List<HuffmanTable> _htables = [];
     private int _restartInterval;
     private int _warningCount;
 
     public int Width => _frame != null ? _frame.Width : 0;
     public int Height => _frame != null ? _frame.Height : 0;
+    /// <summary>
+    /// 获取当前 JPEG 图像的 EXIF 方向值（1 为默认方向）。
+    /// </summary>
     public int ExifOrientation { get; private set; } = 1;
 
+    /// <summary>
+    /// 将传入的 JPEG 流解码为 RGB 字节数组。
+    /// </summary>
+    /// <param name="stream">包含 JPEG 图像数据的输入流。</param>
+    /// <returns>按行排列的 24-bit RGB 像素字节数组。</returns>
     public byte[] DecodeToRGB(Stream stream)
     {
         using (var ms = new MemoryStream())
@@ -198,12 +209,14 @@ public class JpegDecoder
         int p = _pos + 2;
         if (p + 6 > _data.Length) throw new Exception("SOF truncated");
 
-        FrameHeader frame = new FrameHeader();
-        frame.IsProgressive = isProgressive;
-        frame.Precision = _data[p++];
-        frame.Height = (_data[p++] << 8) | _data[p++];
-        frame.Width = (_data[p++] << 8) | _data[p++];
-        frame.ComponentsCount = _data[p++];
+        FrameHeader frame = new()
+        {
+            IsProgressive = isProgressive,
+            Precision = _data[p++],
+            Height = (_data[p++] << 8) | _data[p++],
+            Width = (_data[p++] << 8) | _data[p++],
+            ComponentsCount = _data[p++]
+        };
         frame.Components = new Component[frame.ComponentsCount];
 
         int maxH = 0, maxV = 0;
@@ -345,7 +358,7 @@ public class JpegDecoder
         }
     }
 
-    private bool GenerateHuffmanTables(HuffmanTable ht)
+    private static bool GenerateHuffmanTables(HuffmanTable ht)
     {
         int p = 0;
         int[] huffsize = new int[257];
@@ -415,8 +428,10 @@ public class JpegDecoder
         for (int i = 0; i < scan.ComponentsCount; i++)
         {
             if (p + 1 >= _data.Length) throw new Exception("SOS components truncated");
-            var sc = new ScanComponent();
-            sc.ComponentId = _data[p++];
+            var sc = new ScanComponent
+            {
+                ComponentId = _data[p++]
+            };
             int tableInfo = _data[p++];
             sc.DcTableId = tableInfo >> 4;
             sc.AcTableId = tableInfo & 0xF;
@@ -678,7 +693,7 @@ public class JpegDecoder
                                int idx = JpegUtils.ZigZag[k];
                                if (block[idx] != 0)
                                {
-                                   RefineNonZero(reader, block, idx, Al);
+                                RefineNonZero(reader, block, idx, Al);
                                }
                                else
                                {
@@ -692,7 +707,7 @@ public class JpegDecoder
         }
     }
 
-    private void RefineNonZero(JpegBitReader reader, int[] block, int idx, int Al)
+    private static void RefineNonZero(JpegBitReader reader, int[] block, int idx, int Al)
     {
         int bit = reader.ReadBit();
         if (bit == 1)
@@ -737,7 +752,7 @@ public class JpegDecoder
         }
     }
 
-    private int Receive(int n, JpegBitReader reader)
+    private static int Receive(int n, JpegBitReader reader)
     {
         if (n == 0) return 0;
         return reader.ReadBits(n);
@@ -934,7 +949,7 @@ public class JpegDecoder
         return ht.Symbols[j2];
     }
 
-    private int Extend(int v, int t)
+    private static int Extend(int v, int t)
     {
         int vt = 1 << (t - 1);
         if (v < vt)
@@ -1258,14 +1273,14 @@ static class JpegIDCT
             long z4 = tmp1 + tmp3;
             long z5 = (z3 + z4) * FIX_1_175875602;
 
-            tmp0 = tmp0 * FIX_0_298631336;
-            tmp1 = tmp1 * FIX_2_053119869;
-            tmp2 = tmp2 * FIX_3_072711026;
-            tmp3 = tmp3 * FIX_1_501321110;
-            z1 = z1 * (-FIX_0_899976223);
-            z2 = z2 * (-FIX_2_562915447);
-            z3 = z3 * (-FIX_1_961570560);
-            z4 = z4 * (-FIX_0_390180644);
+            tmp0 *= FIX_0_298631336;
+            tmp1 *= FIX_2_053119869;
+            tmp2 *= FIX_3_072711026;
+            tmp3 *= FIX_1_501321110;
+            z1 *= -FIX_0_899976223;
+            z2 *= -FIX_2_562915447;
+            z3 *= -FIX_1_961570560;
+            z4 *= -FIX_0_390180644;
 
             z3 += z5;
             z4 += z5;
@@ -1312,14 +1327,14 @@ static class JpegIDCT
             long z4 = tmp1 + tmp3;
             long z5 = (z3 + z4) * FIX_1_175875602;
 
-            tmp0 = tmp0 * FIX_0_298631336;
-            tmp1 = tmp1 * FIX_2_053119869;
-            tmp2 = tmp2 * FIX_3_072711026;
-            tmp3 = tmp3 * FIX_1_501321110;
-            z1 = z1 * (-FIX_0_899976223);
-            z2 = z2 * (-FIX_2_562915447);
-            z3 = z3 * (-FIX_1_961570560);
-            z4 = z4 * (-FIX_0_390180644);
+            tmp0 *= FIX_0_298631336;
+            tmp1 *= FIX_2_053119869;
+            tmp2 *= FIX_3_072711026;
+            tmp3 *= FIX_1_501321110;
+            z1 *= -FIX_0_899976223;
+            z2 *= -FIX_2_562915447;
+            z3 *= -FIX_1_961570560;
+            z4 *= -FIX_0_390180644;
 
             z3 += z5;
             z4 += z5;
@@ -1352,24 +1367,14 @@ static class JpegIDCT
     }
 }
 
-class JpegBitReader
+class JpegBitReader(byte[] data)
 {
-    private readonly byte[] _data;
-    private int _bytePos;
-    private int _bitPos;
-    private int _currentByte;
-    private bool _hitMarker;
-    private byte _marker;
-
-    public JpegBitReader(byte[] data)
-    {
-        _data = data;
-        _bytePos = 0;
-        _bitPos = 0;
-        _currentByte = 0;
-        _hitMarker = false;
-        _marker = 0;
-    }
+    private readonly byte[] _data = data;
+    private int _bytePos = 0;
+    private int _bitPos = 0;
+    private int _currentByte = 0;
+    private bool _hitMarker = false;
+    private byte _marker = 0;
 
     public int BytePosition => _bytePos;
 
