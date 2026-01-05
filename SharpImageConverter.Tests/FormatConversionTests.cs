@@ -4,6 +4,8 @@ using System.IO;
 using System.Reflection;
 using SharpImageConverter;
 using SharpImageConverter.Core;
+using SharpImageConverter.Formats;
+using SharpImageConverter.Formats.Gif;
 using Tests.Helpers;
 using Xunit;
 
@@ -202,6 +204,75 @@ namespace Jpeg2Bmp.Tests
             {
                 return;
             }
+        }
+
+        [Fact]
+        public void Gif_Animated_To_Webp_Animated_Works()
+        {
+            byte[] gifBytes = CreateTinyAnimatedGif1x1();
+            using var gifStream = new MemoryStream(gifBytes);
+            var dec = new GifDecoder();
+            var anim = dec.DecodeAnimationRgb24(gifStream);
+            Assert.True(anim.Frames.Count >= 2);
+
+            using var outStream = new MemoryStream();
+            WebpAnimationEncoder.EncodeRgb24(outStream, anim.Frames, anim.FrameDurationsMs, anim.LoopCount, 75f);
+            byte[] webp = outStream.ToArray();
+
+            Assert.True(webp.Length >= 16);
+            Assert.Equal((byte)'R', webp[0]);
+            Assert.Equal((byte)'I', webp[1]);
+            Assert.Equal((byte)'F', webp[2]);
+            Assert.Equal((byte)'F', webp[3]);
+            Assert.Equal((byte)'W', webp[8]);
+            Assert.Equal((byte)'E', webp[9]);
+            Assert.Equal((byte)'B', webp[10]);
+            Assert.Equal((byte)'P', webp[11]);
+
+            Assert.True(IndexOfAscii(webp, "ANIM") >= 0);
+            Assert.True(IndexOfAscii(webp, "ANMF") >= 0);
+        }
+
+        private static int IndexOfAscii(byte[] data, string needle)
+        {
+            if (data.Length == 0) return -1;
+            if (string.IsNullOrEmpty(needle)) return 0;
+
+            byte[] n = System.Text.Encoding.ASCII.GetBytes(needle);
+            for (int i = 0; i <= data.Length - n.Length; i++)
+            {
+                bool ok = true;
+                for (int j = 0; j < n.Length; j++)
+                {
+                    if (data[i + j] != n[j]) { ok = false; break; }
+                }
+                if (ok) return i;
+            }
+            return -1;
+        }
+
+        private static byte[] CreateTinyAnimatedGif1x1()
+        {
+            return
+            [
+                0x47, 0x49, 0x46, 0x38, 0x39, 0x61,
+                0x01, 0x00, 0x01, 0x00, 0x80, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF,
+
+                0x21, 0xFF, 0x0B,
+                0x4E, 0x45, 0x54, 0x53, 0x43, 0x41, 0x50, 0x45, 0x32, 0x2E, 0x30,
+                0x03, 0x01, 0x00, 0x00, 0x00,
+
+                0x21, 0xF9, 0x04, 0x00, 0x02, 0x00, 0x00, 0x00,
+                0x2C, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00,
+                0x02, 0x02, 0x44, 0x01, 0x00,
+
+                0x21, 0xF9, 0x04, 0x00, 0x02, 0x00, 0x00, 0x00,
+                0x2C, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00,
+                0x02, 0x02, 0x4C, 0x01, 0x00,
+
+                0x3B
+            ];
         }
 
         private static byte[] CreateNoiseRgba(int width, int height)

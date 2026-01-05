@@ -4,28 +4,32 @@ using SharpImageConverter.Core;
 
 namespace SharpImageConverter.Formats.Gif
 {
+    public sealed class GifAnimation
+    {
+        public System.Collections.Generic.IReadOnlyList<Image<Rgb24>> Frames { get; }
+        public System.Collections.Generic.IReadOnlyList<int> FrameDurationsMs { get; }
+        public int LoopCount { get; }
+
+        public GifAnimation(System.Collections.Generic.IReadOnlyList<Image<Rgb24>> frames, System.Collections.Generic.IReadOnlyList<int> frameDurationsMs, int loopCount)
+        {
+            Frames = frames;
+            FrameDurationsMs = frameDurationsMs;
+            LoopCount = loopCount;
+        }
+    }
+
     /// <summary>
     /// GIF 解码器，支持多帧与单帧解码为 Rgb24。
     /// </summary>
     public class GifDecoder : IImageDecoder
     {
-        /// <summary>
-        /// 解码 GIF 所有帧为 Rgb24 图像列表
-        /// </summary>
-        /// <param name="path">输入文件路径</param>
-        /// <returns>帧列表（Rgb24）</returns>
-        public System.Collections.Generic.List<Image<Rgb24>> DecodeAllFrames(string path)
+        public GifAnimation DecodeAnimationRgb24(string path)
         {
             using var fs = File.OpenRead(path);
-            return DecodeAllFrames(fs);
+            return DecodeAnimationRgb24(fs);
         }
 
-        /// <summary>
-        /// 从流解码 GIF 所有帧为 Rgb24 图像列表
-        /// </summary>
-        /// <param name="stream">输入流</param>
-        /// <returns>帧列表（Rgb24）</returns>
-        public System.Collections.Generic.List<Image<Rgb24>> DecodeAllFrames(Stream stream)
+        public GifAnimation DecodeAnimationRgb24(Stream stream)
         {
             byte[] sig = new byte[6];
             if (stream.Read(sig, 0, 6) != 6) throw new InvalidDataException("Invalid GIF header");
@@ -73,7 +77,10 @@ namespace SharpImageConverter.Formats.Gif
             int transIndex = -1;
             int disposal = 0;
             int delayCs = 0;
+            int loopCount = 1;
+
             var frames = new System.Collections.Generic.List<Image<Rgb24>>();
+            var durations = new System.Collections.Generic.List<int>();
 
             byte[]? prevCanvas = null;
             int lastIx = 0, lastIy = 0, lastIw = 0, lastIh = 0;
@@ -102,6 +109,33 @@ namespace SharpImageConverter.Formats.Gif
                         delayCs = gce[1] | (gce[2] << 8);
                         transIndex = hasTrans ? gce[3] : -1;
                         stream.ReadByte();
+                    }
+                    else if (label == 0xFF)
+                    {
+                        int size = stream.ReadByte();
+                        byte[] app = new byte[size];
+                        if (size > 0) ReadExact(stream, app, size);
+                        string appId = System.Text.Encoding.ASCII.GetString(app, 0, app.Length);
+                        if (appId == "NETSCAPE2.0" || appId == "ANIMEXTS1.0")
+                        {
+                            int subLen = stream.ReadByte();
+                            if (subLen < 0) throw new EndOfStreamException();
+                            if (subLen > 0)
+                            {
+                                var sub = new byte[subLen];
+                                ReadExact(stream, sub, subLen);
+                                if (subLen >= 3 && sub[0] == 1)
+                                {
+                                    int rep = sub[1] | (sub[2] << 8);
+                                    loopCount = rep == 0 ? 0 : rep;
+                                }
+                            }
+                            SkipBlocks(stream);
+                        }
+                        else
+                        {
+                            SkipBlocks(stream);
+                        }
                     }
                     else
                     {
@@ -214,6 +248,9 @@ namespace SharpImageConverter.Formats.Gif
                     Buffer.BlockCopy(canvas, 0, frameBuf, 0, canvas.Length);
                     frames.Add(new Image<Rgb24>(width, height, frameBuf));
 
+                    int ms = delayCs * 10;
+                    durations.Add(ms < 10 ? 10 : ms);
+
                     if (disposal == 2)
                     {
                         for (int y = 0; y < lastIh; y++)
@@ -237,6 +274,10 @@ namespace SharpImageConverter.Formats.Gif
                         Buffer.BlockCopy(prevCanvas, 0, canvas, 0, canvas.Length);
                         prevCanvas = null;
                     }
+
+                    transIndex = -1;
+                    disposal = 0;
+                    delayCs = 0;
                 }
                 else
                 {
@@ -244,8 +285,34 @@ namespace SharpImageConverter.Formats.Gif
             }
 
             if (frames.Count == 0)
+            {
                 frames.Add(new Image<Rgb24>(width, height, canvas));
-            return frames;
+                durations.Add(100);
+            }
+
+            return new GifAnimation(frames, durations, loopCount);
+        }
+
+        /// <summary>
+        /// 解码 GIF 所有帧为 Rgb24 图像列表
+        /// </summary>
+        /// <param name="path">输入文件路径</param>
+        /// <returns>帧列表（Rgb24）</returns>
+        public System.Collections.Generic.List<Image<Rgb24>> DecodeAllFrames(string path)
+        {
+            using var fs = File.OpenRead(path);
+            return DecodeAllFrames(fs);
+        }
+
+        /// <summary>
+        /// 从流解码 GIF 所有帧为 Rgb24 图像列表
+        /// </summary>
+        /// <param name="stream">输入流</param>
+        /// <returns>帧列表（Rgb24）</returns>
+        public System.Collections.Generic.List<Image<Rgb24>> DecodeAllFrames(Stream stream)
+        {
+            var anim = DecodeAnimationRgb24(stream);
+            return new System.Collections.Generic.List<Image<Rgb24>>(anim.Frames);
         }
 
         /// <summary>

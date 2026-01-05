@@ -4,6 +4,8 @@ using System.IO;
 
 using SharpImageConverter.Core;
 using SharpImageConverter.Processing;
+using SharpImageConverter.Formats.Gif;
+using SharpImageConverter.Formats;
 
 namespace SharpImageConverter;
 
@@ -147,19 +149,47 @@ class Program
                 string defExt = ".png";
                 outputPath = Path.ChangeExtension(inputPath, defExt);
             }
-            var rgbaImage = Image.LoadRgba32(inputPath);
             string outExt2 = Path.GetExtension(outputPath).ToLowerInvariant();
-            if (outExt2 is ".jpg" or ".jpeg")
+            if (inExt == ".gif" && outExt2 == ".webp")
             {
-                int q = jpegQuality ?? 75;
-                var frame = new ImageFrame(rgbaImage.Width, rgbaImage.Height, RgbaToRgb(rgbaImage.Buffer));
-                JpegEncoder.DebugPrintConfig = jpegDebug;
-                bool effectiveSubsample420 = subsample420 ?? true;
-                frame.SaveAsJpeg(outputPath, q, effectiveSubsample420);
+                var gifDec = new GifDecoder();
+                GifAnimation anim;
+                using (var fs = File.OpenRead(inputPath))
+                {
+                    anim = gifDec.DecodeAnimationRgb24(fs);
+                }
+
+                if (anim.Frames.Count == 0)
+                {
+                    var rgbaImage = Image.LoadRgba32(inputPath);
+                    Image.Save(rgbaImage, outputPath);
+                }
+                else if (anim.Frames.Count == 1)
+                {
+                    var rgbaImage = ToRgba32(anim.Frames[0]);
+                    Image.Save(rgbaImage, outputPath);
+                }
+                else
+                {
+                    int loop = anim.LoopCount;
+                    WebpAnimationEncoder.EncodeRgb24(outputPath, anim.Frames, anim.FrameDurationsMs, loop, 75f);
+                }
             }
             else
             {
-                Image.Save(rgbaImage, outputPath);
+                var rgbaImage = Image.LoadRgba32(inputPath);
+                if (outExt2 is ".jpg" or ".jpeg")
+                {
+                    int q = jpegQuality ?? 75;
+                    var frame = new ImageFrame(rgbaImage.Width, rgbaImage.Height, RgbaToRgb(rgbaImage.Buffer));
+                    JpegEncoder.DebugPrintConfig = jpegDebug;
+                    bool effectiveSubsample420 = subsample420 ?? true;
+                    frame.SaveAsJpeg(outputPath, q, effectiveSubsample420);
+                }
+                else
+                {
+                    Image.Save(rgbaImage, outputPath);
+                }
             }
             swTotal.Stop();
             Console.WriteLine($"✅ 写入完成: {outputPath}");
@@ -168,28 +198,53 @@ class Program
         }
         else
         {
-            var image = Image.Load(inputPath);
-            ImageExtensions.Mutate(image, ctx =>
-            {
-                foreach (var a in ops) a(ctx);
-            });
             if (outputPath == null)
             {
                 string defExt = ".bmp";
                 outputPath = Path.ChangeExtension(inputPath, defExt);
             }
             string outExt = Path.GetExtension(outputPath).ToLowerInvariant();
-            if (outExt is ".jpg" or ".jpeg")
+            if (inExt == ".gif" && outExt == ".webp")
             {
-                int q = jpegQuality ?? 75;
-                var frame = new ImageFrame(image.Width, image.Height, image.Buffer);
-                JpegEncoder.DebugPrintConfig = jpegDebug;
-                bool effectiveSubsample420 = subsample420 ?? true;
-                frame.SaveAsJpeg(outputPath, q, effectiveSubsample420);
+                var gifDec = new GifDecoder();
+                GifAnimation anim;
+                using (var fs = File.OpenRead(inputPath))
+                {
+                    anim = gifDec.DecodeAnimationRgb24(fs);
+                }
+
+                var processed = new List<Image<Rgb24>>(anim.Frames.Count);
+                for (int i = 0; i < anim.Frames.Count; i++)
+                {
+                    var frame = anim.Frames[i];
+                    ImageExtensions.Mutate(frame, ctx =>
+                    {
+                        foreach (var a in ops) a(ctx);
+                    });
+                    processed.Add(frame);
+                }
+
+                WebpAnimationEncoder.EncodeRgb24(outputPath, processed, anim.FrameDurationsMs, anim.LoopCount, 75f);
             }
             else
             {
-                Image.Save(image, outputPath);
+                var image = Image.Load(inputPath);
+                ImageExtensions.Mutate(image, ctx =>
+                {
+                    foreach (var a in ops) a(ctx);
+                });
+                if (outExt is ".jpg" or ".jpeg")
+                {
+                    int q = jpegQuality ?? 75;
+                    var frame = new ImageFrame(image.Width, image.Height, image.Buffer);
+                    JpegEncoder.DebugPrintConfig = jpegDebug;
+                    bool effectiveSubsample420 = subsample420 ?? true;
+                    frame.SaveAsJpeg(outputPath, q, effectiveSubsample420);
+                }
+                else
+                {
+                    Image.Save(image, outputPath);
+                }
             }
             swTotal.Stop();
             Console.WriteLine($"✅ 写入完成: {outputPath}");
@@ -207,6 +262,19 @@ class Program
             rgb[j + 2] = rgba[i + 2];
         }
         return rgb;
+    }
+
+    static Image<Rgba32> ToRgba32(Image<Rgb24> image)
+    {
+        var rgba = new byte[image.Width * image.Height * 4];
+        for (int i = 0, j = 0; j < image.Buffer.Length; i += 4, j += 3)
+        {
+            rgba[i + 0] = image.Buffer[j + 0];
+            rgba[i + 1] = image.Buffer[j + 1];
+            rgba[i + 2] = image.Buffer[j + 2];
+            rgba[i + 3] = 255;
+        }
+        return new Image<Rgba32>(image.Width, image.Height, rgba);
     }
 
     private static string ResolveOutputPath(string inputPath, string? outputPath, string defaultExtension)

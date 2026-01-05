@@ -2,6 +2,7 @@ using System;
 using SharpImageConverter.Core;
 using SharpImageConverter;
 using System.IO;
+using System.Collections.Generic;
 
 namespace SharpImageConverter.Formats
 {
@@ -153,6 +154,53 @@ namespace SharpImageConverter.Formats
         public void EncodeRgba32(Stream stream, Image<Rgba32> image)
         {
             var webp = WebpCodec.EncodeRgba(image.Buffer, image.Width, image.Height, 75f);
+            stream.Write(webp, 0, webp.Length);
+        }
+    }
+
+    public static class WebpAnimationEncoder
+    {
+        public static void EncodeRgb24(string path, IReadOnlyList<Image<Rgb24>> frames, IReadOnlyList<int> frameDurationsMs, int loopCount, float quality = 75f)
+        {
+            using var fs = new FileStream(path, FileMode.Create, FileAccess.Write);
+            EncodeRgb24(fs, frames, frameDurationsMs, loopCount, quality);
+        }
+
+        public static void EncodeRgb24(Stream stream, IReadOnlyList<Image<Rgb24>> frames, IReadOnlyList<int> frameDurationsMs, int loopCount, float quality = 75f)
+        {
+            ArgumentNullException.ThrowIfNull(stream, nameof(stream));
+            ArgumentNullException.ThrowIfNull(frames, nameof(frames));
+            ArgumentNullException.ThrowIfNull(frameDurationsMs, nameof(frameDurationsMs));
+
+            if (frames.Count == 0) throw new ArgumentOutOfRangeException(nameof(frames));
+            if (frames.Count != frameDurationsMs.Count) throw new ArgumentException("帧与时长数量不一致");
+
+            int width = frames[0].Width;
+            int height = frames[0].Height;
+
+            var rgbaFrames = new byte[frames.Count][];
+            var durations = new int[frames.Count];
+
+            for (int fi = 0; fi < frames.Count; fi++)
+            {
+                var frame = frames[fi];
+                if (frame.Width != width || frame.Height != height) throw new ArgumentException("所有帧必须具有相同的宽高");
+
+                var rgba = new byte[width * height * 4];
+                for (int i = 0, j = 0; j < frame.Buffer.Length; i += 4, j += 3)
+                {
+                    rgba[i + 0] = frame.Buffer[j + 0];
+                    rgba[i + 1] = frame.Buffer[j + 1];
+                    rgba[i + 2] = frame.Buffer[j + 2];
+                    rgba[i + 3] = 255;
+                }
+                rgbaFrames[fi] = rgba;
+
+                int d = frameDurationsMs[fi];
+                durations[fi] = d < 10 ? 10 : d;
+            }
+
+            var webp = WebpCodec.EncodeAnimatedRgba(rgbaFrames, width, height, durations, loopCount, quality);
             stream.Write(webp, 0, webp.Length);
         }
     }
