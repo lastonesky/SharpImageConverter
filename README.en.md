@@ -6,10 +6,10 @@ Pure C# image processing and format conversion library with minimal external dep
 
 ### JPEG
 - Decode Baseline and Progressive JPEG
-- Huffman decode, dequantization, IDCT, YCbCr to RGB
+- Huffman decode, dequantization, integer IDCT, YCbCr to RGB
 - Auto-apply EXIF Orientation (rotate/flip)
 - Encode Baseline JPEG from intermediate RGB with adjustable quality
-- Chroma upsampling optimizations: fast paths for 4:2:0 and 4:2:2; general 16.16 fixed-point bilinear fallback
+- Supports common sampling factors (e.g. 4:4:4/4:2:2/4:2:0); chroma upsampling uses nearest-neighbor resampling
 
 ### PNG
 - Read:
@@ -69,6 +69,12 @@ SharpImageConverter/
 Requirements:
 - .NET SDK 8.0 or newer (library target frameworks: `net8.0;net10.0`)
 - Windows/Linux/macOS (WebP requires loading the native libraries under `runtimes/` for your platform)
+
+## Install (NuGet)
+
+```bash
+dotnet add package SharpImageConverter --version 0.1.0
+```
 
 Namespaces:
 
@@ -161,3 +167,7 @@ dotnet run -- input.jpg output.png resize:800x600
 # Resize to fit and set JPEG quality
 dotnet run -- big.png thumb.jpg resizefit:200x200 --quality 90
 ```
+
+## License
+
+MIT

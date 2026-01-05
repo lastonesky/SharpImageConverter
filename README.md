@@ -6,10 +6,10 @@
 
 ### JPEG 支持
 - 基线（Baseline）与渐进式（Progressive）解码
-- Huffman 解码、反量化、IDCT、YCbCr 转 RGB
+- Huffman 解码、反量化、整数 IDCT、YCbCr 转 RGB
 - 支持 EXIF Orientation 自动旋转/翻转
 - 支持将中间 RGB 图像编码输出为基线 JPEG（Baseline，quality 可调）
-- 色度上采样优化：4:2:0/4:2:2 专用快速路径，通用 16.16 定点双线性回退
+- 支持常见采样因子（如 4:4:4/4:2:2/4:2:0），色度上采样使用最近邻回采样
 
 ### PNG 支持
 - 读取：
@@ -69,6 +69,12 @@ SharpImageConverter/
 环境要求：
 - .NET SDK 8.0 或更高版本（本库目标框架：`net8.0;net10.0`）
 - Windows/Linux/macOS（WebP 对应平台需加载 `runtimes/` 下原生库）
+
+## 安装（NuGet）
+
+```bash
+dotnet add package SharpImageConverter --version 0.1.0
+```
 
 引用命名空间：
 ```csharp
@@ -160,3 +166,7 @@ dotnet run -- input.jpg output.png resize:800x600
 # 缩放适应并设置 JPEG 质量
 dotnet run -- big.png thumb.jpg resizefit:200x200 --quality 90
 ```
+
+## 许可证
+
+MIT
