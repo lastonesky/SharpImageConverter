@@ -81,12 +81,12 @@ using SharpImageConverter.Processing;
 
 ```csharp
 // 加载为 RGB24
-var image = Image.Load("input.jpg"); // 参见 API 入口 [Image](file:///d:/Project/jpeg2bmp/src/Core/Image.cs#L51-L95)
+var image = Image.Load("input.jpg"); // 参见 API 入口 [Image](src/Core/Image.cs)
 
 // 处理：缩放到不超过 320x240，转灰度
 image.Mutate(ctx => ctx
     .ResizeToFit(320, 240)       // 最近邻或双线性请选用不同 API
-    .Grayscale());               // 参见处理管线 [Processing](file:///d:/Project/jpeg2bmp/src/Processing/Processing.cs#L18-L143)
+    .Grayscale());               // 参见处理管线 [Processing](src/Processing/Processing.cs)
 
 // 保存（根据扩展名选择编码器）
 Image.Save(image, "output.png");
@@ -101,119 +101,62 @@ var rgba = Image.LoadRgba32("input.png");
 Image.Save(rgba, "output.webp");
 ```
 
-- 通过 Stream 加载（自动嗅探文件头）
+- 流式操作（Stream）：
 
 ```csharp
-using var fs = File.OpenRead("input.jpg");
-var frame = SharpImageConverter.ImageFrame.Load(fs); // 入口 [ImageFrame.Load(Stream)](file:///d:/Project/jpeg2bmp/src/ImageFrame.cs#L69-L114)
-var imageFromStream = new Image<Rgb24>(frame.Width, frame.Height, frame.Pixels);
+using SharpImageConverter; // ImageFrame
+
+// 从流加载（自动嗅探格式）
+using var input = File.OpenRead("input.jpg");
+var frame = ImageFrame.Load(input);
+
+// 如需处理，转换为 Image<Rgb24>
+var image = new Image<Rgb24>(frame.Width, frame.Height, frame.Pixels);
+image.Mutate(ctx => ctx.Grayscale());
+
+// 保存到流（需明确指定格式，或封装回 ImageFrame 使用便捷方法）
+using var output = new MemoryStream();
+// 方式 A: 使用 ImageFrame 便捷方法
+new ImageFrame(image.Width, image.Height, image.Buffer).SaveAsPng(output);
+// 方式 B: 使用特定编码器
+// new SharpImageConverter.Formats.PngEncoderAdapter().EncodeRgb24(output, image);
 ```
 
-- 克隆并缩放用法
+## 命令行工具 (CLI)
 
-```csharp
-var original = Image.Load("input.jpg");
-var clone = new Image<Rgb24>(original.Width, original.Height, (byte[])original.Buffer.Clone());
-clone.Mutate(ctx => ctx.Resize(640, 480));
-Image.Save(clone, "resized.png");
-```
+位于 `Cli/` 目录下，提供便捷的格式转换与简单处理功能。
 
-说明：
-- API 入口位于 [Image](file:///d:/Project/jpeg2bmp/src/Core/Image.cs#L51-L95)，其内部通过 [Configuration](file:///d:/Project/jpeg2bmp/src/Core/Configuration.cs#L20-L55) 进行格式嗅探与编码器路由。
-- RGB24 与 RGBA32 的保存会根据扩展名选择具体编码器，详见 [Configuration.SaveRgb24](file:///d:/Project/jpeg2bmp/src/Core/Configuration.cs#L77-L93) 与 [Configuration.SaveRgba32](file:///d:/Project/jpeg2bmp/src/Core/Configuration.cs#L127-L146)。
-- 处理管线使用扩展方法 `Mutate` 构建上下文，示例见 [ImageExtensions.Mutate](file:///d:/Project/jpeg2bmp/src/Processing/Processing.cs#L148-L160)。
+### 运行方式
 
-<details>
-<summary>命令行用法（CLI，默认折叠；点击展开）</summary>
-
-CLI 项目路径：`Cli/SharpImageConverter.Cli.csproj`
-
-环境要求：
-- .NET SDK 8.0+（或更高）
-- Windows/Linux/macOS（按平台加载 `runtimes/` 原生库）
-
-运行方式：
 ```bash
-# 在仓库根目录，指定 CLI 项目运行
-dotnet run --project Cli/SharpImageConverter.Cli.csproj -- <输入> [输出] [操作] [--quality N]
+# 在 Cli 目录下运行
+dotnet run -- <输入文件路径> [输出文件路径] [操作] [参数]
 ```
 
-支持的转换：
-- JPEG/PNG/BMP/WebP/GIF -> JPEG/PNG/BMP/WebP/GIF
+### 支持格式
+- 输入: .jpg/.jpeg/.png/.bmp/.webp/.gif
+- 输出: .jpg/.jpeg/.png/.bmp/.webp/.gif
 
-程序会自动根据输入文件扩展名（.jpg/.jpeg/.png/.bmp/.webp/.gif）识别格式，并根据输出文件扩展名选择保存格式。
+### 操作 (Operations)
+- `resize:WxH` : 强制缩放到指定宽 (W) 高 (H)
+- `resizefit:WxH` : 等比缩放到适应指定矩形框 (W x H)
+- `grayscale` : 转为灰度图
 
-操作（可选）：
-- resize:WxH
-- resizefit:WxH
-- grayscale
+### 参数 (Options)
+- `--quality N` : 设置 JPEG 编码质量 (0-100)，默认 75
+- `--subsample 420|444` : 设置 JPEG 色度采样，默认 420
+- `--jpeg-debug` : 启用 JPEG 解码调试输出
+- `--gif-frames` : (仅调试) 输出 GIF 的每一帧信息
 
-JPEG 参数（可选）：
-- --quality N
-- --subsample 420/444
-- --jpeg-debug
+### 示例
 
-示例：
 ```bash
-# JPEG 转 PNG
-dotnet run --project Cli/SharpImageConverter.Cli.csproj -- image.jpg image.png
+# 转换格式
+dotnet run -- input.png output.jpg
 
-# PNG 转 BMP
-dotnet run --project Cli/SharpImageConverter.Cli.csproj -- icon.png icon.bmp
+# 调整大小并转换
+dotnet run -- input.jpg output.png resize:800x600
 
-# BMP 转 PNG
-dotnet run --project Cli/SharpImageConverter.Cli.csproj -- screenshot.bmp screenshot.png
-
-# PNG 转 JPEG
-dotnet run --project Cli/SharpImageConverter.Cli.csproj -- icon.png icon.jpg
-
-# JPEG 转 JPEG（重编码）
-dotnet run --project Cli/SharpImageConverter.Cli.csproj -- image.jpg image_reencode.jpg
-
-# JPEG 转 WebP
-dotnet run --project Cli/SharpImageConverter.Cli.csproj -- image.jpg image.webp
-
-# WebP 转 PNG
-dotnet run --project Cli/SharpImageConverter.Cli.csproj -- image.webp image.png
-
-# GIF 转 PNG
-dotnet run --project Cli/SharpImageConverter.Cli.csproj -- animation.gif frame_0.png
-
-# PNG 转 GIF
-dotnet run --project Cli/SharpImageConverter.Cli.csproj -- image.png image.gif
-
-# 转换并缩放到 320x240 内
-dotnet run --project Cli/SharpImageConverter.Cli.csproj -- image.jpg out.webp resizefit:320x240
+# 缩放适应并设置 JPEG 质量
+dotnet run -- big.png thumb.jpg resizefit:200x200 --quality 90
 ```
-
-</details>
-
-## 已知限制
-
-- 非常规采样率（非 4:2:0 / 4:2:2 / 4:4:4）走通用定点双线性回退路径，性能相对较低。
-- PNG 写入仅支持 Truecolor（RGB24），不保留源文件的调色板、元数据与透明通道。
-- JPEG 编码目前仅支持 Baseline（非 Progressive），默认使用 4:2:0 子采样，不写入 EXIF 等元数据。
-- WebP 编码参数目前较少（质量固定），后续会补齐可配置项。
-- GIF 写入仅支持单帧；不写入透明通道、帧延时与循环信息。
-
-
-## 下一步计划
-
-- 进一步压榨 JPEG 颜色转换与上采样性能（SIMD/Vector 化，块级 2×2 处理）。
-- 增强鲁棒性（容错、特殊 JPEG 变体）。
-- 增加单元测试与更多示例图片验证。
-- 完善 WebP 编码参数（质量/无损/alpha 等）与跨平台运行时布局。
-
-
-## 故障排查
-
-- “文件不存在”：请检查 `Program.InputPath` 路径是否正确。
-- 解析/解码异常：请检查输入文件是否损坏。
-- WebP 写入/读取报错 `DllNotFoundException (0x8007007E)`：
-  - 确认输出目录存在 `runtimes/win-x64/*.dll`、`runtimes/linux-x64/*.so*` 或 `runtimes/osx-arm64/*.dylib`
-  - Windows 推荐至少包含：`libwebp.dll`、`libwebpdecoder.dll`（以及部分版本需要的 `libsharpyuv.dll`）
-  - Windows 下部分 `libwebp.dll` 依赖 `libsharpyuv.dll` 与 VC++ 运行时：请将依赖 DLL 放到同目录，或安装 Microsoft Visual C++ 2015-2022 x64 运行库
-
-## 说明
-
-本项目为学习/演示用途，准确性优先于性能。若要支持更广泛的 JPEG 变体或大批量处理，建议逐步引入更高效的 IDCT、采样与缓存策略。
