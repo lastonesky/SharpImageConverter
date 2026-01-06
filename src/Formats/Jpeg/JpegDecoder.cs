@@ -10,6 +10,13 @@ namespace SharpImageConverter;
 /// </summary>
 public class JpegDecoder
 {
+    private const int ColorShift = 16;
+    private const int ColorHalf = 1 << (ColorShift - 1);
+    private static readonly int[] CbToB = BuildColorTable(116130);
+    private static readonly int[] CbToG = BuildColorTable(-22554);
+    private static readonly int[] CrToR = BuildColorTable(91881);
+    private static readonly int[] CrToG = BuildColorTable(-46802);
+
     private Stream _stream;
     private FrameHeader _frame;
     private readonly List<JpegQuantTable> _qtables = [];
@@ -740,6 +747,11 @@ public class JpegDecoder
         int mcuW = _frame.McuWidth;
         int mcuH = _frame.McuHeight;
 
+        bool is420 = compCb != null && compCr != null &&
+                     compY.HFactor == 2 && compY.VFactor == 2 &&
+                     compCb.HFactor == 1 && compCb.VFactor == 1 &&
+                     compCr.HFactor == 1 && compCr.VFactor == 1;
+
         byte[][] yBuffer = new byte[compY.HFactor * compY.VFactor][];
         for (int i = 0; i < yBuffer.Length; i++) yBuffer[i] = new byte[64];
 
@@ -781,7 +793,7 @@ public class JpegDecoder
                         }
                         if (qt == null) throw new InvalidDataException("Quantization table not found for Y component");
 
-                        for (int i = 0; i < 64; i++) 
+                        for (int i = 0; i < 64; i++)
                             dequantY[i] = compY.Coeffs[blockIdx * 64 + i] * qt.Values[i];
 
                         JpegIDCT.BlockIDCT(dequantY, yBuffer[v * compY.HFactor + h]);
@@ -805,7 +817,7 @@ public class JpegDecoder
                                 qtCb = _qtablesById[cbQId];
                             }
                             if (qtCb == null) throw new InvalidDataException("Quantization table not found for Cb component");
-                            for (int i = 0; i < 64; i++) 
+                            for (int i = 0; i < 64; i++)
                                 dequantCb[i] = compCb.Coeffs[cbIdx * 64 + i] * qtCb.Values[i];
                             JpegIDCT.BlockIDCT(dequantCb, cbBuffer[v * compCb.HFactor + h]);
                         }
@@ -829,7 +841,7 @@ public class JpegDecoder
                                 qtCr = _qtablesById[crQId];
                             }
                             if (qtCr == null) throw new InvalidDataException("Quantization table not found for Cr component");
-                            for (int i = 0; i < 64; i++) 
+                            for (int i = 0; i < 64; i++)
                                 dequantCr[i] = compCr.Coeffs[crIdx * 64 + i] * qtCr.Values[i];
                             JpegIDCT.BlockIDCT(dequantCr, crBuffer[v * compCr.HFactor + h]);
                         }
@@ -839,79 +851,132 @@ public class JpegDecoder
                 int pixelBaseX = mcuX * mcuW;
                 int pixelBaseY = mcuY * mcuH;
 
-                for (int py = 0; py < mcuH; py++)
+                if (is420 && cbBuffer != null && crBuffer != null)
                 {
-                    for (int px = 0; px < mcuW; px++)
+                    byte[] cbBlock = cbBuffer[0];
+                    byte[] crBlock = crBuffer[0];
+
+                    for (int py = 0; py < mcuH; py++)
                     {
-                        int globalX = pixelBaseX + px;
                         int globalY = pixelBaseY + py;
+                        if (globalY >= height) break;
 
-                        if (globalX >= width || globalY >= height) continue;
+                        int yBlockY = py >> 3;
+                        int yInnerY = py & 7;
+                        int cbY = py >> 1;
 
-                        int yBlockX = px / 8;
-                        int yBlockY = py / 8;
-                        int yBlockIdx = yBlockY * compY.HFactor + yBlockX;
-                        int yInnerX = px % 8;
-                        int yInnerY = py % 8;
-
-                        byte Y = yBuffer[yBlockIdx][yInnerY * 8 + yInnerX];
-
-                        byte Cb = 128;
-                        byte Cr = 128;
-
-                        if (compCb != null)
+                        for (int px = 0; px < mcuW; px++)
                         {
-                            int cbX = (px * compCb.HFactor) / compY.HFactor;
-                            int cbY = (py * compCb.VFactor) / compY.VFactor;
+                            int globalX = pixelBaseX + px;
+                            if (globalX >= width) break;
 
-                            int cbBlockX = cbX / 8;
-                            int cbBlockY = cbY / 8;
-                            int cbInnerX = cbX % 8;
-                            int cbInnerY = cbY % 8;
+                            int yBlockX = px >> 3;
+                            int yBlockIdx = yBlockY * compY.HFactor + yBlockX;
+                            int yInnerX = px & 7;
 
-                            int cbBlockIdx = cbBlockY * compCb.HFactor + cbBlockX;
+                            byte Y = yBuffer[yBlockIdx][yInnerY * 8 + yInnerX];
 
-                            if (cbBlockIdx < cbBuffer.Length)
-                            {
-                                Cb = cbBuffer[cbBlockIdx][cbInnerY * 8 + cbInnerX];
-                            }
+                            int cbX = px >> 1;
+                            int cbIdx = cbY * 8 + cbX;
+
+                            byte Cb = cbBlock[cbIdx];
+                            byte Cr = crBlock[cbIdx];
+
+                            int yScaled = Y << ColorShift;
+                            int r = (yScaled + CrToR[Cr] + ColorHalf) >> ColorShift;
+                            int g = (yScaled + CbToG[Cb] + CrToG[Cr] + ColorHalf) >> ColorShift;
+                            int b = (yScaled + CbToB[Cb] + ColorHalf) >> ColorShift;
+
+                            int idx = (globalY * width + globalX) * 3;
+                            rgb[idx] = (byte)JpegUtils.Clamp(r);
+                            rgb[idx + 1] = (byte)JpegUtils.Clamp(g);
+                            rgb[idx + 2] = (byte)JpegUtils.Clamp(b);
                         }
-
-                        if (compCr != null)
+                    }
+                }
+                else
+                {
+                    for (int py = 0; py < mcuH; py++)
+                    {
+                        for (int px = 0; px < mcuW; px++)
                         {
-                            int crX = (px * compCr.HFactor) / compY.HFactor;
-                            int crY = (py * compCr.VFactor) / compY.VFactor;
+                            int globalX = pixelBaseX + px;
+                            int globalY = pixelBaseY + py;
 
-                            int crBlockX = crX / 8;
-                            int crBlockY = crY / 8;
-                            int crInnerX = crX % 8;
-                            int crInnerY = crY % 8;
+                            if (globalX >= width || globalY >= height) continue;
 
-                            int crBlockIdx = crBlockY * compCr.HFactor + crBlockX;
+                            int yBlockX = px / 8;
+                            int yBlockY = py / 8;
+                            int yBlockIdx = yBlockY * compY.HFactor + yBlockX;
+                            int yInnerX = px % 8;
+                            int yInnerY = py % 8;
 
-                            if (crBlockIdx < crBuffer.Length)
+                            byte Y = yBuffer[yBlockIdx][yInnerY * 8 + yInnerX];
+
+                            byte Cb = 128;
+                            byte Cr = 128;
+
+                            if (compCb != null && cbBuffer != null)
                             {
-                                Cr = crBuffer[crBlockIdx][crInnerY * 8 + crInnerX];
+                                int cbX = (px * compCb.HFactor) / compY.HFactor;
+                                int cbY = (py * compCb.VFactor) / compY.VFactor;
+
+                                int cbBlockX = cbX / 8;
+                                int cbBlockY = cbY / 8;
+                                int cbInnerX = cbX % 8;
+                                int cbInnerY = cbY % 8;
+
+                                int cbBlockIdx = cbBlockY * compCb.HFactor + cbBlockX;
+
+                                if (cbBlockIdx < cbBuffer.Length)
+                                {
+                                    Cb = cbBuffer[cbBlockIdx][cbInnerY * 8 + cbInnerX];
+                                }
                             }
+
+                            if (compCr != null && crBuffer != null)
+                            {
+                                int crX = (px * compCr.HFactor) / compY.HFactor;
+                                int crY = (py * compCr.VFactor) / compY.VFactor;
+
+                                int crBlockX = crX / 8;
+                                int crBlockY = crY / 8;
+                                int crInnerX = crX % 8;
+                                int crInnerY = crY % 8;
+
+                                int crBlockIdx = crBlockY * compCr.HFactor + crBlockX;
+
+                                if (crBlockIdx < crBuffer.Length)
+                                {
+                                    Cr = crBuffer[crBlockIdx][crInnerY * 8 + crInnerX];
+                                }
+                            }
+
+                            int yScaled = Y << ColorShift;
+                            int r = (yScaled + CrToR[Cr] + ColorHalf) >> ColorShift;
+                            int g = (yScaled + CbToG[Cb] + CrToG[Cr] + ColorHalf) >> ColorShift;
+                            int b = (yScaled + CbToB[Cb] + ColorHalf) >> ColorShift;
+
+                            int idx = (globalY * width + globalX) * 3;
+                            rgb[idx] = (byte)JpegUtils.Clamp(r);
+                            rgb[idx + 1] = (byte)JpegUtils.Clamp(g);
+                            rgb[idx + 2] = (byte)JpegUtils.Clamp(b);
                         }
-
-                        double cCb = Cb - 128;
-                        double cCr = Cr - 128;
-
-                        int r = (int)(Y + 1.402 * cCr);
-                        int g = (int)(Y - 0.344136 * cCb - 0.714136 * cCr);
-                        int b = (int)(Y + 1.772 * cCb);
-
-                        int idx = (globalY * width + globalX) * 3;
-                        rgb[idx] = (byte)JpegUtils.Clamp(r);
-                        rgb[idx + 1] = (byte)JpegUtils.Clamp(g);
-                        rgb[idx + 2] = (byte)JpegUtils.Clamp(b);
                     }
                 }
             }
         }
-
         return new Image<Rgb24>(width, height, rgb);
+    }
+
+    private static int[] BuildColorTable(int k)
+    {
+        var t = new int[256];
+        for (int i = 0; i < 256; i++)
+        {
+            t[i] = (i - 128) * k;
+        }
+        return t;
     }
 
     private int DecodeHuffman(HuffmanDecodingTable ht, JpegBitReader reader)

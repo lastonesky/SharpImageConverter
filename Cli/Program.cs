@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 
 using SharpImageConverter.Core;
@@ -26,17 +27,11 @@ class Program
         string? outputPath = null;
         int? jpegQuality = null;
         bool? subsample420 = null;
-        bool jpegDebug = false;
         bool gifFrames = false;
         var ops = new List<Action<Processing.ImageProcessingContext>>();
         for (int i = 1; i < args.Length; i++)
         {
             string a = args[i];
-            if (string.Equals(a, "--jpeg-debug", StringComparison.OrdinalIgnoreCase) || string.Equals(a, "--debug-jpeg", StringComparison.OrdinalIgnoreCase))
-            {
-                jpegDebug = true;
-                continue;
-            }
             if (string.Equals(a, "--gif-frames", StringComparison.OrdinalIgnoreCase))
             {
                 gifFrames = true;
@@ -177,18 +172,33 @@ class Program
             }
             else
             {
-                var rgbaImage = Image.LoadRgba32(inputPath);
-                if (outExt2 is ".jpg" or ".jpeg")
+                if (inExt is ".jpg" or ".jpeg" && outExt2 == ".bmp")
                 {
+                    var image = Image.Load(inputPath);
+                    Image.Save(image, outputPath);
+                }
+                else if (inExt is ".jpg" or ".jpeg" && (outExt2 is ".jpg" or ".jpeg"))
+                {
+                    var image = Image.Load(inputPath);
                     int q = jpegQuality ?? 75;
-                    var frame = new ImageFrame(rgbaImage.Width, rgbaImage.Height, RgbaToRgb(rgbaImage.Buffer));
-                    JpegEncoder.DebugPrintConfig = jpegDebug;
+                    var frame = new ImageFrame(image.Width, image.Height, image.Buffer);
                     bool effectiveSubsample420 = subsample420 ?? true;
                     frame.SaveAsJpeg(outputPath, q, effectiveSubsample420);
                 }
                 else
                 {
-                    Image.Save(rgbaImage, outputPath);
+                    var rgbaImage = Image.LoadRgba32(inputPath);
+                    if (outExt2 is ".jpg" or ".jpeg")
+                    {
+                        int q = jpegQuality ?? 75;
+                        var frame = new ImageFrame(rgbaImage.Width, rgbaImage.Height, RgbaToRgb(rgbaImage.Buffer));
+                        bool effectiveSubsample420 = subsample420 ?? true;
+                        frame.SaveAsJpeg(outputPath, q, effectiveSubsample420);
+                    }
+                    else
+                    {
+                        Image.Save(rgbaImage, outputPath);
+                    }
                 }
             }
             swTotal.Stop();
@@ -237,7 +247,6 @@ class Program
                 {
                     int q = jpegQuality ?? 75;
                     var frame = new ImageFrame(image.Width, image.Height, image.Buffer);
-                    JpegEncoder.DebugPrintConfig = jpegDebug;
                     bool effectiveSubsample420 = subsample420 ?? true;
                     frame.SaveAsJpeg(outputPath, q, effectiveSubsample420);
                 }
