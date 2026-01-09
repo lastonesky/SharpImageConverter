@@ -19,7 +19,7 @@ class Program
             Console.WriteLine("用法: dotnet run -- <输入文件路径> [输出文件路径] [操作] [--quality N]");
             Console.WriteLine("支持输入: .jpg/.jpeg/.png/.bmp/.webp/.gif");
             Console.WriteLine("支持输出: .jpg/.jpeg/.png/.bmp/.webp/.gif");
-            Console.WriteLine("操作: resize:WxH | resizefit:WxH | grayscale");
+            Console.WriteLine("操作: resize:WxH | resizebilinear:WxH | resizefit:WxH | grayscale");
             Console.WriteLine("参数: --quality N | --subsample 420/444 | --fdct int/float | --jpeg-debug | --gif-frames");
             return;
         }
@@ -28,7 +28,7 @@ class Program
         int? jpegQuality = null;
         bool? subsample420 = null;
         bool gifFrames = false;
-        var ops = new List<Action<Processing.ImageProcessingContext>>();
+        var ops = new List<Action<ImageProcessingContext>>();
         for (int i = 1; i < args.Length; i++)
         {
             string a = args[i];
@@ -49,7 +49,7 @@ class Program
             if (a.StartsWith("--quality=", StringComparison.OrdinalIgnoreCase))
             {
                 string v = a["--quality=".Length..];
-                if (int.TryParse(v, out int q)) jpegQuality = q;
+                if (int.TryParse(v, out int q2)) jpegQuality = q2;
                 continue;
             }
             if (string.Equals(a, "--subsample", StringComparison.OrdinalIgnoreCase))
@@ -80,12 +80,21 @@ class Program
                 }
                 continue;
             }
+            if (op.StartsWith("resizebilinear:"))
+            {
+                var parts = op.Substring("resizebilinear:".Length).Split('x');
+                if (parts.Length == 2 && int.TryParse(parts[0], out int w) && int.TryParse(parts[1], out int h))
+                {
+                    ops.Add(ctx => ctx.ResizeBilinear(w, h));
+                }
+                continue;
+            }
             if (op.StartsWith("resizefit:"))
             {
                 var parts = op[10..].Split('x');
-                if (parts.Length == 2 && int.TryParse(parts[0], out int w) && int.TryParse(parts[1], out int h))
+                if (parts.Length == 2 && int.TryParse(parts[0], out int w2) && int.TryParse(parts[1], out int h2))
                 {
-                    ops.Add(ctx => ctx.ResizeToFit(w, h));
+                    ops.Add(ctx => ctx.ResizeToFit(w2, h2));
                 }
                 continue;
             }
@@ -100,7 +109,7 @@ class Program
                 outputPath = a;
             }
         }
-        var swTotal = System.Diagnostics.Stopwatch.StartNew();
+        var swTotal = Stopwatch.StartNew();
         string inExt = Path.GetExtension(inputPath).ToLowerInvariant();
         if (gifFrames && inExt == ".gif")
         {
@@ -112,7 +121,7 @@ class Program
             {
                 ext = ".png";
             }
-            var gifDec = new SharpImageConverter.Formats.Gif.GifDecoder();
+            var gifDec = new GifDecoder();
             var frames = gifDec.DecodeAllFrames(inputPath);
             int digits = Math.Max(3, frames.Count.ToString().Length);
             for (int i = 0; i < frames.Count; i++)
@@ -142,7 +151,7 @@ class Program
             if (outputPath == null)
             {
                 string defExt = ".png";
-                outputPath = Path.ChangeExtension(inputPath, defExt);
+                outputPath = ResolveOutputPath(inputPath, outputPath, defExt);
             }
             string outExt2 = Path.GetExtension(outputPath).ToLowerInvariant();
             if (inExt == ".gif" && outExt2 == ".webp")
@@ -172,12 +181,18 @@ class Program
             }
             else
             {
-                if (inExt is ".jpg" or ".jpeg" && outExt2 == ".bmp")
+                if (outputPath == null)
+                {
+                    string defExt = ".png";
+                    outputPath = ResolveOutputPath(inputPath, outputPath, defExt);
+                }
+                string outExt2b = Path.GetExtension(outputPath).ToLowerInvariant();
+                if (inExt is ".jpg" or ".jpeg" && outExt2b == ".bmp")
                 {
                     var image = Image.Load(inputPath);
                     Image.Save(image, outputPath);
                 }
-                else if (inExt is ".jpg" or ".jpeg" && (outExt2 is ".jpg" or ".jpeg"))
+                else if (inExt is ".jpg" or ".jpeg" && (outExt2b is ".jpg" or ".jpeg"))
                 {
                     var image = Image.Load(inputPath);
                     int q = jpegQuality ?? 75;
@@ -188,7 +203,7 @@ class Program
                 else
                 {
                     var rgbaImage = Image.LoadRgba32(inputPath);
-                    if (outExt2 is ".jpg" or ".jpeg")
+                    if (outExt2b is ".jpg" or ".jpeg")
                     {
                         int q = jpegQuality ?? 75;
                         var frame = new ImageFrame(rgbaImage.Width, rgbaImage.Height, RgbaToRgb(rgbaImage.Buffer));
@@ -211,7 +226,7 @@ class Program
             if (outputPath == null)
             {
                 string defExt = ".bmp";
-                outputPath = Path.ChangeExtension(inputPath, defExt);
+                outputPath = ResolveOutputPath(inputPath, outputPath, defExt);
             }
             string outExt = Path.GetExtension(outputPath).ToLowerInvariant();
             if (inExt == ".gif" && outExt == ".webp")

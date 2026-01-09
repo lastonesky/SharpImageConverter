@@ -1,4 +1,6 @@
 using System;
+using System.Numerics;
+using System.Threading.Tasks;
 using SharpImageConverter.Core;
 
 namespace SharpImageConverter.Processing
@@ -38,9 +40,12 @@ namespace SharpImageConverter.Processing
             if (sw <= 0 || sh <= 0 || width <= 0 || height <= 0) return this;
 
             bool isUpscale = width > sw || height > sh;
-            return isUpscale
-                ? ResizeBicubic(width, height)
-                : ResizeBilinear(width, height);
+            if (isUpscale)
+            {
+                return ResizeBicubicOptimized(width, height);
+            }
+
+            return ResizeArea(width, height);
         }
 
         /// <summary>
@@ -84,6 +89,89 @@ namespace SharpImageConverter.Processing
                     dst[d + 2] = (byte)(b0 * (1 - ty) + b1 * ty + 0.5);
                 }
             }
+            _image.Update(width, height, dst);
+            return this;
+        }
+
+        private ImageProcessingContext ResizeArea(int width, int height)
+        {
+            var src = _image.Buffer;
+            int sw = _image.Width;
+            int sh = _image.Height;
+            if (sw <= 0 || sh <= 0 || width <= 0 || height <= 0) return this;
+
+            var dst = new byte[width * height * 3];
+
+            double scaleX = (double)sw / width;
+            double scaleY = (double)sh / height;
+
+            for (int dy = 0; dy < height; dy++)
+            {
+                double sy0 = dy * scaleY;
+                double sy1 = (dy + 1) * scaleY;
+                int syStart = (int)Math.Floor(sy0);
+                int syEnd = (int)Math.Ceiling(sy1);
+                if (syStart < 0) syStart = 0;
+                if (syEnd > sh) syEnd = sh;
+
+                for (int dx = 0; dx < width; dx++)
+                {
+                    double sx0 = dx * scaleX;
+                    double sx1 = (dx + 1) * scaleX;
+                    int sxStart = (int)Math.Floor(sx0);
+                    int sxEnd = (int)Math.Ceiling(sx1);
+                    if (sxStart < 0) sxStart = 0;
+                    if (sxEnd > sw) sxEnd = sw;
+
+                    double sumR = 0;
+                    double sumG = 0;
+                    double sumB = 0;
+                    double totalArea = 0;
+
+                    for (int sy = syStart; sy < syEnd; sy++)
+                    {
+                        double yTop = sy;
+                        double yBottom = sy + 1;
+                        double yOverlapTop = sy0 > yTop ? sy0 : yTop;
+                        double yOverlapBottom = sy1 < yBottom ? sy1 : yBottom;
+                        double yWeight = yOverlapBottom - yOverlapTop;
+                        if (yWeight <= 0) continue;
+
+                        for (int sx = sxStart; sx < sxEnd; sx++)
+                        {
+                            double xLeft = sx;
+                            double xRight = sx + 1;
+                            double xOverlapLeft = sx0 > xLeft ? sx0 : xLeft;
+                            double xOverlapRight = sx1 < xRight ? sx1 : xRight;
+                            double xWeight = xOverlapRight - xOverlapLeft;
+                            if (xWeight <= 0) continue;
+
+                            double area = xWeight * yWeight;
+                            int s = (sy * sw + sx) * 3;
+                            sumR += src[s + 0] * area;
+                            sumG += src[s + 1] * area;
+                            sumB += src[s + 2] * area;
+                            totalArea += area;
+                        }
+                    }
+
+                    int d = (dy * width + dx) * 3;
+                    if (totalArea > 0)
+                    {
+                        double invArea = 1.0 / totalArea;
+                        dst[d + 0] = (byte)(sumR * invArea + 0.5);
+                        dst[d + 1] = (byte)(sumG * invArea + 0.5);
+                        dst[d + 2] = (byte)(sumB * invArea + 0.5);
+                    }
+                    else
+                    {
+                        dst[d + 0] = 0;
+                        dst[d + 1] = 0;
+                        dst[d + 2] = 0;
+                    }
+                }
+            }
+
             _image.Update(width, height, dst);
             return this;
         }
@@ -214,6 +302,212 @@ namespace SharpImageConverter.Processing
                     return a * x * x * x - 5.0 * a * x * x + 8.0 * a * x - 4.0 * a;
                 }
                 return 0.0;
+            }
+        }
+
+        public ImageProcessingContext ResizeBicubicOptimized(int width, int height)
+        {
+            var src = _image.Buffer;
+            var dst = new byte[width * height * 3];
+            int sw = _image.Width, sh = _image.Height;
+            if (sw <= 0 || sh <= 0 || width <= 0 || height <= 0)
+            {
+                _image.Update(width, height, dst);
+                return this;
+            }
+
+            float scaleX = (float)sw / width;
+            float scaleY = (float)sh / height;
+
+            int[] xIndex = new int[width * 4];
+            float[] xWeight = new float[width * 4];
+            for (int x = 0; x < width; x++)
+            {
+                float gx = (x + 0.5f) * scaleX - 0.5f;
+                int ix = (int)MathF.Floor(gx);
+                float t = gx - ix;
+                for (int k = -1; k <= 2; k++)
+                {
+                    int idx = x * 4 + (k + 1);
+                    int sx = ix + k;
+                    if (sx < 0) sx = 0;
+                    else if (sx >= sw) sx = sw - 1;
+                    xIndex[idx] = sx;
+                    xWeight[idx] = CubicF(t - k);
+                }
+            }
+
+            int[] yIndex = new int[height * 4];
+            float[] yWeight = new float[height * 4];
+            for (int y = 0; y < height; y++)
+            {
+                float gy = (y + 0.5f) * scaleY - 0.5f;
+                int iy = (int)MathF.Floor(gy);
+                float t = gy - iy;
+                for (int k = -1; k <= 2; k++)
+                {
+                    int idx = y * 4 + (k + 1);
+                    int sy = iy + k;
+                    if (sy < 0) sy = 0;
+                    else if (sy >= sh) sy = sh - 1;
+                    yIndex[idx] = sy;
+                    yWeight[idx] = CubicF(t - k);
+                }
+            }
+
+            int vecSize = Vector<float>.Count;
+
+            Parallel.For(0, height, y =>
+            {
+                int yOff = y * 4;
+                int sy0 = yIndex[yOff + 0];
+                int sy1 = yIndex[yOff + 1];
+                int sy2 = yIndex[yOff + 2];
+                int sy3 = yIndex[yOff + 3];
+                float wy0 = yWeight[yOff + 0];
+                float wy1 = yWeight[yOff + 1];
+                float wy2 = yWeight[yOff + 2];
+                float wy3 = yWeight[yOff + 3];
+
+                int dBase = y * width * 3;
+
+                int x = 0;
+                int vecLimit = width - (width % vecSize);
+                for (; x < vecLimit; x += vecSize)
+                {
+                    int xOff0 = x * 4;
+                    Span<int> sxBuf0 = stackalloc int[4 * Vector<float>.Count];
+                    Span<float> wxBuf0 = stackalloc float[4 * Vector<float>.Count];
+
+                    for (int i = 0; i < vecSize; i++)
+                    {
+                        int xo = x + i;
+                        int xOff = xo * 4;
+                        sxBuf0[i * 4 + 0] = xIndex[xOff + 0];
+                        sxBuf0[i * 4 + 1] = xIndex[xOff + 1];
+                        sxBuf0[i * 4 + 2] = xIndex[xOff + 2];
+                        sxBuf0[i * 4 + 3] = xIndex[xOff + 3];
+                        wxBuf0[i * 4 + 0] = xWeight[xOff + 0];
+                        wxBuf0[i * 4 + 1] = xWeight[xOff + 1];
+                        wxBuf0[i * 4 + 2] = xWeight[xOff + 2];
+                        wxBuf0[i * 4 + 3] = xWeight[xOff + 3];
+                    }
+
+                    for (int c = 0; c < 3; c++)
+                    {
+                        var vRes = Vector<float>.Zero;
+                        for (int i = 0; i < vecSize; i++)
+                        {
+                            int sx0 = sxBuf0[i * 4 + 0];
+                            int sx1 = sxBuf0[i * 4 + 1];
+                            int sx2 = sxBuf0[i * 4 + 2];
+                            int sx3 = sxBuf0[i * 4 + 3];
+                            float wx0 = wxBuf0[i * 4 + 0];
+                            float wx1 = wxBuf0[i * 4 + 1];
+                            float wx2 = wxBuf0[i * 4 + 2];
+                            float wx3 = wxBuf0[i * 4 + 3];
+
+                            float row0 =
+                                wx0 * src[(sy0 * sw + sx0) * 3 + c] +
+                                wx1 * src[(sy0 * sw + sx1) * 3 + c] +
+                                wx2 * src[(sy0 * sw + sx2) * 3 + c] +
+                                wx3 * src[(sy0 * sw + sx3) * 3 + c];
+                            float row1 =
+                                wx0 * src[(sy1 * sw + sx0) * 3 + c] +
+                                wx1 * src[(sy1 * sw + sx1) * 3 + c] +
+                                wx2 * src[(sy1 * sw + sx2) * 3 + c] +
+                                wx3 * src[(sy1 * sw + sx3) * 3 + c];
+                            float row2 =
+                                wx0 * src[(sy2 * sw + sx0) * 3 + c] +
+                                wx1 * src[(sy2 * sw + sx1) * 3 + c] +
+                                wx2 * src[(sy2 * sw + sx2) * 3 + c] +
+                                wx3 * src[(sy2 * sw + sx3) * 3 + c];
+                            float row3 =
+                                wx0 * src[(sy3 * sw + sx0) * 3 + c] +
+                                wx1 * src[(sy3 * sw + sx1) * 3 + c] +
+                                wx2 * src[(sy3 * sw + sx2) * 3 + c] +
+                                wx3 * src[(sy3 * sw + sx3) * 3 + c];
+
+                            float val =
+                                wy0 * row0 +
+                                wy1 * row1 +
+                                wy2 * row2 +
+                                wy3 * row3;
+
+                            if (val < 0f) val = 0f;
+                            else if (val > 255f) val = 255f;
+
+                            int d = dBase + (x + i) * 3 + c;
+                            dst[d] = (byte)(val + 0.5f);
+                        }
+                    }
+                }
+
+                for (; x < width; x++)
+                {
+                    int xOff = x * 4;
+                    int sx0 = xIndex[xOff + 0];
+                    int sx1 = xIndex[xOff + 1];
+                    int sx2 = xIndex[xOff + 2];
+                    int sx3 = xIndex[xOff + 3];
+                    float wx0 = xWeight[xOff + 0];
+                    float wx1 = xWeight[xOff + 1];
+                    float wx2 = xWeight[xOff + 2];
+                    float wx3 = xWeight[xOff + 3];
+                    int d = dBase + x * 3;
+
+                    for (int c = 0; c < 3; c++)
+                    {
+                        float row0 =
+                            wx0 * src[(sy0 * sw + sx0) * 3 + c] +
+                            wx1 * src[(sy0 * sw + sx1) * 3 + c] +
+                            wx2 * src[(sy0 * sw + sx2) * 3 + c] +
+                            wx3 * src[(sy0 * sw + sx3) * 3 + c];
+                        float row1 =
+                            wx0 * src[(sy1 * sw + sx0) * 3 + c] +
+                            wx1 * src[(sy1 * sw + sx1) * 3 + c] +
+                            wx2 * src[(sy1 * sw + sx2) * 3 + c] +
+                            wx3 * src[(sy1 * sw + sx3) * 3 + c];
+                        float row2 =
+                            wx0 * src[(sy2 * sw + sx0) * 3 + c] +
+                            wx1 * src[(sy2 * sw + sx1) * 3 + c] +
+                            wx2 * src[(sy2 * sw + sx2) * 3 + c] +
+                            wx3 * src[(sy2 * sw + sx3) * 3 + c];
+                        float row3 =
+                            wx0 * src[(sy3 * sw + sx0) * 3 + c] +
+                            wx1 * src[(sy3 * sw + sx1) * 3 + c] +
+                            wx2 * src[(sy3 * sw + sx2) * 3 + c] +
+                            wx3 * src[(sy3 * sw + sx3) * 3 + c];
+
+                        float val =
+                            wy0 * row0 +
+                            wy1 * row1 +
+                            wy2 * row2 +
+                            wy3 * row3;
+
+                        if (val < 0f) val = 0f;
+                        else if (val > 255f) val = 255f;
+                        dst[d + c] = (byte)(val + 0.5f);
+                    }
+                }
+            });
+
+            _image.Update(width, height, dst);
+            return this;
+
+            static float CubicF(float x)
+            {
+                const float a = -0.5f;
+                x = MathF.Abs(x);
+                if (x <= 1f)
+                {
+                    return (a + 2f) * x * x * x - (a + 3f) * x * x + 1f;
+                }
+                if (x < 2f)
+                {
+                    return a * x * x * x - 5f * a * x * x + 8f * a * x - 4f * a;
+                }
+                return 0f;
             }
         }
 

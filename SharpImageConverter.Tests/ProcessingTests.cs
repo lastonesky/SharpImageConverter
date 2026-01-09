@@ -8,19 +8,22 @@ namespace Jpeg2Bmp.Tests
     public class ProcessingTests
     {
         [Fact]
-        public void Resize_2x2_To_1x1_Picks_TopLeft()
+        public void Resize_2x2_To_1x1_Downscale_Uses_AreaAverage()
         {
             var img = TestImageFactory.CreateChecker(2, 2, (100, 110, 120), (200, 210, 220));
             ImageExtensions.Mutate(img, ctx => ctx.Resize(1, 1));
             Assert.Equal(1, img.Width);
             Assert.Equal(1, img.Height);
-            Assert.Equal(100, img.Buffer[0]);
-            Assert.Equal(110, img.Buffer[1]);
-            Assert.Equal(120, img.Buffer[2]);
+            int expectedR = (100 + 200 + 200 + 100) / 4;
+            int expectedG = (110 + 210 + 210 + 110) / 4;
+            int expectedB = (120 + 220 + 220 + 120) / 4;
+            Assert.Equal(expectedR, img.Buffer[0]);
+            Assert.Equal(expectedG, img.Buffer[1]);
+            Assert.Equal(expectedB, img.Buffer[2]);
         }
 
         [Fact]
-        public void Resize_3x3_To_6x6_NearestNeighborMapping()
+        public void Resize_3x3_To_6x6_Gradient_Is_Monotonic()
         {
             int sw = 3, sh = 3;
             var img = TestImageFactory.CreateGradient(sw, sh);
@@ -29,20 +32,25 @@ namespace Jpeg2Bmp.Tests
             Assert.Equal(6, img.Height);
             int width = img.Width, height = img.Height;
             var dst = img.Buffer;
-            var src = TestImageFactory.CreateGradient(sw, sh).Buffer;
-            int[] xs = new[] { 0, 1, 5 };
-            int[] ys = new[] { 0, 2, 5 };
-            foreach (var y in ys)
+
+            for (int y = 0; y < height; y++)
             {
-                foreach (var x in xs)
+                int rowOffset = y * width * 3;
+                for (int x = 1; x < width; x++)
                 {
-                    int sy = (int)((long)y * sh / height);
-                    int sx = (int)((long)x * sw / width);
-                    int s = (sy * sw + sx) * 3;
-                    int d = (y * width + x) * 3;
-                    Assert.Equal(src[s + 0], dst[d + 0]);
-                    Assert.Equal(src[s + 1], dst[d + 1]);
-                    Assert.Equal(src[s + 2], dst[d + 2]);
+                    int prev = rowOffset + (x - 1) * 3;
+                    int curr = rowOffset + x * 3;
+                    Assert.True(dst[prev + 0] <= dst[curr + 0]);
+                }
+            }
+
+            for (int x = 0; x < width; x++)
+            {
+                for (int y = 1; y < height; y++)
+                {
+                    int prev = ((y - 1) * width + x) * 3;
+                    int curr = (y * width + x) * 3;
+                    Assert.True(dst[prev + 1] <= dst[curr + 1]);
                 }
             }
         }
