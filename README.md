@@ -169,4 +169,4 @@ dotnet run -- big.png thumb.jpg resizefit:200x200 --quality 90
 
 ## 许可证
 
-MIT
+本项目主要在 AI 辅助下生成，并遵循 MIT 许可证。

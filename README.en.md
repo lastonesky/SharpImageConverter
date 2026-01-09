@@ -170,4 +170,4 @@ dotnet run -- big.png thumb.jpg resizefit:200x200 --quality 90
 
 ## License
 
-MIT
+This project is licensed under the MIT License. Please note that the code in this repository is primarily generated with the assistance of AI.
