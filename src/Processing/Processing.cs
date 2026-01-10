@@ -437,6 +437,23 @@ namespace SharpImageConverter.Processing
     public static class ImageExtensions
     {
         /// <summary>
+        /// 克隆图像，应用处理上下文并返回新图像
+        /// </summary>
+        /// <param name="image">输入图像（Rgb24）</param>
+        /// <param name="action">处理操作</param>
+        /// <returns>处理后的新图像（Rgb24）</returns>
+        public static Image<Rgb24> Clone(this Image<Rgb24> image, Action<ImageProcessingContext> action)
+        {
+            var srcBuffer = image.Buffer;
+            var clonedBuffer = new byte[srcBuffer.Length];
+            Buffer.BlockCopy(srcBuffer, 0, clonedBuffer, 0, srcBuffer.Length);
+            var clonedImage = new Image<Rgb24>(image.Width, image.Height, clonedBuffer);
+            var ctx = new ImageProcessingContext(clonedImage);
+            action(ctx);
+            return clonedImage;
+        }
+
+        /// <summary>
         /// 对图像应用处理上下文并执行指定操作
         /// </summary>
         /// <param name="image">输入图像（Rgb24）</param>
