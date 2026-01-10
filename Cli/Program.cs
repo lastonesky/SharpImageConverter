@@ -171,12 +171,14 @@ class Program
                 else if (anim.Frames.Count == 1)
                 {
                     var rgbaImage = ToRgba32(anim.Frames[0]);
+                    WebpEncoderAdapterRgba.DefaultQuality = (jpegQuality ?? 75);
                     Image.Save(rgbaImage, outputPath);
                 }
                 else
                 {
                     int loop = anim.LoopCount;
-                    WebpAnimationEncoder.EncodeRgb24(outputPath, anim.Frames, anim.FrameDurationsMs, loop, 75f);
+                    float qWebp = jpegQuality.HasValue ? jpegQuality.Value : 75f;
+                    WebpAnimationEncoder.EncodeRgb24(outputPath, anim.Frames, anim.FrameDurationsMs, loop, qWebp);
                 }
             }
             else
@@ -212,6 +214,10 @@ class Program
                     }
                     else
                     {
+                        if (outExt2b == ".webp")
+                        {
+                            WebpEncoderAdapterRgba.DefaultQuality = (jpegQuality ?? 75);
+                        }
                         Image.Save(rgbaImage, outputPath);
                     }
                 }
@@ -229,7 +235,7 @@ class Program
                 outputPath = ResolveOutputPath(inputPath, outputPath, defExt);
             }
             string outExt = Path.GetExtension(outputPath).ToLowerInvariant();
-            if (inExt == ".gif" && outExt == ".webp")
+                if (inExt == ".gif" && outExt == ".webp")
             {
                 var gifDec = new GifDecoder();
                 GifAnimation anim;
@@ -249,7 +255,8 @@ class Program
                     processed.Add(frame);
                 }
 
-                WebpAnimationEncoder.EncodeRgb24(outputPath, processed, anim.FrameDurationsMs, anim.LoopCount, 75f);
+                float qWebpOps = jpegQuality.HasValue ? jpegQuality.Value : 75f;
+                WebpAnimationEncoder.EncodeRgb24(outputPath, processed, anim.FrameDurationsMs, anim.LoopCount, qWebpOps);
             }
             else
             {
@@ -267,6 +274,10 @@ class Program
                 }
                 else
                 {
+                    if (outExt == ".webp")
+                    {
+                        WebpEncoderAdapter.Quality = (jpegQuality ?? 75);
+                    }
                     Image.Save(image, outputPath);
                 }
             }
