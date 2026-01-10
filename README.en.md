@@ -99,6 +99,18 @@ image.Mutate(ctx => ctx
 Image.Save(image, "output.png");
 ```
 
+- Clone and process (keep the original image unchanged)
+
+```csharp
+// Create a processed copy from an existing image
+var processed = image.Clone(ctx => ctx
+    .ResizeToFit(320, 240)
+    .Grayscale());
+
+// image remains unchanged, processed is the result
+Image.Save(processed, "output_clone.png");
+```
+
 - RGBA mode (preserve alpha for load/save; unsupported targets automatically fall back to RGB saving)
 
 ```csharp

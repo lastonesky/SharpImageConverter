@@ -98,6 +98,18 @@ image.Mutate(ctx => ctx
 Image.Save(image, "output.png");
 ```
 
+- 克隆并处理（不修改原图）
+
+```csharp
+// 基于已有图像创建处理后的副本
+var processed = image.Clone(ctx => ctx
+    .ResizeToFit(320, 240)
+    .Grayscale());
+
+// image 保持不变，processed 为处理结果
+Image.Save(processed, "output_clone.png");
+```
+
 - RGBA 模式（保留 Alpha 的加载/保存；不支持的目标格式会自动回退为 RGB 保存）
 
 ```csharp
