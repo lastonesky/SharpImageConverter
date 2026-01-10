@@ -41,6 +41,7 @@
 - 读取/写入 WebP（通过 `runtimes/` 下的原生 `libwebp`）
 - 统一解码为 RGB24，再根据输出扩展名选择编码器写回
 - 当前 WebP 编码质量固定为 75（后续可扩展为命令行参数/Options）
+- WebP 实现依赖 Google 的 libwebp 及相关组件（BSD-3-Clause License），其版权与许可信息详见 `THIRD-PARTY-NOTICES.md`
 
 ### 中间格式
 - 引入 `ImageFrame` 作为格式转换的中间数据结构（当前为 `Rgb24`）

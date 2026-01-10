@@ -41,6 +41,7 @@ Pure C# image processing and format conversion library with minimal external dep
 - Read/Write WebP via native libwebp under `runtimes/`
 - Unified decode to RGB24; select encoder based on output file extension
 - Current WebP encode quality is fixed to 75 (may become configurable later)
+- WebP implementation relies on Google's libwebp and related components (BSD-3-Clause License); see `THIRD-PARTY-NOTICES.md` for copyright and license details
 
 ### Intermediate Format
 - `ImageFrame` as the intermediate structure for format conversion (currently `Rgb24`)
