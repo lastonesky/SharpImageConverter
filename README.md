@@ -1,5 +1,7 @@
 # SharpImageConverter
 
+简体中文 | [English Version](README.en.md)
+
 一个用 C# 编写的图像处理与格式转换库，尽量减少第三方托管依赖（不使用 `System.Drawing`）。支持 JPEG/PNG/BMP/WebP/GIF 格式的相互转换（包含 JPEG 解码与 JPEG 编码输出）。目前主要面向 API 调用；命令行（CLI）已独立为单独项目。
 
 ## 项目特点

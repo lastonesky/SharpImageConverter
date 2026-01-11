@@ -1,5 +1,7 @@
 # SharpImageConverter
 
+English | [简体中文](README.md)
+
 Pure C# image processing and format conversion library with minimal external dependencies (does not use System.Drawing). Supports JPEG/PNG/BMP/WebP/GIF conversions (including JPEG decoding and Baseline JPEG encoding). The primary usage is via the library API; the CLI has been split into a separate project.
 
 ## Key Characteristics
