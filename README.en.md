@@ -4,9 +4,13 @@ English | [简体中文](README.md)
 
 Pure C# image processing and format conversion library with minimal external dependencies (does not use System.Drawing). Supports JPEG/PNG/BMP/WebP/GIF conversions (including JPEG decoding and Baseline JPEG encoding). The primary usage is via the library API; the CLI has been split into a separate project.
 
-## Key Characteristics
+## Motivation
 
-- Lightweight and stable: no bundled ffmpeg/ImageMagick, ImageSharp, or SkiaSharp. Typical publish configurations keep all runnable artifacts under 5 MB in total and each single-platform binary under 2 MB, while avoiding potential commercial licensing issues and reducing crash/compatibility risks across different .NET runtime environments.
+This library was originally created to address several practical issues we encountered when using existing .NET imaging libraries in production:
+
+- Cross-platform requirements: our services need to run reliably on Linux and other non-Windows environments, so we cannot depend on `System.Drawing`, which is effectively Windows-only. On modern .NET versions it also produces many “Windows only” warnings at build time, which is undesirable for long-term maintenance.
+- Licensing and cost: we want to avoid components that introduce revenue-based commercial licensing. For example, ImageSharp requires a paid license for companies with annual revenue above 1M USD, which adds uncertainty to future commercial usage.
+- Stability and operability: in our production services, using SkiaSharp led to native crashes in the unmanaged layer that brought down the entire managed process and restarted the service, while leaving very little actionable information for root cause analysis. We prefer a fully managed, more predictable stack where failures are easier to diagnose.
 
 ## Features
 
