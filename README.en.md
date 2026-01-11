@@ -11,6 +11,7 @@ This library was originally created to address several practical issues we encou
 - Cross-platform requirements: our services need to run reliably on Linux and other non-Windows environments, so we cannot depend on `System.Drawing`, which is effectively Windows-only. On modern .NET versions it also produces many “Windows only” warnings at build time, which is undesirable for long-term maintenance.
 - Licensing and cost: we want to avoid components that introduce revenue-based commercial licensing. For example, ImageSharp requires a paid license for companies with annual revenue above 1M USD, which adds uncertainty to future commercial usage.
 - Stability and operability: in our production services, using SkiaSharp led to native crashes in the unmanaged layer that brought down the entire managed process and restarted the service, while leaving very little actionable information for root cause analysis. We prefer a fully managed, more predictable stack where failures are easier to diagnose.
+- For internal use only, with no concurrency pressure, and capable of handling typical product images.
 
 ## Features
 
