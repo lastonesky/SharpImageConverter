@@ -4,8 +4,7 @@ Pure C# image processing and format conversion library with minimal external dep
 
 ## Key Characteristics
 
-- Ultra-lightweight binaries: no ffmpeg or ImageMagick are bundled. In typical publish configurations, all runnable artifacts together are under 5 MB, and each single-platform binary is usually under 2 MB.
-- No potentially commercial/paid imaging libraries: avoids dependencies such as ImageSharp that may introduce commercial licensing terms, reducing licensing and legal risks.
+- Lightweight and stable: no bundled ffmpeg/ImageMagick, ImageSharp, or SkiaSharp. Typical publish configurations keep all runnable artifacts under 5 MB in total and each single-platform binary under 2 MB, while avoiding potential commercial licensing issues and reducing crash/compatibility risks across different .NET runtime environments.
 
 ## Features
 
