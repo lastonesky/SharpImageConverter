@@ -2,6 +2,11 @@
 
 Pure C# image processing and format conversion library with minimal external dependencies (does not use System.Drawing). Supports JPEG/PNG/BMP/WebP/GIF conversions (including JPEG decoding and Baseline JPEG encoding). The primary usage is via the library API; the CLI has been split into a separate project.
 
+## Key Characteristics
+
+- Ultra-lightweight binaries: no ffmpeg or ImageMagick are bundled. In typical publish configurations, all runnable artifacts together are under 5 MB, and each single-platform binary is usually under 2 MB.
+- No potentially commercial/paid imaging libraries: avoids dependencies such as ImageSharp that may introduce commercial licensing terms, reducing licensing and legal risks.
+
 ## Features
 
 ### JPEG
