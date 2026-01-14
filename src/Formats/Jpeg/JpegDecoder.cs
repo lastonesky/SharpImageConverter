@@ -169,7 +169,7 @@ public class JpegDecoder
         if (marker == 0x00) return;
 
         ushort length = ReadUShort();
-        long endPos = _stream.Position + length - 2;
+        int contentLen = length >= 2 ? length - 2 : 0;
 
         switch (marker)
         {
@@ -177,29 +177,36 @@ public class JpegDecoder
             case JpegMarkers.SOF2:
                 ParseSOF(length, marker == JpegMarkers.SOF2);
                 break;
+
             case JpegMarkers.DQT:
                 ParseDQT(length);
                 break;
+
             case JpegMarkers.DHT:
                 ParseDHT(length);
                 break;
+
             case JpegMarkers.DRI:
-                if (length >= 4)
+                if (contentLen >= 2)
                 {
                     _restartInterval = ReadUShort();
+                    contentLen -= 2;
+                }
+                if (contentLen > 0)
+                {
+                    _stream.Seek(contentLen, SeekOrigin.Current);
                 }
                 break;
+
             case JpegMarkers.APP1:
+                if (contentLen > 0)
                 {
-                    int contentLen = length - 2;
-                    if (contentLen > 0)
-                    {
-                        byte[] buf = new byte[contentLen];
-                        _stream.ReadExactly(buf, 0, contentLen);
-                        TryParseExifOrientation(buf);
-                    }
-                    break;
+                    byte[] buf = new byte[contentLen];
+                    _stream.ReadExactly(buf, 0, contentLen);
+                    TryParseExifOrientation(buf);
                 }
+                break;
+
             case JpegMarkers.APP0:
             case JpegMarkers.APP2:
             case JpegMarkers.APP3:
@@ -216,14 +223,19 @@ public class JpegDecoder
             case JpegMarkers.APP14:
             case JpegMarkers.APP15:
             case JpegMarkers.COM:
-                // Skip
+                if (contentLen > 0)
+                {
+                    _stream.Seek(contentLen, SeekOrigin.Current);
+                }
                 break;
+
             default:
-                // Skip unknown
+                if (contentLen > 0)
+                {
+                    _stream.Seek(contentLen, SeekOrigin.Current);
+                }
                 break;
         }
-
-        _stream.Position = endPos;
     }
 
     private void ParseSOF(int length, bool isProgressive)
