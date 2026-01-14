@@ -73,7 +73,8 @@ class Program
             string op = a.ToLowerInvariant();
             if (op.StartsWith("resize:"))
             {
-                var parts = op.Substring(7).Split('x');
+                var sizePart = op.Substring(7);
+                var parts = sizePart.Split(['x', '*'], StringSplitOptions.RemoveEmptyEntries);
                 if (parts.Length == 2 && int.TryParse(parts[0], out int w) && int.TryParse(parts[1], out int h))
                 {
                     ops.Add(ctx => ctx.Resize(w, h));
@@ -82,7 +83,8 @@ class Program
             }
             if (op.StartsWith("resizebilinear:"))
             {
-                var parts = op.Substring("resizebilinear:".Length).Split('x');
+                var sizePart = op.Substring("resizebilinear:".Length);
+                var parts = sizePart.Split(['x', '*'], StringSplitOptions.RemoveEmptyEntries);
                 if (parts.Length == 2 && int.TryParse(parts[0], out int w) && int.TryParse(parts[1], out int h))
                 {
                     ops.Add(ctx => ctx.ResizeBilinear(w, h));
@@ -91,7 +93,8 @@ class Program
             }
             if (op.StartsWith("resizefit:"))
             {
-                var parts = op[10..].Split('x');
+                var sizePart = op[10..];
+                var parts = sizePart.Split(['x', '*'], StringSplitOptions.RemoveEmptyEntries);
                 if (parts.Length == 2 && int.TryParse(parts[0], out int w2) && int.TryParse(parts[1], out int h2))
                 {
                     ops.Add(ctx => ctx.ResizeToFit(w2, h2));
