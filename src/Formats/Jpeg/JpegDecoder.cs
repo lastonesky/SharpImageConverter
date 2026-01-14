@@ -576,8 +576,7 @@ public class JpegDecoder
                     k += r;
                     int val = Receive(n, reader);
                     val = Extend(val, n);
-                    if (k <= 63)
-                        coeffs[offset + JpegUtils.ZigZag[k]] = val << Al;
+                    coeffs[offset + JpegUtils.ZigZag[k]] = val << Al;
                 }
                 else
                 {

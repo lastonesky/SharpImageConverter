@@ -1,8 +1,10 @@
+using System;
+
 namespace SharpImageConverter;
 
 internal static class JpegUtils
 {
-    public static readonly int[] ZigZag = new int[64]
+    private static readonly byte[] ZigZagData =
     {
          0,  1,  8, 16,  9,  2,  3, 10,
         17, 24, 32, 25, 18, 11,  4,  5,
@@ -11,8 +13,12 @@ internal static class JpegUtils
         35, 42, 49, 56, 57, 50, 43, 36,
         29, 22, 15, 23, 30, 37, 44, 51,
         58, 59, 52, 45, 38, 31, 39, 46,
-        53, 60, 61, 54, 47, 55, 62, 63
+        53, 60, 61, 54, 47, 55, 62, 63,
+        63, 63, 63, 63, 63, 63, 63, 63,
+        63, 63, 63, 63, 63, 63, 63, 63
     };
+
+    public static ReadOnlySpan<byte> ZigZag => ZigZagData;
 
     public static int Clamp(int val)
     {
