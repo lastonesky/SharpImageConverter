@@ -24,6 +24,11 @@ class Program
             return;
         }
         string inputPath = args[0];
+        if (!File.Exists(inputPath))
+        {
+            Console.Error.WriteLine($"输入文件不存在: {inputPath}");
+            return;
+        }
         string? outputPath = null;
         int? jpegQuality = null;
         bool? subsample420 = null;
