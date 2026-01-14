@@ -63,19 +63,20 @@ namespace SharpImageConverter.Formats
             throw new InvalidOperationException("WebPNewInternal 创建失败（ABI 版本不匹配或库不兼容）");
         }
 
-        public static byte[] DecodeRgba(byte[] data, out int width, out int height)
+        public static byte[] DecodeRgba(ReadOnlySpan<byte> data, out int width, out int height)
         {
-            // .NET 10 现代写法：不再需要 GCHandle
             if (WebPGetInfo(data, (nuint)data.Length, out width, out height) == 0)
                 throw new InvalidOperationException("WebP 解析失败");
 
             var buffer = new byte[width * height * 4];
-            
-            // 直接传递 Span 给 P/Invoke，无需手动锁定内存
             IntPtr res = WebPDecodeRGBAInto(data, (nuint)data.Length, buffer, buffer.Length, width * 4);
-            
             if (res == IntPtr.Zero) throw new InvalidOperationException("WebP 解码失败");
             return buffer;
+        }
+
+        public static byte[] DecodeRgba(byte[] data, out int width, out int height)
+        {
+            return DecodeRgba(data.AsSpan(), out width, out height);
         }
 
         public static byte[] EncodeRgba(byte[] rgba, int width, int height, float quality)
