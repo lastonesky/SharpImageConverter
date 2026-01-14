@@ -6,11 +6,38 @@ using System.Collections.Generic;
 
 namespace SharpImageConverter.Formats
 {
+    internal static class WebpStreamDecoder
+    {
+        internal static byte[] DecodeRgbaFromStream(Stream stream, out int width, out int height)
+        {
+            ArgumentNullException.ThrowIfNull(stream);
+
+            if (stream is MemoryStream ms && ms.TryGetBuffer(out ArraySegment<byte> segment))
+            {
+                ReadOnlySpan<byte> span = segment.AsSpan(0, (int)ms.Length);
+                return WebpCodec.DecodeRgba(span, out width, out height);
+            }
+
+            using var tempMs = new MemoryStream();
+            stream.CopyTo(tempMs);
+
+            if (tempMs.TryGetBuffer(out ArraySegment<byte> segment2))
+            {
+                ReadOnlySpan<byte> span = segment2.AsSpan(0, (int)tempMs.Length);
+                return WebpCodec.DecodeRgba(span, out width, out height);
+            }
+
+            var data = tempMs.ToArray();
+            return WebpCodec.DecodeRgba(data, out width, out height);
+        }
+    }
+
     /// <summary>
     /// WebP 解码器适配器（RGB24）
     /// </summary>
     public sealed class WebpDecoderAdapter : IImageDecoder
     {
+
         /// <summary>
         /// 解码 WebP 文件为 RGB24 图像
         /// </summary>
@@ -29,20 +56,7 @@ namespace SharpImageConverter.Formats
         /// <returns>RGB24 图像</returns>
         public Image<Rgb24> DecodeRgb24(Stream stream)
         {
-            // WebP 解码需要完整的数据 buffer
-            byte[] data;
-            if (stream is MemoryStream ms)
-            {
-                data = ms.ToArray();
-            }
-            else
-            {
-                using var tempMs = new MemoryStream();
-                stream.CopyTo(tempMs);
-                data = tempMs.ToArray();
-            }
-
-            var rgba = WebpCodec.DecodeRgba(data, out int width, out int height);
+            var rgba = WebpStreamDecoder.DecodeRgbaFromStream(stream, out int width, out int height);
             var rgb = new byte[width * height * 3];
             for (int i = 0, j = 0; i < rgba.Length; i += 4, j += 3)
             {
@@ -77,19 +91,7 @@ namespace SharpImageConverter.Formats
         /// <returns>RGBA32 图像</returns>
         public Image<Rgba32> DecodeRgba32(Stream stream)
         {
-            byte[] data;
-            if (stream is MemoryStream ms)
-            {
-                data = ms.ToArray();
-            }
-            else
-            {
-                using var tempMs = new MemoryStream();
-                stream.CopyTo(tempMs);
-                data = tempMs.ToArray();
-            }
-
-            var rgba = WebpCodec.DecodeRgba(data, out int width, out int height);
+            var rgba = WebpStreamDecoder.DecodeRgbaFromStream(stream, out int width, out int height);
             return new Image<Rgba32>(width, height, rgba);
         }
     }
@@ -138,6 +140,12 @@ namespace SharpImageConverter.Formats
     public sealed class WebpEncoderAdapterRgba : IImageEncoderRgba
     {
         public static float Quality { get; set; } = 75f;
+
+        public static float DefaultQuality
+        {
+            get => Quality;
+            set => Quality = value;
+        }
 
         /// <summary>
         /// 将 RGBA32 图像编码为 WebP 文件
