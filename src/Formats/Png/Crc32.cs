@@ -57,9 +57,10 @@ public static class Crc32
     public static uint Compute(uint crc, byte[] bytes, int offset, int count)
     {
         crc = ~crc;
-        for (int i = 0; i < count; i++)
+        int end = offset + count;
+        for (int i = offset; i < end; i++)
         {
-            byte index = (byte)(crc ^ bytes[offset + i]);
+            byte index = (byte)(crc ^ bytes[i]);
             crc = (crc >> 8) ^ Table[index];
         }
         return ~crc;

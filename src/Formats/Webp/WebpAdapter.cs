@@ -6,6 +6,19 @@ using System.Collections.Generic;
 
 namespace SharpImageConverter.Formats
 {
+    public readonly struct WebpEncoderOptions
+    {
+        public float Quality { get; }
+
+        public WebpEncoderOptions(float quality)
+        {
+            if (quality < 0f || quality > 100f) throw new ArgumentOutOfRangeException(nameof(quality));
+            Quality = quality;
+        }
+
+        public static WebpEncoderOptions Default => new WebpEncoderOptions(75f);
+    }
+
     internal static class WebpStreamDecoder
     {
         internal static byte[] DecodeRgbaFromStream(Stream stream, out int width, out int height)
@@ -101,7 +114,15 @@ namespace SharpImageConverter.Formats
     /// </summary>
     public sealed class WebpEncoderAdapter : IImageEncoder
     {
-        public static float Quality { get; set; } = 75f;
+        private static WebpEncoderOptions _defaultOptions = WebpEncoderOptions.Default;
+
+        public static float Quality
+        {
+            get => _defaultOptions.Quality;
+            set => _defaultOptions = new WebpEncoderOptions(value);
+        }
+
+        internal static WebpEncoderOptions DefaultOptions => _defaultOptions;
 
         /// <summary>
         /// 将 RGB24 图像编码为 WebP 文件
@@ -129,7 +150,7 @@ namespace SharpImageConverter.Formats
                 rgba[i + 2] = image.Buffer[j + 2];
                 rgba[i + 3] = 255;
             }
-            var webp = WebpCodec.EncodeRgba(rgba, image.Width, image.Height, Quality);
+            var webp = WebpCodec.EncodeRgba(rgba, image.Width, image.Height, DefaultOptions);
             stream.Write(webp, 0, webp.Length);
         }
     }
@@ -139,13 +160,21 @@ namespace SharpImageConverter.Formats
     /// </summary>
     public sealed class WebpEncoderAdapterRgba : IImageEncoderRgba
     {
-        public static float Quality { get; set; } = 75f;
+        private static WebpEncoderOptions _defaultOptions = WebpEncoderOptions.Default;
+
+        public static float Quality
+        {
+            get => _defaultOptions.Quality;
+            set => _defaultOptions = new WebpEncoderOptions(value);
+        }
 
         public static float DefaultQuality
         {
             get => Quality;
             set => Quality = value;
         }
+
+        internal static WebpEncoderOptions DefaultOptions => _defaultOptions;
 
         /// <summary>
         /// 将 RGBA32 图像编码为 WebP 文件
@@ -165,7 +194,7 @@ namespace SharpImageConverter.Formats
         /// <param name="image">输入图像</param>
         public void EncodeRgba32(Stream stream, Image<Rgba32> image)
         {
-            var webp = WebpCodec.EncodeRgba(image.Buffer, image.Width, image.Height, Quality);
+            var webp = WebpCodec.EncodeRgba(image.Buffer, image.Width, image.Height, DefaultOptions);
             stream.Write(webp, 0, webp.Length);
         }
     }
