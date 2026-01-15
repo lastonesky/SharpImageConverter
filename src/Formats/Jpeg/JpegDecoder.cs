@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using SharpImageConverter.Core;
+using SharpImageConverter.Metadata;
 
 namespace SharpImageConverter;
 
@@ -25,6 +26,12 @@ public class JpegDecoder
     private readonly HuffmanDecodingTable[,] _htablesByClassAndId = new HuffmanDecodingTable[2, 4];
     private readonly Component[] _componentsById = new Component[256];
     private int _restartInterval;
+    private int _adobeColorTransform = -1;
+    private ImageMetadata _metadata = new ImageMetadata();
+    private byte[][]? _iccChunks;
+    private int _iccChunkCount;
+    private int _iccChunksReceived;
+    private bool _huffmanRecoveryAttempted;
 
     public int Width => _frame != null ? _frame.Width : 0;
     public int Height => _frame != null ? _frame.Height : 0;
@@ -33,6 +40,8 @@ public class JpegDecoder
     /// 获取当前 JPEG 图像的 EXIF 方向值（1 为默认方向）。
     /// </summary>
     public int ExifOrientation { get; private set; } = 1;
+
+    internal bool EnableHuffmanFastPath { get; set; } = true;
 
     /// <summary>
     /// 将传入的 JPEG 流解码为 RGB 图像。
@@ -50,6 +59,12 @@ public class JpegDecoder
         Array.Clear(_htablesByClassAndId, 0, _htablesByClassAndId.Length);
         Array.Clear(_componentsById, 0, _componentsById.Length);
         _restartInterval = 0;
+        _adobeColorTransform = -1;
+        _metadata = new ImageMetadata();
+        _iccChunks = null;
+        _iccChunkCount = 0;
+        _iccChunksReceived = 0;
+        _huffmanRecoveryAttempted = false;
         ExifOrientation = 1;
 
         // Check SOI
@@ -57,7 +72,7 @@ public class JpegDecoder
         int b2 = _stream.ReadByte();
         if (b1 != 0xFF || b2 != JpegMarkers.SOI)
         {
-             throw new InvalidDataException("Not a valid JPEG file (missing SOI)");
+             throw new JpegHeaderException("Not a valid JPEG file (missing SOI)");
         }
 
         ParseHeaders();
@@ -120,6 +135,7 @@ public class JpegDecoder
             }
         }
 
+        FinalizeIccProfile();
         return PerformIDCTAndOutput();
     }
 
@@ -140,25 +156,34 @@ public class JpegDecoder
     
     private void ParseHeaders()
     {
-        long initialPos = _stream.Position;
         while (_stream.Position < _stream.Length)
         {
-            int b = _stream.ReadByte();
-            if (b == -1) break;
-            if (b != 0xFF) continue;
-            
-            int markerInt = _stream.ReadByte();
-            while (markerInt == 0xFF) markerInt = _stream.ReadByte();
-            if (markerInt == -1) break;
-            
+            int prefix;
+            do
+            {
+                prefix = _stream.ReadByte();
+                if (prefix == -1) return;
+            } while (prefix != 0xFF);
+
+            int markerInt;
+            do
+            {
+                markerInt = _stream.ReadByte();
+                if (markerInt == -1) return;
+            } while (markerInt == 0xFF);
+
             byte marker = (byte)markerInt;
+            if (marker == 0x00) continue;
 
             if (marker == JpegMarkers.SOS || marker == JpegMarkers.EOI)
             {
-                // Rewind 2 bytes so main loop can process it
                 _stream.Seek(-2, SeekOrigin.Current);
                 return;
             }
+
+            if (marker == JpegMarkers.SOI) continue;
+            if (marker >= JpegMarkers.RST0 && marker <= JpegMarkers.RST7) continue;
+            if (marker == JpegMarkers.TEM) continue;
 
             ParseMarker(marker);
         }
@@ -203,12 +228,33 @@ public class JpegDecoder
                 {
                     byte[] buf = new byte[contentLen];
                     _stream.ReadExactly(buf, 0, contentLen);
-                    TryParseExifOrientation(buf);
+                    TryParseExif(buf);
+                }
+                break;
+
+            case JpegMarkers.APP2:
+                if (contentLen > 0)
+                {
+                    byte[] buf = new byte[contentLen];
+                    _stream.ReadExactly(buf, 0, contentLen);
+                    TryParseIccProfileSegment(buf);
+                }
+                break;
+
+            case JpegMarkers.APP14:
+                if (contentLen > 0)
+                {
+                    byte[] buf = new byte[contentLen];
+                    _stream.ReadExactly(buf, 0, contentLen);
+                    if (buf.Length >= 12 &&
+                        buf[0] == (byte)'A' && buf[1] == (byte)'d' && buf[2] == (byte)'o' && buf[3] == (byte)'b' && buf[4] == (byte)'e')
+                    {
+                        _adobeColorTransform = buf[11];
+                    }
                 }
                 break;
 
             case JpegMarkers.APP0:
-            case JpegMarkers.APP2:
             case JpegMarkers.APP3:
             case JpegMarkers.APP4:
             case JpegMarkers.APP5:
@@ -220,7 +266,12 @@ public class JpegDecoder
             case JpegMarkers.APP11:
             case JpegMarkers.APP12:
             case JpegMarkers.APP13:
-            case JpegMarkers.APP14:
+                if (contentLen > 0)
+                {
+                    _stream.Seek(contentLen, SeekOrigin.Current);
+                }
+                break;
+
             case JpegMarkers.APP15:
             case JpegMarkers.COM:
                 if (contentLen > 0)
@@ -236,6 +287,293 @@ public class JpegDecoder
                 }
                 break;
         }
+    }
+
+    private void TryParseIccProfileSegment(byte[] app2)
+    {
+        if (app2.Length < 14) return;
+        if (app2[0] != (byte)'I' || app2[1] != (byte)'C' || app2[2] != (byte)'C' || app2[3] != (byte)'_' ||
+            app2[4] != (byte)'P' || app2[5] != (byte)'R' || app2[6] != (byte)'O' || app2[7] != (byte)'F' ||
+            app2[8] != (byte)'I' || app2[9] != (byte)'L' || app2[10] != (byte)'E' || app2[11] != 0x00)
+        {
+            return;
+        }
+
+        int seqNo = app2[12];
+        int count = app2[13];
+        if (seqNo <= 0 || count <= 0) return;
+
+        if (_iccChunks == null || _iccChunkCount != count)
+        {
+            _iccChunkCount = count;
+            _iccChunks = new byte[count][];
+            _iccChunksReceived = 0;
+        }
+
+        int idx = seqNo - 1;
+        if (idx < 0 || idx >= _iccChunks!.Length) return;
+        if (_iccChunks[idx] != null) return;
+
+        int payloadLen = app2.Length - 14;
+        if (payloadLen <= 0) return;
+        byte[] payload = new byte[payloadLen];
+        Buffer.BlockCopy(app2, 14, payload, 0, payloadLen);
+        _iccChunks[idx] = payload;
+        _iccChunksReceived++;
+    }
+
+    private void FinalizeIccProfile()
+    {
+        if (_iccChunks == null || _iccChunkCount <= 0) return;
+        if (_iccChunksReceived != _iccChunkCount) return;
+
+        int total = 0;
+        for (int i = 0; i < _iccChunks.Length; i++)
+        {
+            if (_iccChunks[i] == null) return;
+            total += _iccChunks[i].Length;
+        }
+
+        byte[] profile = new byte[total];
+        int offset = 0;
+        for (int i = 0; i < _iccChunks.Length; i++)
+        {
+            byte[] chunk = _iccChunks[i];
+            Buffer.BlockCopy(chunk, 0, profile, offset, chunk.Length);
+            offset += chunk.Length;
+        }
+
+        _metadata.IccProfile = profile;
+        _metadata.IccProfileKind = DetectIccProfileKind(profile);
+    }
+
+    private static IccProfileKind DetectIccProfileKind(byte[] profile)
+    {
+        static bool ContainsAscii(byte[] haystack, string needle)
+        {
+            if (haystack.Length == 0 || string.IsNullOrEmpty(needle)) return false;
+            byte[] n = System.Text.Encoding.ASCII.GetBytes(needle);
+            for (int i = 0; i <= haystack.Length - n.Length; i++)
+            {
+                bool ok = true;
+                for (int j = 0; j < n.Length; j++)
+                {
+                    if (haystack[i + j] != n[j]) { ok = false; break; }
+                }
+                if (ok) return true;
+            }
+            return false;
+        }
+
+        if (ContainsAscii(profile, "sRGB")) return IccProfileKind.SRgb;
+        if (ContainsAscii(profile, "Display P3") || ContainsAscii(profile, "DisplayP3")) return IccProfileKind.DisplayP3;
+        if (ContainsAscii(profile, "Adobe RGB") || ContainsAscii(profile, "AdobeRGB")) return IccProfileKind.AdobeRgb;
+        if (ContainsAscii(profile, "ProPhoto")) return IccProfileKind.ProPhotoRgb;
+        return IccProfileKind.Unknown;
+    }
+
+    private void TryParseExif(byte[] app1)
+    {
+        if (app1.Length < 8) return;
+        if (!(app1[0] == (byte)'E' && app1[1] == (byte)'x' && app1[2] == (byte)'i' && app1[3] == (byte)'f' && app1[4] == 0 && app1[5] == 0))
+            return;
+
+        _metadata.ExifRaw = app1;
+        _metadata.Exif ??= new ExifMetadata();
+
+        int tiffBase = 6;
+        if (app1.Length < tiffBase + 8) return;
+        bool littleEndian;
+        if (app1[tiffBase + 0] == (byte)'I' && app1[tiffBase + 1] == (byte)'I') littleEndian = true;
+        else if (app1[tiffBase + 0] == (byte)'M' && app1[tiffBase + 1] == (byte)'M') littleEndian = false;
+        else return;
+
+        ushort ReadU16(int offset)
+        {
+            if (offset < 0 || offset + 2 > app1.Length) return 0;
+            return littleEndian ? (ushort)(app1[offset] | (app1[offset + 1] << 8)) : (ushort)((app1[offset] << 8) | app1[offset + 1]);
+        }
+
+        uint ReadU32(int offset)
+        {
+            if (offset < 0 || offset + 4 > app1.Length) return 0;
+            return littleEndian
+                ? (uint)(app1[offset] | (app1[offset + 1] << 8) | (app1[offset + 2] << 16) | (app1[offset + 3] << 24))
+                : (uint)((app1[offset] << 24) | (app1[offset + 1] << 16) | (app1[offset + 2] << 8) | app1[offset + 3]);
+        }
+
+        int TypeSize(ushort type) => type switch
+        {
+            1 => 1,
+            2 => 1,
+            3 => 2,
+            4 => 4,
+            5 => 8,
+            7 => 1,
+            9 => 4,
+            10 => 8,
+            _ => 0
+        };
+
+        int ValueOffset(int entryOffset, ushort type, uint count)
+        {
+            int size = TypeSize(type);
+            long bytes = (long)size * count;
+            if (bytes <= 4) return entryOffset + 8;
+            return tiffBase + (int)ReadU32(entryOffset + 8);
+        }
+
+        string? ReadAscii(int offset, uint count)
+        {
+            if (offset < 0 || offset >= app1.Length) return null;
+            int len = (int)Math.Min(count, (uint)(app1.Length - offset));
+            int end = 0;
+            for (int i = 0; i < len; i++)
+            {
+                if (app1[offset + i] == 0) { end = i; break; }
+                end = i + 1;
+            }
+            if (end <= 0) return null;
+            return System.Text.Encoding.ASCII.GetString(app1, offset, end);
+        }
+
+        double? ReadRationalAsDouble(int offset)
+        {
+            uint num = ReadU32(offset);
+            uint den = ReadU32(offset + 4);
+            if (den == 0) return null;
+            return (double)num / den;
+        }
+
+        void ParseExifSubIfd(int ifdOffset)
+        {
+            if (ifdOffset < 0 || ifdOffset + 2 > app1.Length) return;
+            ushort numEntries = ReadU16(ifdOffset);
+            int entryBase = ifdOffset + 2;
+            for (int i = 0; i < numEntries; i++)
+            {
+                int e = entryBase + i * 12;
+                if (e + 12 > app1.Length) break;
+                ushort tag = ReadU16(e + 0);
+                ushort type = ReadU16(e + 2);
+                uint count = ReadU32(e + 4);
+                int vOff = ValueOffset(e, type, count);
+                if (tag == 0x9003 && type == 2)
+                {
+                    _metadata.Exif!.DateTimeOriginal = ReadAscii(vOff, count);
+                }
+            }
+        }
+
+        void ParseGpsIfd(int ifdOffset)
+        {
+            if (ifdOffset < 0 || ifdOffset + 2 > app1.Length) return;
+            ushort numEntries = ReadU16(ifdOffset);
+            int entryBase = ifdOffset + 2;
+            string? latRef = null;
+            string? lonRef = null;
+            double? lat = null;
+            double? lon = null;
+            for (int i = 0; i < numEntries; i++)
+            {
+                int e = entryBase + i * 12;
+                if (e + 12 > app1.Length) break;
+                ushort tag = ReadU16(e + 0);
+                ushort type = ReadU16(e + 2);
+                uint count = ReadU32(e + 4);
+                int vOff = ValueOffset(e, type, count);
+                switch (tag)
+                {
+                    case 0x0001:
+                        if (type == 2) latRef = ReadAscii(vOff, count);
+                        break;
+                    case 0x0003:
+                        if (type == 2) lonRef = ReadAscii(vOff, count);
+                        break;
+                    case 0x0002:
+                        if (type == 5 && count == 3)
+                        {
+                            double? d = ReadRationalAsDouble(vOff + 0);
+                            double? m = ReadRationalAsDouble(vOff + 8);
+                            double? s = ReadRationalAsDouble(vOff + 16);
+                            if (d.HasValue && m.HasValue && s.HasValue) lat = d.Value + m.Value / 60d + s.Value / 3600d;
+                        }
+                        break;
+                    case 0x0004:
+                        if (type == 5 && count == 3)
+                        {
+                            double? d = ReadRationalAsDouble(vOff + 0);
+                            double? m = ReadRationalAsDouble(vOff + 8);
+                            double? s = ReadRationalAsDouble(vOff + 16);
+                            if (d.HasValue && m.HasValue && s.HasValue) lon = d.Value + m.Value / 60d + s.Value / 3600d;
+                        }
+                        break;
+                }
+            }
+
+            if (lat.HasValue)
+            {
+                if (string.Equals(latRef, "S", StringComparison.OrdinalIgnoreCase)) lat = -lat.Value;
+                _metadata.Exif!.GpsLatitude = lat;
+            }
+            if (lon.HasValue)
+            {
+                if (string.Equals(lonRef, "W", StringComparison.OrdinalIgnoreCase)) lon = -lon.Value;
+                _metadata.Exif!.GpsLongitude = lon;
+            }
+        }
+
+        ushort magic = ReadU16(tiffBase + 2);
+        if (magic != 42) return;
+        uint ifd0Offset = ReadU32(tiffBase + 4);
+        int ifd0 = tiffBase + (int)ifd0Offset;
+        if (ifd0 < 0 || ifd0 + 2 > app1.Length) return;
+
+        ushort numEntries0 = ReadU16(ifd0);
+        int entryBase0 = ifd0 + 2;
+        int? exifIfdOffset = null;
+        int? gpsIfdOffset = null;
+        for (int i = 0; i < numEntries0; i++)
+        {
+            int e = entryBase0 + i * 12;
+            if (e + 12 > app1.Length) break;
+            ushort tag = ReadU16(e + 0);
+            ushort type = ReadU16(e + 2);
+            uint count = ReadU32(e + 4);
+            int vOff = ValueOffset(e, type, count);
+            switch (tag)
+            {
+                case 0x010F:
+                    if (type == 2) _metadata.Exif.Make = ReadAscii(vOff, count);
+                    break;
+                case 0x0110:
+                    if (type == 2) _metadata.Exif.Model = ReadAscii(vOff, count);
+                    break;
+                case 0x0132:
+                    if (type == 2) _metadata.Exif.DateTime = ReadAscii(vOff, count);
+                    break;
+                case 0x0112:
+                    if (type == 3 && count >= 1)
+                    {
+                        int o = ReadU16(vOff);
+                        if (o >= 1 && o <= 8)
+                        {
+                            ExifOrientation = o;
+                            _metadata.Orientation = o;
+                        }
+                    }
+                    break;
+                case 0x8769:
+                    if (type == 4 && count == 1) exifIfdOffset = tiffBase + (int)ReadU32(vOff);
+                    break;
+                case 0x8825:
+                    if (type == 4 && count == 1) gpsIfdOffset = tiffBase + (int)ReadU32(vOff);
+                    break;
+            }
+        }
+
+        if (exifIfdOffset.HasValue) ParseExifSubIfd(exifIfdOffset.Value);
+        if (gpsIfdOffset.HasValue) ParseGpsIfd(gpsIfdOffset.Value);
     }
 
     private void ParseSOF(int length, bool isProgressive)
@@ -254,9 +592,9 @@ public class JpegDecoder
             throw new NotSupportedException("Only 8-bit JPEG precision is supported.");
         }
 
-        if (frame.ComponentsCount < 1 || frame.ComponentsCount > 3)
+        if (frame.ComponentsCount < 1 || frame.ComponentsCount > 4)
         {
-            throw new NotSupportedException("Only JPEG images with 1 to 3 components are supported.");
+            throw new NotSupportedException("Only JPEG images with 1 to 4 components are supported.");
         }
 
         frame.Components = new Component[frame.ComponentsCount];
@@ -388,7 +726,7 @@ public class JpegDecoder
 
     private void ProcessScan()
     {
-        if (_frame == null) throw new InvalidOperationException("Frame not parsed before scan");
+        if (_frame == null) throw new JpegHeaderException("Frame not parsed before scan");
 
         int length = ReadUShort();
         
@@ -416,6 +754,33 @@ public class JpegDecoder
 
         var reader = new JpegBitReader(_stream);
         // Position is already correct
+        bool missingTables = false;
+        bool needsDc = scan.StartSpectralSelection == 0 && scan.SuccessiveApproximationBitHigh == 0;
+        bool needsAc = scan.StartSpectralSelection != 0;
+        for (int i = 0; i < scan.ComponentsCount; i++)
+        {
+            if (needsDc && GetHuffmanTable(0, scan.Components[i].DcTableId) == null)
+            {
+                missingTables = true;
+            }
+            if (needsAc && GetHuffmanTable(1, scan.Components[i].AcTableId) == null)
+            {
+                missingTables = true;
+            }
+        }
+
+        if (missingTables)
+        {
+            int b = reader.ReadBit();
+            if (b == -1 && reader.HitMarker)
+            {
+                if (reader.Marker != 0) _stream.Seek(-2, SeekOrigin.Current);
+                return;
+            }
+            reader.AlignToByte();
+            DrainToNextMarker();
+            return;
+        }
 
         try
         {
@@ -435,8 +800,16 @@ public class JpegDecoder
         }
         catch (Exception ex)
         {
-             // Log or suppress? Jpeg decoding often has some corruption at end.
-             // We'll suppress generic errors during scan but maybe throw on critical ones.
+            if (!reader.HitMarker)
+            {
+                string info = $"components={scan.ComponentsCount} Ss={scan.StartSpectralSelection} Se={scan.EndSpectralSelection} Ah={scan.SuccessiveApproximationBitHigh} Al={scan.SuccessiveApproximationBitLow}";
+                for (int i = 0; i < scan.ComponentsCount; i++)
+                {
+                    var c = scan.Components[i];
+                    info += $" [cid={c.ComponentId} dc={c.DcTableId} ac={c.AcTableId}]";
+                }
+                throw new JpegScanException($"JPEG scan decode failed ({info}).", ex);
+            }
         }
 
         if (reader.HitMarker)
@@ -459,6 +832,33 @@ public class JpegDecoder
              {
                  _stream.Seek(-2, SeekOrigin.Current);
              }
+        }
+        else
+        {
+            reader.AlignToByte();
+            DrainToNextMarker();
+        }
+    }
+
+    private void DrainToNextMarker()
+    {
+        while (_stream.Position < _stream.Length)
+        {
+            int b = _stream.ReadByte();
+            if (b == -1) return;
+            if (b != 0xFF) continue;
+
+            int markerInt = _stream.ReadByte();
+            if (markerInt == -1) return;
+            while (markerInt == 0xFF)
+            {
+                markerInt = _stream.ReadByte();
+                if (markerInt == -1) return;
+            }
+
+            if (markerInt == 0x00) continue;
+            _stream.Seek(-2, SeekOrigin.Current);
+            return;
         }
     }
 
@@ -486,7 +886,7 @@ public class JpegDecoder
                     foreach (var sc in scan.Components)
                     {
                         var comp = sc.ComponentId >= 0 && sc.ComponentId < _componentsById.Length ? _componentsById[sc.ComponentId] : null;
-                        if (comp == null) throw new InvalidDataException("Component not found in frame");
+                        if (comp == null) throw new JpegScanException("Component not found in frame");
                         int baseX = mcuX * comp.HFactor;
                         int baseY = mcuY * comp.VFactor;
 
@@ -506,7 +906,7 @@ public class JpegDecoder
         {
             var sc = scan.Components[0];
             var comp = sc.ComponentId >= 0 && sc.ComponentId < _componentsById.Length ? _componentsById[sc.ComponentId] : null;
-            if (comp == null) throw new InvalidDataException("Component not found in frame");
+            if (comp == null) throw new JpegScanException("Component not found in frame");
             for (int blockY = 0; blockY < comp.HeightInBlocks; blockY++)
             {
                 for (int blockX = 0; blockX < comp.WidthInBlocks; blockX++)
@@ -532,13 +932,10 @@ public class JpegDecoder
         if (Ah == 0)
         {
             HuffmanDecodingTable ht = null;
-            if (dcTableId >= 0 && dcTableId < _htablesByClassAndId.GetLength(1))
-            {
-                ht = _htablesByClassAndId[0, dcTableId];
-            }
-            if (ht == null) throw new InvalidDataException("Missing DC Huffman table");
+            ht = GetHuffmanTable(0, dcTableId);
+            if (ht == null) throw new JpegHeaderException("Missing DC Huffman table");
             int s = DecodeHuffman(ht, reader);
-            if (s < 0) throw new InvalidDataException("Huffman decode error (DC)");
+            if (s < 0) throw new JpegScanException("Huffman decode error (DC)");
 
             int diff = Receive(s, reader);
             diff = Extend(diff, s);
@@ -569,16 +966,13 @@ public class JpegDecoder
             }
 
             HuffmanDecodingTable ht = null;
-            if (acTableId >= 0 && acTableId < _htablesByClassAndId.GetLength(1))
-            {
-                ht = _htablesByClassAndId[1, acTableId];
-            }
-            if (ht == null) throw new InvalidDataException("Missing AC Huffman table");
+            ht = GetHuffmanTable(1, acTableId);
+            if (ht == null) throw new JpegHeaderException("Missing AC Huffman table");
 
             for (int k = Ss; k <= Se; k++)
             {
                 int s = DecodeHuffman(ht, reader);
-                if (s < 0) throw new InvalidDataException("Huffman decode error (AC)");
+                if (s < 0) throw new JpegScanException("Huffman decode error (AC)");
 
                 int r = s >> 4;
                 int n = s & 0xF;
@@ -617,16 +1011,13 @@ public class JpegDecoder
             }
 
             HuffmanDecodingTable ht = null;
-            if (acTableId >= 0 && acTableId < _htablesByClassAndId.GetLength(1))
-            {
-                ht = _htablesByClassAndId[1, acTableId];
-            }
-            if (ht == null) throw new InvalidDataException("Missing AC Huffman table");
+            ht = GetHuffmanTable(1, acTableId);
+            if (ht == null) throw new JpegHeaderException("Missing AC Huffman table");
 
             while (k <= Se)
             {
                 int s = DecodeHuffman(ht, reader);
-                if (s < 0) throw new InvalidDataException("Huffman decode error (AC Refinement)");
+                if (s < 0) throw new JpegScanException("Huffman decode error (AC Refinement)");
 
                 int r = s >> 4;
                 int n = s & 0xF;
@@ -717,7 +1108,7 @@ public class JpegDecoder
                 foreach (var sc in scan.Components)
                 {
                     var comp = sc.ComponentId >= 0 && sc.ComponentId < _componentsById.Length ? _componentsById[sc.ComponentId] : null;
-                    if (comp == null) throw new InvalidDataException("Component not found in frame");
+                    if (comp == null) throw new JpegScanException("Component not found in frame");
                     int baseX = mcuX * comp.HFactor;
                     int baseY = mcuY * comp.VFactor;
 
@@ -754,11 +1145,12 @@ public class JpegDecoder
         Component compY = _frame.Components[0];
         Component compCb = _frame.Components.Length > 1 ? _frame.Components[1] : null;
         Component compCr = _frame.Components.Length > 2 ? _frame.Components[2] : null;
+        Component compK = _frame.Components.Length > 3 ? _frame.Components[3] : null;
 
         int mcuW = _frame.McuWidth;
         int mcuH = _frame.McuHeight;
 
-        bool is420 = compCb != null && compCr != null &&
+        bool is420 = compK == null && compCb != null && compCr != null &&
                      compY.HFactor == 2 && compY.VFactor == 2 &&
                      compCb.HFactor == 1 && compCb.VFactor == 1 &&
                      compCr.HFactor == 1 && compCr.VFactor == 1;
@@ -780,81 +1172,89 @@ public class JpegDecoder
             for (int i = 0; i < crBuffer.Length; i++) crBuffer[i] = new byte[64];
         }
 
+        byte[][] kBuffer = null;
+        if (compK != null)
+        {
+            kBuffer = new byte[compK.HFactor * compK.VFactor][];
+            for (int i = 0; i < kBuffer.Length; i++) kBuffer[i] = new byte[64];
+        }
+
         int[] dequantY = new int[64];
         int[] dequantCb = compCb != null ? new int[64] : null;
         int[] dequantCr = compCr != null ? new int[64] : null;
+        int[] dequantK = compK != null ? new int[64] : null;
 
         for (int mcuY = 0; mcuY < _frame.McuRows; mcuY++)
         {
             for (int mcuX = 0; mcuX < _frame.McuCols; mcuX++)
             {
-                int yBlockBaseX = mcuX * compY.HFactor;
-                int yBlockBaseY = mcuY * compY.VFactor;
-
-                for (int v = 0; v < compY.VFactor; v++)
+                // Y Component
                 {
-                    for (int h = 0; h < compY.HFactor; h++)
+                    int blockBaseX = mcuX * compY.HFactor;
+                    int blockBaseY = mcuY * compY.VFactor;
+                    for (int v = 0; v < compY.VFactor; v++)
                     {
-                        int blockIdx = (yBlockBaseY + v) * compY.WidthInBlocks + (yBlockBaseX + h);
-                        int qId = compY.QuantTableId;
-                        JpegQuantTable qt = null;
-                        if (qId >= 0 && qId < _qtablesById.Length)
+                        for (int h = 0; h < compY.HFactor; h++)
                         {
-                            qt = _qtablesById[qId];
+                            int blockIdx = (blockBaseY + v) * compY.WidthInBlocks + (blockBaseX + h);
+                            JpegQuantTable qt = _qtablesById[compY.QuantTableId];
+                            if (qt == null) throw new JpegHeaderException("Quantization table not found for Y");
+                            for (int i = 0; i < 64; i++) dequantY[i] = compY.Coeffs[blockIdx * 64 + i] * qt.Values[i];
+                            JpegIDCT.BlockIDCT(dequantY, yBuffer[v * compY.HFactor + h]);
                         }
-                        if (qt == null) throw new InvalidDataException("Quantization table not found for Y component");
-
-                        for (int i = 0; i < 64; i++)
-                            dequantY[i] = compY.Coeffs[blockIdx * 64 + i] * qt.Values[i];
-
-                        JpegIDCT.BlockIDCT(dequantY, yBuffer[v * compY.HFactor + h]);
                     }
                 }
 
+                // Cb Component
                 if (compCb != null)
                 {
-                    int cbBlockBaseX = mcuX * compCb.HFactor;
-                    int cbBlockBaseY = mcuY * compCb.VFactor;
-
+                    int blockBaseX = mcuX * compCb.HFactor;
+                    int blockBaseY = mcuY * compCb.VFactor;
                     for (int v = 0; v < compCb.VFactor; v++)
                     {
                         for (int h = 0; h < compCb.HFactor; h++)
                         {
-                            int cbIdx = (cbBlockBaseY + v) * compCb.WidthInBlocks + (cbBlockBaseX + h);
-                            JpegQuantTable qtCb = null;
-                            int cbQId = compCb.QuantTableId;
-                            if (cbQId >= 0 && cbQId < _qtablesById.Length)
-                            {
-                                qtCb = _qtablesById[cbQId];
-                            }
-                            if (qtCb == null) throw new InvalidDataException("Quantization table not found for Cb component");
-                            for (int i = 0; i < 64; i++)
-                                dequantCb[i] = compCb.Coeffs[cbIdx * 64 + i] * qtCb.Values[i];
+                            int blockIdx = (blockBaseY + v) * compCb.WidthInBlocks + (blockBaseX + h);
+                            JpegQuantTable qt = _qtablesById[compCb.QuantTableId];
+                            if (qt == null) throw new JpegHeaderException("Quantization table not found for Cb");
+                            for (int i = 0; i < 64; i++) dequantCb[i] = compCb.Coeffs[blockIdx * 64 + i] * qt.Values[i];
                             JpegIDCT.BlockIDCT(dequantCb, cbBuffer[v * compCb.HFactor + h]);
                         }
                     }
                 }
 
+                // Cr Component
                 if (compCr != null)
                 {
-                    int crBlockBaseX = mcuX * compCr.HFactor;
-                    int crBlockBaseY = mcuY * compCr.VFactor;
-
+                    int blockBaseX = mcuX * compCr.HFactor;
+                    int blockBaseY = mcuY * compCr.VFactor;
                     for (int v = 0; v < compCr.VFactor; v++)
                     {
                         for (int h = 0; h < compCr.HFactor; h++)
                         {
-                            int crIdx = (crBlockBaseY + v) * compCr.WidthInBlocks + (crBlockBaseX + h);
-                            JpegQuantTable qtCr = null;
-                            int crQId = compCr.QuantTableId;
-                            if (crQId >= 0 && crQId < _qtablesById.Length)
-                            {
-                                qtCr = _qtablesById[crQId];
-                            }
-                            if (qtCr == null) throw new InvalidDataException("Quantization table not found for Cr component");
-                            for (int i = 0; i < 64; i++)
-                                dequantCr[i] = compCr.Coeffs[crIdx * 64 + i] * qtCr.Values[i];
+                            int blockIdx = (blockBaseY + v) * compCr.WidthInBlocks + (blockBaseX + h);
+                            JpegQuantTable qt = _qtablesById[compCr.QuantTableId];
+                            if (qt == null) throw new JpegHeaderException("Quantization table not found for Cr");
+                            for (int i = 0; i < 64; i++) dequantCr[i] = compCr.Coeffs[blockIdx * 64 + i] * qt.Values[i];
                             JpegIDCT.BlockIDCT(dequantCr, crBuffer[v * compCr.HFactor + h]);
+                        }
+                    }
+                }
+
+                // K Component
+                if (compK != null)
+                {
+                    int blockBaseX = mcuX * compK.HFactor;
+                    int blockBaseY = mcuY * compK.VFactor;
+                    for (int v = 0; v < compK.VFactor; v++)
+                    {
+                        for (int h = 0; h < compK.HFactor; h++)
+                        {
+                            int blockIdx = (blockBaseY + v) * compK.WidthInBlocks + (blockBaseX + h);
+                            JpegQuantTable qt = _qtablesById[compK.QuantTableId];
+                            if (qt == null) throw new JpegHeaderException("Quantization table not found for K");
+                            for (int i = 0; i < 64; i++) dequantK[i] = compK.Coeffs[blockIdx * 64 + i] * qt.Values[i];
+                            JpegIDCT.BlockIDCT(dequantK, kBuffer[v * compK.HFactor + h]);
                         }
                     }
                 }
@@ -886,10 +1286,9 @@ public class JpegDecoder
                             int yInnerX = px & 7;
 
                             byte Y = yBuffer[yBlockIdx][yInnerY * 8 + yInnerX];
-
+                            
                             int cbX = px >> 1;
                             int cbIdx = cbY * 8 + cbX;
-
                             byte Cb = cbBlock[cbIdx];
                             byte Cr = crBlock[cbIdx];
 
@@ -922,51 +1321,80 @@ public class JpegDecoder
                             int yInnerX = px % 8;
                             int yInnerY = py % 8;
 
-                            byte Y = yBuffer[yBlockIdx][yInnerY * 8 + yInnerX];
-
-                            byte Cb = 128;
-                            byte Cr = 128;
+                            byte val0 = yBuffer[yBlockIdx][yInnerY * 8 + yInnerX];
+                            byte val1 = 128;
+                            byte val2 = 128;
+                            byte val3 = 255;
 
                             if (compCb != null && cbBuffer != null)
                             {
                                 int cbX = (px * compCb.HFactor) / compY.HFactor;
                                 int cbY = (py * compCb.VFactor) / compY.VFactor;
-
-                                int cbBlockX = cbX / 8;
-                                int cbBlockY = cbY / 8;
-                                int cbInnerX = cbX % 8;
-                                int cbInnerY = cbY % 8;
-
-                                int cbBlockIdx = cbBlockY * compCb.HFactor + cbBlockX;
-
+                                int cbBlockIdx = (cbY / 8) * compCb.HFactor + (cbX / 8);
                                 if (cbBlockIdx < cbBuffer.Length)
-                                {
-                                    Cb = cbBuffer[cbBlockIdx][cbInnerY * 8 + cbInnerX];
-                                }
+                                    val1 = cbBuffer[cbBlockIdx][(cbY % 8) * 8 + (cbX % 8)];
                             }
 
                             if (compCr != null && crBuffer != null)
                             {
                                 int crX = (px * compCr.HFactor) / compY.HFactor;
                                 int crY = (py * compCr.VFactor) / compY.VFactor;
-
-                                int crBlockX = crX / 8;
-                                int crBlockY = crY / 8;
-                                int crInnerX = crX % 8;
-                                int crInnerY = crY % 8;
-
-                                int crBlockIdx = crBlockY * compCr.HFactor + crBlockX;
-
+                                int crBlockIdx = (crY / 8) * compCr.HFactor + (crX / 8);
                                 if (crBlockIdx < crBuffer.Length)
-                                {
-                                    Cr = crBuffer[crBlockIdx][crInnerY * 8 + crInnerX];
-                                }
+                                    val2 = crBuffer[crBlockIdx][(crY % 8) * 8 + (crX % 8)];
                             }
 
-                            int yScaled = Y << ColorShift;
-                            int r = (yScaled + CrToR[Cr] + ColorHalf) >> ColorShift;
-                            int g = (yScaled + CbToG[Cb] + CrToG[Cr] + ColorHalf) >> ColorShift;
-                            int b = (yScaled + CbToB[Cb] + ColorHalf) >> ColorShift;
+                            if (compK != null && kBuffer != null)
+                            {
+                                int kX = (px * compK.HFactor) / compY.HFactor;
+                                int kY = (py * compK.VFactor) / compY.VFactor;
+                                int kBlockIdx = (kY / 8) * compK.HFactor + (kX / 8);
+                                if (kBlockIdx < kBuffer.Length)
+                                    val3 = kBuffer[kBlockIdx][(kY % 8) * 8 + (kX % 8)];
+                            }
+
+                            int r, g, b;
+
+                            if (compK != null)
+                            {
+                                // 4 Components
+                                if (_adobeColorTransform == 2) // YCCK
+                                {
+                                    // Y = val0, Cb = val1, Cr = val2, K = val3
+                                    int yScaled = val0 << ColorShift;
+                                    r = (yScaled + CrToR[val2] + ColorHalf) >> ColorShift;
+                                    g = (yScaled + CbToG[val1] + CrToG[val2] + ColorHalf) >> ColorShift;
+                                    b = (yScaled + CbToB[val1] + ColorHalf) >> ColorShift;
+
+                                    r = JpegUtils.Clamp(r) * val3 / 255;
+                                    g = JpegUtils.Clamp(g) * val3 / 255;
+                                    b = JpegUtils.Clamp(b) * val3 / 255;
+                                }
+                                else // CMYK (Inverted)
+                                {
+                                    // C = val0, M = val1, Y = val2, K = val3
+                                    // Inverted CMYK: 255 = White (0 ink?), No.
+                                    // Photoshop CMYK is 0=White (inverted). So 255 is Black.
+                                    // Actually, if it's inverted CMYK, then C,M,Y,K are 0..255.
+                                    // Formula:
+                                    // R = (C * K) / 255
+                                    // G = (M * K) / 255
+                                    // B = (Y * K) / 255
+                                    // Assuming inputs are "Inverted CMY" and "Inverted K".
+                                    
+                                    r = val0 * val3 / 255;
+                                    g = val1 * val3 / 255;
+                                    b = val2 * val3 / 255;
+                                }
+                            }
+                            else
+                            {
+                                // 1 or 3 Components (Y/RGB or YCbCr)
+                                int yScaled = val0 << ColorShift;
+                                r = (yScaled + CrToR[val2] + ColorHalf) >> ColorShift;
+                                g = (yScaled + CbToG[val1] + CrToG[val2] + ColorHalf) >> ColorShift;
+                                b = (yScaled + CbToB[val1] + ColorHalf) >> ColorShift;
+                            }
 
                             int idx = (globalY * width + globalX) * 3;
                             rgb[idx] = (byte)JpegUtils.Clamp(r);
@@ -977,7 +1405,7 @@ public class JpegDecoder
                 }
             }
         }
-        return new Image<Rgb24>(width, height, rgb);
+        return new Image<Rgb24>(width, height, rgb, _metadata);
     }
 
     private static int[] BuildColorTable(int k)
@@ -992,6 +1420,20 @@ public class JpegDecoder
 
     private int DecodeHuffman(HuffmanDecodingTable ht, JpegBitReader reader)
     {
+        if (EnableHuffmanFastPath)
+        {
+            int first8 = reader.PeekBits(8);
+            if (first8 != -1)
+            {
+                int len = ht.FastBits[first8];
+                if (len != 0)
+                {
+                    reader.SkipBits(len);
+                    return ht.FastSymbols[first8];
+                }
+            }
+        }
+
         int code = reader.ReadBit();
         int i = 1;
         if (code == -1) return -1;
@@ -1008,6 +1450,82 @@ public class JpegDecoder
         int j = ht.ValPtr[i];
         int j2 = j + code - ht.MinCode[i];
         return ht.Table.Symbols[j2];
+    }
+
+    private HuffmanDecodingTable? GetHuffmanTable(int tableClass, int tableId)
+    {
+        if ((uint)tableClass >= (uint)_htablesByClassAndId.GetLength(0)) return null;
+        if ((uint)tableId >= (uint)_htablesByClassAndId.GetLength(1)) return null;
+
+        var ht = _htablesByClassAndId[tableClass, tableId];
+        if (ht != null) return ht;
+
+        if (!_huffmanRecoveryAttempted && _stream != null && _stream.CanSeek)
+        {
+            _huffmanRecoveryAttempted = true;
+            TryRecoverHuffmanTables(_stream.Position);
+            ht = _htablesByClassAndId[tableClass, tableId];
+            if (ht != null) return ht;
+        }
+
+        for (int i = 0; i < _htables.Count; i++)
+        {
+            var t = _htables[i];
+            if (t.Table.TableClass == tableClass && t.Table.TableId == tableId)
+            {
+                _htablesByClassAndId[tableClass, tableId] = t;
+                return t;
+            }
+        }
+        return null;
+    }
+
+    private void TryRecoverHuffmanTables(long stopPos)
+    {
+        long cur = _stream.Position;
+        try
+        {
+            if (stopPos < 2) stopPos = 2;
+            _stream.Seek(2, SeekOrigin.Begin);
+            while (_stream.Position < stopPos && _stream.Position < _stream.Length)
+            {
+                int prefix;
+                do
+                {
+                    prefix = _stream.ReadByte();
+                    if (prefix == -1) return;
+                } while (prefix != 0xFF);
+
+                int markerInt;
+                do
+                {
+                    markerInt = _stream.ReadByte();
+                    if (markerInt == -1) return;
+                } while (markerInt == 0xFF);
+
+                byte marker = (byte)markerInt;
+                if (marker == 0x00) continue;
+                if (marker == JpegMarkers.SOI) continue;
+                if (marker >= JpegMarkers.RST0 && marker <= JpegMarkers.RST7) continue;
+                if (marker == JpegMarkers.TEM) continue;
+                if (marker == JpegMarkers.SOS || marker == JpegMarkers.EOI) break;
+
+                ushort length = ReadUShort();
+                if (marker == JpegMarkers.DHT)
+                {
+                    ParseDHT(length);
+                }
+                else
+                {
+                    int contentLen = length >= 2 ? length - 2 : 0;
+                    if (contentLen > 0) _stream.Seek(contentLen, SeekOrigin.Current);
+                }
+            }
+        }
+        finally
+        {
+            _stream.Position = cur;
+        }
     }
 
     private static int Extend(int v, int t)

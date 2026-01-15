@@ -32,9 +32,10 @@ namespace SharpImageConverter.Formats
             var img = decoder.Decode(stream);
             if (decoder.ExifOrientation != 1)
             {
-                var frame = new ImageFrame(img.Width, img.Height, img.Buffer);
+                var frame = new ImageFrame(img.Width, img.Height, img.Buffer, img.Metadata);
                 frame = frame.ApplyExifOrientation(decoder.ExifOrientation);
                 img.Update(frame.Width, frame.Height, frame.Pixels);
+                img.Metadata.Orientation = 1;
             }
             return img;
         }

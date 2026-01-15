@@ -8,6 +8,8 @@ internal class HuffmanDecodingTable
     public int[] MaxCode { get; } = new int[17];
     public int[] MinCode { get; } = new int[17];
     public int[] ValPtr { get; } = new int[17];
+    public byte[] FastBits { get; } = new byte[256];
+    public byte[] FastSymbols { get; } = new byte[256];
 
     public HuffmanDecodingTable(JpegHuffmanTable table)
     {
@@ -63,6 +65,27 @@ internal class HuffmanDecodingTable
                 MinCode[i] = huffcode[jIdx];
                 MaxCode[i] = huffcode[jIdx + Table.CodeLengths[i - 1] - 1];
                 jIdx += Table.CodeLengths[i - 1];
+            }
+        }
+
+        Array.Clear(FastBits, 0, FastBits.Length);
+        Array.Clear(FastSymbols, 0, FastSymbols.Length);
+
+        int total = Math.Min(jIdx, Table.Symbols.Length);
+        for (int i = 0; i < total; i++)
+        {
+            int size = huffsize[i];
+            if (size <= 0 || size > 16) continue;
+            if (size > 8) continue;
+
+            int code8 = huffcode[i] << (8 - size);
+            int fill = 1 << (8 - size);
+            byte sym = Table.Symbols[i];
+            for (int j = 0; j < fill; j++)
+            {
+                int idx = code8 | j;
+                FastBits[idx] = (byte)size;
+                FastSymbols[idx] = sym;
             }
         }
     }
