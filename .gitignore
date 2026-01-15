@@ -109,3 +109,6 @@ StyleCopReport.xml
 # NuGet packages
 *.nupkg
 *.snupkg
+
+
+example/
