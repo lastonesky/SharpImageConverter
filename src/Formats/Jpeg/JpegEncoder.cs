@@ -1,6 +1,7 @@
 using System;
 using System.IO;
 using System.Numerics;
+using SharpImageConverter.Metadata;
 
 namespace SharpImageConverter;
 
@@ -207,7 +208,7 @@ public static class JpegEncoder
         if (quality > 100) quality = 100;
 
         bool subsample420 = true;
-        WriteInternal(stream, width, height, rgb24, quality, subsample420);
+        WriteInternal(stream, width, height, rgb24, quality, subsample420, null, false);
     }
 
     /// <summary>
@@ -235,10 +236,20 @@ public static class JpegEncoder
         if (quality < 1) quality = 1;
         if (quality > 100) quality = 100;
 
-        WriteInternal(stream, width, height, rgb24, quality, subsample420);
+        WriteInternal(stream, width, height, rgb24, quality, subsample420, null, false);
     }
 
-    private static void WriteInternal(Stream stream, int width, int height, byte[] rgb24, int quality, bool subsample420)
+    public static void Write(Stream stream, int width, int height, byte[] rgb24, int quality, bool subsample420, ImageMetadata? metadata, bool keepMetadata)
+    {
+        if (rgb24 == null) throw new ArgumentNullException(nameof(rgb24));
+        if (rgb24.Length != checked(width * height * 3)) throw new ArgumentException("RGB24 像素长度不匹配", nameof(rgb24));
+        if (quality < 1) quality = 1;
+        if (quality > 100) quality = 100;
+
+        WriteInternal(stream, width, height, rgb24, quality, subsample420, metadata, keepMetadata);
+    }
+
+    private static void WriteInternal(Stream stream, int width, int height, byte[] rgb24, int quality, bool subsample420, ImageMetadata? metadata, bool keepMetadata)
     {
         if (DebugPrintConfig)
         {
@@ -257,6 +268,10 @@ public static class JpegEncoder
 
         WriteMarker(stream, 0xD8);
         WriteApp0Jfif(stream);
+        if (keepMetadata && metadata != null)
+        {
+            WriteMetadata(stream, metadata);
+        }
         WriteDqt(stream, 0, qY);
         WriteDqt(stream, 1, qC);
         WriteSof0(stream, width, height, subsample420);
@@ -735,6 +750,124 @@ public static class JpegEncoder
         WriteBe16(s, 1);
         s.WriteByte(0);
         s.WriteByte(0);
+    }
+
+    private static void WriteMetadata(Stream s, ImageMetadata metadata)
+    {
+        if (metadata.ExifRaw != null && metadata.ExifRaw.Length > 0)
+        {
+            byte[] exif = PatchExifOrientation(metadata.ExifRaw, 1);
+            WriteAppSegment(s, 0xE1, exif);
+        }
+
+        if (metadata.IccProfile != null && metadata.IccProfile.Length > 0)
+        {
+            WriteIccProfile(s, metadata.IccProfile);
+        }
+    }
+
+    private static void WriteAppSegment(Stream s, byte markerLow, byte[] payload)
+    {
+        int len = payload.Length + 2;
+        if (len > 0xFFFF) throw new ArgumentOutOfRangeException(nameof(payload), "APP 段长度过大");
+        WriteMarker(s, markerLow);
+        WriteBe16(s, len);
+        s.Write(payload, 0, payload.Length);
+    }
+
+    private static void WriteIccProfile(Stream s, byte[] profile)
+    {
+        byte[] sig = new byte[]
+        {
+            (byte)'I',(byte)'C',(byte)'C',(byte)'_',(byte)'P',(byte)'R',(byte)'O',(byte)'F',(byte)'I',(byte)'L',(byte)'E',0x00
+        };
+
+        const int overhead = 14;
+        int maxPayload = 0xFFFD - overhead;
+        int count = (profile.Length + maxPayload - 1) / maxPayload;
+        if (count <= 0) count = 1;
+        if (count > 255) throw new ArgumentOutOfRangeException(nameof(profile), "ICC Profile 过大");
+
+        int offset = 0;
+        for (int i = 0; i < count; i++)
+        {
+            int take = Math.Min(maxPayload, profile.Length - offset);
+            byte[] payload = new byte[overhead + take];
+            Buffer.BlockCopy(sig, 0, payload, 0, sig.Length);
+            payload[12] = (byte)(i + 1);
+            payload[13] = (byte)count;
+            Buffer.BlockCopy(profile, offset, payload, overhead, take);
+            WriteAppSegment(s, 0xE2, payload);
+            offset += take;
+        }
+    }
+
+    private static byte[] PatchExifOrientation(byte[] exifApp1, ushort newOrientation)
+    {
+        if (exifApp1.Length < 14) return exifApp1;
+        if (!(exifApp1[0] == (byte)'E' && exifApp1[1] == (byte)'x' && exifApp1[2] == (byte)'i' && exifApp1[3] == (byte)'f' && exifApp1[4] == 0 && exifApp1[5] == 0))
+            return exifApp1;
+
+        byte[] buf = new byte[exifApp1.Length];
+        Buffer.BlockCopy(exifApp1, 0, buf, 0, exifApp1.Length);
+
+        int tiffBase = 6;
+        if (buf.Length < tiffBase + 8) return buf;
+
+        bool littleEndian;
+        if (buf[tiffBase + 0] == (byte)'I' && buf[tiffBase + 1] == (byte)'I') littleEndian = true;
+        else if (buf[tiffBase + 0] == (byte)'M' && buf[tiffBase + 1] == (byte)'M') littleEndian = false;
+        else return buf;
+
+        ushort ReadU16(int offset)
+        {
+            if (offset < 0 || offset + 2 > buf.Length) return 0;
+            return littleEndian ? (ushort)(buf[offset] | (buf[offset + 1] << 8)) : (ushort)((buf[offset] << 8) | buf[offset + 1]);
+        }
+
+        uint ReadU32(int offset)
+        {
+            if (offset < 0 || offset + 4 > buf.Length) return 0;
+            return littleEndian
+                ? (uint)(buf[offset] | (buf[offset + 1] << 8) | (buf[offset + 2] << 16) | (buf[offset + 3] << 24))
+                : (uint)((buf[offset] << 24) | (buf[offset + 1] << 16) | (buf[offset + 2] << 8) | buf[offset + 3]);
+        }
+
+        void WriteU16(int offset, ushort v)
+        {
+            if (offset < 0 || offset + 2 > buf.Length) return;
+            if (littleEndian)
+            {
+                buf[offset] = (byte)(v & 0xFF);
+                buf[offset + 1] = (byte)((v >> 8) & 0xFF);
+            }
+            else
+            {
+                buf[offset] = (byte)((v >> 8) & 0xFF);
+                buf[offset + 1] = (byte)(v & 0xFF);
+            }
+        }
+
+        ushort magic = ReadU16(tiffBase + 2);
+        if (magic != 42) return buf;
+        int ifd0 = tiffBase + (int)ReadU32(tiffBase + 4);
+        if (ifd0 < 0 || ifd0 + 2 > buf.Length) return buf;
+
+        ushort numEntries = ReadU16(ifd0);
+        int entryBase = ifd0 + 2;
+        for (int i = 0; i < numEntries; i++)
+        {
+            int e = entryBase + i * 12;
+            if (e + 12 > buf.Length) break;
+            ushort tag = ReadU16(e + 0);
+            ushort type = ReadU16(e + 2);
+            uint count = ReadU32(e + 4);
+            if (tag != 0x0112 || type != 3 || count < 1) continue;
+            WriteU16(e + 8, newOrientation);
+            break;
+        }
+
+        return buf;
     }
 
     private static void WriteDqt(Stream s, byte tableId, byte[] tableNatural)

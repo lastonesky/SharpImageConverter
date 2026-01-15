@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using SharpImageConverter.Metadata;
 
 namespace SharpImageConverter.Core
 {
@@ -21,17 +22,20 @@ namespace SharpImageConverter.Core
         /// </summary>
         public byte[] Buffer { get; private set; }
 
+        public ImageMetadata Metadata { get; }
+
         /// <summary>
         /// 使用指定尺寸与缓冲区创建图像
         /// </summary>
         /// <param name="width">宽度</param>
         /// <param name="height">高度</param>
         /// <param name="buffer">像素缓冲区</param>
-        public Image(int width, int height, byte[] buffer)
+        public Image(int width, int height, byte[] buffer, ImageMetadata? metadata = null)
         {
             Width = width;
             Height = height;
             Buffer = buffer;
+            Metadata = metadata ?? new ImageMetadata();
         }
 
         /// <summary>

@@ -118,7 +118,7 @@ namespace SharpImageConverter.Core
                         rgbaBuf[i + 2] = rgb.Buffer[j + 2];
                         rgbaBuf[i + 3] = 255;
                     }
-                    return new Image<Rgba32>(rgb.Width, rgb.Height, rgbaBuf);
+                    return new Image<Rgba32>(rgb.Width, rgb.Height, rgbaBuf, rgb.Metadata);
                 }
             }
             throw new NotSupportedException("未知图像格式");
@@ -141,7 +141,7 @@ namespace SharpImageConverter.Core
                 enc.EncodeRgba32(path, image);
                 return;
             }
-            var rgb = new Image<Rgb24>(image.Width, image.Height, RgbaToRgb(image.Buffer));
+            var rgb = new Image<Rgb24>(image.Width, image.Height, RgbaToRgb(image.Buffer), image.Metadata);
             SaveRgb24(rgb, path);
         }
 

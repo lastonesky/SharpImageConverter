@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using SharpImageConverter.Metadata;
 
 namespace SharpImageConverter;
 
@@ -36,13 +37,15 @@ public sealed class ImageFrame
     /// </summary>
     public byte[] Pixels { get; }
 
+    public ImageMetadata Metadata { get; }
+
     /// <summary>
     /// 创建一个新的图像帧
     /// </summary>
     /// <param name="width">图像宽度</param>
     /// <param name="height">图像高度</param>
     /// <param name="rgb24">RGB24 像素缓冲区</param>
-    public ImageFrame(int width, int height, byte[] rgb24)
+    public ImageFrame(int width, int height, byte[] rgb24, ImageMetadata? metadata = null)
     {
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(width, nameof(width));
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(height, nameof(height));
@@ -53,6 +56,7 @@ public sealed class ImageFrame
         Height = height;
         PixelFormat = ImagePixelFormat.Rgb24;
         Pixels = rgb24;
+        Metadata = metadata ?? new ImageMetadata();
     }
 
     /// <summary>
@@ -135,10 +139,11 @@ public sealed class ImageFrame
         if (decoder.ExifOrientation != 1)
         {
             var t = ApplyExifOrientation(rgb, decoder.Width, decoder.Height, decoder.ExifOrientation);
-            return new ImageFrame(t.width, t.height, t.pixels);
+            img.Metadata.Orientation = 1;
+            return new ImageFrame(t.width, t.height, t.pixels, img.Metadata);
         }
 
-        return new ImageFrame(decoder.Width, decoder.Height, rgb);
+        return new ImageFrame(decoder.Width, decoder.Height, rgb, img.Metadata);
     }
 
     /// <summary>
@@ -319,6 +324,17 @@ public sealed class ImageFrame
         JpegEncoder.Write(stream, Width, Height, Pixels, quality, subsample420);
     }
 
+    public void SaveAsJpeg(string path, int quality, bool subsample420, bool keepMetadata)
+    {
+        using var fs = File.Create(path);
+        SaveAsJpeg(fs, quality, subsample420, keepMetadata);
+    }
+
+    public void SaveAsJpeg(Stream stream, int quality, bool subsample420, bool keepMetadata)
+    {
+        JpegEncoder.Write(stream, Width, Height, Pixels, quality, subsample420, Metadata, keepMetadata);
+    }
+
     /// <summary>
     /// 以 GIF 格式保存图像
     /// </summary>
@@ -348,7 +364,8 @@ public sealed class ImageFrame
     {
         if (orientation == 1) return this;
         var t = ApplyExifOrientation(Pixels, Width, Height, orientation);
-        return new ImageFrame(t.width, t.height, t.pixels);
+        Metadata.Orientation = 1;
+        return new ImageFrame(t.width, t.height, t.pixels, Metadata);
     }
 
     private static (byte[] pixels, int width, int height) ApplyExifOrientation(byte[] src, int width, int height, int orientation)

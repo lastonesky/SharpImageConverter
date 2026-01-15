@@ -20,7 +20,7 @@ class Program
             Console.WriteLine("支持输入: .jpg/.jpeg/.png/.bmp/.webp/.gif");
             Console.WriteLine("支持输出: .jpg/.jpeg/.png/.bmp/.webp/.gif");
             Console.WriteLine("操作: resize:WxH | resizebilinear:WxH | resizefit:WxH | grayscale");
-            Console.WriteLine("参数: --quality N | --subsample 420/444 | --fdct int/float | --jpeg-debug | --gif-frames");
+            Console.WriteLine("参数: --quality N | --subsample 420/444 | --keep-metadata | --fdct int/float | --jpeg-debug | --gif-frames");
             return;
         }
         string inputPath = args[0];
@@ -32,6 +32,7 @@ class Program
         string? outputPath = null;
         int? jpegQuality = null;
         bool? subsample420 = null;
+        bool keepMetadata = false;
         bool gifFrames = false;
         var ops = new List<Action<ImageProcessingContext>>();
         for (int i = 1; i < args.Length; i++)
@@ -66,6 +67,11 @@ class Program
                     else if (string.Equals(v, "444", StringComparison.OrdinalIgnoreCase)) subsample420 = false;
                     i++;
                 }
+                continue;
+            }
+            if (string.Equals(a, "--keep-metadata", StringComparison.OrdinalIgnoreCase))
+            {
+                keepMetadata = true;
                 continue;
             }
             if (a.StartsWith("--subsample=", StringComparison.OrdinalIgnoreCase))
@@ -206,9 +212,9 @@ class Program
                 {
                     var image = Image.Load(inputPath);
                     int q = jpegQuality ?? 75;
-                    var frame = new ImageFrame(image.Width, image.Height, image.Buffer);
+                    var frame = new ImageFrame(image.Width, image.Height, image.Buffer, image.Metadata);
                     bool effectiveSubsample420 = subsample420 ?? true;
-                    frame.SaveAsJpeg(outputPath, q, effectiveSubsample420);
+                    frame.SaveAsJpeg(outputPath, q, effectiveSubsample420, keepMetadata);
                 }
                 else
                 {
@@ -276,9 +282,9 @@ class Program
                 if (outExt is ".jpg" or ".jpeg")
                 {
                     int q = jpegQuality ?? 75;
-                    var frame = new ImageFrame(image.Width, image.Height, image.Buffer);
+                    var frame = new ImageFrame(image.Width, image.Height, image.Buffer, image.Metadata);
                     bool effectiveSubsample420 = subsample420 ?? true;
-                    frame.SaveAsJpeg(outputPath, q, effectiveSubsample420);
+                    frame.SaveAsJpeg(outputPath, q, effectiveSubsample420, keepMetadata);
                 }
                 else
                 {
