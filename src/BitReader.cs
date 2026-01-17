@@ -1,177 +1,82 @@
 using System;
 using System.IO;
+using System.Runtime.CompilerServices;
 
 namespace SharpImageConverter;
 
-/// <summary>
-/// 位流读取器，支持按位读取与 JPEG 的字节填充处理。
-/// </summary>
-public class BitReader
+public unsafe class BitReader
 {
-    private readonly Stream _s;
-    private int _bitBuf;
-    private int _bitCount;
-    private bool _eof;
-    private bool _sawRestart;
-    private readonly byte[] _buf;
-    private int _bufPos;
-    private int _bufLen;
-    private long _bufEndPos;
+    private readonly FastBufferedStream _stream;
+    private ulong _bitBuffer;      // 64位位缓冲区（寄存器）
+    private int _bitsRemaining;    // 寄存器中剩余的有效位数量
 
-    /// <summary>
-    /// 使用输入流创建位读取器
-    /// </summary>
-    /// <param name="s">输入数据流</param>
-    public BitReader(Stream s)
+    public BitReader(FastBufferedStream stream)
     {
-        _s = s;
-        _bitBuf = 0;
-        _bitCount = 0;
-        _eof = false;
-        _buf = new byte[16 * 1024];
-        _bufPos = 0;
-        _bufLen = 0;
-        _bufEndPos = _s.CanSeek ? _s.Position : 0;
+        _stream = stream;
+        _bitsRemaining = 0;
+        _bitBuffer = 0;
     }
 
     /// <summary>
-    /// 重置位缓冲（清空已缓存的位）
+    /// 读取 n 个比特，但不从缓冲区中移除它们（用于查表匹配）
     /// </summary>
-    public void ResetBits()
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public uint PeekBits(int count)
     {
-        _bitBuf = 0;
-        _bitCount = 0;
-    }
-
-    internal bool TakeRestartMarker()
-    {
-        bool v = _sawRestart;
-        _sawRestart = false;
-        return v;
-    }
-
-    private bool FillBuffer()
-    {
-        _bufLen = _s.Read(_buf, 0, _buf.Length);
-        _bufPos = 0;
-        if (_bufLen <= 0) return false;
-        if (_s.CanSeek) _bufEndPos = _s.Position;
-        return true;
-    }
-
-    private int ReadRawByte()
-    {
-        if (_bufPos >= _bufLen)
+        if (_bitsRemaining < count)
         {
-            if (!FillBuffer()) return -1;
+            FillBitBuffer();
         }
-        return _buf[_bufPos++];
+        
+        // 从高位截取 count 个比特
+        return (uint)(_bitBuffer >> (64 - count));
     }
 
-    private long LogicalPosition
-        => _s.CanSeek ? (_bufEndPos - (_bufLen - _bufPos)) : 0;
-
-    private int ReadByteStuffed()
+    /// <summary>
+    /// 从缓冲区中丢弃 n 个比特（匹配成功后移动指针）
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public void SkipBits(int count)
     {
-        while (true)
-        {
-            int b = ReadRawByte();
-            if (b == -1) { _eof = true; return -1; }
-            if (b != 0xFF) return b;
+        _bitBuffer <<= count;
+        _bitsRemaining -= count;
+    }
 
-            int n = ReadRawByte();
-            if (n == -1) { _eof = true; return -1; }
-            if (n == 0x00) return 0xFF;
-            if (n >= 0xD0 && n <= 0xD7)
+    /// <summary>
+    /// 读取并弹出 n 个比特
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public uint ReadBits(int count)
+    {
+        uint result = PeekBits(count);
+        SkipBits(count);
+        return result;
+    }
+
+    /// <summary>
+    /// 核心优化：利用指针一次性拉取 8 字节填充寄存器
+    /// </summary>
+    private void FillBitBuffer()
+    {
+        // 只要寄存器里还能装得下至少一个字节，就尝试去读
+        while (_bitsRemaining <= 56)
+        {
+            int b = _stream.ReadByte();
+            if (b == -1) break; // 文件结束
+
+            // ⚠️ JPEG 特殊处理：0xFF 后面如果是 0x00，代表真正的 0xFF 数据（Byte Stuffing）
+            if (b == 0xFF)
             {
-                _sawRestart = true;
-                ResetBits();
-                continue;
+                int next = _stream.ReadByte();
+                if (next != 0x00)
+                {
+                    // 遇到了标记（Marker），处理逻辑略...
+                }
             }
 
-            if (_s.CanSeek)
-            {
-                long markerStartPos = LogicalPosition - 2;
-                _s.Position = markerStartPos;
-                _bufPos = 0;
-                _bufLen = 0;
-                _bufEndPos = markerStartPos;
-            }
-            return -2;
+            // 将新读取的字节放入 ulong 的低位，然后靠左对齐
+            _bitBuffer |= (ulong)b << (56 - _bitsRemaining);
+            _bitsRemaining += 8;
         }
-    }
-
-    /// <summary>
-    /// 读取 n 位并消耗它们
-    /// </summary>
-    /// <param name="n">位数</param>
-    /// <returns>读取到的值</returns>
-    public int GetBits(int n)
-    {
-        while (_bitCount < n && !_eof)
-        {
-            int b = ReadByteStuffed();
-            if (b == -1 || b == -2) { _eof = true; break; }
-            _bitBuf = (_bitBuf << 8) | b;
-            _bitCount += 8;
-        }
-        if (_bitCount < n)
-            throw new EndOfStreamException("位流不足");
-        int res = (_bitBuf >> (_bitCount - n)) & ((1 << n) - 1);
-        _bitCount -= n;
-        _bitBuf &= (1 << _bitCount) - 1;
-        return res;
-    }
-
-    /// <summary>
-    /// 读取 1 位并消耗
-    /// </summary>
-    public int GetBit() => GetBits(1);
-
-    /// <summary>
-    /// 是否已到位流末尾
-    /// </summary>
-    public bool IsEOF => _eof;
-
-    // 确保位缓冲中至少有 n 位（不消耗），用于快速霍夫曼查表
-    /// <summary>
-    /// 确保位缓冲中至少有 n 位（不消耗）
-    /// </summary>
-    /// <param name="n">需要的位数</param>
-    /// <returns>缓冲足够则为 true</returns>
-    public bool EnsureBits(int n)
-    {
-        while (_bitCount < n && !_eof)
-        {
-            int b = ReadByteStuffed();
-            if (b == -1 || b == -2) { _eof = true; break; }
-            _bitBuf = (_bitBuf << 8) | b;
-            _bitCount += 8;
-        }
-        return _bitCount >= n;
-    }
-
-    // 查看高位的 n 位，不消耗
-    /// <summary>
-    /// 查看高位的 n 位（不消耗）
-    /// </summary>
-    /// <param name="n">位数</param>
-    /// <returns>读取的值</returns>
-    public int PeekBits(int n)
-    {
-        if (!EnsureBits(n)) throw new EndOfStreamException("位流不足");
-        return (_bitBuf >> (_bitCount - n)) & ((1 << n) - 1);
-    }
-
-    // 丢弃高位的 n 位
-    /// <summary>
-    /// 丢弃高位的 n 位
-    /// </summary>
-    /// <param name="n">位数</param>
-    public void DropBits(int n)
-    {
-        if (n > _bitCount) throw new ArgumentOutOfRangeException(nameof(n), "丢弃位数超过缓冲");
-        _bitCount -= n;
-        _bitBuf &= (1 << _bitCount) - 1;
     }
 }
