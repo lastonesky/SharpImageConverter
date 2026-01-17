@@ -875,6 +875,39 @@ public class JpegDecoder
 
         foreach (var c in _frame.Components) c.DcPred = 0;
 
+        bool needsDc = Ss == 0 && Ah == 0;
+        bool needsAc = Ss != 0;
+
+        HuffmanDecodingTable[] dcTables = null;
+        HuffmanDecodingTable[] acTables = null;
+
+        if (compsInScan > 0)
+        {
+            if (needsDc)
+            {
+                dcTables = new HuffmanDecodingTable[compsInScan];
+                for (int i = 0; i < compsInScan; i++)
+                {
+                    var sc = scan.Components[i];
+                    var ht = GetHuffmanTable(0, sc.DcTableId);
+                    if (ht == null) throw new JpegHeaderException("Missing DC Huffman table");
+                    dcTables[i] = ht;
+                }
+            }
+
+            if (needsAc)
+            {
+                acTables = new HuffmanDecodingTable[compsInScan];
+                for (int i = 0; i < compsInScan; i++)
+                {
+                    var sc = scan.Components[i];
+                    var ht = GetHuffmanTable(1, sc.AcTableId);
+                    if (ht == null) throw new JpegHeaderException("Missing AC Huffman table");
+                    acTables[i] = ht;
+                }
+            }
+        }
+
         if (compsInScan > 1)
         {
             for (int mcuY = 0; mcuY < _frame.McuRows; mcuY++)
@@ -883,58 +916,61 @@ public class JpegDecoder
                 {
                     CheckRestart(ref restartsLeft, reader);
 
-                    foreach (var sc in scan.Components)
+                    for (int ci = 0; ci < compsInScan; ci++)
                     {
+                        var sc = scan.Components[ci];
                         var comp = sc.ComponentId >= 0 && sc.ComponentId < _componentsById.Length ? _componentsById[sc.ComponentId] : null;
                         if (comp == null) throw new JpegScanException("Component not found in frame");
                         int baseX = mcuX * comp.HFactor;
                         int baseY = mcuY * comp.VFactor;
+                        var dcTable = dcTables != null ? dcTables[ci] : null;
 
                         for (int v = 0; v < comp.VFactor; v++)
                         {
                             for (int h = 0; h < comp.HFactor; h++)
                             {
                                 int blockIndex = (baseY + v) * comp.WidthInBlocks + (baseX + h);
-                                DecodeDCProgressive(reader, comp.Coeffs, blockIndex * 64, sc.DcTableId, Ah, Al, ref comp.DcPred);
+                                DecodeDCProgressive(reader, comp.Coeffs, blockIndex * 64, dcTable, Ah, Al, ref comp.DcPred);
                             }
                         }
                     }
                 }
             }
         }
-        else
+        else if (compsInScan == 1)
         {
             var sc = scan.Components[0];
             var comp = sc.ComponentId >= 0 && sc.ComponentId < _componentsById.Length ? _componentsById[sc.ComponentId] : null;
             if (comp == null) throw new JpegScanException("Component not found in frame");
+            var dcTable = dcTables != null ? dcTables[0] : null;
+            var acTable = acTables != null ? acTables[0] : null;
+
             for (int blockY = 0; blockY < comp.HeightInBlocks; blockY++)
             {
                 for (int blockX = 0; blockX < comp.WidthInBlocks; blockX++)
                 {
                     CheckRestart(ref restartsLeft, reader);
-                    
+
                     int blockIndex = blockY * comp.WidthInBlocks + blockX;
                     if (Ss == 0)
                     {
-                        DecodeDCProgressive(reader, comp.Coeffs, blockIndex * 64, sc.DcTableId, Ah, Al, ref comp.DcPred);
+                        DecodeDCProgressive(reader, comp.Coeffs, blockIndex * 64, dcTable, Ah, Al, ref comp.DcPred);
                     }
                     else
                     {
-                        DecodeACProgressive(reader, comp.Coeffs, blockIndex * 64, sc.AcTableId, Ss, Se, Ah, Al, ref eobRun);
+                        DecodeACProgressive(reader, comp.Coeffs, blockIndex * 64, acTable, Ss, Se, Ah, Al, ref eobRun);
                     }
                 }
             }
         }
     }
 
-    private void DecodeDCProgressive(JpegBitReader reader, int[] coeffs, int offset, int dcTableId, int Ah, int Al, ref int dcPred)
+    private void DecodeDCProgressive(JpegBitReader reader, int[] coeffs, int offset, HuffmanDecodingTable dcTable, int Ah, int Al, ref int dcPred)
     {
         if (Ah == 0)
         {
-            HuffmanDecodingTable ht = null;
-            ht = GetHuffmanTable(0, dcTableId);
-            if (ht == null) throw new JpegHeaderException("Missing DC Huffman table");
-            int s = DecodeHuffman(ht, reader);
+            if (dcTable == null) throw new JpegHeaderException("Missing DC Huffman table");
+            int s = DecodeHuffman(dcTable, reader);
             if (s < 0) throw new JpegScanException("Huffman decode error (DC)");
 
             int diff = Receive(s, reader);
@@ -955,8 +991,10 @@ public class JpegDecoder
         }
     }
 
-    private void DecodeACProgressive(JpegBitReader reader, int[] coeffs, int offset, int acTableId, int Ss, int Se, int Ah, int Al, ref int eobRun)
+    private void DecodeACProgressive(JpegBitReader reader, int[] coeffs, int offset, HuffmanDecodingTable acTable, int Ss, int Se, int Ah, int Al, ref int eobRun)
     {
+        if (acTable == null) throw new JpegHeaderException("Missing AC Huffman table");
+
         if (Ah == 0)
         {
             if (eobRun > 0)
@@ -965,13 +1003,9 @@ public class JpegDecoder
                 return;
             }
 
-            HuffmanDecodingTable ht = null;
-            ht = GetHuffmanTable(1, acTableId);
-            if (ht == null) throw new JpegHeaderException("Missing AC Huffman table");
-
             for (int k = Ss; k <= Se; k++)
             {
-                int s = DecodeHuffman(ht, reader);
+                int s = DecodeHuffman(acTable, reader);
                 if (s < 0) throw new JpegScanException("Huffman decode error (AC)");
 
                 int r = s >> 4;
@@ -1010,13 +1044,9 @@ public class JpegDecoder
                 return;
             }
 
-            HuffmanDecodingTable ht = null;
-            ht = GetHuffmanTable(1, acTableId);
-            if (ht == null) throw new JpegHeaderException("Missing AC Huffman table");
-
             while (k <= Se)
             {
-                int s = DecodeHuffman(ht, reader);
+                int s = DecodeHuffman(acTable, reader);
                 if (s < 0) throw new JpegScanException("Huffman decode error (AC Refinement)");
 
                 int r = s >> 4;
@@ -1099,28 +1129,48 @@ public class JpegDecoder
         int restartsLeft = _restartInterval;
         foreach (var c in _frame.Components) c.DcPred = 0;
 
+        int compsInScan = scan.ComponentsCount;
+        var dcTables = new HuffmanDecodingTable[compsInScan];
+        var acTables = new HuffmanDecodingTable[compsInScan];
+
+        for (int i = 0; i < compsInScan; i++)
+        {
+            var sc = scan.Components[i];
+            var dcTable = GetHuffmanTable(0, sc.DcTableId);
+            if (dcTable == null) throw new JpegHeaderException("Missing DC Huffman table");
+            dcTables[i] = dcTable;
+
+            var acTable = GetHuffmanTable(1, sc.AcTableId);
+            if (acTable == null) throw new JpegHeaderException("Missing AC Huffman table");
+            acTables[i] = acTable;
+        }
+
         for (int mcuY = 0; mcuY < _frame.McuRows; mcuY++)
         {
             for (int mcuX = 0; mcuX < _frame.McuCols; mcuX++)
             {
                 CheckRestart(ref restartsLeft, reader);
 
-                foreach (var sc in scan.Components)
+                for (int ci = 0; ci < compsInScan; ci++)
                 {
+                    var sc = scan.Components[ci];
                     var comp = sc.ComponentId >= 0 && sc.ComponentId < _componentsById.Length ? _componentsById[sc.ComponentId] : null;
                     if (comp == null) throw new JpegScanException("Component not found in frame");
                     int baseX = mcuX * comp.HFactor;
                     int baseY = mcuY * comp.VFactor;
+
+                    var dcTable = dcTables[ci];
+                    var acTable = acTables[ci];
 
                     for (int v = 0; v < comp.VFactor; v++)
                     {
                         for (int h = 0; h < comp.HFactor; h++)
                         {
                             int blockIndex = (baseY + v) * comp.WidthInBlocks + (baseX + h);
-                            DecodeDCProgressive(reader, comp.Coeffs, blockIndex * 64, sc.DcTableId, 0, 0, ref comp.DcPred);
+                            DecodeDCProgressive(reader, comp.Coeffs, blockIndex * 64, dcTable, 0, 0, ref comp.DcPred);
 
                             int dummyEob = 0;
-                            DecodeACProgressive(reader, comp.Coeffs, blockIndex * 64, sc.AcTableId, 1, 63, 0, 0, ref dummyEob);
+                            DecodeACProgressive(reader, comp.Coeffs, blockIndex * 64, acTable, 1, 63, 0, 0, ref dummyEob);
                         }
                     }
                 }
@@ -1315,11 +1365,11 @@ public class JpegDecoder
 
                             if (globalX >= width || globalY >= height) continue;
 
-                            int yBlockX = px / 8;
-                            int yBlockY = py / 8;
+                            int yBlockX = px >> 3;
+                            int yBlockY = py >> 3;
                             int yBlockIdx = yBlockY * compY.HFactor + yBlockX;
-                            int yInnerX = px % 8;
-                            int yInnerY = py % 8;
+                            int yInnerX = px & 7;
+                            int yInnerY = py & 7;
 
                             byte val0 = yBuffer[yBlockIdx][yInnerY * 8 + yInnerX];
                             byte val1 = 128;
