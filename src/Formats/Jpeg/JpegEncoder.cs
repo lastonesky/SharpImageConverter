@@ -15,18 +15,6 @@ public static class JpegEncoder
     /// </summary>
     public static bool DebugPrintConfig { get; set; }
 
-    private static readonly int[] ZigZag = new int[]
-    {
-        0, 1, 8,16, 9, 2, 3,10,
-       17,24,32,25,18,11, 4, 5,
-       12,19,26,33,40,48,41,34,
-       27,20,13, 6, 7,14,21,28,
-       35,42,49,56,57,50,43,36,
-       29,22,15,23,30,37,44,51,
-       58,59,52,45,38,31,39,46,
-       53,60,61,54,47,55,62,63
-    };
-
     private static readonly double[] AAN = new double[]
     {
         1.0,
@@ -372,7 +360,7 @@ public static class JpegEncoder
         int run = 0;
         for (int k = 1; k < 64; k++)
         {
-            int idx = ZigZag[k];
+            int idx = JpegUtils.ZigZag[k];
             int v = qcoeffOut[idx];
             if (v == 0)
             {
@@ -877,7 +865,7 @@ public static class JpegEncoder
         s.WriteByte((byte)(0x00 | (tableId & 0x0F)));
         for (int i = 0; i < 64; i++)
         {
-            s.WriteByte(tableNatural[ZigZag[i]]);
+            s.WriteByte(tableNatural[JpegUtils.ZigZag[i]]);
         }
     }
 
