@@ -1,9 +1,25 @@
 using System;
+using System.Runtime.CompilerServices;
 
 namespace SharpImageConverter;
 
 internal static class JpegUtils
 {
+    private static readonly byte[] ClampTable = CreateClampTable();
+    private static byte[] CreateClampTable()
+    {
+        var table = new byte[768];
+        for (int i = -256; i < 512; i++)
+        {
+            int index = i + 256;
+            if (i < 0) table[index] = 0;
+            else if (i > 255) table[index] = 255;
+            else table[index] = (byte)i;
+        }
+        return table;
+    }
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static byte ClampToByte(int v) => ClampTable[v + 256];
     private static readonly byte[] ZigZagData =
     {
          0,  1,  8, 16,  9,  2,  3, 10,
@@ -19,11 +35,4 @@ internal static class JpegUtils
     };
 
     public static ReadOnlySpan<byte> ZigZag => ZigZagData;
-
-    public static int Clamp(int val)
-    {
-        if (val < 0) return 0;
-        if (val > 255) return 255;
-        return val;
-    }
 }

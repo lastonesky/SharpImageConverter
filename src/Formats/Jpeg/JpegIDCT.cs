@@ -1,4 +1,5 @@
 using System;
+using System.Runtime.CompilerServices;
 
 namespace SharpImageConverter;
 
@@ -20,13 +21,20 @@ internal static class JpegIDCT
     private const int FIX_2_562915447 = 20995;
     private const int FIX_3_072711026 = 25172;
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static int Descale(long x, int n) => (int)((x + (1L << (n - 1))) >> n);
-
-    private static byte ClampToByte(int v)
+    
+    private static byte[] CreateClampTable()
     {
-        if (v < 0) return 0;
-        if (v > 255) return 255;
-        return (byte)v;
+        var table = new byte[768];
+        for (int i = -256; i < 512; i++)
+        {
+            int index = i + 256;
+            if (i < 0) table[index] = 0;
+            else if (i > 255) table[index] = 255;
+            else table[index] = (byte)i;
+        }
+        return table;
     }
 
     public static void BlockIDCT(ReadOnlySpan<int> block, Span<byte> dest)
@@ -161,14 +169,14 @@ internal static class JpegIDCT
             int v3 = Descale(tmp13 + tmp0, shift);
             int v4 = Descale(tmp13 - tmp0, shift);
 
-            dest[i + 0] = ClampToByte(v0 + 128);
-            dest[i + 7] = ClampToByte(v7 + 128);
-            dest[i + 1] = ClampToByte(v1 + 128);
-            dest[i + 6] = ClampToByte(v6 + 128);
-            dest[i + 2] = ClampToByte(v2 + 128);
-            dest[i + 5] = ClampToByte(v5 + 128);
-            dest[i + 3] = ClampToByte(v3 + 128);
-            dest[i + 4] = ClampToByte(v4 + 128);
+            dest[i + 0] = JpegUtils.ClampToByte(v0 + 128);
+            dest[i + 7] = JpegUtils.ClampToByte(v7 + 128);
+            dest[i + 1] = JpegUtils.ClampToByte(v1 + 128);
+            dest[i + 6] = JpegUtils.ClampToByte(v6 + 128);
+            dest[i + 2] = JpegUtils.ClampToByte(v2 + 128);
+            dest[i + 5] = JpegUtils.ClampToByte(v5 + 128);
+            dest[i + 3] = JpegUtils.ClampToByte(v3 + 128);
+            dest[i + 4] = JpegUtils.ClampToByte(v4 + 128);
         }
     }
 }
