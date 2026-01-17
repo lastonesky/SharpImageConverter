@@ -1206,6 +1206,22 @@ public class JpegDecoder
                      compCb.HFactor == 1 && compCb.VFactor == 1 &&
                      compCr.HFactor == 1 && compCr.VFactor == 1;
 
+        int[] yBlockIndexPerPx = null;
+        int[] yInnerXPerPx = null;
+        int[] cbXPerPx = null;
+        if (is420)
+        {
+            yBlockIndexPerPx = new int[mcuW];
+            yInnerXPerPx = new int[mcuW];
+            cbXPerPx = new int[mcuW];
+            for (int px = 0; px < mcuW; px++)
+            {
+                yBlockIndexPerPx[px] = px >> 3;
+                yInnerXPerPx[px] = px & 7;
+                cbXPerPx[px] = px >> 1;
+            }
+        }
+
         byte[][] yBuffer = new byte[compY.HFactor * compY.VFactor][];
         for (int i = 0; i < yBuffer.Length; i++) yBuffer[i] = new byte[64];
 
@@ -1382,16 +1398,16 @@ public class JpegDecoder
 
                         int rowBase = (globalY * width + pixelBaseX) * 3;
                         int idx = rowBase;
+                        int yBlockRowBase = yBlockY * compY.HFactor;
 
                         for (int px = 0; px < maxX; px++)
                         {
-                            int yBlockX = px >> 3;
-                            int yBlockIdx = yBlockY * compY.HFactor + yBlockX;
-                            int yInnerX = px & 7;
+                            int yBlockIdx = yBlockRowBase + yBlockIndexPerPx[px];
+                            int yInnerX = yInnerXPerPx[px];
 
                             byte Y = yBuffer[yBlockIdx][yInnerY * 8 + yInnerX];
-                            
-                            int cbX = px >> 1;
+
+                            int cbX = cbXPerPx[px];
                             int cbIdx = cbY * 8 + cbX;
                             byte Cb = cbBlock[cbIdx];
                             byte Cr = crBlock[cbIdx];
