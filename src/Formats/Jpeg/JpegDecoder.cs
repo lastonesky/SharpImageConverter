@@ -1200,6 +1200,7 @@ public class JpegDecoder
         int mcuW = _frame.McuWidth;
         int mcuH = _frame.McuHeight;
 
+        bool isGrayscale = compCb == null && compCr == null && compK == null;
         bool is420 = compK == null && compCb != null && compCr != null &&
                      compY.HFactor == 2 && compY.VFactor == 2 &&
                      compCb.HFactor == 1 && compCb.VFactor == 1 &&
@@ -1242,14 +1243,18 @@ public class JpegDecoder
                 {
                     int blockBaseX = mcuX * compY.HFactor;
                     int blockBaseY = mcuY * compY.VFactor;
+                    int blocksPerRow = compY.WidthInBlocks;
+                    JpegQuantTable qtY = _qtablesById[compY.QuantTableId];
+                    if (qtY == null) throw new JpegHeaderException("Quantization table not found for Y");
+                    ushort[] qtYValues = qtY.Values;
                     for (int v = 0; v < compY.VFactor; v++)
                     {
                         for (int h = 0; h < compY.HFactor; h++)
                         {
-                            int blockIdx = (blockBaseY + v) * compY.WidthInBlocks + (blockBaseX + h);
-                            JpegQuantTable qt = _qtablesById[compY.QuantTableId];
-                            if (qt == null) throw new JpegHeaderException("Quantization table not found for Y");
-                            for (int i = 0; i < 64; i++) dequantY[i] = compY.Coeffs[blockIdx * 64 + i] * qt.Values[i];
+                            int blockIdx = (blockBaseY + v) * blocksPerRow + (blockBaseX + h);
+                            int coeffBase = blockIdx * 64;
+                            int[] src = compY.Coeffs;
+                            for (int i = 0; i < 64; i++) dequantY[i] = src[coeffBase + i] * qtYValues[i];
                             JpegIDCT.BlockIDCT(dequantY, yBuffer[v * compY.HFactor + h]);
                         }
                     }
@@ -1260,14 +1265,18 @@ public class JpegDecoder
                 {
                     int blockBaseX = mcuX * compCb.HFactor;
                     int blockBaseY = mcuY * compCb.VFactor;
+                    int blocksPerRow = compCb.WidthInBlocks;
+                    JpegQuantTable qtCb = _qtablesById[compCb.QuantTableId];
+                    if (qtCb == null) throw new JpegHeaderException("Quantization table not found for Cb");
+                    ushort[] qtCbValues = qtCb.Values;
+                    int[] cbCoeffs = compCb.Coeffs;
                     for (int v = 0; v < compCb.VFactor; v++)
                     {
                         for (int h = 0; h < compCb.HFactor; h++)
                         {
-                            int blockIdx = (blockBaseY + v) * compCb.WidthInBlocks + (blockBaseX + h);
-                            JpegQuantTable qt = _qtablesById[compCb.QuantTableId];
-                            if (qt == null) throw new JpegHeaderException("Quantization table not found for Cb");
-                            for (int i = 0; i < 64; i++) dequantCb[i] = compCb.Coeffs[blockIdx * 64 + i] * qt.Values[i];
+                            int blockIdx = (blockBaseY + v) * blocksPerRow + (blockBaseX + h);
+                            int coeffBase = blockIdx * 64;
+                            for (int i = 0; i < 64; i++) dequantCb[i] = cbCoeffs[coeffBase + i] * qtCbValues[i];
                             JpegIDCT.BlockIDCT(dequantCb, cbBuffer[v * compCb.HFactor + h]);
                         }
                     }
@@ -1278,14 +1287,18 @@ public class JpegDecoder
                 {
                     int blockBaseX = mcuX * compCr.HFactor;
                     int blockBaseY = mcuY * compCr.VFactor;
+                    int blocksPerRow = compCr.WidthInBlocks;
+                    JpegQuantTable qtCr = _qtablesById[compCr.QuantTableId];
+                    if (qtCr == null) throw new JpegHeaderException("Quantization table not found for Cr");
+                    ushort[] qtCrValues = qtCr.Values;
+                    int[] crCoeffs = compCr.Coeffs;
                     for (int v = 0; v < compCr.VFactor; v++)
                     {
                         for (int h = 0; h < compCr.HFactor; h++)
                         {
-                            int blockIdx = (blockBaseY + v) * compCr.WidthInBlocks + (blockBaseX + h);
-                            JpegQuantTable qt = _qtablesById[compCr.QuantTableId];
-                            if (qt == null) throw new JpegHeaderException("Quantization table not found for Cr");
-                            for (int i = 0; i < 64; i++) dequantCr[i] = compCr.Coeffs[blockIdx * 64 + i] * qt.Values[i];
+                            int blockIdx = (blockBaseY + v) * blocksPerRow + (blockBaseX + h);
+                            int coeffBase = blockIdx * 64;
+                            for (int i = 0; i < 64; i++) dequantCr[i] = crCoeffs[coeffBase + i] * qtCrValues[i];
                             JpegIDCT.BlockIDCT(dequantCr, crBuffer[v * compCr.HFactor + h]);
                         }
                     }
@@ -1296,14 +1309,18 @@ public class JpegDecoder
                 {
                     int blockBaseX = mcuX * compK.HFactor;
                     int blockBaseY = mcuY * compK.VFactor;
+                    int blocksPerRow = compK.WidthInBlocks;
+                    JpegQuantTable qtK = _qtablesById[compK.QuantTableId];
+                    if (qtK == null) throw new JpegHeaderException("Quantization table not found for K");
+                    ushort[] qtKValues = qtK.Values;
+                    int[] kCoeffs = compK.Coeffs;
                     for (int v = 0; v < compK.VFactor; v++)
                     {
                         for (int h = 0; h < compK.HFactor; h++)
                         {
-                            int blockIdx = (blockBaseY + v) * compK.WidthInBlocks + (blockBaseX + h);
-                            JpegQuantTable qt = _qtablesById[compK.QuantTableId];
-                            if (qt == null) throw new JpegHeaderException("Quantization table not found for K");
-                            for (int i = 0; i < 64; i++) dequantK[i] = compK.Coeffs[blockIdx * 64 + i] * qt.Values[i];
+                            int blockIdx = (blockBaseY + v) * blocksPerRow + (blockBaseX + h);
+                            int coeffBase = blockIdx * 64;
+                            for (int i = 0; i < 64; i++) dequantK[i] = kCoeffs[coeffBase + i] * qtKValues[i];
                             JpegIDCT.BlockIDCT(dequantK, kBuffer[v * compK.HFactor + h]);
                         }
                     }
@@ -1312,7 +1329,40 @@ public class JpegDecoder
                 int pixelBaseX = mcuX * mcuW;
                 int pixelBaseY = mcuY * mcuH;
 
-                if (is420 && cbBuffer != null && crBuffer != null)
+                if (isGrayscale)
+                {
+                    for (int py = 0; py < mcuH; py++)
+                    {
+                        int globalY = pixelBaseY + py;
+                        if (globalY >= height) break;
+
+                        int yBlockY = py >> 3;
+                        int yInnerY = py & 7;
+                        int yBlockRow = yBlockY * compY.HFactor;
+                        int maxX = width - pixelBaseX;
+                        if (maxX <= 0) break;
+                        if (maxX > mcuW) maxX = mcuW;
+
+                        int rowBase = (globalY * width + pixelBaseX) * 3;
+                        int idx = rowBase;
+
+                        for (int px = 0; px < maxX; px++)
+                        {
+                            int yBlockX = px >> 3;
+                            int yBlockIdx = yBlockRow + yBlockX;
+                            int yInnerX = px & 7;
+
+                            byte Y = yBuffer[yBlockIdx][yInnerY * 8 + yInnerX];
+
+                            rgb[idx] = Y;
+                            rgb[idx + 1] = Y;
+                            rgb[idx + 2] = Y;
+
+                            idx += 3;
+                        }
+                    }
+                }
+                else if (is420 && cbBuffer != null && crBuffer != null)
                 {
                     byte[] cbBlock = cbBuffer[0];
                     byte[] crBlock = crBuffer[0];
@@ -1326,11 +1376,15 @@ public class JpegDecoder
                         int yInnerY = py & 7;
                         int cbY = py >> 1;
 
-                        for (int px = 0; px < mcuW; px++)
-                        {
-                            int globalX = pixelBaseX + px;
-                            if (globalX >= width) break;
+                        int maxX = width - pixelBaseX;
+                        if (maxX <= 0) break;
+                        if (maxX > mcuW) maxX = mcuW;
 
+                        int rowBase = (globalY * width + pixelBaseX) * 3;
+                        int idx = rowBase;
+
+                        for (int px = 0; px < maxX; px++)
+                        {
                             int yBlockX = px >> 3;
                             int yBlockIdx = yBlockY * compY.HFactor + yBlockX;
                             int yInnerX = px & 7;
@@ -1347,10 +1401,10 @@ public class JpegDecoder
                             int g = (yScaled + CbToG[Cb] + CrToG[Cr] + ColorHalf) >> ColorShift;
                             int b = (yScaled + CbToB[Cb] + ColorHalf) >> ColorShift;
 
-                            int idx = (globalY * width + globalX) * 3;
                             rgb[idx] = (byte)JpegUtils.Clamp(r);
                             rgb[idx + 1] = (byte)JpegUtils.Clamp(g);
                             rgb[idx + 2] = (byte)JpegUtils.Clamp(b);
+                            idx += 3;
                         }
                     }
                 }
