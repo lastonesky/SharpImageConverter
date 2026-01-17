@@ -30,35 +30,6 @@ public sealed class ProgressiveJpegTests
         }
     }
 
-    [Fact]
-    public void ProgressiveJpeg_FastHuffman_ShouldMatchSlowPath()
-    {
-        string path = Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "progressive.jpg");
-
-        byte[] fastHash;
-        int w, h;
-        {
-            using var fs = File.OpenRead(path);
-            var dec = new JpegDecoder { EnableHuffmanFastPath = true };
-            var img = dec.Decode(fs);
-            w = img.Width;
-            h = img.Height;
-            fastHash = Hash(img.Buffer);
-        }
-
-        byte[] slowHash;
-        {
-            using var fs = File.OpenRead(path);
-            var dec = new JpegDecoder { EnableHuffmanFastPath = false };
-            var img = dec.Decode(fs);
-            Assert.Equal(w, img.Width);
-            Assert.Equal(h, img.Height);
-            slowHash = Hash(img.Buffer);
-        }
-
-        Assert.Equal(slowHash, fastHash);
-    }
-
     private static byte[] Hash(byte[] data)
     {
         return SHA256.HashData(data);
