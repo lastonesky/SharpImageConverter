@@ -29,7 +29,7 @@ internal static class JpegIDCT
         return (byte)v;
     }
 
-    public static void BlockIDCT(int[] block, byte[] dest)
+    public static void BlockIDCT(ReadOnlySpan<int> block, Span<byte> dest)
     {
         Span<long> ws = stackalloc long[64];
 
