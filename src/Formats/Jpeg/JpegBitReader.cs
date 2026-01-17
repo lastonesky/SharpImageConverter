@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using System.Runtime.CompilerServices;
 
 namespace SharpImageConverter;
 
@@ -18,12 +19,14 @@ internal class JpegBitReader
 
     public long BytePosition => _stream.Position;
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void ResetBits()
     {
         _bitBuffer = 0;
         _bitCount = 0;
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void SetPosition(long pos)
     {
         _stream.Position = pos;
@@ -33,11 +36,13 @@ internal class JpegBitReader
         _marker = 0;
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public int ReadBit()
     {
         return ReadBits(1);
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public int ReadBits(int n)
     {
         if (n <= 0) return 0;
@@ -47,6 +52,7 @@ internal class JpegBitReader
         return bits;
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public int PeekBits(int n)
     {
         FillBits(n);
@@ -56,6 +62,7 @@ internal class JpegBitReader
         return (int)((_bitBuffer >> shift) & mask);
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void SkipBits(int n)
     {
         if (n <= 0) return;
@@ -72,6 +79,7 @@ internal class JpegBitReader
         }
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private void FillBits(int minBits)
     {
         while (!_hitMarker && _bitCount < minBits)
@@ -107,6 +115,7 @@ internal class JpegBitReader
         }
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private void AppendByte(byte b)
     {
         if (_bitCount > 56) throw new InvalidOperationException("Bit buffer overflow");
@@ -114,6 +123,7 @@ internal class JpegBitReader
         _bitCount += 8;
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void AlignToByte()
     {
         int mod = _bitCount & 7;
@@ -123,6 +133,7 @@ internal class JpegBitReader
     public bool HitMarker => _hitMarker;
     public byte Marker => _marker;
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public bool ConsumeRestartMarker()
     {
         AlignToByte();

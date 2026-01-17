@@ -1,3 +1,5 @@
+using System.Runtime.CompilerServices;
+
 namespace SharpImageConverter;
 
 internal static class JpegMarkers
@@ -62,7 +64,10 @@ internal static class JpegMarkers
     public const byte RST6 = 0xD6;
     public const byte RST7 = 0xD7;
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static bool IsRST(byte marker) => marker >= RST0 && marker <= RST7;
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static bool IsSOF(byte marker) => marker == SOF0 || marker == SOF1 || marker == SOF2 || marker == SOF3 ||
                                              marker == SOF9 || marker == SOF10 || marker == SOF11 ||
                                              marker == SOF5 || marker == SOF6 || marker == SOF7 ||

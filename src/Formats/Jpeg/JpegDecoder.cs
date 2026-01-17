@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Runtime.CompilerServices;
 using SharpImageConverter.Core;
 using SharpImageConverter.Metadata;
 
@@ -139,6 +140,7 @@ public class JpegDecoder
         return PerformIDCTAndOutput();
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private byte ReadByte()
     {
         int b = _stream.ReadByte();
@@ -146,6 +148,7 @@ public class JpegDecoder
         return (byte)b;
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private ushort ReadUShort()
     {
         int b1 = _stream.ReadByte();
@@ -965,6 +968,7 @@ public class JpegDecoder
         }
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private void DecodeDCProgressive(JpegBitReader reader, int[] coeffs, int offset, HuffmanDecodingTable dcTable, int Ah, int Al, ref int dcPred)
     {
         if (Ah == 0)
@@ -991,6 +995,7 @@ public class JpegDecoder
         }
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private void DecodeACProgressive(JpegBitReader reader, int[] coeffs, int offset, HuffmanDecodingTable acTable, int Ss, int Se, int Ah, int Al, ref int eobRun)
     {
         if (acTable == null) throw new JpegHeaderException("Missing AC Huffman table");
@@ -1114,6 +1119,7 @@ public class JpegDecoder
         }
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static void RefineNonZero(JpegBitReader reader, int[] coeffs, int idx, int Al)
     {
         int bit = reader.ReadBit();
@@ -1178,6 +1184,7 @@ public class JpegDecoder
         }
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static int Receive(int n, JpegBitReader reader)
     {
         if (n == 0) return 0;
@@ -1417,9 +1424,9 @@ public class JpegDecoder
                             int g = (yScaled + CbToG[Cb] + CrToG[Cr] + ColorHalf) >> ColorShift;
                             int b = (yScaled + CbToB[Cb] + ColorHalf) >> ColorShift;
 
-                            rgb[idx] = (byte)JpegUtils.Clamp(r);
-                            rgb[idx + 1] = (byte)JpegUtils.Clamp(g);
-                            rgb[idx + 2] = (byte)JpegUtils.Clamp(b);
+                            rgb[idx] = JpegUtils.ClampToByte(r);
+                            rgb[idx + 1] = JpegUtils.ClampToByte(g);
+                            rgb[idx + 2] = JpegUtils.ClampToByte(b);
                             idx += 3;
                         }
                     }
@@ -1486,9 +1493,9 @@ public class JpegDecoder
                                     g = (yScaled + CbToG[val1] + CrToG[val2] + ColorHalf) >> ColorShift;
                                     b = (yScaled + CbToB[val1] + ColorHalf) >> ColorShift;
 
-                                    r = JpegUtils.Clamp(r) * val3 / 255;
-                                    g = JpegUtils.Clamp(g) * val3 / 255;
-                                    b = JpegUtils.Clamp(b) * val3 / 255;
+                                    r = JpegUtils.ClampToByte(r) * val3 / 255;
+                                    g = JpegUtils.ClampToByte(g) * val3 / 255;
+                                    b = JpegUtils.ClampToByte(b) * val3 / 255;
                                 }
                                 else // CMYK (Inverted)
                                 {
@@ -1517,9 +1524,9 @@ public class JpegDecoder
                             }
 
                             int idx = (globalY * width + globalX) * 3;
-                            rgb[idx] = (byte)JpegUtils.Clamp(r);
-                            rgb[idx + 1] = (byte)JpegUtils.Clamp(g);
-                            rgb[idx + 2] = (byte)JpegUtils.Clamp(b);
+                            rgb[idx] = JpegUtils.ClampToByte(r);
+                            rgb[idx + 1] = JpegUtils.ClampToByte(g);
+                            rgb[idx + 2] = JpegUtils.ClampToByte(b);
                         }
                     }
                 }
@@ -1538,6 +1545,7 @@ public class JpegDecoder
         return t;
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private int DecodeHuffman(HuffmanDecodingTable ht, JpegBitReader reader)
     {
         if (EnableHuffmanFastPath)
@@ -1648,6 +1656,7 @@ public class JpegDecoder
         }
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static int Extend(int v, int t)
     {
         int vt = 1 << (t - 1);
@@ -1659,6 +1668,7 @@ public class JpegDecoder
         return v;
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private void CheckRestart(ref int restartsLeft, JpegBitReader reader)
     {
         if (_restartInterval == 0) return;
