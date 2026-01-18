@@ -37,146 +37,150 @@ internal static class JpegIDCT
         return table;
     }
 
-    public static void BlockIDCT(ReadOnlySpan<int> block, Span<byte> dest)
+    public static unsafe void BlockIDCT(ReadOnlySpan<int> block, Span<byte> dest)
     {
-        Span<long> ws = stackalloc long[64];
+        long* ws = stackalloc long[64];
 
-        for (int i = 0; i < 8; i++)
+        fixed (int* blockPtr = block)
+        fixed (byte* destPtr = dest)
         {
-            int ptr = i;
-            if (block[ptr + 8] == 0 && block[ptr + 16] == 0 && block[ptr + 24] == 0 &&
-                block[ptr + 32] == 0 && block[ptr + 40] == 0 && block[ptr + 48] == 0 &&
-                block[ptr + 56] == 0)
+            for (int i = 0; i < 8; i++)
             {
-                long dc = (long)block[ptr] << PASS1_BITS;
-                ws[ptr + 0] = dc;
-                ws[ptr + 8] = dc;
-                ws[ptr + 16] = dc;
-                ws[ptr + 24] = dc;
-                ws[ptr + 32] = dc;
-                ws[ptr + 40] = dc;
-                ws[ptr + 48] = dc;
-                ws[ptr + 56] = dc;
-                continue;
+                int ptr = i;
+                if (blockPtr[ptr + 8] == 0 && blockPtr[ptr + 16] == 0 && blockPtr[ptr + 24] == 0 &&
+                    blockPtr[ptr + 32] == 0 && blockPtr[ptr + 40] == 0 && blockPtr[ptr + 48] == 0 &&
+                    blockPtr[ptr + 56] == 0)
+                {
+                    long dc = (long)blockPtr[ptr] << PASS1_BITS;
+                    ws[ptr + 0] = dc;
+                    ws[ptr + 8] = dc;
+                    ws[ptr + 16] = dc;
+                    ws[ptr + 24] = dc;
+                    ws[ptr + 32] = dc;
+                    ws[ptr + 40] = dc;
+                    ws[ptr + 48] = dc;
+                    ws[ptr + 56] = dc;
+                    continue;
+                }
+
+                long z2 = blockPtr[ptr + 16];
+                long z3 = blockPtr[ptr + 48];
+                long z1 = (z2 + z3) * FIX_0_541196100;
+                long tmp2 = z1 + z3 * (-FIX_1_847759065);
+                long tmp3 = z1 + z2 * FIX_0_765366865;
+
+                z2 = blockPtr[ptr + 0];
+                z3 = blockPtr[ptr + 32];
+                long tmp0 = (z2 + z3) << CONST_BITS;
+                long tmp1 = (z2 - z3) << CONST_BITS;
+
+                long tmp10 = tmp0 + tmp3;
+                long tmp13 = tmp0 - tmp3;
+                long tmp11 = tmp1 + tmp2;
+                long tmp12 = tmp1 - tmp2;
+
+                tmp0 = blockPtr[ptr + 56];
+                tmp1 = blockPtr[ptr + 40];
+                tmp2 = blockPtr[ptr + 24];
+                tmp3 = blockPtr[ptr + 8];
+
+                z1 = tmp0 + tmp3;
+                z2 = tmp1 + tmp2;
+                z3 = tmp0 + tmp2;
+                long z4 = tmp1 + tmp3;
+                long z5 = (z3 + z4) * FIX_1_175875602;
+
+                tmp0 *= FIX_0_298631336;
+                tmp1 *= FIX_2_053119869;
+                tmp2 *= FIX_3_072711026;
+                tmp3 *= FIX_1_501321110;
+                z1 *= -FIX_0_899976223;
+                z2 *= -FIX_2_562915447;
+                z3 *= -FIX_1_961570560;
+                z4 *= -FIX_0_390180644;
+
+                z3 += z5;
+                z4 += z5;
+
+                tmp0 += z1 + z3;
+                tmp1 += z2 + z4;
+                tmp2 += z2 + z3;
+                tmp3 += z1 + z4;
+
+                ws[ptr + 0] = (tmp10 + tmp3) >> (CONST_BITS - PASS1_BITS);
+                ws[ptr + 56] = (tmp10 - tmp3) >> (CONST_BITS - PASS1_BITS);
+                ws[ptr + 8] = (tmp11 + tmp2) >> (CONST_BITS - PASS1_BITS);
+                ws[ptr + 48] = (tmp11 - tmp2) >> (CONST_BITS - PASS1_BITS);
+                ws[ptr + 16] = (tmp12 + tmp1) >> (CONST_BITS - PASS1_BITS);
+                ws[ptr + 40] = (tmp12 - tmp1) >> (CONST_BITS - PASS1_BITS);
+                ws[ptr + 24] = (tmp13 + tmp0) >> (CONST_BITS - PASS1_BITS);
+                ws[ptr + 32] = (tmp13 - tmp0) >> (CONST_BITS - PASS1_BITS);
             }
 
-            long z2 = block[ptr + 16];
-            long z3 = block[ptr + 48];
-            long z1 = (z2 + z3) * FIX_0_541196100;
-            long tmp2 = z1 + z3 * (-FIX_1_847759065);
-            long tmp3 = z1 + z2 * FIX_0_765366865;
+            for (int i = 0; i < 64; i += 8)
+            {
+                long z2 = ws[i + 2];
+                long z3 = ws[i + 6];
+                long z1 = (z2 + z3) * FIX_0_541196100;
+                long tmp2 = z1 + z3 * (-FIX_1_847759065);
+                long tmp3 = z1 + z2 * FIX_0_765366865;
 
-            z2 = block[ptr + 0];
-            z3 = block[ptr + 32];
-            long tmp0 = (z2 + z3) << CONST_BITS;
-            long tmp1 = (z2 - z3) << CONST_BITS;
+                long tmp0 = (ws[i + 0] + ws[i + 4]) << CONST_BITS;
+                long tmp1 = (ws[i + 0] - ws[i + 4]) << CONST_BITS;
 
-            long tmp10 = tmp0 + tmp3;
-            long tmp13 = tmp0 - tmp3;
-            long tmp11 = tmp1 + tmp2;
-            long tmp12 = tmp1 - tmp2;
+                long tmp10 = tmp0 + tmp3;
+                long tmp13 = tmp0 - tmp3;
+                long tmp11 = tmp1 + tmp2;
+                long tmp12 = tmp1 - tmp2;
 
-            tmp0 = block[ptr + 56];
-            tmp1 = block[ptr + 40];
-            tmp2 = block[ptr + 24];
-            tmp3 = block[ptr + 8];
+                tmp0 = ws[i + 7];
+                tmp1 = ws[i + 5];
+                tmp2 = ws[i + 3];
+                tmp3 = ws[i + 1];
 
-            z1 = tmp0 + tmp3;
-            z2 = tmp1 + tmp2;
-            z3 = tmp0 + tmp2;
-            long z4 = tmp1 + tmp3;
-            long z5 = (z3 + z4) * FIX_1_175875602;
+                z1 = tmp0 + tmp3;
+                z2 = tmp1 + tmp2;
+                z3 = tmp0 + tmp2;
+                long z4 = tmp1 + tmp3;
+                long z5 = (z3 + z4) * FIX_1_175875602;
 
-            tmp0 *= FIX_0_298631336;
-            tmp1 *= FIX_2_053119869;
-            tmp2 *= FIX_3_072711026;
-            tmp3 *= FIX_1_501321110;
-            z1 *= -FIX_0_899976223;
-            z2 *= -FIX_2_562915447;
-            z3 *= -FIX_1_961570560;
-            z4 *= -FIX_0_390180644;
+                tmp0 *= FIX_0_298631336;
+                tmp1 *= FIX_2_053119869;
+                tmp2 *= FIX_3_072711026;
+                tmp3 *= FIX_1_501321110;
+                z1 *= -FIX_0_899976223;
+                z2 *= -FIX_2_562915447;
+                z3 *= -FIX_1_961570560;
+                z4 *= -FIX_0_390180644;
 
-            z3 += z5;
-            z4 += z5;
+                z3 += z5;
+                z4 += z5;
 
-            tmp0 += z1 + z3;
-            tmp1 += z2 + z4;
-            tmp2 += z2 + z3;
-            tmp3 += z1 + z4;
+                tmp0 += z1 + z3;
+                tmp1 += z2 + z4;
+                tmp2 += z2 + z3;
+                tmp3 += z1 + z4;
 
-            ws[ptr + 0] = (tmp10 + tmp3) >> (CONST_BITS - PASS1_BITS);
-            ws[ptr + 56] = (tmp10 - tmp3) >> (CONST_BITS - PASS1_BITS);
-            ws[ptr + 8] = (tmp11 + tmp2) >> (CONST_BITS - PASS1_BITS);
-            ws[ptr + 48] = (tmp11 - tmp2) >> (CONST_BITS - PASS1_BITS);
-            ws[ptr + 16] = (tmp12 + tmp1) >> (CONST_BITS - PASS1_BITS);
-            ws[ptr + 40] = (tmp12 - tmp1) >> (CONST_BITS - PASS1_BITS);
-            ws[ptr + 24] = (tmp13 + tmp0) >> (CONST_BITS - PASS1_BITS);
-            ws[ptr + 32] = (tmp13 - tmp0) >> (CONST_BITS - PASS1_BITS);
-        }
+                int shift = CONST_BITS + PASS1_BITS + 3;
 
-        for (int i = 0; i < 64; i += 8)
-        {
-            long z2 = ws[i + 2];
-            long z3 = ws[i + 6];
-            long z1 = (z2 + z3) * FIX_0_541196100;
-            long tmp2 = z1 + z3 * (-FIX_1_847759065);
-            long tmp3 = z1 + z2 * FIX_0_765366865;
+                int v0 = Descale(tmp10 + tmp3, shift);
+                int v7 = Descale(tmp10 - tmp3, shift);
+                int v1 = Descale(tmp11 + tmp2, shift);
+                int v6 = Descale(tmp11 - tmp2, shift);
+                int v2 = Descale(tmp12 + tmp1, shift);
+                int v5 = Descale(tmp12 - tmp1, shift);
+                int v3 = Descale(tmp13 + tmp0, shift);
+                int v4 = Descale(tmp13 - tmp0, shift);
 
-            long tmp0 = (ws[i + 0] + ws[i + 4]) << CONST_BITS;
-            long tmp1 = (ws[i + 0] - ws[i + 4]) << CONST_BITS;
-
-            long tmp10 = tmp0 + tmp3;
-            long tmp13 = tmp0 - tmp3;
-            long tmp11 = tmp1 + tmp2;
-            long tmp12 = tmp1 - tmp2;
-
-            tmp0 = ws[i + 7];
-            tmp1 = ws[i + 5];
-            tmp2 = ws[i + 3];
-            tmp3 = ws[i + 1];
-
-            z1 = tmp0 + tmp3;
-            z2 = tmp1 + tmp2;
-            z3 = tmp0 + tmp2;
-            long z4 = tmp1 + tmp3;
-            long z5 = (z3 + z4) * FIX_1_175875602;
-
-            tmp0 *= FIX_0_298631336;
-            tmp1 *= FIX_2_053119869;
-            tmp2 *= FIX_3_072711026;
-            tmp3 *= FIX_1_501321110;
-            z1 *= -FIX_0_899976223;
-            z2 *= -FIX_2_562915447;
-            z3 *= -FIX_1_961570560;
-            z4 *= -FIX_0_390180644;
-
-            z3 += z5;
-            z4 += z5;
-
-            tmp0 += z1 + z3;
-            tmp1 += z2 + z4;
-            tmp2 += z2 + z3;
-            tmp3 += z1 + z4;
-
-            int shift = CONST_BITS + PASS1_BITS + 3;
-
-            int v0 = Descale(tmp10 + tmp3, shift);
-            int v7 = Descale(tmp10 - tmp3, shift);
-            int v1 = Descale(tmp11 + tmp2, shift);
-            int v6 = Descale(tmp11 - tmp2, shift);
-            int v2 = Descale(tmp12 + tmp1, shift);
-            int v5 = Descale(tmp12 - tmp1, shift);
-            int v3 = Descale(tmp13 + tmp0, shift);
-            int v4 = Descale(tmp13 - tmp0, shift);
-
-            dest[i + 0] = JpegUtils.ClampToByte(v0 + 128);
-            dest[i + 7] = JpegUtils.ClampToByte(v7 + 128);
-            dest[i + 1] = JpegUtils.ClampToByte(v1 + 128);
-            dest[i + 6] = JpegUtils.ClampToByte(v6 + 128);
-            dest[i + 2] = JpegUtils.ClampToByte(v2 + 128);
-            dest[i + 5] = JpegUtils.ClampToByte(v5 + 128);
-            dest[i + 3] = JpegUtils.ClampToByte(v3 + 128);
-            dest[i + 4] = JpegUtils.ClampToByte(v4 + 128);
+                destPtr[i + 0] = JpegUtils.ClampToByte(v0 + 128);
+                destPtr[i + 7] = JpegUtils.ClampToByte(v7 + 128);
+                destPtr[i + 1] = JpegUtils.ClampToByte(v1 + 128);
+                destPtr[i + 6] = JpegUtils.ClampToByte(v6 + 128);
+                destPtr[i + 2] = JpegUtils.ClampToByte(v2 + 128);
+                destPtr[i + 5] = JpegUtils.ClampToByte(v5 + 128);
+                destPtr[i + 3] = JpegUtils.ClampToByte(v3 + 128);
+                destPtr[i + 4] = JpegUtils.ClampToByte(v4 + 128);
+            }
         }
     }
 }
