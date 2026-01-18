@@ -1,39 +1,43 @@
 using System;
-using System.IO;
 using System.Runtime.CompilerServices;
 
 namespace SharpImageConverter;
 
-internal class JpegBitReader
+internal unsafe class JpegBitReader
 {
-    private readonly Stream _stream;
+    private readonly byte* _data;
+    private readonly int _length;
+    private int _byteOffset;
     private ulong _bitBuffer;
     private int _bitCount;
     private bool _hitMarker;
     private byte _marker;
+    private int _markerOffset;
 
-    public JpegBitReader(Stream stream)
+    public JpegBitReader(byte* data, int length)
     {
-        _stream = stream;
+        _data = data;
+        _length = length;
+        _byteOffset = 0;
+        _bitBuffer = 0;
+        _bitCount = 0;
+        _hitMarker = false;
+        _marker = 0;
+        _markerOffset = -1;
     }
 
-    public long BytePosition => _stream.Position;
+    public int ByteOffset => _byteOffset;
+    public int MarkerOffset => _markerOffset;
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void ResetBits()
     {
         _bitBuffer = 0;
         _bitCount = 0;
-    }
-
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public void SetPosition(long pos)
-    {
-        _stream.Position = pos;
-        _bitBuffer = 0;
-        _bitCount = 0;
         _hitMarker = false;
         _marker = 0;
+        _markerOffset = -1;
+        _byteOffset = 0;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -82,36 +86,41 @@ internal class JpegBitReader
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private void FillBits(int minBits)
     {
-        while (!_hitMarker && _bitCount < minBits)
+        while (!_hitMarker && _bitCount < minBits && _byteOffset < _length)
         {
-            int b = _stream.ReadByte();
-            if (b == -1)
-            {
-                _hitMarker = true;
-                _marker = 0;
-                return;
-            }
+            byte b = _data[_byteOffset++];
 
             if (b == 0xFF)
             {
-                int b2 = _stream.ReadByte();
-                if (b2 == -1)
+                if (_byteOffset >= _length)
                 {
-                    AppendByte(0xFF);
+                    _hitMarker = true;
+                    _marker = 0;
+                    _markerOffset = _byteOffset - 1;
                     return;
                 }
+
+                byte b2 = _data[_byteOffset++];
                 if (b2 == 0x00)
                 {
                     AppendByte(0xFF);
                     continue;
                 }
 
+                _markerOffset = _byteOffset - 2;
                 _hitMarker = true;
-                _marker = (byte)b2;
+                _marker = b2;
                 return;
             }
 
-            AppendByte((byte)b);
+            AppendByte(b);
+        }
+
+        if (!_hitMarker && _byteOffset >= _length && _bitCount < minBits)
+        {
+            _hitMarker = true;
+            _marker = 0;
+            _markerOffset = _length;
         }
     }
 

@@ -60,17 +60,36 @@ public static class BmpWriter
 
             int pixelOffset = 14 + 40;
             int srcRowSize = width * 3;
-            for (int y = height - 1, rowIdx = 0; y >= 0; y--, rowIdx++)
+
+            unsafe
             {
-                int src = y * srcRowSize;
-                int dst = pixelOffset + rowIdx * rowStride;
-                for (int x = 0; x < width; x++)
+                fixed (byte* rgbPtr = rgb)
+                fixed (byte* filePtr = file)
                 {
-                    int si = src + x * 3;
-                    int di = dst + x * 3;
-                    file[di + 0] = rgb[si + 2];
-                    file[di + 1] = rgb[si + 1];
-                    file[di + 2] = rgb[si + 0];
+                    byte* dstRow = filePtr + pixelOffset;
+
+                    for (int y = height - 1; y >= 0; y--)
+                    {
+                        byte* src = rgbPtr + y * srcRowSize;
+                        byte* dst = dstRow;
+                        byte* srcEnd = src + srcRowSize;
+
+                        while (src < srcEnd)
+                        {
+                            byte r = src[0];
+                            byte g = src[1];
+                            byte b = src[2];
+
+                            dst[0] = b;
+                            dst[1] = g;
+                            dst[2] = r;
+
+                            src += 3;
+                            dst += 3;
+                        }
+
+                        dstRow += rowStride;
+                    }
                 }
             }
             stream.Write(file, 0, fileSize);
