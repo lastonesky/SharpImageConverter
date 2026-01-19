@@ -35,68 +35,57 @@ public static class BmpWriter
         int imageSize = rowStride * height;
         int fileSize = 14 + 40 + imageSize;
 
-        byte[] file = ArrayPool<byte>.Shared.Rent(fileSize);
+        byte[] header = new byte[14 + 40];
+        header[0] = (byte)'B';
+        header[1] = (byte)'M';
+        WriteLe32ToBuffer(header, 2, fileSize);
+        WriteLe16ToBuffer(header, 6, 0);
+        WriteLe16ToBuffer(header, 8, 0);
+        WriteLe32ToBuffer(header, 10, 14 + 40);
+        WriteLe32ToBuffer(header, 14, 40);
+        WriteLe32ToBuffer(header, 18, width);
+        WriteLe32ToBuffer(header, 22, height);
+        WriteLe16ToBuffer(header, 26, 1);
+        WriteLe16ToBuffer(header, 28, 24);
+        WriteLe32ToBuffer(header, 30, 0);
+        WriteLe32ToBuffer(header, 34, imageSize);
+        WriteLe32ToBuffer(header, 38, 2835);
+        WriteLe32ToBuffer(header, 42, 2835);
+        WriteLe32ToBuffer(header, 46, 0);
+        WriteLe32ToBuffer(header, 50, 0);
+        stream.Write(header, 0, header.Length);
 
+        int srcRowSize = width * 3;
+        byte[] row = ArrayPool<byte>.Shared.Rent(rowStride);
         try
         {
-            file[0] = (byte)'B';
-            file[1] = (byte)'M';
-            WriteLe32ToBuffer(file, 2, fileSize);
-            WriteLe16ToBuffer(file, 6, 0);
-            WriteLe16ToBuffer(file, 8, 0);
-            WriteLe32ToBuffer(file, 10, 14 + 40);
-
-            WriteLe32ToBuffer(file, 14, 40);
-            WriteLe32ToBuffer(file, 18, width);
-            WriteLe32ToBuffer(file, 22, height);
-            WriteLe16ToBuffer(file, 26, 1);
-            WriteLe16ToBuffer(file, 28, 24);
-            WriteLe32ToBuffer(file, 30, 0);
-            WriteLe32ToBuffer(file, 34, imageSize);
-            WriteLe32ToBuffer(file, 38, 2835);
-            WriteLe32ToBuffer(file, 42, 2835);
-            WriteLe32ToBuffer(file, 46, 0);
-            WriteLe32ToBuffer(file, 50, 0);
-
-            int pixelOffset = 14 + 40;
-            int srcRowSize = width * 3;
-
-            unsafe
+            for (int y = height - 1; y >= 0; y--)
             {
-                fixed (byte* rgbPtr = rgb)
-                fixed (byte* filePtr = file)
+                int srcBase = y * srcRowSize;
+                int dstIndex = 0;
+                int srcIndex = srcBase;
+                int srcEnd = srcBase + srcRowSize;
+                while (srcIndex < srcEnd)
                 {
-                    byte* dstRow = filePtr + pixelOffset;
-
-                    for (int y = height - 1; y >= 0; y--)
-                    {
-                        byte* src = rgbPtr + y * srcRowSize;
-                        byte* dst = dstRow;
-                        byte* srcEnd = src + srcRowSize;
-
-                        while (src < srcEnd)
-                        {
-                            byte r = src[0];
-                            byte g = src[1];
-                            byte b = src[2];
-
-                            dst[0] = b;
-                            dst[1] = g;
-                            dst[2] = r;
-
-                            src += 3;
-                            dst += 3;
-                        }
-
-                        dstRow += rowStride;
-                    }
+                    byte r = rgb[srcIndex + 0];
+                    byte g = rgb[srcIndex + 1];
+                    byte b = rgb[srcIndex + 2];
+                    row[dstIndex + 0] = b;
+                    row[dstIndex + 1] = g;
+                    row[dstIndex + 2] = r;
+                    srcIndex += 3;
+                    dstIndex += 3;
                 }
+                while (dstIndex < rowStride)
+                {
+                    row[dstIndex++] = 0;
+                }
+                stream.Write(row, 0, rowStride);
             }
-            stream.Write(file, 0, fileSize);
         }
         finally
         {
-            ArrayPool<byte>.Shared.Return(file);
+            ArrayPool<byte>.Shared.Return(row);
         }
     }
 

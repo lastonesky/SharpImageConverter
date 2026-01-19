@@ -38,7 +38,6 @@ public class JpegDecoder
     private bool _huffmanRecoveryAttempted;
     private TimeSpan _huffmanElapsed;
     private TimeSpan _postprocessElapsed;
-    private int _postprocessWorkerCount = 1;
     private BlockingCollection<int>? _mcuWorkQueue;
     private Task[]? _postprocessTasks;
     private byte[]? _rgbBuffer;
@@ -59,10 +58,7 @@ public class JpegDecoder
 
     internal bool EnableHuffmanFastPath { get; set; } = true;
 
-    public TimeSpan HuffmanDecodeElapsed => _huffmanElapsed;
-    public TimeSpan PostprocessElapsed => _postprocessElapsed;
-    public int PostprocessWorkerCount => _postprocessWorkerCount;
-    public int MaxPostprocessThreads { get; set; } = 2;
+    public int MaxPostprocessThreads { get; set; } = 3;
 
     /// <summary>
     /// 将传入的 JPEG 流解码为 RGB 图像。
@@ -89,7 +85,6 @@ public class JpegDecoder
         ExifOrientation = 1;
         _huffmanElapsed = TimeSpan.Zero;
         _postprocessElapsed = TimeSpan.Zero;
-        _postprocessWorkerCount = 1;
         _mcuWorkQueue = null;
         _postprocessTasks = null;
         _rgbBuffer = null;
@@ -1008,14 +1003,13 @@ public class JpegDecoder
         int totalMcus = _frame.McuRows * _frame.McuCols;
         int maxThreads = MaxPostprocessThreads;
         if (maxThreads < 1) maxThreads = 1;
-        if (maxThreads > 2) maxThreads = 2;
+        //if (maxThreads > 2) maxThreads = 2;
 
         int workerCount = 1;
         if (totalMcus > 1 && Environment.ProcessorCount > 1)
         {
             workerCount = Math.Min(maxThreads, Environment.ProcessorCount);
         }
-        _postprocessWorkerCount = workerCount;
 
         _mcuWorkQueue = new BlockingCollection<int>(Math.Min(totalMcus, 1024));
         _postprocessTasks = new Task[workerCount];
@@ -1805,14 +1799,12 @@ public class JpegDecoder
         int totalMcus = _frame.McuRows * _frame.McuCols;
         int maxThreads = MaxPostprocessThreads;
         if (maxThreads < 1) maxThreads = 1;
-        if (maxThreads > 2) maxThreads = 2;
 
         int workerCount = 1;
         if (totalMcus > 1 && Environment.ProcessorCount > 1)
         {
             workerCount = Math.Min(maxThreads, Environment.ProcessorCount);
         }
-        _postprocessWorkerCount = workerCount;
 
         if (workerCount == 1)
         {
