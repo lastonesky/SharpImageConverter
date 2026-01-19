@@ -1,6 +1,7 @@
 using System;
 using System.IO;
 using System.Numerics;
+using System.Diagnostics;
 using SharpImageConverter.Metadata;
 
 namespace SharpImageConverter;
@@ -24,6 +25,9 @@ public static class JpegEncoder
     private static readonly int[] CrR = BuildScale(128);
     private static readonly int[] CrG = BuildScale(-107);
     private static readonly int[] CrB = BuildScale(-21);
+
+    private static long _ticksFillMcu420;
+    private static long _ticksFillBlock444;
 
     private static int[] BuildScale(int k)
     {
@@ -228,6 +232,11 @@ public static class JpegEncoder
 
     private static void WriteInternal(Stream stream, int width, int height, byte[] rgb24, int quality, bool subsample420, ImageMetadata? metadata, bool keepMetadata)
     {
+        long totalStartTicks = Stopwatch.GetTimestamp();
+
+        _ticksFillMcu420 = 0;
+        _ticksFillBlock444 = 0;
+
         if (DebugPrintConfig)
         {
             Console.WriteLine($"[jpeg] quality={quality} subsample={(subsample420 ? "420" : "444")}");
@@ -262,8 +271,6 @@ public static class JpegEncoder
 
         int prevYdc = 0, prevCbdc = 0, prevCrdc = 0;
 
-        Span<int> qcoeff = stackalloc int[64];
-
         if (subsample420)
         {
             int mcusX = (width + 15) / 16;
@@ -290,12 +297,12 @@ public static class JpegEncoder
                         cbBlock,
                         crBlock);
 
-                    EncodeBlock(bw, yBlocks.Slice(0, 64), qY, qYRecip, dcY, acY, ref prevYdc, qcoeff);
-                    EncodeBlock(bw, yBlocks.Slice(64, 64), qY, qYRecip, dcY, acY, ref prevYdc, qcoeff);
-                    EncodeBlock(bw, yBlocks.Slice(128, 64), qY, qYRecip, dcY, acY, ref prevYdc, qcoeff);
-                    EncodeBlock(bw, yBlocks.Slice(192, 64), qY, qYRecip, dcY, acY, ref prevYdc, qcoeff);
-                    EncodeBlock(bw, cbBlock, qC, qCRecip, dcC, acC, ref prevCbdc, qcoeff);
-                    EncodeBlock(bw, crBlock, qC, qCRecip, dcC, acC, ref prevCrdc, qcoeff);
+                    EncodeBlock(bw, yBlocks.Slice(0, 64), qYRecip, dcY, acY, ref prevYdc);
+                    EncodeBlock(bw, yBlocks.Slice(64, 64), qYRecip, dcY, acY, ref prevYdc);
+                    EncodeBlock(bw, yBlocks.Slice(128, 64), qYRecip, dcY, acY, ref prevYdc);
+                    EncodeBlock(bw, yBlocks.Slice(192, 64), qYRecip, dcY, acY, ref prevYdc);
+                    EncodeBlock(bw, cbBlock, qCRecip, dcC, acC, ref prevCbdc);
+                    EncodeBlock(bw, crBlock, qCRecip, dcC, acC, ref prevCrdc);
                 }
             }
         }
@@ -313,28 +320,42 @@ public static class JpegEncoder
                 for (int bx = 0; bx < blocksX; bx++)
                 {
                     FillBlockRgbToYCbCr444(rgb24, width, height, bx * 8, by * 8, yBlock, cbBlock, crBlock);
-                    EncodeBlock(bw, yBlock, qY, qYRecip, dcY, acY, ref prevYdc, qcoeff);
-                    EncodeBlock(bw, cbBlock, qC, qCRecip, dcC, acC, ref prevCbdc, qcoeff);
-                    EncodeBlock(bw, crBlock, qC, qCRecip, dcC, acC, ref prevCrdc, qcoeff);
+                    EncodeBlock(bw, yBlock, qYRecip, dcY, acY, ref prevYdc);
+                    EncodeBlock(bw, cbBlock, qCRecip, dcC, acC, ref prevCbdc);
+                    EncodeBlock(bw, crBlock, qCRecip, dcC, acC, ref prevCrdc);
                 }
             }
         }
 
         bw.FlushFinal();
         WriteMarker(stream, 0xD9);
+
+        long totalEndTicks = Stopwatch.GetTimestamp();
+
+        if (DebugPrintConfig)
+        {
+            long totalTicks = totalEndTicks - totalStartTicks;
+            double totalMs = totalTicks * 1000.0 / Stopwatch.Frequency;
+            double mcu420Ms = _ticksFillMcu420 * 1000.0 / Stopwatch.Frequency;
+            double block444Ms = _ticksFillBlock444 * 1000.0 / Stopwatch.Frequency;
+            double mcu420Pct = totalTicks != 0 ? (double)_ticksFillMcu420 * 100.0 / totalTicks : 0.0;
+            double block444Pct = totalTicks != 0 ? (double)_ticksFillBlock444 * 100.0 / totalTicks : 0.0;
+
+            Console.WriteLine($"[jpeg-timing] total={totalMs:F3}ms FillMcu420={mcu420Ms:F3}ms ({mcu420Pct:F1}%) FillBlock444={block444Ms:F3}ms ({block444Pct:F1}%)");
+        }
     }
 
-    private static void EncodeBlock(JpegBitWriter bw, Span<int> spatial, byte[] quant, int[] quantRecip, HuffCode[] dc, HuffCode[] ac, ref int prevDc, Span<int> qcoeffOut)
+    private static void EncodeBlock(JpegBitWriter bw, Span<int> block, int[] quantRecip, HuffCode[] dc, HuffCode[] ac, ref int prevDc)
     {
-        FDCT8x8(spatial, qcoeffOut);
+        FDCT8x8IntInPlace(block);
 
         for (int i = 0; i < 64; i++)
         {
-            int v = qcoeffOut[i];
-            qcoeffOut[i] = QuantizeNearest(v, quantRecip[i]);
+            int v = block[i];
+            block[i] = QuantizeNearest(v, quantRecip[i]);
         }
 
-        int dcCoeff = qcoeffOut[0];
+        int dcCoeff = block[0];
         int diff = dcCoeff - prevDc;
         prevDc = dcCoeff;
 
@@ -350,7 +371,7 @@ public static class JpegEncoder
         for (int k = 63; k >= 1; k--)
         {
             int idx = JpegUtils.ZigZag[k];
-            if (qcoeffOut[idx] != 0)
+            if (block[idx] != 0)
             {
                 lastNz = k;
                 break;
@@ -367,7 +388,7 @@ public static class JpegEncoder
         for (int k = 1; k <= lastNz; k++)
         {
             int idx = JpegUtils.ZigZag[k];
-            int v = qcoeffOut[idx];
+            int v = block[idx];
             if (v == 0)
             {
                 run++;
@@ -406,6 +427,8 @@ public static class JpegEncoder
         Span<int> cb,
         Span<int> cr)
     {
+        long startTicks = Stopwatch.GetTimestamp();
+
         Span<int> cbAcc = stackalloc int[64];
         Span<int> crAcc = stackalloc int[64];
         for (int i = 0; i < 64; i++)
@@ -472,10 +495,15 @@ public static class JpegEncoder
             cb[i] = cbVal - 128;
             cr[i] = crVal - 128;
         }
+
+        long endTicks = Stopwatch.GetTimestamp();
+        _ticksFillMcu420 += endTicks - startTicks;
     }
 
     private static unsafe void FillBlockRgbToYCbCr444(byte[] rgb, int width, int height, int baseX, int baseY, Span<int> y, Span<int> cb, Span<int> cr)
     {
+        long startTicks = Stopwatch.GetTimestamp();
+
         fixed (byte* rgbPtr = rgb)
         {
             int stride = width * 3;
@@ -507,12 +535,9 @@ public static class JpegEncoder
                 }
             }
         }
-    }
 
-    private static void FDCT8x8(Span<int> spatial, Span<int> coeffOut)
-    {
-        for (int i = 0; i < 64; i++) coeffOut[i] = spatial[i];
-        FDCT8x8IntInPlace(coeffOut);
+        long endTicks = Stopwatch.GetTimestamp();
+        _ticksFillBlock444 += endTicks - startTicks;
     }
 
     private static int MagnitudeCategory(int v)

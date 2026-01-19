@@ -43,6 +43,11 @@ class Program
                 gifFrames = true;
                 continue;
             }
+            if (string.Equals(a, "--jpeg-debug", StringComparison.OrdinalIgnoreCase))
+            {
+                JpegEncoder.DebugPrintConfig = true;
+                continue;
+            }
             if (string.Equals(a, "--quality", StringComparison.OrdinalIgnoreCase) || string.Equals(a, "-q", StringComparison.OrdinalIgnoreCase))
             {
                 if (i + 1 < args.Length && int.TryParse(args[i + 1], out int q))
