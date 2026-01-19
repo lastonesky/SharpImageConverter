@@ -422,6 +422,9 @@ public static class JpegEncoder
                 int sy = baseY + yy;
                 if (sy >= height) sy = height - 1;
                 int rowOffset = sy * stride;
+                int localY = yy & 7;
+                int yRowBase = localY * 8;
+                bool top = yy < 8;
                 for (int xx = 0; xx < 16; xx++)
                 {
                     int sx = baseX + xx;
@@ -434,13 +437,11 @@ public static class JpegEncoder
                     int b = p[2];
 
                     int yyVal = (YR[r] + YG[g] + YB[b]) >> 8;
-                    if (yyVal < 0) yyVal = 0; else if (yyVal > 255) yyVal = 255;
 
-                    int localY = yy & 7;
                     int localX = xx & 7;
-                    int yIndex = localY * 8 + localX;
+                    int yIndex = yRowBase + localX;
 
-                    if (yy < 8)
+                    if (top)
                     {
                         if (xx < 8) y00[yIndex] = yyVal - 128;
                         else y10[yIndex] = yyVal - 128;
@@ -468,9 +469,6 @@ public static class JpegEncoder
             int cbVal = (cbAcc[i] + 2) >> 2;
             int crVal = (crAcc[i] + 2) >> 2;
 
-            if (cbVal < 0) cbVal = 0; else if (cbVal > 255) cbVal = 255;
-            if (crVal < 0) crVal = 0; else if (crVal > 255) crVal = 255;
-
             cb[i] = cbVal - 128;
             cr[i] = crVal - 128;
         }
@@ -486,6 +484,7 @@ public static class JpegEncoder
                 int sy = baseY + yy;
                 if (sy >= height) sy = height - 1;
                 int rowOffset = sy * stride;
+                int yRowBase = yy * 8;
                 for (int xx = 0; xx < 8; xx++)
                 {
                     int sx = baseX + xx;
@@ -501,11 +500,7 @@ public static class JpegEncoder
                     int cbVal = ((CbR[r] + CbG[g] + CbB[b]) >> 8) + 128;
                     int crVal = ((CrR[r] + CrG[g] + CrB[b]) >> 8) + 128;
 
-                    if (yyVal < 0) yyVal = 0; else if (yyVal > 255) yyVal = 255;
-                    if (cbVal < 0) cbVal = 0; else if (cbVal > 255) cbVal = 255;
-                    if (crVal < 0) crVal = 0; else if (crVal > 255) crVal = 255;
-
-                    int i = yy * 8 + xx;
+                    int i = yRowBase + xx;
                     y[i] = yyVal - 128;
                     cb[i] = cbVal - 128;
                     cr[i] = crVal - 128;
