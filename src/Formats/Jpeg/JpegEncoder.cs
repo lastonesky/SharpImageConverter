@@ -15,17 +15,6 @@ public static class JpegEncoder
     /// </summary>
     public static bool DebugPrintConfig { get; set; }
 
-    private static readonly double[] AAN = new double[]
-    {
-        1.0,
-        1.387039845,
-        1.306562965,
-        1.175875602,
-        1.0,
-        0.785694958,
-        0.541196100,
-        0.275899379
-    };
     private static readonly int[] YR = BuildScale(77);
     private static readonly int[] YG = BuildScale(150);
     private static readonly int[] YB = BuildScale(29);
@@ -357,8 +346,25 @@ public static class JpegEncoder
             bw.WriteBits(bits, dcCat);
         }
 
+        int lastNz = 0;
+        for (int k = 63; k >= 1; k--)
+        {
+            int idx = JpegUtils.ZigZag[k];
+            if (qcoeffOut[idx] != 0)
+            {
+                lastNz = k;
+                break;
+            }
+        }
+
+        if (lastNz == 0)
+        {
+            bw.WriteHuff(ac[0x00]);
+            return;
+        }
+
         int run = 0;
-        for (int k = 1; k < 64; k++)
+        for (int k = 1; k <= lastNz; k++)
         {
             int idx = JpegUtils.ZigZag[k];
             int v = qcoeffOut[idx];
@@ -382,12 +388,12 @@ public static class JpegEncoder
             run = 0;
         }
 
-        if (run > 0) bw.WriteHuff(ac[0x00]);
+        if (lastNz != 63) bw.WriteHuff(ac[0x00]);
     }
 
     // float FDCT removed; always use integer FDCT
 
-    private static void FillMcu420RgbToYCbCr(
+    private static unsafe void FillMcu420RgbToYCbCr(
         byte[] rgb,
         int width,
         int height,
@@ -400,114 +406,118 @@ public static class JpegEncoder
         Span<int> cb,
         Span<int> cr)
     {
-        FillLumaBlock(rgb, width, height, baseX + 0, baseY + 0, y00);
-        FillLumaBlock(rgb, width, height, baseX + 8, baseY + 0, y10);
-        FillLumaBlock(rgb, width, height, baseX + 0, baseY + 8, y01);
-        FillLumaBlock(rgb, width, height, baseX + 8, baseY + 8, y11);
-
-        for (int yy = 0; yy < 8; yy++)
+        Span<int> cbAcc = stackalloc int[64];
+        Span<int> crAcc = stackalloc int[64];
+        for (int i = 0; i < 64; i++)
         {
-            for (int xx = 0; xx < 8; xx++)
-            {
-                int sx = baseX + xx * 2;
-                int sy = baseY + yy * 2;
+            cbAcc[i] = 0;
+            crAcc[i] = 0;
+        }
 
-                int cbSum = 0;
-                int crSum = 0;
-                for (int dy = 0; dy < 2; dy++)
+        fixed (byte* rgbPtr = rgb)
+        {
+            int stride = width * 3;
+            for (int yy = 0; yy < 16; yy++)
+            {
+                int sy = baseY + yy;
+                if (sy >= height) sy = height - 1;
+                int rowOffset = sy * stride;
+                for (int xx = 0; xx < 16; xx++)
                 {
-                    int py = sy + dy;
-                    if (py >= height) py = height - 1;
-                    for (int dx = 0; dx < 2; dx++)
+                    int sx = baseX + xx;
+                    if (sx >= width) sx = width - 1;
+
+                    int pixelOffset = rowOffset + sx * 3;
+                    byte* p = rgbPtr + pixelOffset;
+                    int r = p[0];
+                    int g = p[1];
+                    int b = p[2];
+
+                    int yyVal = (YR[r] + YG[g] + YB[b]) >> 8;
+                    if (yyVal < 0) yyVal = 0; else if (yyVal > 255) yyVal = 255;
+
+                    int localY = yy & 7;
+                    int localX = xx & 7;
+                    int yIndex = localY * 8 + localX;
+
+                    if (yy < 8)
                     {
-                        int px = sx + dx;
-                        if (px >= width) px = width - 1;
-
-                        int src = (py * width + px) * 3;
-                        int r = rgb[src + 0];
-                        int g = rgb[src + 1];
-                        int b = rgb[src + 2];
-
-                        cbSum += ((CbR[r] + CbG[g] + CbB[b]) >> 8) + 128;
-                        crSum += ((CrR[r] + CrG[g] + CrB[b]) >> 8) + 128;
+                        if (xx < 8) y00[yIndex] = yyVal - 128;
+                        else y10[yIndex] = yyVal - 128;
                     }
+                    else
+                    {
+                        if (xx < 8) y01[yIndex] = yyVal - 128;
+                        else y11[yIndex] = yyVal - 128;
+                    }
+
+                    int cbVal = ((CbR[r] + CbG[g] + CbB[b]) >> 8) + 128;
+                    int crVal = ((CrR[r] + CrG[g] + CrB[b]) >> 8) + 128;
+
+                    int cy = yy >> 1;
+                    int cx = xx >> 1;
+                    int cIndex = cy * 8 + cx;
+                    cbAcc[cIndex] += cbVal;
+                    crAcc[cIndex] += crVal;
                 }
-
-                int cbVal = (cbSum + 2) >> 2;
-                int crVal = (crSum + 2) >> 2;
-
-                if (cbVal < 0) cbVal = 0; else if (cbVal > 255) cbVal = 255;
-                if (crVal < 0) crVal = 0; else if (crVal > 255) crVal = 255;
-
-                int i = yy * 8 + xx;
-                cb[i] = cbVal - 128;
-                cr[i] = crVal - 128;
             }
+        }
+
+        for (int i = 0; i < 64; i++)
+        {
+            int cbVal = (cbAcc[i] + 2) >> 2;
+            int crVal = (crAcc[i] + 2) >> 2;
+
+            if (cbVal < 0) cbVal = 0; else if (cbVal > 255) cbVal = 255;
+            if (crVal < 0) crVal = 0; else if (crVal > 255) crVal = 255;
+
+            cb[i] = cbVal - 128;
+            cr[i] = crVal - 128;
         }
     }
 
-    private static void FillBlockRgbToYCbCr444(byte[] rgb, int width, int height, int baseX, int baseY, Span<int> y, Span<int> cb, Span<int> cr)
+    private static unsafe void FillBlockRgbToYCbCr444(byte[] rgb, int width, int height, int baseX, int baseY, Span<int> y, Span<int> cb, Span<int> cr)
     {
-        for (int yy = 0; yy < 8; yy++)
+        fixed (byte* rgbPtr = rgb)
         {
-            int sy = baseY + yy;
-            if (sy >= height) sy = height - 1;
-            for (int xx = 0; xx < 8; xx++)
+            int stride = width * 3;
+            for (int yy = 0; yy < 8; yy++)
             {
-                int sx = baseX + xx;
-                if (sx >= width) sx = width - 1;
+                int sy = baseY + yy;
+                if (sy >= height) sy = height - 1;
+                int rowOffset = sy * stride;
+                for (int xx = 0; xx < 8; xx++)
+                {
+                    int sx = baseX + xx;
+                    if (sx >= width) sx = width - 1;
 
-                int src = (sy * width + sx) * 3;
-                int r = rgb[src + 0];
-                int g = rgb[src + 1];
-                int b = rgb[src + 2];
+                    int pixelOffset = rowOffset + sx * 3;
+                    byte* p = rgbPtr + pixelOffset;
+                    int r = p[0];
+                    int g = p[1];
+                    int b = p[2];
 
-                int yyVal = (YR[r] + YG[g] + YB[b]) >> 8;
-                int cbVal = ((CbR[r] + CbG[g] + CbB[b]) >> 8) + 128;
-                int crVal = ((CrR[r] + CrG[g] + CrB[b]) >> 8) + 128;
+                    int yyVal = (YR[r] + YG[g] + YB[b]) >> 8;
+                    int cbVal = ((CbR[r] + CbG[g] + CbB[b]) >> 8) + 128;
+                    int crVal = ((CrR[r] + CrG[g] + CrB[b]) >> 8) + 128;
 
-                if (yyVal < 0) yyVal = 0; else if (yyVal > 255) yyVal = 255;
-                if (cbVal < 0) cbVal = 0; else if (cbVal > 255) cbVal = 255;
-                if (crVal < 0) crVal = 0; else if (crVal > 255) crVal = 255;
+                    if (yyVal < 0) yyVal = 0; else if (yyVal > 255) yyVal = 255;
+                    if (cbVal < 0) cbVal = 0; else if (cbVal > 255) cbVal = 255;
+                    if (crVal < 0) crVal = 0; else if (crVal > 255) crVal = 255;
 
-                int i = yy * 8 + xx;
-                y[i] = yyVal - 128;
-                cb[i] = cbVal - 128;
-                cr[i] = crVal - 128;
-            }
-        }
-    }
-
-    private static void FillLumaBlock(byte[] rgb, int width, int height, int baseX, int baseY, Span<int> y)
-    {
-        for (int yy = 0; yy < 8; yy++)
-        {
-            int sy = baseY + yy;
-            if (sy >= height) sy = height - 1;
-            for (int xx = 0; xx < 8; xx++)
-            {
-                int sx = baseX + xx;
-                if (sx >= width) sx = width - 1;
-
-                int src = (sy * width + sx) * 3;
-                int r = rgb[src + 0];
-                int g = rgb[src + 1];
-                int b = rgb[src + 2];
-
-                int yyVal = (YR[r] + YG[g] + YB[b]) >> 8;
-                if (yyVal < 0) yyVal = 0; else if (yyVal > 255) yyVal = 255;
-
-                y[yy * 8 + xx] = yyVal - 128;
+                    int i = yy * 8 + xx;
+                    y[i] = yyVal - 128;
+                    cb[i] = cbVal - 128;
+                    cr[i] = crVal - 128;
+                }
             }
         }
     }
 
     private static void FDCT8x8(Span<int> spatial, Span<int> coeffOut)
     {
-        Span<int> data = stackalloc int[64];
-        for (int i = 0; i < 64; i++) data[i] = spatial[i];
-        FDCT8x8IntInPlace(data);
-        for (int i = 0; i < 64; i++) coeffOut[i] = data[i];
+        for (int i = 0; i < 64; i++) coeffOut[i] = spatial[i];
+        FDCT8x8IntInPlace(coeffOut);
     }
 
     private static int MagnitudeCategory(int v)
@@ -574,22 +584,6 @@ public static class JpegEncoder
         }
         int a = -v;
         return -(int)(((long)a * recip20 + (1L << 19)) >> 20);
-    }
-
-    private static int[] BuildQuantRecipAAN(byte[] quant)
-    {
-        var recip = new int[64];
-        for (int i = 0; i < 64; i++)
-        {
-            int u = i & 7;
-            int v = i >> 3;
-            double scale = AAN[u] * AAN[v] * 8.0;
-            double denom = quant[i] * scale;
-            long r = (long)((1L << 20) / denom);
-            if (r <= 0) r = 1;
-            recip[i] = (int)r;
-        }
-        return recip;
     }
 
     private const int FDCT_CONST_BITS = 13;
