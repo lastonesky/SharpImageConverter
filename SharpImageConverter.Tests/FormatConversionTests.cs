@@ -63,6 +63,7 @@ namespace Jpeg2Bmp.Tests
             var img = new Image<Rgb24>(w, h, buf);
             string path = NewTemp(".jpg");
             var frame = new ImageFrame(img.Width, img.Height, img.Buffer);
+            JpegEncoder.DebugPrintConfig = true;
             frame.SaveAsJpeg(path, 99, false);
             var loaded = Image.Load(path);
             Assert.Equal(img.Width, loaded.Width);
@@ -105,6 +106,7 @@ namespace Jpeg2Bmp.Tests
 
             var img = new Image<Rgb24>(w, h, buf);
             string path = NewTemp(".jpg");
+            JpegEncoder.DebugPrintConfig = true;
             JpegEncoder.Write(path, img.Width, img.Height, img.Buffer, 90);
             var loaded = Image.Load(path);
             Assert.Equal(img.Width, loaded.Width);
