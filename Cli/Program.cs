@@ -205,12 +205,18 @@ class Program
                 string outExt2b = Path.GetExtension(outputPath).ToLowerInvariant();
                 if (inExt is ".jpg" or ".jpeg" && outExt2b == ".bmp")
                 {
+                    var swDecode = Stopwatch.StartNew();
                     var image = Image.Load(inputPath);
+                    swDecode.Stop();
+                    Console.WriteLine($"解码耗时: {swDecode.ElapsedMilliseconds} ms");
                     Image.Save(image, outputPath);
                 }
                 else if (inExt is ".jpg" or ".jpeg" && (outExt2b is ".jpg" or ".jpeg"))
                 {
+                    var swDecode = Stopwatch.StartNew();
                     var image = Image.Load(inputPath);
+                    swDecode.Stop();
+                    Console.WriteLine($"解码耗时: {swDecode.ElapsedMilliseconds} ms");
                     int q = jpegQuality ?? 75;
                     var frame = new ImageFrame(image.Width, image.Height, image.Buffer, image.Metadata);
                     bool effectiveSubsample420 = subsample420 ?? true;

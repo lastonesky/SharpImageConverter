@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Text;
+using System.Numerics;
 
 namespace SharpImageConverter;
 
@@ -40,8 +41,7 @@ public class PngDecoder
     public byte InterlaceMethod { get; private set; }
 
     private byte[]? _palette;
-    private byte[]? _transparency; // for tRNS chunk
-    private List<byte> _idatData = new List<byte>();
+    private byte[]? _transparency;
 
     /// <summary>
     /// 解码 PNG 文件为 RGB24 像素数据
@@ -63,38 +63,32 @@ public class PngDecoder
     /// <returns>按 RGB 顺序排列的字节数组（长度为 Width*Height*3）</returns>
     public byte[] DecodeToRGB(Stream stream)
     {
-        // Check Signature
         byte[] sig = new byte[8];
         if (stream.Read(sig, 0, 8) != 8) throw new InvalidDataException("File too short");
         if (!IsPngSignature(sig)) throw new InvalidDataException("Not a PNG file");
 
+        using var idatStream = new PooledMemoryStream(4096);
         bool endChunkFound = false;
         while (!endChunkFound && stream.Position < stream.Length)
         {
-            // Read Length
             byte[] lenBytes = new byte[4];
             if (stream.Read(lenBytes, 0, 4) != 4) break;
             uint length = ReadBigEndianUint32(lenBytes, 0);
 
-            // Read Type
             byte[] typeBytes = new byte[4];
             if (stream.Read(typeBytes, 0, 4) != 4) break;
             string type = Encoding.ASCII.GetString(typeBytes);
 
-            // Read Data
             byte[] data = new byte[length];
             if (length > 0)
             {
                 if (stream.Read(data, 0, (int)length) != length) throw new InvalidDataException("Unexpected EOF in chunk data");
             }
 
-            // Read CRC
             byte[] crcBytes = new byte[4];
             if (stream.Read(crcBytes, 0, 4) != 4) break;
             uint fileCrc = ReadBigEndianUint32(crcBytes, 0);
 
-            // Verify CRC
-            // CRC covers Type + Data
             uint calcCrc = Crc32.Compute(typeBytes);
             calcCrc = Crc32.Update(calcCrc, data, 0, (int)length);
             if (calcCrc != fileCrc)
@@ -111,7 +105,7 @@ public class PngDecoder
                     _palette = data;
                     break;
                 case "IDAT":
-                    _idatData.AddRange(data);
+                    idatStream.Write(data, 0, data.Length);
                     break;
                 case "tRNS":
                     _transparency = data;
@@ -125,10 +119,8 @@ public class PngDecoder
             }
         }
 
-        // Decompress IDAT
-        byte[] decompressed = ZlibHelper.Decompress(_idatData.ToArray());
-
-        // Unfilter and convert to RGB
+        ArraySegment<byte> idatSegment = idatStream.GetBuffer();
+        byte[] decompressed = ZlibHelper.Decompress(idatSegment.Array, idatSegment.Offset, idatSegment.Count);
         return ProcessImage(decompressed);
     }
 
@@ -155,6 +147,7 @@ public class PngDecoder
         byte[] sig = new byte[8];
         if (stream.Read(sig, 0, 8) != 8) throw new InvalidDataException("File too short");
         if (!IsPngSignature(sig)) throw new InvalidDataException("Not a PNG file");
+        using var idatStream = new PooledMemoryStream(4096);
         bool endChunkFound = false;
         while (!endChunkFound && stream.Position < stream.Length)
         {
@@ -180,7 +173,7 @@ public class PngDecoder
                     _palette = data;
                     break;
                 case "IDAT":
-                    _idatData.AddRange(data);
+                    idatStream.Write(data, 0, data.Length);
                     break;
                 case "tRNS":
                     _transparency = data;
@@ -192,7 +185,8 @@ public class PngDecoder
                     break;
             }
         }
-        byte[] decompressed = ZlibHelper.Decompress(_idatData.ToArray());
+        ArraySegment<byte> idatSegment = idatStream.GetBuffer();
+        byte[] decompressed = ZlibHelper.Decompress(idatSegment.Array, idatSegment.Offset, idatSegment.Count);
         return ProcessImageRgba(decompressed);
     }
 
@@ -358,51 +352,89 @@ public class PngDecoder
         int reconIdx = 0;
         int rawIdx = 0;
 
-        byte[] prevRow = new byte[stride]; // Initialized to 0
+        byte[] prevRow = new byte[stride];
+        byte[] curRow = new byte[stride];
 
         for (int y = 0; y < h; y++)
         {
             byte filterType = rawData[rawIdx++];
-            byte[] curRow = new byte[stride];
-            
-            // Read scanline
             Array.Copy(rawData, rawIdx, curRow, 0, stride);
             rawIdx += stride;
 
-            // Unfilter
-            for (int i = 0; i < stride; i++)
+            if (filterType == 0)
             {
-                byte x = curRow[i];
-                byte a = (i >= bpp) ? curRow[i - bpp] : (byte)0;
-                byte b = prevRow[i];
-                byte c = (i >= bpp) ? prevRow[i - bpp] : (byte)0;
+                Array.Copy(curRow, 0, recon, reconIdx, stride);
+                reconIdx += stride;
+                var tmp0 = prevRow;
+                prevRow = curRow;
+                curRow = tmp0;
+                continue;
+            }
 
-                switch (filterType)
+            if (filterType == 2)
+            {
+                ApplyUpFilterDecodeSimd(curRow, prevRow, stride);
+            }
+            else
+            {
+                for (int i = 0; i < stride; i++)
                 {
-                    case 0: // None
-                        break;
-                    case 1: // Sub
-                        x += a;
-                        break;
-                    case 2: // Up
-                        x += b;
-                        break;
-                    case 3: // Average
-                        x += (byte)((a + b) / 2);
-                        break;
-                    case 4: // Paeth
-                        x += PaethPredictor(a, b, c);
-                        break;
+                    byte x = curRow[i];
+                    byte a = (i >= bpp) ? curRow[i - bpp] : (byte)0;
+                    byte b = prevRow[i];
+                    byte c = (i >= bpp) ? prevRow[i - bpp] : (byte)0;
+
+                    switch (filterType)
+                    {
+                        case 1:
+                            x += a;
+                            break;
+                        case 3:
+                            x += (byte)((a + b) / 2);
+                            break;
+                        case 4:
+                            x += PaethPredictor(a, b, c);
+                            break;
+                    }
+                    curRow[i] = x;
                 }
-                curRow[i] = x;
             }
 
             Array.Copy(curRow, 0, recon, reconIdx, stride);
             reconIdx += stride;
+            var tmp = prevRow;
             prevRow = curRow;
+            curRow = tmp;
         }
 
         return recon;
+    }
+
+    private static void ApplyUpFilterDecodeSimd(byte[] curRow, byte[] prevRow, int length)
+    {
+        Span<byte> curSpan = curRow;
+        Span<byte> prevSpan = prevRow;
+        int i = 0;
+        if (Vector.IsHardwareAccelerated && length >= Vector<byte>.Count)
+        {
+            int simdCount = Vector<byte>.Count;
+            var mask = new Vector<ushort>(0xFF);
+            for (; i <= length - simdCount; i += simdCount)
+            {
+                var curVec = new Vector<byte>(curSpan.Slice(i));
+                var prevVec = new Vector<byte>(prevSpan.Slice(i));
+                Vector.Widen(curVec, out Vector<ushort> curLow, out Vector<ushort> curHigh);
+                Vector.Widen(prevVec, out Vector<ushort> prevLow, out Vector<ushort> prevHigh);
+                var resLow = (curLow + prevLow) & mask;
+                var resHigh = (curHigh + prevHigh) & mask;
+                var result = Vector.Narrow(resLow, resHigh);
+                result.CopyTo(curSpan.Slice(i));
+            }
+        }
+        for (; i < length; i++)
+        {
+            curSpan[i] = (byte)(curSpan[i] + prevSpan[i]);
+        }
     }
 
     private byte PaethPredictor(byte a, byte b, byte c)
@@ -445,7 +477,6 @@ public class PngDecoder
     private byte[] ConvertToRGB(byte[] data, int w, int h)
     {
         byte[] rgb = new byte[w * h * 3];
-        // int srcIdx = 0; // Unused
         int dstIdx = 0;
 
         // Note: data is packed by scanlines (stride).
@@ -455,6 +486,7 @@ public class PngDecoder
         for (int y = 0; y < h; y++)
         {
             int rowStart = y * stride;
+            var row = data.AsSpan(rowStart, stride);
             int bitOffset = 0;
 
             for (int x = 0; x < w; x++)
@@ -475,16 +507,18 @@ public class PngDecoder
                         {
                             if (BitDepth == 8)
                             {
-                                r = data[rowStart + bitOffset / 8];
-                                g = data[rowStart + bitOffset / 8 + 1];
-                                b = data[rowStart + bitOffset / 8 + 2];
+                                int idx = bitOffset / 8;
+                                r = row[idx];
+                                g = row[idx + 1];
+                                b = row[idx + 2];
                                 bitOffset += 24;
                             }
                             else if (BitDepth == 16)
                             {
-                                r = data[rowStart + bitOffset / 8];
-                                g = data[rowStart + bitOffset / 8 + 2];
-                                b = data[rowStart + bitOffset / 8 + 4];
+                                int idx = bitOffset / 8;
+                                r = row[idx];
+                                g = row[idx + 2];
+                                b = row[idx + 4];
                                 bitOffset += 48;
                             }
                         }
@@ -494,9 +528,10 @@ public class PngDecoder
                             int index = ReadBits(data, rowStart, ref bitOffset, BitDepth);
                             if (_palette != null && index * 3 + 2 < _palette.Length)
                             {
-                                r = _palette[index * 3];
-                                g = _palette[index * 3 + 1];
-                                b = _palette[index * 3 + 2];
+                                int p = index * 3;
+                                r = _palette[p];
+                                g = _palette[p + 1];
+                                b = _palette[p + 2];
                             }
                         }
                         break;
@@ -505,13 +540,12 @@ public class PngDecoder
                             int val = 0; 
                             if (BitDepth == 8)
                             {
-                                val = data[rowStart + bitOffset / 8];
-                                // alpha = data[...]
+                                val = row[bitOffset / 8];
                                 bitOffset += 16;
                             }
                             else // 16
                             {
-                                val = data[rowStart + bitOffset / 8];
+                                val = row[bitOffset / 8];
                                 bitOffset += 32;
                             }
                             r = g = b = (byte)val;
@@ -521,17 +555,18 @@ public class PngDecoder
                         {
                              if (BitDepth == 8)
                             {
-                                r = data[rowStart + bitOffset / 8];
-                                g = data[rowStart + bitOffset / 8 + 1];
-                                b = data[rowStart + bitOffset / 8 + 2];
-                                // alpha
+                                int idx = bitOffset / 8;
+                                r = row[idx];
+                                g = row[idx + 1];
+                                b = row[idx + 2];
                                 bitOffset += 32;
                             }
                             else // 16
                             {
-                                r = data[rowStart + bitOffset / 8];
-                                g = data[rowStart + bitOffset / 8 + 2];
-                                b = data[rowStart + bitOffset / 8 + 4];
+                                int idx = bitOffset / 8;
+                                r = row[idx];
+                                g = row[idx + 2];
+                                b = row[idx + 4];
                                 bitOffset += 64;
                             }
                         }
@@ -555,6 +590,7 @@ public class PngDecoder
         for (int y = 0; y < h; y++)
         {
             int rowStart = y * stride;
+            var row = data.AsSpan(rowStart, stride);
             int bitOffset = 0;
             for (int x = 0; x < w; x++)
             {
@@ -578,9 +614,10 @@ public class PngDecoder
                     {
                         if (BitDepth == 8)
                         {
-                            r = data[rowStart + bitOffset / 8];
-                            g = data[rowStart + bitOffset / 8 + 1];
-                            b = data[rowStart + bitOffset / 8 + 2];
+                            int idx = bitOffset / 8;
+                            r = row[idx];
+                            g = row[idx + 1];
+                            b = row[idx + 2];
                             bitOffset += 24;
                             if (_transparency != null && _transparency.Length >= 6)
                             {
@@ -592,9 +629,10 @@ public class PngDecoder
                         }
                         else
                         {
-                            r = data[rowStart + bitOffset / 8];
-                            g = data[rowStart + bitOffset / 8 + 2];
-                            b = data[rowStart + bitOffset / 8 + 4];
+                            int idx = bitOffset / 8;
+                            r = row[idx];
+                            g = row[idx + 2];
+                            b = row[idx + 4];
                             bitOffset += 48;
                         }
                     }
@@ -618,16 +656,18 @@ public class PngDecoder
                     {
                         if (BitDepth == 8)
                         {
-                            byte v = data[rowStart + bitOffset / 8];
-                            byte al = data[rowStart + bitOffset / 8 + 1];
+                            int idx = bitOffset / 8;
+                            byte v = row[idx];
+                            byte al = row[idx + 1];
                             bitOffset += 16;
                             r = g = b = v;
                             a = al;
                         }
                         else
                         {
-                            byte v = data[rowStart + bitOffset / 8];
-                            byte al = data[rowStart + bitOffset / 8 + 2];
+                            int idx = bitOffset / 8;
+                            byte v = row[idx];
+                            byte al = row[idx + 2];
                             bitOffset += 32;
                             r = g = b = v;
                             a = al;
@@ -638,18 +678,20 @@ public class PngDecoder
                     {
                         if (BitDepth == 8)
                         {
-                            r = data[rowStart + bitOffset / 8];
-                            g = data[rowStart + bitOffset / 8 + 1];
-                            b = data[rowStart + bitOffset / 8 + 2];
-                            a = data[rowStart + bitOffset / 8 + 3];
+                            int idx = bitOffset / 8;
+                            r = row[idx];
+                            g = row[idx + 1];
+                            b = row[idx + 2];
+                            a = row[idx + 3];
                             bitOffset += 32;
                         }
                         else
                         {
-                            r = data[rowStart + bitOffset / 8];
-                            g = data[rowStart + bitOffset / 8 + 2];
-                            b = data[rowStart + bitOffset / 8 + 4];
-                            a = data[rowStart + bitOffset / 8 + 6];
+                            int idx = bitOffset / 8;
+                            r = row[idx];
+                            g = row[idx + 2];
+                            b = row[idx + 4];
+                            a = row[idx + 6];
                             bitOffset += 64;
                         }
                     }

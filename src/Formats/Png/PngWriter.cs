@@ -1,6 +1,8 @@
 using System;
+using System.Buffers;
 using System.IO;
 using System.Text;
+using System.Numerics;
 
 namespace SharpImageConverter;
 
@@ -33,17 +35,19 @@ public static class PngWriter
     /// <param name="rgb">RGB24 像素数据</param>
     public static void Write(Stream stream, int width, int height, byte[] rgb)
     {
-        // PNG Signature
         stream.Write(new byte[] { 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A }, 0, 8);
-
-        // IHDR
         WriteChunk(stream, "IHDR", CreateIHDR(width, height));
-
-        // IDAT
-        byte[] idatData = CreateIDAT(width, height, rgb);
-        WriteChunk(stream, "IDAT", idatData);
-
-        // IEND
+        int stride = width * 3;
+        int rawSize = (stride + 1) * height;
+        using (var ms = new PooledMemoryStream(rawSize))
+        {
+            ZlibHelper.CompressRaw(s =>
+            {
+                WriteUpFilteredScanlines(s, rgb, width, height, 3);
+            }, ms);
+            ArraySegment<byte> segment = ms.GetBuffer();
+            WriteChunk(stream, "IDAT", segment.Array, segment.Offset, segment.Count);
+        }
         WriteChunk(stream, "IEND", new byte[0]);
     }
 
@@ -73,27 +77,37 @@ public static class PngWriter
     {
         stream.Write(new byte[] { 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A }, 0, 8);
         WriteChunk(stream, "IHDR", CreateIHDRRgba(width, height));
-        byte[] idatData = CreateIDATRgba(width, height, rgba);
-        WriteChunk(stream, "IDAT", idatData);
+        int stride = width * 4;
+        int rawSize = (stride + 1) * height;
+        using (var ms = new PooledMemoryStream(rawSize))
+        {
+            ZlibHelper.CompressRaw(s =>
+            {
+                WriteUpFilteredScanlines(s, rgba, width, height, 4);
+            }, ms);
+            ArraySegment<byte> segment = ms.GetBuffer();
+            WriteChunk(stream, "IDAT", segment.Array, segment.Offset, segment.Count);
+        }
         WriteChunk(stream, "IEND", new byte[0]);
     }
 
     private static void WriteChunk(Stream s, string type, byte[] data)
     {
-        byte[] lenBytes = ToBigEndian((uint)data.Length);
-        s.Write(lenBytes, 0, 4);
+        WriteChunk(s, type, data, 0, data.Length);
+    }
 
+    private static void WriteChunk(Stream s, string type, byte[] data, int offset, int count)
+    {
+        byte[] lenBytes = ToBigEndian((uint)count);
+        s.Write(lenBytes, 0, 4);
         byte[] typeBytes = Encoding.ASCII.GetBytes(type);
         s.Write(typeBytes, 0, 4);
-
-        if (data.Length > 0)
+        if (count > 0)
         {
-            s.Write(data, 0, data.Length);
+            s.Write(data, offset, count);
         }
-
         uint crc = Crc32.Compute(typeBytes);
-        crc = Crc32.Update(crc, data, 0, data.Length);
-        
+        crc = Crc32.Update(crc, data, offset, count);
         byte[] crcBytes = ToBigEndian(crc);
         s.Write(crcBytes, 0, 4);
     }
@@ -129,16 +143,19 @@ public static class PngWriter
         int stride = width * 3;
         int rawSize = (stride + 1) * height;
         byte[] rawData = new byte[rawSize];
-
         int rawIdx = 0;
         int rgbIdx = 0;
+        byte[] prevRow = new byte[stride];
+        byte[] filtered = new byte[stride];
 
         for (int y = 0; y < height; y++)
         {
-            rawData[rawIdx++] = 0;
-            Array.Copy(rgb, rgbIdx, rawData, rawIdx, stride);
+            rawData[rawIdx++] = 2;
+            ApplyUpFilterSimd(rgb.AsSpan(rgbIdx, stride), prevRow, filtered);
+            Array.Copy(filtered, 0, rawData, rawIdx, stride);
             rgbIdx += stride;
             rawIdx += stride;
+            Array.Copy(rgb, rgbIdx - stride, prevRow, 0, stride);
         }
 
         return ZlibHelper.Compress(rawData);
@@ -151,14 +168,60 @@ public static class PngWriter
         byte[] rawData = new byte[rawSize];
         int rawIdx = 0;
         int srcIdx = 0;
+        byte[] prevRow = new byte[stride];
+        byte[] filtered = new byte[stride];
         for (int y = 0; y < height; y++)
         {
-            rawData[rawIdx++] = 0;
-            Array.Copy(rgba, srcIdx, rawData, rawIdx, stride);
+            rawData[rawIdx++] = 2;
+            ApplyUpFilterSimd(rgba.AsSpan(srcIdx, stride), prevRow, filtered);
+            Array.Copy(filtered, 0, rawData, rawIdx, stride);
             srcIdx += stride;
             rawIdx += stride;
+            Array.Copy(rgba, srcIdx - stride, prevRow, 0, stride);
         }
         return ZlibHelper.Compress(rawData);
+    }
+    private static void WriteUpFilteredScanlines(Stream s, byte[] src, int width, int height, int bytesPerPixel)
+    {
+        int stride = width * bytesPerPixel;
+        byte[] prevRow = new byte[stride];
+        byte[] filtered = new byte[stride];
+        int srcIdx = 0;
+        for (int y = 0; y < height; y++)
+        {
+            s.WriteByte(2);
+            ApplyUpFilterSimd(src.AsSpan(srcIdx, stride), prevRow, filtered);
+            s.Write(filtered, 0, stride);
+            Array.Copy(src, srcIdx, prevRow, 0, stride);
+            srcIdx += stride;
+        }
+    }
+    private static void ApplyUpFilterSimd(ReadOnlySpan<byte> current, byte[] prevRow, byte[] destination)
+    {
+        int length = current.Length;
+        Span<byte> prevSpan = prevRow;
+        Span<byte> destSpan = destination;
+        int i = 0;
+        if (Vector.IsHardwareAccelerated && length >= Vector<byte>.Count)
+        {
+            int simdCount = Vector<byte>.Count;
+            var mask = new Vector<ushort>(0xFF);
+            for (; i <= length - simdCount; i += simdCount)
+            {
+                var curVec = new Vector<byte>(current.Slice(i));
+                var prevVec = new Vector<byte>(prevSpan.Slice(i));
+                Vector.Widen(curVec, out Vector<ushort> curLow, out Vector<ushort> curHigh);
+                Vector.Widen(prevVec, out Vector<ushort> prevLow, out Vector<ushort> prevHigh);
+                var resLow = (curLow - prevLow) & mask;
+                var resHigh = (curHigh - prevHigh) & mask;
+                var result = Vector.Narrow(resLow, resHigh);
+                result.CopyTo(destSpan.Slice(i));
+            }
+        }
+        for (; i < length; i++)
+        {
+            destSpan[i] = (byte)(current[i] - prevSpan[i]);
+        }
     }
     private static byte[] ToBigEndian(uint val)
     {
@@ -169,5 +232,97 @@ public static class PngWriter
             (byte)((val >> 8) & 0xFF),
             (byte)(val & 0xFF)
         };
+    }
+}
+
+internal sealed class PooledMemoryStream : Stream
+{
+    private byte[] _buffer;
+    private int _length;
+    private bool _disposed;
+
+    public PooledMemoryStream(int initialCapacity)
+    {
+        if (initialCapacity < 1) initialCapacity = 1;
+        _buffer = ArrayPool<byte>.Shared.Rent(initialCapacity);
+        _length = 0;
+    }
+
+    public ArraySegment<byte> GetBuffer()
+    {
+        return new ArraySegment<byte>(_buffer, 0, _length);
+    }
+
+    public override bool CanRead => false;
+    public override bool CanSeek => false;
+    public override bool CanWrite => true;
+    public override long Length => _length;
+    public override long Position
+    {
+        get => _length;
+        set => throw new NotSupportedException();
+    }
+
+    public override void Flush()
+    {
+    }
+
+    public override int Read(byte[] buffer, int offset, int count)
+    {
+        throw new NotSupportedException();
+    }
+
+    public override long Seek(long offset, SeekOrigin origin)
+    {
+        throw new NotSupportedException();
+    }
+
+    public override void SetLength(long value)
+    {
+        throw new NotSupportedException();
+    }
+
+    public override void Write(byte[] buffer, int offset, int count)
+    {
+        if (count <= 0) return;
+        EnsureCapacity(_length + count);
+        buffer.AsSpan(offset, count).CopyTo(_buffer.AsSpan(_length));
+        _length += count;
+    }
+
+    public override void WriteByte(byte value)
+    {
+        EnsureCapacity(_length + 1);
+        _buffer[_length] = value;
+        _length++;
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (!_disposed)
+        {
+            if (disposing)
+            {
+                var buffer = _buffer;
+                _buffer = Array.Empty<byte>();
+                if (buffer.Length > 0)
+                {
+                    ArrayPool<byte>.Shared.Return(buffer);
+                }
+            }
+            _disposed = true;
+        }
+        base.Dispose(disposing);
+    }
+
+    private void EnsureCapacity(int required)
+    {
+        if (required <= _buffer.Length) return;
+        int newSize = _buffer.Length * 2;
+        if (newSize < required) newSize = required;
+        var newBuffer = ArrayPool<byte>.Shared.Rent(newSize);
+        _buffer.AsSpan(0, _length).CopyTo(newBuffer);
+        ArrayPool<byte>.Shared.Return(_buffer);
+        _buffer = newBuffer;
     }
 }
