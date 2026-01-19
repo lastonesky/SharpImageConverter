@@ -58,6 +58,12 @@
 - 引入 `ImageFrame` 作为格式转换的中间数据结构（当前为 `Rgb24`）
 - 统一加载为 RGB，再根据输出扩展名选择编码器写回
 
+## What's New / 更新亮点
+
+- PNG：在多数图片上显著降低压缩后体积（例如原先约 110 MB 的 PNG，现在可缩小到约 30 MB，具体效果取决于图像内容），同时略微提升压缩速度。
+- JPEG：大幅提升解码速度，并在编码路径上带来小幅性能提升。
+- BMP：写出路径经过优化，在同一环境下写出约 400 MB 的 BMP 文件，耗时从约 400 ms 降低到约 270 ms。
+
 ## 目录结构
 
 ```
@@ -85,7 +91,7 @@ SharpImageConverter/
 ## 安装（NuGet）
 
 ```bash
-dotnet add package SharpImageConverter --version 0.1.0
+dotnet add package SharpImageConverter --version 0.1.3
 ```
 
 引用命名空间：
@@ -167,16 +173,21 @@ dotnet run -- <输入文件路径> [输出文件路径] [操作] [参数]
 - 输入: .jpg/.jpeg/.png/.bmp/.webp/.gif
 - 输出: .jpg/.jpeg/.png/.bmp/.webp/.gif
 
+特殊情况：
+- GIF → WebP：当输入为动图 GIF、输出扩展名为 `.webp` 时，会编码为动图 WebP（尽量保留帧间隔与循环次数）
+
 ### 操作 (Operations)
 - `resize:WxH` : 强制缩放到指定宽 (W) 高 (H)
+- `resizebilinear:WxH` : 使用双线性插值缩放到指定尺寸
 - `resizefit:WxH` : 等比缩放到适应指定矩形框 (W x H)
 - `grayscale` : 转为灰度图
 
 ### 参数 (Options)
 - `--quality N` : 设置 JPEG 编码质量 (0-100)，默认 75
 - `--subsample 420|444` : 设置 JPEG 色度采样，默认 420
+- `--keep-metadata` : 在重新编码 JPEG 时尽量保留 EXIF/ICC 等基础元数据
 - `--jpeg-debug` : 启用 JPEG 解码调试输出
-- `--gif-frames` : (仅调试) 输出 GIF 的每一帧信息
+- `--gif-frames` : 将动图 GIF 的每一帧导出为独立图片，方便调试与检查
 
 ### 示例
 

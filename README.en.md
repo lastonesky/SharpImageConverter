@@ -58,6 +58,12 @@ This library was originally created to address several practical issues we encou
 - `ImageFrame` as the intermediate structure for format conversion (currently `Rgb24`)
 - Always load as RGB, then encode according to output extension
 
+## What's New
+
+- PNG: Significantly smaller output size for many images (for example, a PNG that was around 110 MB can now shrink to about 30 MB, depending on image content), with a slight improvement in encoding speed.
+- JPEG: Noticeably faster decoding pipeline, plus a modest speedup on the encoding side.
+- BMP: Faster writing; on the same machine, writing a ~400 MB BMP now takes about 270 ms instead of roughly 400 ms.
+
 ## Project Layout
 
 ```
@@ -85,7 +91,7 @@ Requirements:
 ## Install (NuGet)
 
 ```bash
-dotnet add package SharpImageConverter --version 0.1.0
+dotnet add package SharpImageConverter --version 0.1.3
 ```
 
 Namespaces:
@@ -168,16 +174,21 @@ dotnet run -- <input-path> [output-path] [operation] [options]
 - Input: .jpg/.jpeg/.png/.bmp/.webp/.gif
 - Output: .jpg/.jpeg/.png/.bmp/.webp/.gif
 
+Special cases:
+- GIF → WebP: when input is animated GIF and output extension is `.webp`, encodes animated WebP (preserving frame timing and loop count where possible)
+
 ### Operations
 - `resize:WxH` : Force resize to specified width (W) and height (H)
+- `resizebilinear:WxH` : Resize to specified size using bilinear interpolation
 - `resizefit:WxH` : Resize to fit within specified rectangle (W x H) maintaining aspect ratio
 - `grayscale` : Convert to grayscale
 
 ### Options
 - `--quality N` : Set JPEG encoding quality (0-100), default 75
 - `--subsample 420|444` : Set JPEG chroma subsampling, default 420
+- `--keep-metadata` : When recompressing JPEG, try to preserve basic EXIF/ICC metadata
 - `--jpeg-debug` : Enable JPEG decoding debug output
-- `--gif-frames` : (Debug only) Output GIF frame information
+- `--gif-frames` : Export animated GIF frames as individual images for inspection/debugging
 
 ### Examples
 
