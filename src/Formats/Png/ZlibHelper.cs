@@ -4,88 +4,126 @@ using System.IO.Compression;
 
 namespace SharpImageConverter;
 
-/// <summary>
-/// Zlib 格式的压缩/解压辅助。
-/// </summary>
 public static class ZlibHelper
 {
-    // Decompress a Zlib stream (CMF+FLG ... Data ... Adler32)
-    /// <summary>
-    /// 解压 Zlib 数据（跳过头部与 Adler32 尾部，并校验校验值）
-    /// </summary>
-    /// <param name="data">Zlib 数据</param>
-    /// <returns>解压后的原始数据</returns>
     public static byte[] Decompress(byte[] data)
     {
-        if (data == null || data.Length < 6)
+        return Decompress(data, 0, data.Length);
+    }
+
+    public static byte[] Decompress(byte[] data, int offset, int count)
+    {
+        if (data == null || count < 6)
             throw new ArgumentException("Invalid Zlib data");
-
-        // Validate CMF and FLG
-        byte cmf = data[0];
-        byte flg = data[1];
-        
-        if ((cmf & 0x0F) != 8) // Compression method must be 8 (Deflate)
+        byte cmf = data[offset];
+        byte flg = data[offset + 1];
+        if ((cmf & 0x0F) != 8)
             throw new NotSupportedException("Only Deflate compression is supported");
-
         if (((cmf * 256 + flg) % 31) != 0)
             throw new InvalidDataException("Invalid Zlib header check");
-
-        // DeflateStream expects raw deflate data (without zlib header/footer)
-        // We skip first 2 bytes (CMF, FLG) and last 4 bytes (Adler32)
-        using (var ms = new MemoryStream(data, 2, data.Length - 6))
+        using (var ms = new MemoryStream(data, offset + 2, count - 6))
         using (var ds = new DeflateStream(ms, CompressionMode.Decompress))
         using (var outMs = new MemoryStream())
         {
             ds.CopyTo(outMs);
             byte[] decompressed = outMs.ToArray();
-
-            // Verify Adler32
-            // Note: In a production environment, we should verify Adler32. 
-            // For now we implement it to ensure data integrity.
-            uint expectedAdler = (uint)((data[data.Length - 4] << 24) | (data[data.Length - 3] << 16) | (data[data.Length - 2] << 8) | data[data.Length - 1]);
+            int end = offset + count;
+            uint expectedAdler = (uint)((data[end - 4] << 24) | (data[end - 3] << 16) | (data[end - 2] << 8) | data[end - 1]);
             uint actualAdler = Adler32.Compute(decompressed, 0, decompressed.Length);
-            
             if (expectedAdler != actualAdler)
                 throw new InvalidDataException($"Adler32 Checksum failed. Expected {expectedAdler:X8}, got {actualAdler:X8}");
-
             return decompressed;
         }
     }
 
-    // Compress data to Zlib format
-    /// <summary>
-    /// 压缩为 Zlib 格式（写入头部与 Adler32 尾部）
-    /// </summary>
-    /// <param name="data">原始数据</param>
-    /// <returns>Zlib 数据</returns>
     public static byte[] Compress(byte[] data)
     {
-        using (var outMs = new MemoryStream())
+        using var outMs = new PooledMemoryStream(data.Length + 64);
+        CompressRaw(s => s.Write(data, 0, data.Length), outMs);
+        ArraySegment<byte> segment = outMs.GetBuffer();
+        var result = new byte[segment.Count];
+        Buffer.BlockCopy(segment.Array, segment.Offset, result, 0, segment.Count);
+        return result;
+    }
+
+    public static void CompressRaw(Action<Stream> writeRaw, Stream output)
+    {
+        output.WriteByte(0x78);
+        output.WriteByte(0x9C);
+        var ds = new DeflateStream(output, CompressionLevel.Optimal, true);
+        var ads = new Adler32Stream(ds);
+        try
         {
-            // Zlib Header
-            // CMF: 0x78 (Deflate, 32K window)
-            // FLG: 0xDA (Default compression) -> 0x78DA % 31 == 0
-            // We'll use 0x78 0x9C (Default compression level)
-            // 0x78 = 0111 1000 (CM = 8, CINFO = 7 -> 32K window)
-            // 0x9C = 1001 1100 (FLEVEL = 2 -> Default, FDICT = 0, FCHECK = ?)
-            // 0x789C = 30876. 30876 % 31 = 0. OK.
-            
-            outMs.WriteByte(0x78);
-            outMs.WriteByte(0x9C);
+            writeRaw(ads);
+        }
+        finally
+        {
+            ads.Dispose();
+        }
+        uint adler = ads.Adler;
+        output.WriteByte((byte)((adler >> 24) & 0xFF));
+        output.WriteByte((byte)((adler >> 16) & 0xFF));
+        output.WriteByte((byte)((adler >> 8) & 0xFF));
+        output.WriteByte((byte)(adler & 0xFF));
+    }
 
-            using (var ds = new DeflateStream(outMs, CompressionLevel.Optimal, true))
+    private sealed class Adler32Stream : Stream
+    {
+        private readonly Stream _baseStream;
+        private uint _adler;
+
+        public Adler32Stream(Stream baseStream)
+        {
+            _baseStream = baseStream;
+            _adler = 1u;
+        }
+
+        public uint Adler => _adler;
+
+        public override bool CanRead => false;
+        public override bool CanSeek => false;
+        public override bool CanWrite => true;
+        public override long Length => throw new NotSupportedException();
+        public override long Position
+        {
+            get => throw new NotSupportedException();
+            set => throw new NotSupportedException();
+        }
+
+        public override void Flush()
+        {
+            _baseStream.Flush();
+        }
+
+        public override int Read(byte[] buffer, int offset, int count)
+        {
+            throw new NotSupportedException();
+        }
+
+        public override long Seek(long offset, SeekOrigin origin)
+        {
+            throw new NotSupportedException();
+        }
+
+        public override void SetLength(long value)
+        {
+            throw new NotSupportedException();
+        }
+
+        public override void Write(byte[] buffer, int offset, int count)
+        {
+            if (count <= 0) return;
+            _baseStream.Write(buffer, offset, count);
+            _adler = Adler32.Update(_adler, buffer, offset, count);
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
             {
-                ds.Write(data, 0, data.Length);
+                _baseStream.Dispose();
             }
-
-            // Adler32
-            uint adler = Adler32.Compute(data, 0, data.Length);
-            outMs.WriteByte((byte)((adler >> 24) & 0xFF));
-            outMs.WriteByte((byte)((adler >> 16) & 0xFF));
-            outMs.WriteByte((byte)((adler >> 8) & 0xFF));
-            outMs.WriteByte((byte)(adler & 0xFF));
-
-            return outMs.ToArray();
+            base.Dispose(disposing);
         }
     }
 }
