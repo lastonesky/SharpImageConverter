@@ -31,7 +31,7 @@ This library was originally created to address several practical issues we encou
   - Grayscale, Truecolor, Indexed; bit depth 1/2/4/8/16 (normalized to 8-bit on conversion)
 - Write:
   - Save as Truecolor PNG (RGB24)
-  - Zlib (Deflate) compression, filter fixed to None
+  - Zlib (Deflate) compression using the Up filter (per-row differencing), with SIMD acceleration applied to the Up filtering step
   - No palette or additional metadata
 
 ### BMP
@@ -58,7 +58,7 @@ This library was originally created to address several practical issues we encou
 - `ImageFrame` as the intermediate structure for format conversion (currently `Rgb24`)
 - Always load as RGB, then encode according to output extension
 
-## What's New
+## What's New (v0.1.3)
 
 - PNG: Significantly smaller output size for many images (for example, a PNG that was around 110 MB can now shrink to about 30 MB, depending on image content), with a slight improvement in encoding speed.
 - JPEG: Noticeably faster decoding pipeline, plus a modest speedup on the encoding side.
