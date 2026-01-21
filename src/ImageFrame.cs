@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using SharpImageConverter.Formats.Jpeg;
 using SharpImageConverter.Metadata;
 
 namespace SharpImageConverter;

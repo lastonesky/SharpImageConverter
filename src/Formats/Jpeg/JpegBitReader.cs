@@ -1,159 +1,206 @@
-using System;
+using System.Buffers;
 using System.Runtime.CompilerServices;
 
-namespace SharpImageConverter;
+namespace SharpImageConverter.Formats.Jpeg;
 
-internal unsafe class JpegBitReader
+internal ref struct JpegBitReader
 {
-    private readonly byte* _data;
-    private readonly int _length;
-    private int _byteOffset;
-    private ulong _bitBuffer;
-    private int _bitCount;
-    private bool _hitMarker;
-    private byte _marker;
-    private int _markerOffset;
+    private ReadOnlySpan<byte> data;
+    private int offset;
+    private uint bitBuffer;
+    private int bitCount;
+    private int pendingMarker;
+    private int padByteCount;
 
-    public JpegBitReader(byte* data, int length)
+    public JpegBitReader(ReadOnlySpan<byte> entropyData)
     {
-        _data = data;
-        _length = length;
-        _byteOffset = 0;
-        _bitBuffer = 0;
-        _bitCount = 0;
-        _hitMarker = false;
-        _marker = 0;
-        _markerOffset = -1;
+        data = entropyData;
+        offset = 0;
+        bitBuffer = 0;
+        bitCount = 0;
+        pendingMarker = -1;
+        padByteCount = 0;
     }
 
-    public int ByteOffset => _byteOffset;
-    public int MarkerOffset => _markerOffset;
+    public bool HasPendingMarker => pendingMarker >= 0;
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public void ResetBits()
+    public int PendingMarker
     {
-        _bitBuffer = 0;
-        _bitCount = 0;
-        _hitMarker = false;
-        _marker = 0;
-        _markerOffset = -1;
-        _byteOffset = 0;
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        get => pendingMarker;
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public int ReadBit()
+    public int BytesConsumed
     {
-        return ReadBits(1);
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        get => offset;
+    }
+
+    public int BitCount
+    {
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        get => bitCount;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public int ReadBits(int n)
-    {
-        if (n <= 0) return 0;
-        int bits = PeekBits(n);
-        if (bits == -1) return -1;
-        SkipBits(n);
-        return bits;
-    }
+    public void ClearPendingMarker() => pendingMarker = -1;
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public int PeekBits(int n)
+    public void Reset()
     {
-        FillBits(n);
-        if (_bitCount < n) return -1;
-        int shift = _bitCount - n;
-        ulong mask = n == 64 ? ulong.MaxValue : ((1UL << n) - 1);
-        return (int)((_bitBuffer >> shift) & mask);
-    }
-
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public void SkipBits(int n)
-    {
-        if (n <= 0) return;
-        if (n > _bitCount) n = _bitCount;
-        _bitCount -= n;
-        if (_bitCount == 0)
-        {
-            _bitBuffer = 0;
-            return;
-        }
-        if (_bitCount < 64)
-        {
-            _bitBuffer &= (1UL << _bitCount) - 1;
-        }
-    }
-
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private void FillBits(int minBits)
-    {
-        while (!_hitMarker && _bitCount < minBits && _byteOffset < _length)
-        {
-            byte b = _data[_byteOffset++];
-
-            if (b == 0xFF)
-            {
-                if (_byteOffset >= _length)
-                {
-                    _hitMarker = true;
-                    _marker = 0;
-                    _markerOffset = _byteOffset - 1;
-                    return;
-                }
-
-                byte b2 = _data[_byteOffset++];
-                if (b2 == 0x00)
-                {
-                    AppendByte(0xFF);
-                    continue;
-                }
-
-                _markerOffset = _byteOffset - 2;
-                _hitMarker = true;
-                _marker = b2;
-                return;
-            }
-
-            AppendByte(b);
-        }
-
-        if (!_hitMarker && _byteOffset >= _length && _bitCount < minBits)
-        {
-            _hitMarker = true;
-            _marker = 0;
-            _markerOffset = _length;
-        }
-    }
-
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private void AppendByte(byte b)
-    {
-        if (_bitCount > 56) throw new InvalidOperationException("Bit buffer overflow");
-        _bitBuffer = (_bitBuffer << 8) | b;
-        _bitCount += 8;
+        bitBuffer = 0;
+        bitCount = 0;
+        pendingMarker = -1;
+        padByteCount = 0;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void AlignToByte()
     {
-        int mod = _bitCount & 7;
-        if (mod != 0) SkipBits(mod);
+        bitCount -= bitCount & 7;
     }
 
-    public bool HitMarker => _hitMarker;
-    public byte Marker => _marker;
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private bool TryReadByte(out byte value)
+    {
+        if ((uint)offset >= (uint)data.Length)
+        {
+            value = 0;
+            return false;
+        }
+
+        value = data[offset++];
+        return true;
+    }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public bool ConsumeRestartMarker()
+    private void FillBitBuffer(int minBits)
     {
-        AlignToByte();
-        if (!_hitMarker) FillBits(8);
-        if (!_hitMarker) return false;
-        if (!JpegMarkers.IsRST(_marker)) return false;
+        while (bitCount < minBits)
+        {
+            if (pendingMarker == (int)JpegMarker.EOI && padByteCount < 4)
+            {
+                bitBuffer = (bitBuffer << 8) | 0xFFu;
+                bitCount += 8;
+                padByteCount++;
+                continue;
+            }
 
-        _hitMarker = false;
-        _marker = 0;
-        _bitBuffer = 0;
-        _bitCount = 0;
-        return true;
+            if (pendingMarker >= 0)
+            {
+                break;
+            }
+
+            if (!TryReadByte(out byte b))
+            {
+                pendingMarker = (int)JpegMarker.EOI;
+                continue;
+            }
+
+            if (b == 0xFF)
+            {
+                if (!TryReadByte(out byte next))
+                {
+                    pendingMarker = (int)JpegMarker.EOI;
+                    continue;
+                }
+
+                while (next == 0xFF)
+                {
+                    if (!TryReadByte(out next))
+                    {
+                        pendingMarker = (int)JpegMarker.EOI;
+                        break;
+                    }
+                }
+
+                if (pendingMarker >= 0)
+                {
+                    break;
+                }
+
+                if (next == 0x00)
+                {
+                    b = 0xFF;
+                }
+                else
+                {
+                    pendingMarker = next;
+                    if (pendingMarker == (int)JpegMarker.EOI)
+                    {
+                        continue;
+                    }
+
+                    break;
+                }
+            }
+
+            bitBuffer = (bitBuffer << 8) | b;
+            bitCount += 8;
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public uint PeekBits(int count)
+    {
+        FillBitBuffer(count);
+        if (bitCount < count)
+        {
+            int missing = count - bitCount;
+            uint mask = (uint)((1 << count) - 1);
+            if (missing >= 32)
+            {
+                return mask;
+            }
+
+            uint avail = bitCount == 0 ? 0u : (bitBuffer & ((1u << bitCount) - 1u));
+            uint pad = (uint)((1 << missing) - 1);
+            return ((avail << missing) | pad) & mask;
+        }
+
+        return (bitBuffer >> (bitCount - count)) & ((uint)(1 << count) - 1);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public void SkipBits(int count)
+    {
+        if (count <= 0)
+        {
+            return;
+        }
+
+        FillBitBuffer(count);
+        if (bitCount < count)
+        {
+            ThrowHelper.ThrowInvalidData($"Unexpected end of entropy-coded data (needBits={count}, haveBits={bitCount}, bytesConsumed={offset}, pendingMarker={pendingMarker}).");
+        }
+
+        bitCount -= count;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public uint ReadBits(int count)
+    {
+        uint v = PeekBits(count);
+        SkipBits(count);
+        return v;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public int ReceiveAndExtend(int size)
+    {
+        if (size == 0)
+        {
+            return 0;
+        }
+
+        int v = (int)ReadBits(size);
+        int vt = 1 << (size - 1);
+        if (v < vt)
+        {
+            v += (-1 << size) + 1;
+        }
+
+        return v;
     }
 }

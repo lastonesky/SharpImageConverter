@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using SharpImageConverter.Formats;
 using SharpImageConverter.Formats.Gif;
+using SharpImageConverter.Formats.Jpeg;
 
 namespace SharpImageConverter.Core
 {

@@ -4,6 +4,7 @@ using System.IO;
 using System.Reflection;
 using System.Security.Cryptography;
 using SharpImageConverter;
+using SharpImageConverter.Formats.Jpeg;
 using Xunit;
 using Xunit.Sdk;
 
@@ -14,7 +15,7 @@ public sealed class ProgressiveJpegTests
     [Fact]
     public void ProgressiveJpeg_Decode_ShouldSucceed()
     {
-        string path = Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "progressive.jpg");
+        string path = Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "examples", "progressive.jpg");
         using var fs = File.OpenRead(path);
         var dec = new JpegDecoder();
         try

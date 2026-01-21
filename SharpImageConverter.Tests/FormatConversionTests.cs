@@ -4,10 +4,11 @@ using System.IO;
 using System.Reflection;
 using SharpImageConverter;
 using SharpImageConverter.Core;
-using SharpImageConverter.Formats;
+using SharpImageConverter.Formats.Jpeg;
 using SharpImageConverter.Formats.Gif;
 using Tests.Helpers;
 using Xunit;
+using SharpImageConverter.Formats;
 
 namespace Jpeg2Bmp.Tests
 {
