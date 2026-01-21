@@ -1122,9 +1122,19 @@ public sealed class JpegDecoder
     public Image<Rgb24> Decode(Stream stream)
     {
         if (stream == null) throw new ArgumentNullException(nameof(stream));
-        using var ms = new MemoryStream();
-        stream.CopyTo(ms);
-        return Decode(ms.ToArray());
+
+        if (stream is MemoryStream ms)
+        {
+            if (ms.TryGetBuffer(out var buffer))
+            {
+                return Decode(buffer.AsSpan((int)ms.Position));
+            }
+            return Decode(ms.ToArray());
+        }
+
+        using var ms2 = new MemoryStream();
+        stream.CopyTo(ms2);
+        return Decode(ms2.ToArray());
     }
 
     public Image<Rgb24> Decode(ReadOnlySpan<byte> data)

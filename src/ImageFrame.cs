@@ -93,7 +93,13 @@ public sealed class ImageFrame
 
         long startPos = stream.Position;
         byte[] header = new byte[8];
-        int read = stream.Read(header, 0, 8);
+        int read = 0;
+        while (read < 8)
+        {
+            int n = stream.Read(header, read, 8 - read);
+            if (n == 0) break;
+            read += n;
+        }
         stream.Position = startPos; // 回退
 
         if (read < 2) throw new InvalidDataException("流数据过短");

@@ -31,8 +31,14 @@ public static class BmpReader
     public static byte[] Read(Stream stream, out int width, out int height)
     {
         Span<byte> header = stackalloc byte[54];
-        int read = stream.Read(header);
-        if (read != header.Length) throw new EndOfStreamException("BMP header 不完整");
+        int totalRead = 0;
+        while (totalRead < header.Length)
+        {
+            int n = stream.Read(header.Slice(totalRead));
+            if (n == 0) break;
+            totalRead += n;
+        }
+        if (totalRead != header.Length) throw new EndOfStreamException("BMP header 不完整");
 
         if (header[0] != (byte)'B' || header[1] != (byte)'M')
             throw new InvalidDataException("Not a BMP file");
