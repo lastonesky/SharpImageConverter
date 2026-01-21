@@ -142,6 +142,37 @@ namespace Jpeg2Bmp.Tests
         }
 
         [Fact]
+        public void Jpeg_Gray8_Encodes_As_SingleComponent_Gray()
+        {
+            int w = 16, h = 16;
+            var gray = new byte[w * h];
+            for (int y = 0; y < h; y++)
+            {
+                for (int x = 0; x < w; x++)
+                {
+                    byte v = (byte)((x * 255) / (w - 1));
+                    gray[y * w + x] = v;
+                }
+            }
+
+            var img = new Image<Gray8>(w, h, gray);
+            string path = NewTemp(".jpg");
+            Image.Save(img, path);
+
+            byte[] data = File.ReadAllBytes(path);
+            var jpeg = StaticJpegDecoder.Decode(data);
+
+            Assert.Equal(JpegPixelFormat.Gray8, jpeg.PixelFormat);
+            Assert.Equal(w, jpeg.Width);
+            Assert.Equal(h, jpeg.Height);
+
+            var decodedGray = jpeg.PixelData.ToArray();
+            BufferAssert.AssertMseLessThan(gray, decodedGray, 8000.0);
+
+            File.Delete(path);
+        }
+
+        [Fact]
         public void Gif_Animated_To_Webp_Animated_Works()
         {
             byte[] gifBytes = CreateTinyAnimatedGif1x1();

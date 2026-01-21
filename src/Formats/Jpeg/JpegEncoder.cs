@@ -3,6 +3,7 @@ using System.IO;
 using System.Numerics;
 using System.Diagnostics;
 using SharpImageConverter.Metadata;
+using SharpImageConverter.Core;
 using SharpImageConverter.Formats.Jpeg;
 
 namespace SharpImageConverter;
@@ -231,6 +232,62 @@ public static class JpegEncoder
         WriteInternal(stream, width, height, rgb24, quality, subsample420, metadata, keepMetadata);
     }
 
+    public static void WriteGray8(string path, int width, int height, byte[] gray8, int quality = 75)
+    {
+        using var fs = new FileStream(path, FileMode.Create, FileAccess.Write);
+        WriteGray8(fs, width, height, gray8, quality);
+    }
+
+    public static void WriteGray8(Stream stream, int width, int height, byte[] gray8, int quality = 75)
+    {
+        if (gray8 == null) throw new ArgumentNullException(nameof(gray8));
+        if (gray8.Length != checked(width * height)) throw new ArgumentException("Gray8 像素长度不匹配", nameof(gray8));
+        if (quality < 1) quality = 1;
+        if (quality > 100) quality = 100;
+
+        WriteInternalGray(stream, width, height, gray8, quality, null, false);
+    }
+
+    /// <summary>
+    /// 根据图像类型自动选择编码方式
+    /// </summary>
+    /// <typeparam name="T">像素类型</typeparam>
+    /// <param name="image">输入图像</param>
+    /// <param name="stream">输出流</param>
+    /// <param name="quality">质量 (1-100)</param>
+    /// <param name="subsample420">是否使用 4:2:0 子采样（仅对 RGB 有效）</param>
+    /// <param name="keepMetadata">是否保留元数据</param>
+    public static void Encode<T>(Image<T> image, Stream stream, int quality = 75, bool subsample420 = true, bool keepMetadata = true) where T : struct, IPixel
+    {
+        if (typeof(T) == typeof(Gray8))
+        {
+            WriteInternalGray(stream, image.Width, image.Height, image.Buffer, quality, image.Metadata, keepMetadata);
+        }
+        else if (typeof(T) == typeof(Rgb24))
+        {
+            WriteInternal(stream, image.Width, image.Height, image.Buffer, quality, subsample420, image.Metadata, keepMetadata);
+        }
+        else
+        {
+            throw new NotSupportedException($"JPEG encoding not supported for pixel type: {typeof(T).Name}");
+        }
+    }
+
+    /// <summary>
+    /// 根据图像类型自动选择编码方式
+    /// </summary>
+    /// <typeparam name="T">像素类型</typeparam>
+    /// <param name="path">输出文件路径</param>
+    /// <param name="image">输入图像</param>
+    /// <param name="quality">质量 (1-100)</param>
+    /// <param name="subsample420">是否使用 4:2:0 子采样（仅对 RGB 有效）</param>
+    /// <param name="keepMetadata">是否保留元数据</param>
+    public static void Encode<T>(Image<T> image, string path, int quality = 75, bool subsample420 = true, bool keepMetadata = true) where T : struct, IPixel
+    {
+        using var fs = new FileStream(path, FileMode.Create, FileAccess.Write);
+        Encode(image, fs, quality, subsample420, keepMetadata);
+    }
+
     private static void WriteInternal(Stream stream, int width, int height, byte[] rgb24, int quality, bool subsample420, ImageMetadata? metadata, bool keepMetadata)
     {
         long totalStartTicks = Stopwatch.GetTimestamp();
@@ -343,6 +400,64 @@ public static class JpegEncoder
             double block444Pct = totalTicks != 0 ? (double)_ticksFillBlock444 * 100.0 / totalTicks : 0.0;
 
             Console.WriteLine($"[jpeg-timing] total={totalMs:F3}ms FillMcu420={mcu420Ms:F3}ms ({mcu420Pct:F1}%) FillBlock444={block444Ms:F3}ms ({block444Pct:F1}%)");
+        }
+    }
+
+    private static void WriteInternalGray(Stream stream, int width, int height, byte[] gray8, int quality, ImageMetadata? metadata, bool keepMetadata)
+    {
+        long totalStartTicks = Stopwatch.GetTimestamp();
+
+        if (DebugPrintConfig)
+        {
+            Console.WriteLine($"[jpeg] quality={quality} grayscale");
+        }
+
+        byte[] qY = BuildQuantTable(StdLumaQuant, quality);
+        int[] qYRecip = BuildQuantRecipIntDct(qY);
+
+        HuffCode[] dcY = BuildHuffTable(DcLumaCounts, DcLumaSymbols);
+        HuffCode[] acY = BuildHuffTable(AcLumaCounts, AcLumaSymbols);
+
+        WriteMarker(stream, 0xD8);
+        WriteApp0Jfif(stream);
+        if (keepMetadata && metadata != null)
+        {
+            WriteMetadata(stream, metadata);
+        }
+        WriteDqt(stream, 0, qY);
+        WriteSof0Gray(stream, width, height);
+        WriteDht(stream, 0, 0, DcLumaCounts, DcLumaSymbols);
+        WriteDht(stream, 1, 0, AcLumaCounts, AcLumaSymbols);
+        WriteSosGray(stream);
+
+        var bw = new JpegBitWriter(stream);
+
+        int prevYdc = 0;
+
+        int blocksX = (width + 7) / 8;
+        int blocksY = (height + 7) / 8;
+
+        Span<int> yBlock = stackalloc int[64];
+
+        for (int by = 0; by < blocksY; by++)
+        {
+            for (int bx = 0; bx < blocksX; bx++)
+            {
+                FillBlockGray8ToY(gray8, width, height, bx * 8, by * 8, yBlock);
+                EncodeBlock(bw, yBlock, qYRecip, dcY, acY, ref prevYdc);
+            }
+        }
+
+        bw.FlushFinal();
+        WriteMarker(stream, 0xD9);
+
+        long totalEndTicks = Stopwatch.GetTimestamp();
+
+        if (DebugPrintConfig)
+        {
+            long totalTicks = totalEndTicks - totalStartTicks;
+            double totalMs = totalTicks * 1000.0 / Stopwatch.Frequency;
+            Console.WriteLine($"[jpeg-timing] total={totalMs:F3}ms Gray8");
         }
     }
 
@@ -539,6 +654,26 @@ public static class JpegEncoder
 
         long endTicks = Stopwatch.GetTimestamp();
         _ticksFillBlock444 += endTicks - startTicks;
+    }
+
+    private static void FillBlockGray8ToY(byte[] gray, int width, int height, int baseX, int baseY, Span<int> y)
+    {
+        for (int yy = 0; yy < 8; yy++)
+        {
+            int sy = baseY + yy;
+            if (sy >= height) sy = height - 1;
+            int rowOffset = sy * width;
+            int yRowBase = yy * 8;
+            for (int xx = 0; xx < 8; xx++)
+            {
+                int sx = baseX + xx;
+                if (sx >= width) sx = width - 1;
+                int srcIndex = rowOffset + sx;
+                int yyVal = gray[srcIndex];
+                int i = yRowBase + xx;
+                y[i] = yyVal - 128;
+            }
+        }
     }
 
     private static int MagnitudeCategory(int v)
@@ -906,6 +1041,20 @@ public static class JpegEncoder
         s.WriteByte(1);
     }
 
+    private static void WriteSof0Gray(Stream s, int width, int height)
+    {
+        WriteMarker(s, 0xC0);
+        WriteBe16(s, 11);
+        s.WriteByte(8);
+        WriteBe16(s, height);
+        WriteBe16(s, width);
+        s.WriteByte(1);
+
+        s.WriteByte(1);
+        s.WriteByte(0x11);
+        s.WriteByte(0);
+    }
+
     private static void WriteDht(Stream s, int tableClass, int tableId, byte[] counts, byte[] symbols)
     {
         WriteMarker(s, 0xC4);
@@ -930,6 +1079,20 @@ public static class JpegEncoder
 
         s.WriteByte(3);
         s.WriteByte(0x11);
+
+        s.WriteByte(0);
+        s.WriteByte(63);
+        s.WriteByte(0);
+    }
+
+    private static void WriteSosGray(Stream s)
+    {
+        WriteMarker(s, 0xDA);
+        WriteBe16(s, 8);
+        s.WriteByte(1);
+
+        s.WriteByte(1);
+        s.WriteByte(0x00);
 
         s.WriteByte(0);
         s.WriteByte(63);
