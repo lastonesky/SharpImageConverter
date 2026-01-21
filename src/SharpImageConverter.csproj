@@ -11,7 +11,7 @@
     <RootNamespace>SharpImageConverter</RootNamespace>
     <IsPackable>true</IsPackable>
     <PackageId>SharpImageConverter</PackageId>
-    <Version>0.1.4.1-preview</Version>
+    <Version>0.1.4.2-preview</Version>
     <Authors>SharpImageConverter</Authors>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <Description>Pure C# cross-platform image conversion library (JPEG/PNG/BMP/WebP/GIF) with a fast integer JPEG codec and minimal dependencies.</Description>

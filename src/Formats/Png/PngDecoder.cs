@@ -64,7 +64,14 @@ public class PngDecoder
     public byte[] DecodeToRGB(Stream stream)
     {
         byte[] sig = new byte[8];
-        if (stream.Read(sig, 0, 8) != 8) throw new InvalidDataException("File too short");
+        int readCount = 0;
+        while (readCount < 8)
+        {
+            int n = stream.Read(sig, readCount, 8 - readCount);
+            if (n == 0) break;
+            readCount += n;
+        }
+        if (readCount != 8) throw new InvalidDataException("File too short");
         if (!IsPngSignature(sig)) throw new InvalidDataException("Not a PNG file");
 
         using var idatStream = new PooledMemoryStream(4096);
@@ -145,7 +152,14 @@ public class PngDecoder
     public byte[] DecodeToRGBA(Stream stream)
     {
         byte[] sig = new byte[8];
-        if (stream.Read(sig, 0, 8) != 8) throw new InvalidDataException("File too short");
+        int readCount = 0;
+        while (readCount < 8)
+        {
+            int n = stream.Read(sig, readCount, 8 - readCount);
+            if (n == 0) break;
+            readCount += n;
+        }
+        if (readCount != 8) throw new InvalidDataException("File too short");
         if (!IsPngSignature(sig)) throw new InvalidDataException("Not a PNG file");
         using var idatStream = new PooledMemoryStream(4096);
         bool endChunkFound = false;
