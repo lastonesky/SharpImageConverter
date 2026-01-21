@@ -1138,21 +1138,40 @@ public sealed class JpegDecoder
         Width = img.Width;
         Height = img.Height;
 
-        byte[] rgb = img.PixelFormat switch
+        byte[] rgb;
+        if (img.PixelFormat == JpegPixelFormat.Rgb24)
         {
-            JpegPixelFormat.Rgb24 => img.PixelData.ToArray(),
-            JpegPixelFormat.Gray8 => ExpandGray(img.PixelData, Width, Height),
-            JpegPixelFormat.Rgba32 => DropAlpha(img.PixelData, Width, Height),
-            _ => throw new InvalidOperationException("Unsupported pixel format.")
-        };
-        if (ExifOrientation != 1)
+            if (ExifOrientation != 1)
+            {
+                var t = ApplyExifOrientation(img.PixelDataArray, Width, Height, ExifOrientation);
+                rgb = t.pixels;
+                Width = t.width;
+                Height = t.height;
+                ExifOrientation = 1;
+                metadata.Orientation = 1;
+            }
+            else
+            {
+                rgb = img.PixelDataArray;
+            }
+        }
+        else
         {
-            var t = ApplyExifOrientation(rgb, Width, Height, ExifOrientation);
-            rgb = t.pixels;
-            Width = t.width;
-            Height = t.height;
-            ExifOrientation = 1;
-            metadata.Orientation = 1;
+            rgb = img.PixelFormat switch
+            {
+                JpegPixelFormat.Gray8 => ExpandGray(img.PixelData, Width, Height),
+                JpegPixelFormat.Rgba32 => DropAlpha(img.PixelData, Width, Height),
+                _ => throw new InvalidOperationException("Unsupported pixel format.")
+            };
+            if (ExifOrientation != 1)
+            {
+                var t = ApplyExifOrientation(rgb, Width, Height, ExifOrientation);
+                rgb = t.pixels;
+                Width = t.width;
+                Height = t.height;
+                ExifOrientation = 1;
+                metadata.Orientation = 1;
+            }
         }
         return new Image<Rgb24>(Width, Height, rgb, metadata);
     }

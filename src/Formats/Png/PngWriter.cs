@@ -11,6 +11,31 @@ namespace SharpImageConverter;
 /// </summary>
 public static class PngWriter
 {
+    public static void WriteGray(string path, int width, int height, byte[] gray)
+    {
+        using (var fs = new FileStream(path, FileMode.Create, FileAccess.Write))
+        {
+            WriteGray(fs, width, height, gray);
+        }
+    }
+
+    public static void WriteGray(Stream stream, int width, int height, byte[] gray)
+    {
+        stream.Write(new byte[] { 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A }, 0, 8);
+        WriteChunk(stream, "IHDR", CreateIHDRGray(width, height));
+        int stride = width;
+        int rawSize = (stride + 1) * height;
+        using (var ms = new PooledMemoryStream(rawSize))
+        {
+            ZlibHelper.CompressRaw(s =>
+            {
+                WriteUpFilteredScanlines(s, gray, width, height, 1);
+            }, ms);
+            ArraySegment<byte> segment = ms.GetBuffer();
+            WriteChunk(stream, "IDAT", segment.Array, segment.Offset, segment.Count);
+        }
+        WriteChunk(stream, "IEND", new byte[0]);
+    }
     /// <summary>
     /// 写入 RGB24 PNG 文件（颜色类型 2）
     /// </summary>
@@ -132,6 +157,19 @@ public static class PngWriter
         Array.Copy(ToBigEndian((uint)height), 0, data, 4, 4);
         data[8] = 8;
         data[9] = 6;
+        data[10] = 0;
+        data[11] = 0;
+        data[12] = 0;
+        return data;
+    }
+
+    private static byte[] CreateIHDRGray(int width, int height)
+    {
+        byte[] data = new byte[13];
+        Array.Copy(ToBigEndian((uint)width), 0, data, 0, 4);
+        Array.Copy(ToBigEndian((uint)height), 0, data, 4, 4);
+        data[8] = 8;
+        data[9] = 0;
         data[10] = 0;
         data[11] = 0;
         data[12] = 0;
