@@ -266,9 +266,17 @@ class Program
                     swDecode.Stop();
                     Console.WriteLine($"解码耗时: {swDecode.ElapsedMilliseconds} ms");
                     int q = jpegQuality ?? 75;
-                    var frame = new ImageFrame(image.Width, image.Height, image.Buffer, image.Metadata);
-                    bool effectiveSubsample420 = subsample420 ?? true;
-                    frame.SaveAsJpeg(outputPath, q, effectiveSubsample420, keepMetadata);
+                    bool isInputGray = IsGrayRgb(image);
+                    if (gray || isInputGray)
+                    {
+                        var grayImage = ToGray8(image);
+                        JpegEncoder.Encode(grayImage, outputPath, q, true, keepMetadata);
+                    }
+                    else
+                    {
+                        bool effectiveSubsample420 = subsample420 ?? true;
+                        JpegEncoder.Encode(image, outputPath, q, effectiveSubsample420, keepMetadata);
+                    }
                 }
                 else
                 {
@@ -276,9 +284,19 @@ class Program
                     if (outExt2b is ".jpg" or ".jpeg")
                     {
                         int q = jpegQuality ?? 75;
-                        var frame = new ImageFrame(rgbaImage.Width, rgbaImage.Height, RgbaToRgb(rgbaImage.Buffer));
-                        bool effectiveSubsample420 = subsample420 ?? true;
-                        frame.SaveAsJpeg(outputPath, q, effectiveSubsample420);
+                        bool isInputGray = IsGrayRgba(rgbaImage);
+                        if (gray || isInputGray)
+                        {
+                            var rgb = new Image<Rgb24>(rgbaImage.Width, rgbaImage.Height, RgbaToRgb(rgbaImage.Buffer), rgbaImage.Metadata);
+                            var grayImage = ToGray8(rgb);
+                            JpegEncoder.Encode(grayImage, outputPath, q);
+                        }
+                        else
+                        {
+                            var rgbImage = new Image<Rgb24>(rgbaImage.Width, rgbaImage.Height, RgbaToRgb(rgbaImage.Buffer), rgbaImage.Metadata);
+                            bool effectiveSubsample420 = subsample420 ?? true;
+                            JpegEncoder.Encode(rgbImage, outputPath, q, effectiveSubsample420);
+                        }
                     }
                     else
                     {

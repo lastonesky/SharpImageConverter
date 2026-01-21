@@ -107,6 +107,11 @@ namespace SharpImageConverter.Core
                 PngWriter.WriteGray(path, image.Width, image.Height, image.Buffer);
                 return;
             }
+            if (ext == ".jpg" || ext == ".jpeg")
+            {
+                JpegEncoder.WriteGray8(path, image.Width, image.Height, image.Buffer, 75);
+                return;
+            }
             var rgb = new Image<Rgb24>(image.Width, image.Height, GrayToRgb(image.Buffer), image.Metadata);
             SaveRgb24(rgb, path);
         }
