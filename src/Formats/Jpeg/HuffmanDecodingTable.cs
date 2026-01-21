@@ -1,92 +1,176 @@
-using System;
+using System.Runtime.CompilerServices;
 
-namespace SharpImageConverter;
+namespace SharpImageConverter.Formats.Jpeg;
 
-internal class HuffmanDecodingTable
+internal sealed class HuffmanDecodingTable
 {
-    public JpegHuffmanTable Table { get; }
-    public int[] MaxCode { get; } = new int[17];
-    public int[] MinCode { get; } = new int[17];
-    public int[] ValPtr { get; } = new int[17];
-    public byte[] FastBits { get; } = new byte[256];
-    public byte[] FastSymbols { get; } = new byte[256];
+    private readonly ushort[] fast = new ushort[1 << FastBits];
+    private readonly int[] minCode = new int[17];
+    private readonly int[] maxCode = new int[17];
+    private readonly int[] valPtr = new int[17];
+    private readonly byte[] huffVal = new byte[256];
+    private readonly short[] left = new short[512];
+    private readonly short[] right = new short[512];
+    private readonly short[] symbol = new short[512];
+    private int nodeCount;
 
-    public HuffmanDecodingTable(JpegHuffmanTable table)
+    private const int FastBits = 9;
+
+    public void Build(ReadOnlySpan<byte> bits, ReadOnlySpan<byte> values)
     {
-        Table = table;
-        GenerateTables();
-    }
+        if (bits.Length != 16)
+        {
+            ThrowHelper.ThrowInvalidData("Invalid Huffman bits length.");
+        }
 
-    private void GenerateTables()
-    {
-        int p = 0;
-        int[] huffsize = new int[257];
-        int[] huffcode = new int[257];
+        int total = 0;
+        for (int i = 0; i < 16; i++)
+        {
+            total += bits[i];
+        }
 
+        if (total == 0 || total > 256 || values.Length < total)
+        {
+            ThrowHelper.ThrowInvalidData("Invalid Huffman table.");
+        }
+
+        values.Slice(0, total).CopyTo(huffVal);
+
+        Array.Clear(fast);
+        nodeCount = 1;
+        for (int i = 0; i < left.Length; i++)
+        {
+            left[i] = -1;
+            right[i] = -1;
+            symbol[i] = -1;
+        }
+
+        for (int i = 0; i < 17; i++)
+        {
+            minCode[i] = 0;
+            maxCode[i] = -1;
+            valPtr[i] = 0;
+        }
+
+        Span<byte> huffSize = stackalloc byte[257];
+        Span<int> huffCode = stackalloc int[257];
+
+        int k = 0;
         for (int i = 1; i <= 16; i++)
         {
-            for (int j = 1; j <= Table.CodeLengths[i - 1]; j++)
+            int num = bits[i - 1];
+            for (int j = 0; j < num; j++)
             {
-                if (p >= 256)
-                {
-                    throw new InvalidOperationException($"Huffman table overflow. p={p}, i={i}");
-                }
-                huffsize[p++] = i;
+                huffSize[k++] = (byte)i;
             }
         }
-        huffsize[p] = 0;
+        huffSize[k] = 0;
 
         int code = 0;
-        int si = huffsize[0];
-        p = 0;
-        while (huffsize[p] != 0)
+        int si = huffSize[0];
+        k = 0;
+        while (huffSize[k] != 0)
         {
-            while (huffsize[p] == si)
+            while (huffSize[k] == si)
             {
-                huffcode[p++] = code;
+                huffCode[k] = code;
                 code++;
+                k++;
             }
+
             code <<= 1;
             si++;
         }
 
-        int jIdx = 0;
-        for (int i = 0; i < 17; i++) MaxCode[i] = -1;
-
-        for (int i = 1; i <= 16; i++)
+        int p = 0;
+        for (int l = 1; l <= 16; l++)
         {
-            if (Table.CodeLengths[i - 1] == 0)
+            int num = bits[l - 1];
+            if (num == 0)
             {
-                MaxCode[i] = -1;
+                maxCode[l] = -1;
+                continue;
             }
-            else
-            {
-                ValPtr[i] = jIdx;
-                MinCode[i] = huffcode[jIdx];
-                MaxCode[i] = huffcode[jIdx + Table.CodeLengths[i - 1] - 1];
-                jIdx += Table.CodeLengths[i - 1];
-            }
+
+            valPtr[l] = p;
+            minCode[l] = huffCode[p];
+            p += num;
+            maxCode[l] = huffCode[p - 1];
         }
 
-        Array.Clear(FastBits, 0, FastBits.Length);
-        Array.Clear(FastSymbols, 0, FastSymbols.Length);
-
-        int total = Math.Min(jIdx, Table.Symbols.Length);
         for (int i = 0; i < total; i++)
         {
-            int size = huffsize[i];
-            if (size <= 0 || size > 16) continue;
-            if (size > 8) continue;
-
-            int code8 = huffcode[i] << (8 - size);
-            int fill = 1 << (8 - size);
-            byte sym = Table.Symbols[i];
-            for (int j = 0; j < fill; j++)
+            int s = huffSize[i];
+            if (s <= FastBits)
             {
-                int idx = code8 | j;
-                FastBits[idx] = (byte)size;
-                FastSymbols[idx] = sym;
+                int hcode = huffCode[i] << (FastBits - s);
+                int max = 1 << (FastBits - s);
+                ushort packed = (ushort)((s << 8) | huffVal[i]);
+                for (int j = 0; j < max; j++)
+                {
+                    fast[hcode + j] = packed;
+                }
+            }
+
+            int codeBits = huffCode[i];
+            int node = 0;
+            for (int bitPos = s - 1; bitPos >= 0; bitPos--)
+            {
+                int bit = (codeBits >> bitPos) & 1;
+                ref short child = ref (bit == 0 ? ref left[node] : ref right[node]);
+                if (child < 0)
+                {
+                    if (nodeCount >= left.Length)
+                    {
+                        ThrowHelper.ThrowInvalidData("Huffman tree too large.");
+                    }
+
+                    child = (short)nodeCount++;
+                }
+
+                node = child;
+            }
+
+            symbol[node] = huffVal[i];
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public int Decode(ref JpegBitReader reader)
+    {
+        uint c = reader.PeekBits(FastBits);
+        ushort f = fast[c];
+        if (f != 0)
+        {
+            int s = f >> 8;
+            reader.SkipBits(s);
+            return (byte)f;
+        }
+
+        return DecodeSlow(ref reader);
+    }
+
+    private int DecodeSlow(ref JpegBitReader reader)
+    {
+        int code = 0;
+        for (int s = 1; s <= 16; s++)
+        {
+            code = (code << 1) | (int)reader.ReadBits(1);
+            int max = maxCode[s];
+            int min = minCode[s];
+            if (max >= 0 && code >= min && code <= max)
+            {
+                int idx = valPtr[s] + (code - min);
+                if ((uint)idx >= (uint)huffVal.Length)
+                {
+                    ThrowHelper.ThrowInvalidData($"Invalid Huffman table index (idx={idx}, s={s}, code={code}, bytesConsumed={reader.BytesConsumed}, bitCount={reader.BitCount}, pendingMarker={reader.PendingMarker}).");
+                }
+
+                return huffVal[idx];
             }
         }
+
+        ThrowHelper.ThrowInvalidData($"Invalid Huffman code (bytesConsumed={reader.BytesConsumed}, bitCount={reader.BitCount}, pendingMarker={reader.PendingMarker}).");
+        return 0;
     }
 }

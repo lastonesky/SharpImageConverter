@@ -7,6 +7,7 @@ using SharpImageConverter.Core;
 using SharpImageConverter.Processing;
 using SharpImageConverter.Formats.Gif;
 using SharpImageConverter.Formats;
+using SharpImageConverter.Formats.Jpeg;
 
 namespace SharpImageConverter;
 
@@ -20,7 +21,7 @@ class Program
             Console.WriteLine("支持输入: .jpg/.jpeg/.png/.bmp/.webp/.gif");
             Console.WriteLine("支持输出: .jpg/.jpeg/.png/.bmp/.webp/.gif");
             Console.WriteLine("操作: resize:WxH | resizebilinear:WxH | resizefit:WxH | grayscale");
-            Console.WriteLine("参数: --quality N | --subsample 420/444 | --keep-metadata | --fdct int/float | --jpeg-debug | --gif-frames");
+            Console.WriteLine("参数: --quality N | --subsample 420/444 | --keep-metadata | --fdct int/float | --idct int/float | --jpeg-debug | --gif-frames");
             return;
         }
         string inputPath = args[0];
@@ -34,6 +35,7 @@ class Program
         bool? subsample420 = null;
         bool keepMetadata = false;
         bool gifFrames = false;
+        bool useFloatIdct = false;
         var ops = new List<Action<ImageProcessingContext>>();
         for (int i = 1; i < args.Length; i++)
         {
@@ -77,6 +79,24 @@ class Program
             if (string.Equals(a, "--keep-metadata", StringComparison.OrdinalIgnoreCase))
             {
                 keepMetadata = true;
+                continue;
+            }
+            if (string.Equals(a, "--idct", StringComparison.OrdinalIgnoreCase))
+            {
+                if (i + 1 < args.Length)
+                {
+                    string v = args[i + 1].Trim();
+                    if (string.Equals(v, "float", StringComparison.OrdinalIgnoreCase)) useFloatIdct = true;
+                    else if (string.Equals(v, "int", StringComparison.OrdinalIgnoreCase)) useFloatIdct = false;
+                    i++;
+                }
+                continue;
+            }
+            if (a.StartsWith("--idct=", StringComparison.OrdinalIgnoreCase))
+            {
+                string v = a["--idct=".Length..].Trim();
+                if (string.Equals(v, "float", StringComparison.OrdinalIgnoreCase)) useFloatIdct = true;
+                else if (string.Equals(v, "int", StringComparison.OrdinalIgnoreCase)) useFloatIdct = false;
                 continue;
             }
             if (a.StartsWith("--subsample=", StringComparison.OrdinalIgnoreCase))
@@ -211,7 +231,7 @@ class Program
                 if (inExt is ".jpg" or ".jpeg" && outExt2b == ".bmp")
                 {
                     var swDecode = Stopwatch.StartNew();
-                    var image = Image.Load(inputPath);
+                    var image = LoadRgb24(inputPath, useFloatIdct);
                     swDecode.Stop();
                     Console.WriteLine($"解码耗时: {swDecode.ElapsedMilliseconds} ms");
                     Image.Save(image, outputPath);
@@ -219,7 +239,7 @@ class Program
                 else if (inExt is ".jpg" or ".jpeg" && (outExt2b is ".jpg" or ".jpeg"))
                 {
                     var swDecode = Stopwatch.StartNew();
-                    var image = Image.Load(inputPath);
+                    var image = LoadRgb24(inputPath, useFloatIdct);
                     swDecode.Stop();
                     Console.WriteLine($"解码耗时: {swDecode.ElapsedMilliseconds} ms");
                     int q = jpegQuality ?? 75;
@@ -229,7 +249,7 @@ class Program
                 }
                 else
                 {
-                    var rgbaImage = Image.LoadRgba32(inputPath);
+                    var rgbaImage = LoadRgba32(inputPath, useFloatIdct);
                     if (outExt2b is ".jpg" or ".jpeg")
                     {
                         int q = jpegQuality ?? 75;
@@ -285,7 +305,7 @@ class Program
             }
             else
             {
-                var image = Image.Load(inputPath);
+                var image = LoadRgb24(inputPath, useFloatIdct);
                 ImageExtensions.Mutate(image, ctx =>
                 {
                     foreach (var a in ops) a(ctx);
@@ -335,6 +355,39 @@ class Program
             rgba[i + 3] = 255;
         }
         return new Image<Rgba32>(image.Width, image.Height, rgba);
+    }
+
+    static Image<Rgb24> LoadRgb24(string path, bool useFloatIdct)
+    {
+        if (!useFloatIdct) return Image.Load(path);
+        string ext = Path.GetExtension(path);
+        if (!ext.Equals(".jpg", StringComparison.OrdinalIgnoreCase) && !ext.Equals(".jpeg", StringComparison.OrdinalIgnoreCase))
+        {
+            return Image.Load(path);
+        }
+        using var fs = File.OpenRead(path);
+        var decoder = new JpegDecoder { UseFloatingPointIdct = true };
+        var img = decoder.Decode(fs);
+        if (decoder.ExifOrientation != 1)
+        {
+            var frame = new ImageFrame(img.Width, img.Height, img.Buffer, img.Metadata);
+            frame = frame.ApplyExifOrientation(decoder.ExifOrientation);
+            img.Update(frame.Width, frame.Height, frame.Pixels);
+            img.Metadata.Orientation = 1;
+        }
+        return img;
+    }
+
+    static Image<Rgba32> LoadRgba32(string path, bool useFloatIdct)
+    {
+        if (!useFloatIdct) return Image.LoadRgba32(path);
+        string ext = Path.GetExtension(path);
+        if (!ext.Equals(".jpg", StringComparison.OrdinalIgnoreCase) && !ext.Equals(".jpeg", StringComparison.OrdinalIgnoreCase))
+        {
+            return Image.LoadRgba32(path);
+        }
+        var rgb = LoadRgb24(path, true);
+        return ToRgba32(rgb);
     }
 
     private static string ResolveOutputPath(string inputPath, string? outputPath, string defaultExtension)
