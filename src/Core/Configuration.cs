@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using SharpImageConverter;
 using SharpImageConverter.Formats;
 using SharpImageConverter.Formats.Gif;
 using SharpImageConverter.Formats.Jpeg;
@@ -93,6 +94,23 @@ namespace SharpImageConverter.Core
             enc.EncodeRgb24(path, image);
         }
 
+        public void SaveGray8(Image<Gray8> image, string path)
+        {
+            var ext = Path.GetExtension(path).ToLowerInvariant();
+            if (ext == ".bmp")
+            {
+                BmpWriter.Write8(path, image.Width, image.Height, image.Buffer);
+                return;
+            }
+            if (ext == ".png")
+            {
+                PngWriter.WriteGray(path, image.Width, image.Height, image.Buffer);
+                return;
+            }
+            var rgb = new Image<Rgb24>(image.Width, image.Height, GrayToRgb(image.Buffer), image.Metadata);
+            SaveRgb24(rgb, path);
+        }
+
         /// <summary>
         /// 加载为 Rgba32 图像（自动识别格式，优先使用原生 RGBA 解码）
         /// </summary>
@@ -154,6 +172,19 @@ namespace SharpImageConverter.Core
                 rgb[j + 0] = rgba[i + 0];
                 rgb[j + 1] = rgba[i + 1];
                 rgb[j + 2] = rgba[i + 2];
+            }
+            return rgb;
+        }
+
+        private static byte[] GrayToRgb(byte[] gray)
+        {
+            var rgb = new byte[gray.Length * 3];
+            for (int i = 0, j = 0; i < gray.Length; i++, j += 3)
+            {
+                byte v = gray[i];
+                rgb[j + 0] = v;
+                rgb[j + 1] = v;
+                rgb[j + 2] = v;
             }
             return rgb;
         }

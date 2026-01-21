@@ -2,6 +2,7 @@ using Xunit;
 using System;
 using System.IO;
 using SharpImageConverter.Core;
+using SharpImageConverter;
 using Tests.Helpers;
 
 namespace Jpeg2Bmp.Tests
@@ -28,6 +29,30 @@ namespace Jpeg2Bmp.Tests
                 BufferAssert.EqualExact(img.Buffer, loaded.Buffer);
                 File.Delete(path);
             }
+        }
+
+        [Fact]
+        public void Bmp_8bit_Grayscale_CanBeReadAsRgb24()
+        {
+            int w = 4, h = 3;
+            var gray = new byte[w * h];
+            for (int i = 0; i < gray.Length; i++)
+            {
+                gray[i] = (byte)(i * 17);
+            }
+            string path = NewTemp(".bmp");
+            BmpWriter.Write8(path, w, h, gray);
+            var loaded = Image.Load(path);
+            Assert.Equal(w, loaded.Width);
+            Assert.Equal(h, loaded.Height);
+            for (int i = 0; i < gray.Length; i++)
+            {
+                int o = i * 3;
+                Assert.Equal(gray[i], loaded.Buffer[o + 0]);
+                Assert.Equal(gray[i], loaded.Buffer[o + 1]);
+                Assert.Equal(gray[i], loaded.Buffer[o + 2]);
+            }
+            File.Delete(path);
         }
     }
 }

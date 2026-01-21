@@ -21,7 +21,7 @@ class Program
             Console.WriteLine("支持输入: .jpg/.jpeg/.png/.bmp/.webp/.gif");
             Console.WriteLine("支持输出: .jpg/.jpeg/.png/.bmp/.webp/.gif");
             Console.WriteLine("操作: resize:WxH | resizebilinear:WxH | resizefit:WxH | grayscale");
-            Console.WriteLine("参数: --quality N | --subsample 420/444 | --keep-metadata | --fdct int/float | --idct int/float | --jpeg-debug | --gif-frames");
+            Console.WriteLine("参数: --quality N | --subsample 420/444 | --keep-metadata | --fdct int/float | --idct int/float | --jpeg-debug | --gif-frames | --gray");
             return;
         }
         string inputPath = args[0];
@@ -36,6 +36,7 @@ class Program
         bool keepMetadata = false;
         bool gifFrames = false;
         bool useFloatIdct = false;
+        bool gray = false;
         var ops = new List<Action<ImageProcessingContext>>();
         for (int i = 1; i < args.Length; i++)
         {
@@ -48,6 +49,11 @@ class Program
             if (string.Equals(a, "--jpeg-debug", StringComparison.OrdinalIgnoreCase))
             {
                 JpegEncoder.DebugPrintConfig = true;
+                continue;
+            }
+            if (string.Equals(a, "--gray", StringComparison.OrdinalIgnoreCase))
+            {
+                gray = true;
                 continue;
             }
             if (string.Equals(a, "--quality", StringComparison.OrdinalIgnoreCase) || string.Equals(a, "-q", StringComparison.OrdinalIgnoreCase))
@@ -176,7 +182,15 @@ class Program
                 }
                 else
                 {
-                    Image.Save(frames[i], path);
+                    if ((ext == ".bmp" || ext == ".png") && (gray || IsGrayRgb(frames[i])))
+                    {
+                        var grayImage = ToGray8(frames[i]);
+                        Image.Save(grayImage, path);
+                    }
+                    else
+                    {
+                        Image.Save(frames[i], path);
+                    }
                 }
             }
             swTotal.Stop();
@@ -234,7 +248,16 @@ class Program
                     var image = LoadRgb24(inputPath, useFloatIdct);
                     swDecode.Stop();
                     Console.WriteLine($"解码耗时: {swDecode.ElapsedMilliseconds} ms");
-                    Image.Save(image, outputPath);
+                    bool isInputGray = IsGrayRgb(image);
+                    if ((outExt2b == ".bmp" || outExt2b == ".png") && (gray || isInputGray))
+                    {
+                        var grayImage = ToGray8(image);
+                        Image.Save(grayImage, outputPath);
+                    }
+                    else
+                    {
+                        Image.Save(image, outputPath);
+                    }
                 }
                 else if (inExt is ".jpg" or ".jpeg" && (outExt2b is ".jpg" or ".jpeg"))
                 {
@@ -263,7 +286,17 @@ class Program
                         {
                             WebpEncoderAdapterRgba.DefaultQuality = (jpegQuality ?? 75);
                         }
-                        Image.Save(rgbaImage, outputPath);
+                        bool isInputGray = IsGrayRgba(rgbaImage);
+                        if ((outExt2b == ".bmp" || outExt2b == ".png") && (gray || isInputGray))
+                        {
+                            var rgb = new Image<Rgb24>(rgbaImage.Width, rgbaImage.Height, RgbaToRgb(rgbaImage.Buffer), rgbaImage.Metadata);
+                            var grayImage = ToGray8(rgb);
+                            Image.Save(grayImage, outputPath);
+                        }
+                        else
+                        {
+                            Image.Save(rgbaImage, outputPath);
+                        }
                     }
                 }
             }
@@ -306,6 +339,7 @@ class Program
             else
             {
                 var image = LoadRgb24(inputPath, useFloatIdct);
+                bool isInputGray = IsGrayRgb(image);
                 ImageExtensions.Mutate(image, ctx =>
                 {
                     foreach (var a in ops) a(ctx);
@@ -323,7 +357,15 @@ class Program
                     {
                         WebpEncoderAdapter.Quality = (jpegQuality ?? 75);
                     }
-                    Image.Save(image, outputPath);
+                    if ((outExt == ".bmp" || outExt == ".png") && (gray || isInputGray))
+                    {
+                        var grayImage = ToGray8(image);
+                        Image.Save(grayImage, outputPath);
+                    }
+                    else
+                    {
+                        Image.Save(image, outputPath);
+                    }
                 }
             }
             swTotal.Stop();
@@ -355,6 +397,44 @@ class Program
             rgba[i + 3] = 255;
         }
         return new Image<Rgba32>(image.Width, image.Height, rgba);
+    }
+
+    static bool IsGrayRgb(Image<Rgb24> image)
+    {
+        var rgb = image.Buffer;
+        for (int i = 0; i < rgb.Length; i += 3)
+        {
+            byte r = rgb[i + 0];
+            if (r != rgb[i + 1] || r != rgb[i + 2]) return false;
+        }
+        return true;
+    }
+
+    static bool IsGrayRgba(Image<Rgba32> image)
+    {
+        var rgba = image.Buffer;
+        for (int i = 0; i < rgba.Length; i += 4)
+        {
+            byte r = rgba[i + 0];
+            if (r != rgba[i + 1] || r != rgba[i + 2] || rgba[i + 3] != 255) return false;
+        }
+        return true;
+    }
+
+    static Image<Gray8> ToGray8(Image<Rgb24> image)
+    {
+        int count = image.Width * image.Height;
+        var gray = new byte[count];
+        var rgb = image.Buffer;
+        for (int i = 0, j = 0; i < count; i++, j += 3)
+        {
+            int r = rgb[j + 0];
+            int g = rgb[j + 1];
+            int b = rgb[j + 2];
+            int y = (77 * r + 150 * g + 29 * b) >> 8;
+            gray[i] = (byte)y;
+        }
+        return new Image<Gray8>(image.Width, image.Height, gray, image.Metadata);
     }
 
     static Image<Rgb24> LoadRgb24(string path, bool useFloatIdct)

@@ -77,6 +77,11 @@ namespace SharpImageConverter.Core
             Configuration.Default.SaveRgb24(image, path);
         }
 
+        public static void Save(Image<Gray8> image, string path)
+        {
+            Configuration.Default.SaveGray8(image, path);
+        }
+
         /// <summary>
         /// 加载为 Rgba32 图像（自动识别格式）
         /// </summary>

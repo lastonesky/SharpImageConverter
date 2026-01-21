@@ -56,6 +56,7 @@ public sealed class JpegImage
     public int BitsPerSample { get; }
 
     public ReadOnlySpan<byte> PixelData => pixelData;
+    internal byte[] PixelDataArray => pixelData;
 
     public byte[] Rgba32
     {

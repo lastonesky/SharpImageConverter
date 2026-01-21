@@ -4,7 +4,7 @@ using System.IO;
 namespace SharpImageConverter;
 
 /// <summary>
-/// 简单的 BMP 读取器，支持 24/32 位非压缩 BMP，输出 RGB24。
+/// 简单的 BMP 读取器，支持 8/24/32 位非压缩 BMP，输出 RGB24。
 /// </summary>
 public static class BmpReader
 {
@@ -46,11 +46,20 @@ public static class BmpReader
         short bpp = ReadLe16(header, 28);
         int compression = ReadLe32(header, 30);
 
-        if (bpp != 24 && bpp != 32)
-            throw new NotSupportedException($"Only 24/32-bit BMPs are supported. Found {bpp}-bit.");
-        
-        if (compression != 0 && compression != 3) // BI_RGB or BI_BITFIELDS
-            throw new NotSupportedException("Compressed BMPs are not supported");
+        if (bpp == 8)
+        {
+            if (compression != 0)
+                throw new NotSupportedException("Only uncompressed 8-bit BMPs (BI_RGB) are supported.");
+        }
+        else if (bpp == 24 || bpp == 32)
+        {
+            if (compression != 0 && compression != 3) // BI_RGB or BI_BITFIELDS
+                throw new NotSupportedException("Compressed BMPs are not supported");
+        }
+        else
+        {
+            throw new NotSupportedException($"Only 8/24/32-bit BMPs are supported. Found {bpp}-bit.");
+        }
 
         // Assuming standard top-down or bottom-up
         bool bottomUp = height > 0;
@@ -61,48 +70,49 @@ public static class BmpReader
 
         int pixelSize = bpp / 8;
 
+        byte[]? palette = null;
+        int paletteEntries = 0;
+
         // 如果 stream 支持 Seek，则跳转到 dataOffset。
         // 注意：dataOffset 是相对于文件开头的。
         // 如果 stream 是部分流，可能需要考虑偏移。但通常 BMP 是整个文件。
         // 假设 stream 当前位置是 header 之后。
         // dataOffset 通常大于 54。
-        if (stream.CanSeek)
+        int bytesUntilPixelData = dataOffset - (int)stream.Position;
+        if (bytesUntilPixelData < 0)
+            throw new InvalidDataException("Invalid BMP data offset.");
+
+        if (bpp == 8)
         {
-            // 这里假设 dataOffset 是相对于 stream 起始位置的绝对偏移
-            // 但如果 stream 是从中间开始的（例如 MemoryStream 的 slice），Position 可能不是 0
-            // 简单起见，假设 stream 是完整的文件流，或者 dataOffset 是相对于当前 stream 起始位置的。
-            // 实际上 BMP 格式的 dataOffset 是绝对偏移。
-            // 如果传入的是 FileStream，Position = dataOffset 是对的。
-            // 如果传入的是包含其他数据的流，我们需要知道 BMP 在流中的起始位置。
-            // 但 Read 方法无法知道 BMP 在流中的起始位置，除非我们传递它，或者假设当前 Position - 54 就是起始位置。
-            // 让我们假设 stream 刚开始读取 header 时的位置是 BMP 的起始位置。
-            // 也就是 currentPos - 54。
-            // 更好的做法是，不要 Seek 到绝对位置，而是 skip 掉中间的数据。
-            long currentPos = stream.Position;
-            // 已经读了 54 字节。
-            // 需要跳过 dataOffset - 54 字节。
-            int skip = dataOffset - 54;
-            if (skip > 0)
+            int paletteBytes = bytesUntilPixelData;
+            if (paletteBytes < 4)
+                throw new NotSupportedException("8-bit BMP missing palette.");
+
+            int maxEntries = paletteBytes / 4;
+            paletteEntries = Math.Min(256, maxEntries);
+            palette = new byte[paletteEntries * 4];
+            stream.ReadExactly(palette, 0, palette.Length);
+
+            int remaining = paletteBytes - palette.Length;
+            if (remaining > 0)
             {
-                if (stream.CanSeek)
-                {
-                    stream.Seek(skip, SeekOrigin.Current);
-                }
-                else
-                {
-                    byte[] temp = new byte[skip];
-                    stream.ReadExactly(temp, 0, skip);
-                }
+                byte[] temp = new byte[remaining];
+                stream.ReadExactly(temp, 0, remaining);
             }
         }
         else
         {
-             // 无法 Seek，必须读取并丢弃
-            int skip = dataOffset - 54;
-            if (skip > 0)
+            if (bytesUntilPixelData > 0)
             {
-                byte[] temp = new byte[skip];
-                stream.ReadExactly(temp, 0, skip);
+                if (stream.CanSeek)
+                {
+                    stream.Seek(bytesUntilPixelData, SeekOrigin.Current);
+                }
+                else
+                {
+                    byte[] temp = new byte[bytesUntilPixelData];
+                    stream.ReadExactly(temp, 0, bytesUntilPixelData);
+                }
             }
         }
 
@@ -118,10 +128,27 @@ public static class BmpReader
                 int src = x * pixelSize;
                 int dst = dstOffset + x * 3;
 
-                // BMP is BGR(A)
-                byte b = row[src];
-                byte g = row[src + 1];
-                byte r = row[src + 2];
+                byte r, g, b;
+
+                if (bpp == 8)
+                {
+                    int index = row[src];
+                    if (palette == null || paletteEntries == 0)
+                        throw new InvalidDataException("8-bit BMP palette is missing.");
+                    if (index >= paletteEntries)
+                        index = 0;
+                    int palOffset = index * 4;
+                    b = palette[palOffset + 0];
+                    g = palette[palOffset + 1];
+                    r = palette[palOffset + 2];
+                }
+                else
+                {
+                    // BMP is BGR(A)
+                    b = row[src];
+                    g = row[src + 1];
+                    r = row[src + 2];
+                }
 
                 rgb[dst] = r;
                 rgb[dst + 1] = g;
