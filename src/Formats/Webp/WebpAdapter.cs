@@ -145,15 +145,7 @@ namespace SharpImageConverter.Formats.Webp
         /// <param name="image">输入图像</param>
         public void EncodeRgb24(Stream stream, Image<Rgb24> image)
         {
-            var rgba = new byte[image.Width * image.Height * 4];
-            for (int i = 0, j = 0; j < image.Buffer.Length; i += 4, j += 3)
-            {
-                rgba[i + 0] = image.Buffer[j + 0];
-                rgba[i + 1] = image.Buffer[j + 1];
-                rgba[i + 2] = image.Buffer[j + 2];
-                rgba[i + 3] = 255;
-            }
-            var webp = WebpCodec.EncodeRgba(rgba, image.Width, image.Height, DefaultOptions);
+            var webp = WebpCodec.EncodeRgb(image.Buffer, image.Width, image.Height, DefaultOptions);
             stream.Write(webp, 0, webp.Length);
         }
     }
