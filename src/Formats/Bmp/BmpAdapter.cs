@@ -3,7 +3,7 @@ using SharpImageConverter.Core;
 using SharpImageConverter;
 using System.IO;
 
-namespace SharpImageConverter.Formats
+namespace SharpImageConverter.Formats.Bmp
 {
     /// <summary>
     /// BMP 解码适配器（RGB24）。

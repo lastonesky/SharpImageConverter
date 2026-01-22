@@ -1,7 +1,7 @@
 using System;
 using System.IO;
 
-namespace SharpImageConverter;
+namespace SharpImageConverter.Formats.Bmp;
 
 /// <summary>
 /// 简单的 BMP 读取器，支持 8/24/32 位非压缩 BMP，输出 RGB24。

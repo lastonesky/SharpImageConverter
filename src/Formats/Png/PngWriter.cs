@@ -4,7 +4,7 @@ using System.IO;
 using System.Text;
 using System.Numerics;
 
-namespace SharpImageConverter;
+namespace SharpImageConverter.Formats.Png;
 
 /// <summary>
 /// 简单的 PNG 写入器，支持 RGB24 与 RGBA32。
@@ -199,26 +199,6 @@ public static class PngWriter
         return ZlibHelper.Compress(rawData);
     }
 
-    private static byte[] CreateIDATRgba(int width, int height, byte[] rgba)
-    {
-        int stride = width * 4;
-        int rawSize = (stride + 1) * height;
-        byte[] rawData = new byte[rawSize];
-        int rawIdx = 0;
-        int srcIdx = 0;
-        byte[] prevRow = new byte[stride];
-        byte[] filtered = new byte[stride];
-        for (int y = 0; y < height; y++)
-        {
-            rawData[rawIdx++] = 2;
-            ApplyUpFilterSimd(rgba.AsSpan(srcIdx, stride), prevRow, filtered);
-            Array.Copy(filtered, 0, rawData, rawIdx, stride);
-            srcIdx += stride;
-            rawIdx += stride;
-            Array.Copy(rgba, srcIdx - stride, prevRow, 0, stride);
-        }
-        return ZlibHelper.Compress(rawData);
-    }
     private static void WriteUpFilteredScanlines(Stream s, byte[] src, int width, int height, int bytesPerPixel)
     {
         int stride = width * bytesPerPixel;

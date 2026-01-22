@@ -2,7 +2,7 @@ using Xunit;
 using System;
 using System.IO;
 using SharpImageConverter.Core;
-using SharpImageConverter;
+using SharpImageConverter.Formats.Bmp;
 using Tests.Helpers;
 
 namespace Jpeg2Bmp.Tests

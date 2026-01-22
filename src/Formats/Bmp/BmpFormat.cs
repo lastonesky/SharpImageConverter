@@ -2,7 +2,7 @@ using System;
 using System.IO;
 using SharpImageConverter.Core;
 
-namespace SharpImageConverter.Formats
+namespace SharpImageConverter.Formats.Bmp
 {
     /// <summary>
     /// BMP 图像格式描述与探测。
