@@ -372,47 +372,11 @@ public static class StaticJpegDecoder
             offset = entropyStart + reader.BytesConsumed;
         }
 
-        private int FindEntropyDataEnd(int start)
-        {
-            int i = start;
-            while (i < data.Length - 1)
-            {
-                if (data[i] != 0xFF)
-                {
-                    i++;
-                    continue;
-                }
-
-                int j = i + 1;
-                while (j < data.Length && data[j] == 0xFF)
-                {
-                    j++;
-                }
-
-                if (j >= data.Length)
-                {
-                    return data.Length;
-                }
-
-                byte marker = data[j];
-                if (marker == 0x00)
-                {
-                    i = j + 1;
-                    continue;
-                }
-
-                if (marker is >= (byte)JpegMarker.RST0 and <= (byte)JpegMarker.RST7)
-                {
-                    i = j + 1;
-                    continue;
-                }
-
-                return i;
-            }
-
-            return data.Length;
-        }
-
+        /// <summary>
+        /// 解码一次扫描（Scan），处理熵编码数据、重启标记以及渐进 JPEG 的 EOB 运行。
+        /// </summary>
+        /// <param name="scan">扫描头，包含参与的分量及 SS/SE/Ah/Al 参数</param>
+        /// <param name="reader">位流读取器，封装了 JPEG 字节填充与标记处理</param>
         private void DecodeScan(in ScanHeader scan, ref JpegBitReader reader)
         {
             bool interleaved = scan.Components.Length > 1;
@@ -770,6 +734,11 @@ public static class StaticJpegDecoder
             return null!;
         }
 
+        /// <summary>
+        /// 解析 SOF 帧头（SOF0 基线 / SOF2 渐进），并初始化帧尺寸、
+        /// 采样因子、MCU 网格以及各分量的块几何信息。
+        /// </summary>
+        /// <param name="marker">SOF 标记类型（决定是否为渐进 JPEG）</param>
         private void ParseSof(JpegMarker marker)
         {
             ReadOnlySpan<byte> segment = ReadSegment(out _, out int segmentLength);
@@ -1078,6 +1047,15 @@ public static class StaticJpegDecoder
             return coefficientBuffer.AsSpan(start, 64);
         }
 
+        /// <summary>
+        /// 将当前分量的频域系数通过 IDCT 与反量化还原为空间域像素块，
+        /// 并写入目标平面缓冲区，随后归还系数缓冲。
+        /// </summary>
+        /// <param name="plane">输出平面缓冲区</param>
+        /// <param name="planeWidth">平面宽度（像素）</param>
+        /// <param name="planeHeight">平面高度（像素）</param>
+        /// <param name="stride">平面行跨度（字节）</param>
+        /// <param name="quant">对应的量化表</param>
         public void DecodeSpatial(Span<byte> plane, int planeWidth, int planeHeight, int stride, ushort[] quant)
         {
             if (coefficientBuffer is null)
