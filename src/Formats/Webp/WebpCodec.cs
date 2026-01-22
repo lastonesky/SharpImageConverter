@@ -9,39 +9,33 @@ namespace SharpImageConverter.Formats.Webp
         [LibraryImport("libwebpdecoder")]
         [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
         private static partial int WebPGetInfo(ReadOnlySpan<byte> data, nuint data_size, out int width, out int height);
-
         [LibraryImport("libwebpdecoder")]
         [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
         private static partial IntPtr WebPDecodeRGBAInto(ReadOnlySpan<byte> data, nuint data_size, Span<byte> output_buffer, int output_buffer_size, int output_stride);
-
         [LibraryImport("libwebp")]
         [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
         private static partial nuint WebPEncodeRGBA(ReadOnlySpan<byte> rgba, int width, int height, int stride, float quality_factor, out IntPtr output);
-
+        [LibraryImport("libwebp")]
+        [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+        private static partial nuint WebPEncodeRGB(ReadOnlySpan<byte> rgb, int width, int height, int stride, float quality_factor, out IntPtr output);
         [LibraryImport("libwebp")]
         [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
         private static partial void WebPFree(IntPtr ptr);
-
         [LibraryImport("libwebpmux", EntryPoint = "WebPNewInternal")]
         [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
         private static partial IntPtr WebPNewInternal(int version);
-
         [LibraryImport("libwebpmux")]
         [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
         private static partial void WebPMuxDelete(IntPtr mux);
-
         [LibraryImport("libwebpmux")]
         [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
         private static partial WebPMuxError WebPMuxSetCanvasSize(IntPtr mux, int width, int height);
-
         [LibraryImport("libwebpmux")]
         [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
         private static partial WebPMuxError WebPMuxSetAnimationParams(IntPtr mux, ref WebPMuxAnimParams anim_params);
-
         [LibraryImport("libwebpmux")]
         [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
         private static partial WebPMuxError WebPMuxPushFrame(IntPtr mux, ref WebPMuxFrameInfo frame, int copy_data);
-
         [LibraryImport("libwebpmux")]
         [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
         private static partial WebPMuxError WebPMuxAssemble(IntPtr mux, ref WebPData assembled_data);
@@ -92,10 +86,39 @@ namespace SharpImageConverter.Formats.Webp
             try
             {
                 nuint size = WebPEncodeRGBA(rgba, width, height, width * 4, quality, out IntPtr output);
-
                 int len = checked((int)size);
                 if (len <= 0 || output == IntPtr.Zero) throw new InvalidOperationException("WebP 编码失败");
+                try
+                {
+                    unsafe
+                    {
+                        var result = new byte[len];
+                        new ReadOnlySpan<byte>((void*)output, len).CopyTo(result);
+                        return result;
+                    }
+                }
+                finally
+                {
+                    WebPFree(output);
+                }
+            }
+            catch (DllNotFoundException ex)
+            {
+                throw new InvalidOperationException("未能加载 WebP 原生库，请检查 runtimes 目录或平台匹配。", ex);
+            }
+            catch (EntryPointNotFoundException ex)
+            {
+                throw new InvalidOperationException("WebP 原生库版本不兼容，缺少所需入口点。", ex);
+            }
+        }
 
+        public static byte[] EncodeRgb(byte[] rgb, int width, int height, float quality)
+        {
+            try
+            {
+                nuint size = WebPEncodeRGB(rgb, width, height, width * 3, quality, out IntPtr output);
+                int len = checked((int)size);
+                if (len <= 0 || output == IntPtr.Zero) throw new InvalidOperationException("WebP 编码失败");
                 try
                 {
                     unsafe
@@ -123,6 +146,11 @@ namespace SharpImageConverter.Formats.Webp
         public static byte[] EncodeRgba(byte[] rgba, int width, int height, WebpEncoderOptions options)
         {
             return EncodeRgba(rgba, width, height, options.Quality);
+        }
+
+        public static byte[] EncodeRgb(byte[] rgb, int width, int height, WebpEncoderOptions options)
+        {
+            return EncodeRgb(rgb, width, height, options.Quality);
         }
 
         public static byte[] EncodeAnimatedRgba(byte[][] rgbaFrames, int width, int height, int[] frameDurationsMs, int loopCount, float quality)
