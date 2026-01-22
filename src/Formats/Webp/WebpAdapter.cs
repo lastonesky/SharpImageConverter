@@ -4,8 +4,11 @@ using SharpImageConverter;
 using System.IO;
 using System.Collections.Generic;
 
-namespace SharpImageConverter.Formats
+namespace SharpImageConverter.Formats.Webp
 {
+    /// <summary>
+    /// WebP 编码器选项
+    /// </summary>
     public readonly struct WebpEncoderOptions
     {
         public float Quality { get; }

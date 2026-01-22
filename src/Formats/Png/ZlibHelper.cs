@@ -1,8 +1,9 @@
 using System;
 using System.IO;
 using System.IO.Compression;
+using SharpImageConverter.Formats.Png;
 
-namespace SharpImageConverter;
+namespace SharpImageConverter.Formats.Png;
 
 public static class ZlibHelper
 {

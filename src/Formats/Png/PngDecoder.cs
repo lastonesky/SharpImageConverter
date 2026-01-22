@@ -4,7 +4,7 @@ using System.IO;
 using System.Text;
 using System.Numerics;
 
-namespace SharpImageConverter;
+namespace SharpImageConverter.Formats.Png;
 
 /// <summary>
 /// PNG 解码器，读取 PNG 文件并输出 RGB24 或 RGBA32 像素数据。

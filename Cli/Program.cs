@@ -1,12 +1,8 @@
-using System;
-using System.Collections.Generic;
 using System.Diagnostics;
-using System.IO;
-
 using SharpImageConverter.Core;
 using SharpImageConverter.Processing;
 using SharpImageConverter.Formats.Gif;
-using SharpImageConverter.Formats;
+using SharpImageConverter.Formats.Webp;
 using SharpImageConverter.Formats.Jpeg;
 
 namespace SharpImageConverter;
@@ -189,7 +185,15 @@ class Program
                     }
                     else
                     {
-                        Image.Save(frames[i], path);
+                        if ((ext == ".bmp" || ext == ".png" || ext == ".webp") && (gray || IsGrayRgb(frames[i])))
+                        {
+                            var grayImage = ToGray8(frames[i]);
+                            Image.Save(grayImage, path);
+                        }
+                        else
+                        {
+                            Image.Save(frames[i], path);
+                        }
                     }
                 }
             }
@@ -305,7 +309,7 @@ class Program
                             WebpEncoderAdapterRgba.DefaultQuality = (jpegQuality ?? 75);
                         }
                         bool isInputGray = IsGrayRgba(rgbaImage);
-                        if ((outExt2b == ".bmp" || outExt2b == ".png") && (gray || isInputGray))
+                        if ((outExt2b == ".bmp" || outExt2b == ".png" || outExt2b == ".webp") && (gray || isInputGray))
                         {
                             var rgb = new Image<Rgb24>(rgbaImage.Width, rgbaImage.Height, RgbaToRgb(rgbaImage.Buffer), rgbaImage.Metadata);
                             var grayImage = ToGray8(rgb);
@@ -375,7 +379,7 @@ class Program
                     {
                         WebpEncoderAdapter.Quality = (jpegQuality ?? 75);
                     }
-                    if ((outExt == ".bmp" || outExt == ".png") && (gray || isInputGray))
+                    if ((outExt == ".bmp" || outExt == ".png" || outExt == ".webp") && (gray || isInputGray))
                     {
                         var grayImage = ToGray8(image);
                         Image.Save(grayImage, outputPath);

@@ -1,8 +1,12 @@
 using Xunit;
 using System.IO;
+using SharpImageConverter.Formats.Jpeg;
+using SharpImageConverter.Formats.Png;
+using SharpImageConverter.Formats.Webp;
+using SharpImageConverter.Formats.Bmp;
 using SharpImageConverter.Formats;
 
-namespace Jpeg2Bmp.Tests
+namespace SharpImageConverter.Tests
 {
     public class SniffingTests
     {

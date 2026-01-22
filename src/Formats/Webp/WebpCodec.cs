@@ -2,7 +2,7 @@ using System;
 using System.Runtime.InteropServices;
 using System.Runtime.CompilerServices;
 
-namespace SharpImageConverter.Formats
+namespace SharpImageConverter.Formats.Webp
 {
     internal static partial class WebpCodec
     {

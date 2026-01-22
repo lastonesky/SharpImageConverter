@@ -2,7 +2,7 @@ using System;
 using System.Buffers;
 using System.IO;
 
-namespace SharpImageConverter;
+namespace SharpImageConverter.Formats.Bmp;
 
 /// <summary>
 /// 简单的 BMP 写入器，支持将 RGB24 写出为 24 位 BMP。

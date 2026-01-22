@@ -3,8 +3,11 @@ using System.Collections.Generic;
 using System.IO;
 using SharpImageConverter;
 using SharpImageConverter.Formats;
+using SharpImageConverter.Formats.Bmp;
 using SharpImageConverter.Formats.Gif;
 using SharpImageConverter.Formats.Jpeg;
+using SharpImageConverter.Formats.Png;
+using SharpImageConverter.Formats.Webp;
 
 namespace SharpImageConverter.Core
 {

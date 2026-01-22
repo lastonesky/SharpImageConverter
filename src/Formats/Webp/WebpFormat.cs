@@ -2,7 +2,7 @@ using System;
 using System.IO;
 using SharpImageConverter.Core;
 
-namespace SharpImageConverter.Formats
+namespace SharpImageConverter.Formats.Webp
 {
     /// <summary>
     /// WebP 格式探测器与元信息
@@ -16,7 +16,7 @@ namespace SharpImageConverter.Formats
         /// <summary>
         /// 支持的文件扩展名
         /// </summary>
-        public string[] Extensions => new[] { ".webp" };
+        public string[] Extensions => [".webp"];
         /// <summary>
         /// 判断流是否为 WebP 文件（RIFF/WEBP 头）
         /// </summary>

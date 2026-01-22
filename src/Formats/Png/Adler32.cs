@@ -1,6 +1,6 @@
 using System;
 
-namespace SharpImageConverter;
+namespace SharpImageConverter.Formats.Png;
 
 /// <summary>
 /// Adler-32 校验算法实现，用于 Zlib 校验。
@@ -31,7 +31,7 @@ public static class Adler32
     public static uint Update(uint adler, byte[] buffer, int offset, int count)
     {
         uint s1 = adler & 0xFFFF;
-        uint s2 = (adler >> 16) & 0xFFFF;
+        uint s2 = adler >> 16 & 0xFFFF;
         const uint MOD = 65521;
         const uint NMAX = 5552;
 
@@ -45,7 +45,7 @@ public static class Adler32
 
             while (k-- > 0)
             {
-                s1 += (uint)buffer[index++];
+                s1 += buffer[index++];
                 s2 += s1;
             }
 
@@ -53,6 +53,6 @@ public static class Adler32
             s2 %= MOD;
         }
 
-        return (s2 << 16) | s1;
+        return s2 << 16 | s1;
     }
 }
