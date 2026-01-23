@@ -2,6 +2,8 @@ using SharpImageConverter.Core;
 using SharpImageConverter.Metadata;
 using System.Buffers;
 using System.Runtime.CompilerServices;
+using System.Threading;
+using System.Threading.Tasks;
 namespace SharpImageConverter.Formats.Jpeg;
 
 public static class StaticJpegDecoder
@@ -11,6 +13,16 @@ public static class StaticJpegDecoder
         var parser = new Parser(data);
         return parser.Decode();
     }
+
+    public static async Task<StreamingDecodeResult> DecodeFromStreamAsync(Stream stream, CancellationToken cancellationToken = default)
+    {
+        if (stream == null) throw new ArgumentNullException(nameof(stream));
+        await using var input = new JpegStreamInput(stream);
+        var parser = new StreamingParser(input);
+        return await parser.DecodeAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    public readonly record struct StreamingDecodeResult(JpegImage Image, byte[]? ExifRaw, int ExifOrientation);
 
     private ref struct Parser
     {
@@ -264,33 +276,7 @@ public static class StaticJpegDecoder
             return new JpegImage(width, height, pixelFormat, bitsPerSample, output);
         }
 
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private static void YCbCrToRgb(int y, int cb, int cr, Span<byte> dest)
-        {
-            int cbShift = cb - 128;
-            int crShift = cr - 128;
-
-            int r = y + ((91881 * crShift) >> 16);
-            int g = y - ((22554 * cbShift + 46802 * crShift) >> 16);
-            int b = y + ((116130 * cbShift) >> 16);
-
-            dest[0] = ClampToByte(r);
-            dest[1] = ClampToByte(g);
-            dest[2] = ClampToByte(b);
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private static byte ClampToByte(int v)
-        {
-            if ((uint)v <= 255u)
-            {
-                return (byte)v;
-            }
-
-            return v < 0 ? (byte)0 : (byte)255;
-        }
-
-        private int FindComponentIndex(byte id)
+        private readonly int FindComponentIndex(byte id)
         {
             for (int i = 0; i < components.Length; i++)
             {
@@ -973,6 +959,1048 @@ public static class StaticJpegDecoder
         private static ushort ReadU16(ReadOnlySpan<byte> s) => (ushort)((s[0] << 8) | s[1]);
     }
 
+    private sealed class StreamingParser
+    {
+        private readonly JpegStreamInput input;
+        private readonly QuantizationTable[] quantTables = new QuantizationTable[4];
+        private readonly HuffmanDecodingTable[] dcTables = new HuffmanDecodingTable[4];
+        private readonly HuffmanDecodingTable[] acTables = new HuffmanDecodingTable[4];
+
+        private FrameHeader frame;
+        private bool hasFrame;
+        private bool isProgressive;
+        private ushort restartInterval;
+        private ComponentState[] components = Array.Empty<ComponentState>();
+        private int queuedMarker = -1;
+        private byte[]? exifRaw;
+        private int exifOrientation = 1;
+
+        public StreamingParser(JpegStreamInput input)
+        {
+            this.input = input;
+            for (int i = 0; i < 4; i++)
+            {
+                quantTables[i] = new QuantizationTable();
+                dcTables[i] = new HuffmanDecodingTable();
+                acTables[i] = new HuffmanDecodingTable();
+            }
+        }
+
+        public async Task<StreamingDecodeResult> DecodeAsync(CancellationToken cancellationToken)
+        {
+            await ReadMarkerExpectedAsync(JpegMarker.SOI, cancellationToken).ConfigureAwait(false);
+
+            while (true)
+            {
+                JpegMarker marker = await ReadMarkerAsync(cancellationToken).ConfigureAwait(false);
+                if (marker == JpegMarker.EOI)
+                {
+                    break;
+                }
+
+                switch (marker)
+                {
+                    case JpegMarker.APP0:
+                        await ParseApp0Async(cancellationToken).ConfigureAwait(false);
+                        break;
+                    case JpegMarker.APP1:
+                        await ParseApp1Async(cancellationToken).ConfigureAwait(false);
+                        break;
+                    case JpegMarker.COM:
+                        await SkipSegmentAsync(cancellationToken).ConfigureAwait(false);
+                        break;
+                    case JpegMarker.DQT:
+                        await ParseDqtAsync(cancellationToken).ConfigureAwait(false);
+                        break;
+                    case JpegMarker.DHT:
+                        await ParseDhtAsync(cancellationToken).ConfigureAwait(false);
+                        break;
+                    case JpegMarker.DRI:
+                        await ParseDriAsync(cancellationToken).ConfigureAwait(false);
+                        break;
+                    case JpegMarker.SOF0:
+                    case JpegMarker.SOF2:
+                        await ParseSofAsync(marker, cancellationToken).ConfigureAwait(false);
+                        break;
+                    case JpegMarker.SOS:
+                        await ParseSosAndDecodeScanAsync(cancellationToken).ConfigureAwait(false);
+                        break;
+                    default:
+                        if (marker is >= JpegMarker.RST0 and <= JpegMarker.RST7)
+                        {
+                            ThrowHelper.ThrowInvalidData("Unexpected restart marker outside entropy-coded data.");
+                        }
+
+                        await SkipSegmentAsync(cancellationToken).ConfigureAwait(false);
+                        break;
+                }
+            }
+
+            if (!hasFrame)
+            {
+                ThrowHelper.ThrowInvalidData("Missing SOF marker.");
+            }
+
+            for (int i = 0; i < components.Length; i++)
+            {
+                if (!components[i].HasCoefficients)
+                {
+                    ThrowHelper.ThrowInvalidData("Missing scan data.");
+                }
+            }
+
+            var img = ReconstructImage();
+            return new StreamingDecodeResult(img, exifRaw, exifOrientation);
+        }
+
+        private async Task ParseApp0Async(CancellationToken cancellationToken)
+        {
+            SegmentBuffer segment = await ReadSegmentAsync(cancellationToken).ConfigureAwait(false);
+            try
+            {
+                if (segment.Length < 5)
+                {
+                    return;
+                }
+
+                ReadOnlySpan<byte> span = segment.Span;
+                if (span[0] == (byte)'J' &&
+                    span[1] == (byte)'F' &&
+                    span[2] == (byte)'I' &&
+                    span[3] == (byte)'F' &&
+                    span[4] == 0)
+                {
+                    return;
+                }
+            }
+            finally
+            {
+                segment.Dispose();
+            }
+        }
+
+        private async Task ParseApp1Async(CancellationToken cancellationToken)
+        {
+            SegmentBuffer segment = await ReadSegmentAsync(cancellationToken).ConfigureAwait(false);
+            try
+            {
+                if (segment.Length < 6)
+                {
+                    return;
+                }
+
+                ReadOnlySpan<byte> span = segment.Span;
+                if (span[0] == (byte)'E' &&
+                    span[1] == (byte)'x' &&
+                    span[2] == (byte)'i' &&
+                    span[3] == (byte)'f' &&
+                    span[4] == 0 &&
+                    span[5] == 0)
+                {
+                    exifRaw ??= span.ToArray();
+                    if (exifOrientation == 1)
+                    {
+                        int orientation = ParseExifOrientation(span.Slice(6));
+                        if (orientation >= 1 && orientation <= 8)
+                        {
+                            exifOrientation = orientation;
+                        }
+                    }
+                }
+            }
+            finally
+            {
+                segment.Dispose();
+            }
+        }
+
+        private JpegImage ReconstructImage()
+        {
+            int width = frame.Width;
+            int height = frame.Height;
+            int bitsPerSample = frame.Precision;
+            int maxH = frame.MaxH;
+            int maxV = frame.MaxV;
+
+            int fullWidth = frame.McuX * maxH * 8;
+            int fullHeight = frame.McuY * maxV * 8;
+            byte[] output = Array.Empty<byte>();
+            JpegPixelFormat pixelFormat = JpegPixelFormat.Gray8;
+
+            byte[][] planes = new byte[components.Length][];
+            int[] planeStrides = new int[components.Length];
+            int[] planeWidths = new int[components.Length];
+            int[] planeHeights = new int[components.Length];
+
+            for (int i = 0; i < components.Length; i++)
+            {
+                ComponentState c = components[i];
+                int w = frame.McuX * c.H * 8;
+                int h = frame.McuY * c.V * 8;
+
+                planeWidths[i] = w;
+                planeHeights[i] = h;
+                planeStrides[i] = w;
+
+                byte[] plane = ArrayPool<byte>.Shared.Rent(w * h);
+                Array.Clear(plane, 0, w * h);
+                planes[i] = plane;
+
+                c.DecodeSpatial(plane.AsSpan(0, w * h), w, h, w, quantTables[c.QuantTableId].Table);
+            }
+
+            if (components.Length == 1)
+            {
+                pixelFormat = JpegPixelFormat.Gray8;
+                output = new byte[width * height];
+                byte[] yPlane = planes[0];
+                int yStride = planeStrides[0];
+                for (int y = 0; y < height; y++)
+                {
+                    int rowOut = y * width;
+                    int rowY = y * yStride;
+                    for (int x = 0; x < width; x++)
+                    {
+                        byte lum = yPlane[rowY + x];
+                        output[rowOut + x] = lum;
+                    }
+                }
+            }
+            else if (components.Length >= 3)
+            {
+                pixelFormat = JpegPixelFormat.Rgb24;
+                output = new byte[width * height * 3];
+                int yIndex = FindComponentIndex(1);
+                int cbIndex = FindComponentIndex(2);
+                int crIndex = FindComponentIndex(3);
+
+                if (yIndex < 0 || cbIndex < 0 || crIndex < 0)
+                {
+                    yIndex = 0;
+                    cbIndex = 1;
+                    crIndex = 2;
+                }
+
+                byte[] yPlane = planes[yIndex];
+                byte[] cbPlane = planes[cbIndex];
+                byte[] crPlane = planes[crIndex];
+
+                int yStride = planeStrides[yIndex];
+                int cbStride = planeStrides[cbIndex];
+                int crStride = planeStrides[crIndex];
+
+                int yW = planeWidths[yIndex];
+                int yH = planeHeights[yIndex];
+                int cbW = planeWidths[cbIndex];
+                int cbH = planeHeights[cbIndex];
+                int crW = planeWidths[crIndex];
+                int crH = planeHeights[crIndex];
+
+                for (int y = 0; y < height; y++)
+                {
+                    int yy = (y * yH) / fullHeight;
+                    int cby = (y * cbH) / fullHeight;
+                    int cry = (y * crH) / fullHeight;
+
+                    int rowOut = y * width * 3;
+                    int rowY = yy * yStride;
+                    int rowCb = cby * cbStride;
+                    int rowCr = cry * crStride;
+
+                    for (int x = 0; x < width; x++)
+                    {
+                        int xx = (x * yW) / fullWidth;
+                        int cbx = (x * cbW) / fullWidth;
+                        int crx = (x * crW) / fullWidth;
+
+                        int Y = yPlane[rowY + xx];
+                        int Cb = cbPlane[rowCb + cbx];
+                        int Cr = crPlane[rowCr + crx];
+
+                        YCbCrToRgb(Y, Cb, Cr, output.AsSpan(rowOut + (x * 3), 3));
+                    }
+                }
+            }
+            else
+            {
+                ThrowHelper.ThrowNotSupported("Unsupported number of components.");
+            }
+
+            for (int i = 0; i < planes.Length; i++)
+            {
+                ArrayPool<byte>.Shared.Return(planes[i]);
+            }
+
+            return new JpegImage(width, height, pixelFormat, bitsPerSample, output);
+        }
+
+        private int FindComponentIndex(byte id)
+        {
+            for (int i = 0; i < components.Length; i++)
+            {
+                if (components[i].Id == id)
+                {
+                    return i;
+                }
+            }
+
+            return -1;
+        }
+
+        private async Task ParseSosAndDecodeScanAsync(CancellationToken cancellationToken)
+        {
+            if (!hasFrame)
+            {
+                ThrowHelper.ThrowInvalidData("SOS before SOF.");
+            }
+
+            SegmentBuffer segment = await ReadSegmentAsync(cancellationToken).ConfigureAwait(false);
+            try
+            {
+                ReadOnlySpan<byte> span = segment.Span;
+                int count = span[0];
+                if (count <= 0 || count > 4)
+                {
+                    ThrowHelper.ThrowInvalidData("Invalid SOS component count.");
+                }
+
+                if (segment.Length < 1 + (2 * count) + 3)
+                {
+                    ThrowHelper.ThrowInvalidData("Invalid SOS length.");
+                }
+
+                var scanComponents = new ScanComponent[count];
+                int p = 1;
+                for (int i = 0; i < count; i++)
+                {
+                    byte cs = span[p++];
+                    byte tdta = span[p++];
+                    byte td = (byte)(tdta >> 4);
+                    byte ta = (byte)(tdta & 0x0F);
+                    scanComponents[i] = new ScanComponent(cs, td, ta);
+                }
+
+                byte ss = span[p++];
+                byte se = span[p++];
+                byte ahal = span[p++];
+                byte ah = (byte)(ahal >> 4);
+                byte al = (byte)(ahal & 0x0F);
+
+                if (!isProgressive)
+                {
+                    if (ss != 0 || se != 63 || ah != 0 || al != 0)
+                    {
+                        ThrowHelper.ThrowInvalidData("Invalid baseline SOS parameters.");
+                    }
+                }
+                else
+                {
+                    if (se > 63 || ss > se || ah > 13 || al > 13)
+                    {
+                        ThrowHelper.ThrowInvalidData("Invalid progressive SOS parameters.");
+                    }
+                }
+
+                var scan = new ScanHeader(scanComponents, ss, se, ah, al);
+                var reader = new JpegStreamBitReader(input, cancellationToken);
+                DecodeScan(scan, ref reader);
+
+                reader.AlignToByte();
+                _ = reader.PeekBits(1);
+                if (reader.HasPendingMarker)
+                {
+                    queuedMarker = reader.PendingMarker;
+                    reader.ClearPendingMarker();
+                }
+            }
+            finally
+            {
+                segment.Dispose();
+            }
+        }
+
+        private void DecodeScan(in ScanHeader scan, ref JpegStreamBitReader reader)
+        {
+            bool interleaved = scan.Components.Length > 1;
+
+            for (int i = 0; i < scan.Components.Length; i++)
+            {
+                ScanComponent sc = scan.Components[i];
+                ComponentState comp = FindComponent(sc.ComponentId);
+                if (!comp.HasCoefficients)
+                {
+                    comp.EnsureCoefficientBuffer();
+                }
+
+                comp.AssignTables(sc.DcTableId, sc.AcTableId);
+            }
+
+            int expectedRst = (int)JpegMarker.RST0;
+            int unitsUntilRestart = restartInterval;
+            int eobRun = 0;
+
+            if (interleaved)
+            {
+                for (int my = 0; my < frame.McuY; my++)
+                {
+                    for (int mx = 0; mx < frame.McuX; mx++)
+                    {
+                        for (int ci = 0; ci < scan.Components.Length; ci++)
+                        {
+                            ScanComponent sc = scan.Components[ci];
+                            ComponentState comp = FindComponent(sc.ComponentId);
+                            for (int v = 0; v < comp.V; v++)
+                            {
+                                for (int h = 0; h < comp.H; h++)
+                                {
+                                    int bx = (mx * comp.H) + h;
+                                    int by = (my * comp.V) + v;
+                                    try
+                                    {
+                                        DecodeBlock(ref reader, comp, scan, bx, by, ref eobRun);
+                                    }
+                                    catch (InvalidDataException ex)
+                                    {
+                                        ThrowHelper.ThrowInvalidData($"Scan decode failed (mx={mx}, my={my}, componentId={comp.Id}, bx={bx}, by={by}, bytesConsumed={reader.BytesConsumed}, bitCount={reader.BitCount}, pendingMarker={reader.PendingMarker}). {ex.Message}");
+                                    }
+                                }
+                            }
+                        }
+
+                        if (restartInterval != 0 && --unitsUntilRestart == 0)
+                        {
+                            ProcessRestart(ref reader, ref expectedRst, scan.Components, ref eobRun);
+                            unitsUntilRestart = restartInterval;
+                        }
+                    }
+                }
+            }
+            else
+            {
+                ComponentState comp = FindComponent(scan.Components[0].ComponentId);
+                int compWidth = (frame.Width * comp.H + frame.MaxH - 1) / frame.MaxH;
+                int compHeight = (frame.Height * comp.V + frame.MaxV - 1) / frame.MaxV;
+                int blocksX = (compWidth + 7) / 8;
+                int blocksY = (compHeight + 7) / 8;
+                for (int by = 0; by < blocksY; by++)
+                {
+                    for (int bx = 0; bx < blocksX; bx++)
+                    {
+                        try
+                        {
+                            DecodeBlock(ref reader, comp, scan, bx, by, ref eobRun);
+                        }
+                        catch (InvalidDataException ex)
+                        {
+                            ThrowHelper.ThrowInvalidData($"Scan decode failed (componentId={comp.Id}, bx={bx}, by={by}, bytesConsumed={reader.BytesConsumed}, bitCount={reader.BitCount}, pendingMarker={reader.PendingMarker}). {ex.Message}");
+                        }
+
+                        if (restartInterval != 0 && --unitsUntilRestart == 0)
+                        {
+                            ProcessRestart(ref reader, ref expectedRst, scan.Components, ref eobRun);
+                            unitsUntilRestart = restartInterval;
+                        }
+                    }
+                }
+            }
+        }
+
+        private void ProcessRestart(ref JpegStreamBitReader reader, ref int expectedRst, ScanComponent[] scanComponents, ref int eobRun)
+        {
+            reader.AlignToByte();
+            _ = reader.PeekBits(1);
+            if (!reader.HasPendingMarker)
+            {
+                ThrowHelper.ThrowInvalidData("Missing restart marker.");
+            }
+
+            int marker = reader.PendingMarker;
+            reader.ClearPendingMarker();
+            if (marker != expectedRst)
+            {
+                ThrowHelper.ThrowInvalidData("Unexpected restart marker.");
+            }
+
+            expectedRst++;
+            if (expectedRst > (int)JpegMarker.RST7)
+            {
+                expectedRst = (int)JpegMarker.RST0;
+            }
+
+            for (int i = 0; i < scanComponents.Length; i++)
+            {
+                FindComponent(scanComponents[i].ComponentId).ResetPredictors();
+            }
+
+            eobRun = 0;
+            reader.Reset();
+        }
+
+        private void DecodeBlock(ref JpegStreamBitReader reader, ComponentState comp, in ScanHeader scan, int bx, int by, ref int eobRun)
+        {
+            int blockIndex = (by * comp.BlocksX) + bx;
+            Span<short> block = comp.GetBlockSpan(blockIndex);
+
+            if (!isProgressive)
+            {
+                block.Clear();
+                DecodeBaselineBlock(ref reader, comp, block);
+                comp.HasCoefficients = true;
+                return;
+            }
+
+            DecodeProgressiveBlock(ref reader, comp, block, scan.Ss, scan.Se, scan.Ah, scan.Al, ref eobRun);
+            comp.HasCoefficients = true;
+        }
+
+        private void DecodeBaselineBlock(ref JpegStreamBitReader reader, ComponentState comp, Span<short> block)
+        {
+            int s = dcTables[comp.DcTableId].Decode(ref reader);
+            int diff = reader.ReceiveAndExtend(s);
+            comp.DcPredictor += diff;
+            block[0] = (short)comp.DcPredictor;
+
+            int k = 1;
+            ReadOnlySpan<byte> zigzag = JpegConstants.ZigZag;
+            while (k < 64)
+            {
+                int rs = acTables[comp.AcTableId].Decode(ref reader);
+                int r = rs >> 4;
+                s = rs & 0x0F;
+
+                if (s == 0)
+                {
+                    if (r == 15)
+                    {
+                        k += 16;
+                        continue;
+                    }
+
+                    break;
+                }
+
+                k += r;
+                if (k >= 64)
+                {
+                    ThrowHelper.ThrowInvalidData("Bad AC coefficients.");
+                }
+
+                int coef = reader.ReceiveAndExtend(s);
+                block[zigzag[k]] = (short)coef;
+                k++;
+            }
+        }
+
+        private void DecodeProgressiveBlock(ref JpegStreamBitReader reader, ComponentState comp, Span<short> block, int ss, int se, int ah, int al, ref int eobRun)
+        {
+            ReadOnlySpan<byte> zigzag = JpegConstants.ZigZag;
+
+            if (ss == 0)
+            {
+                if (ah == 0)
+                {
+                    int t = dcTables[comp.DcTableId].Decode(ref reader);
+                    int diff = reader.ReceiveAndExtend(t);
+                    comp.DcPredictor += diff;
+                    block[0] = (short)(comp.DcPredictor << al);
+                }
+                else
+                {
+                    if (reader.ReadBits(1) != 0)
+                    {
+                        int delta = 1 << al;
+                        block[0] = (short)(block[0] >= 0 ? block[0] + delta : block[0] - delta);
+                    }
+                }
+
+                return;
+            }
+
+            if (ah == 0)
+            {
+                int k = ss;
+                if (eobRun > 0)
+                {
+                    eobRun--;
+                    return;
+                }
+
+                while (k <= se)
+                {
+                    int rs = acTables[comp.AcTableId].Decode(ref reader);
+                    int r = rs >> 4;
+                    int s = rs & 0x0F;
+
+                    if (s == 0)
+                    {
+                        if (r < 15)
+                        {
+                            int extra = (int)reader.ReadBits(r);
+                            eobRun = ((1 << r) - 1) + extra;
+                            return;
+                        }
+
+                        k += 16;
+                        continue;
+                    }
+
+                    k += r;
+                    if (k > se)
+                    {
+                        ThrowHelper.ThrowInvalidData("Bad progressive AC.");
+                    }
+
+                    int coef = reader.ReceiveAndExtend(s) << al;
+                    block[zigzag[k]] = (short)coef;
+                    k++;
+                }
+
+                return;
+            }
+
+            int bit = 1 << al;
+            if (eobRun > 0)
+            {
+                for (int k = ss; k <= se; k++)
+                {
+                    int idx = zigzag[k];
+                    if (block[idx] != 0)
+                    {
+                        if (reader.ReadBits(1) != 0)
+                        {
+                            block[idx] = (short)(block[idx] >= 0 ? block[idx] + bit : block[idx] - bit);
+                        }
+                    }
+                }
+
+                eobRun--;
+                return;
+            }
+
+            int kk = ss;
+            while (kk <= se)
+            {
+                int rs = acTables[comp.AcTableId].Decode(ref reader);
+                int r = rs >> 4;
+                int s = rs & 0x0F;
+
+                if (s == 0)
+                {
+                    if (r < 15)
+                    {
+                        int extra = (int)reader.ReadBits(r);
+                        eobRun = ((1 << r) - 1) + extra;
+
+                        for (int k = kk; k <= se; k++)
+                        {
+                            int idx = zigzag[k];
+                            if (block[idx] != 0)
+                            {
+                                if (reader.ReadBits(1) != 0)
+                                {
+                                    block[idx] = (short)(block[idx] >= 0 ? block[idx] + bit : block[idx] - bit);
+                                }
+                            }
+                        }
+
+                        return;
+                    }
+
+                    int zeroCount = 16;
+                    while (kk <= se && zeroCount > 0)
+                    {
+                        int idx = zigzag[kk];
+                        if (block[idx] != 0)
+                        {
+                            if (reader.ReadBits(1) != 0)
+                            {
+                                block[idx] = (short)(block[idx] >= 0 ? block[idx] + bit : block[idx] - bit);
+                            }
+                        }
+                        else
+                        {
+                            zeroCount--;
+                        }
+
+                        kk++;
+                    }
+
+                    continue;
+                }
+
+                if (s != 1)
+                {
+                    ThrowHelper.ThrowInvalidData("Bad progressive refinement.");
+                }
+
+                int newCoef = reader.ReadBits(1) != 0 ? bit : -bit;
+                int zc = r;
+                while (kk <= se)
+                {
+                    int idx = zigzag[kk];
+                    if (block[idx] != 0)
+                    {
+                        if (reader.ReadBits(1) != 0)
+                        {
+                            block[idx] = (short)(block[idx] >= 0 ? block[idx] + bit : block[idx] - bit);
+                        }
+                    }
+                    else
+                    {
+                        if (zc == 0)
+                        {
+                            block[idx] = (short)newCoef;
+                            kk++;
+                            break;
+                        }
+
+                        zc--;
+                    }
+
+                    kk++;
+                }
+            }
+        }
+
+        private ComponentState FindComponent(byte id)
+        {
+            for (int i = 0; i < components.Length; i++)
+            {
+                if (components[i].Id == id)
+                {
+                    return components[i];
+                }
+            }
+
+            ThrowHelper.ThrowInvalidData("Unknown component id.");
+            return null!;
+        }
+
+        private async Task ParseSofAsync(JpegMarker marker, CancellationToken cancellationToken)
+        {
+            SegmentBuffer segment = await ReadSegmentAsync(cancellationToken).ConfigureAwait(false);
+            try
+            {
+                if (segment.Length < 6)
+                {
+                    ThrowHelper.ThrowInvalidData("Invalid SOF length.");
+                }
+
+                ReadOnlySpan<byte> span = segment.Span;
+                byte precision = span[0];
+                if (precision != 8)
+                {
+                    ThrowHelper.ThrowNotSupported("Only 8-bit JPEG is supported.");
+                }
+
+                ushort height = ReadU16(span.Slice(1));
+                ushort width = ReadU16(span.Slice(3));
+                byte count = span[5];
+                if (count <= 0 || count > 4)
+                {
+                    ThrowHelper.ThrowInvalidData("Invalid component count.");
+                }
+
+                if (segment.Length < 6 + (3 * count))
+                {
+                    ThrowHelper.ThrowInvalidData("Invalid SOF length.");
+                }
+
+                var comps = new ComponentState[count];
+                int p = 6;
+                int maxH = 0;
+                int maxV = 0;
+                for (int i = 0; i < count; i++)
+                {
+                    byte id = span[p++];
+                    byte hv = span[p++];
+                    byte tq = span[p++];
+                    int h = hv >> 4;
+                    int v = hv & 0x0F;
+                    if (h <= 0 || v <= 0 || h > 4 || v > 4)
+                    {
+                        ThrowHelper.ThrowInvalidData("Invalid sampling factor.");
+                    }
+
+                    if (tq >= 4)
+                    {
+                        ThrowHelper.ThrowInvalidData("Invalid quant table id.");
+                    }
+
+                    if (h > maxH) maxH = h;
+                    if (v > maxV) maxV = v;
+
+                    comps[i] = new ComponentState(id, (byte)h, (byte)v, tq);
+                }
+
+                int mcuX = (width + (8 * maxH) - 1) / (8 * maxH);
+                int mcuY = (height + (8 * maxV) - 1) / (8 * maxV);
+
+                for (int i = 0; i < comps.Length; i++)
+                {
+                    comps[i].SetGeometry(mcuX, mcuY);
+                }
+
+                frame = new FrameHeader(width, height, precision, maxH, maxV, mcuX, mcuY);
+                hasFrame = true;
+                isProgressive = marker == JpegMarker.SOF2;
+                components = comps;
+            }
+            finally
+            {
+                segment.Dispose();
+            }
+        }
+
+        private async Task ParseDqtAsync(CancellationToken cancellationToken)
+        {
+            SegmentBuffer segment = await ReadSegmentAsync(cancellationToken).ConfigureAwait(false);
+            try
+            {
+                ReadOnlySpan<byte> span = segment.Span;
+                int p = 0;
+                ReadOnlySpan<byte> zigzag = JpegConstants.ZigZag;
+
+                while (p < segment.Length)
+                {
+                    byte pqTq = span[p++];
+                    int pq = pqTq >> 4;
+                    int tq = pqTq & 0x0F;
+                    if (tq >= 4)
+                    {
+                        ThrowHelper.ThrowInvalidData("Invalid DQT table id.");
+                    }
+
+                    if (pq == 0)
+                    {
+                        if (p + 64 > segment.Length) ThrowHelper.ThrowInvalidData("Invalid DQT length.");
+                        for (int i = 0; i < 64; i++)
+                        {
+                            quantTables[tq].Table[zigzag[i]] = span[p++];
+                        }
+                    }
+                    else if (pq == 1)
+                    {
+                        if (p + 128 > segment.Length) ThrowHelper.ThrowInvalidData("Invalid DQT length.");
+                        for (int i = 0; i < 64; i++)
+                        {
+                            quantTables[tq].Table[zigzag[i]] = ReadU16(span.Slice(p + (i * 2)));
+                        }
+
+                        p += 128;
+                    }
+                    else
+                    {
+                        ThrowHelper.ThrowInvalidData("Invalid DQT precision.");
+                    }
+                }
+            }
+            finally
+            {
+                segment.Dispose();
+            }
+        }
+
+        private async Task ParseDhtAsync(CancellationToken cancellationToken)
+        {
+            SegmentBuffer segment = await ReadSegmentAsync(cancellationToken).ConfigureAwait(false);
+            try
+            {
+                ReadOnlySpan<byte> span = segment.Span;
+                int p = 0;
+
+                while (p < segment.Length)
+                {
+                    byte tcTh = span[p++];
+                    int tc = tcTh >> 4;
+                    int th = tcTh & 0x0F;
+                    if (th >= 4) ThrowHelper.ThrowInvalidData("Invalid DHT table id.");
+                    if (tc is not (0 or 1)) ThrowHelper.ThrowInvalidData("Invalid DHT class.");
+
+                    if (p + 16 > segment.Length) ThrowHelper.ThrowInvalidData("Invalid DHT length.");
+                    ReadOnlySpan<byte> bits = span.Slice(p, 16);
+                    p += 16;
+
+                    int total = 0;
+                    for (int i = 0; i < 16; i++) total += bits[i];
+                    if (p + total > segment.Length) ThrowHelper.ThrowInvalidData("Invalid DHT length.");
+                    ReadOnlySpan<byte> values = span.Slice(p, total);
+                    p += total;
+
+                    if (tc == 0)
+                    {
+                        dcTables[th].Build(bits, values);
+                    }
+                    else
+                    {
+                        acTables[th].Build(bits, values);
+                    }
+                }
+            }
+            finally
+            {
+                segment.Dispose();
+            }
+        }
+
+        private async Task ParseDriAsync(CancellationToken cancellationToken)
+        {
+            SegmentBuffer segment = await ReadSegmentAsync(cancellationToken).ConfigureAwait(false);
+            try
+            {
+                if (segment.Length != 2)
+                {
+                    ThrowHelper.ThrowInvalidData("Invalid DRI length.");
+                }
+
+                restartInterval = ReadU16(segment.Span);
+            }
+            finally
+            {
+                segment.Dispose();
+            }
+        }
+
+        private async Task SkipSegmentAsync(CancellationToken cancellationToken)
+        {
+            SegmentBuffer segment = await ReadSegmentAsync(cancellationToken).ConfigureAwait(false);
+            segment.Dispose();
+        }
+
+        private async Task<SegmentBuffer> ReadSegmentAsync(CancellationToken cancellationToken)
+        {
+            ushort length = await ReadU16Async(cancellationToken).ConfigureAwait(false);
+            if (length < 2)
+            {
+                ThrowHelper.ThrowInvalidData("Invalid segment length.");
+            }
+
+            int segmentLength = length - 2;
+            byte[] buffer = ArrayPool<byte>.Shared.Rent(segmentLength);
+            if (segmentLength > 0)
+            {
+                await input.ReadExactAsync(buffer.AsMemory(0, segmentLength), cancellationToken).ConfigureAwait(false);
+            }
+
+            return new SegmentBuffer(buffer, segmentLength);
+        }
+
+        private async Task ReadMarkerExpectedAsync(JpegMarker expected, CancellationToken cancellationToken)
+        {
+            JpegMarker m = await ReadMarkerAsync(cancellationToken).ConfigureAwait(false);
+            if (m != expected)
+            {
+                ThrowHelper.ThrowInvalidData("Invalid JPEG header.");
+            }
+        }
+
+        private async Task<JpegMarker> ReadMarkerAsync(CancellationToken cancellationToken)
+        {
+            if (queuedMarker >= 0)
+            {
+                byte m = (byte)queuedMarker;
+                queuedMarker = -1;
+                return (JpegMarker)m;
+            }
+
+            byte b;
+            do
+            {
+                b = await input.ReadByteAsync(cancellationToken).ConfigureAwait(false);
+            } while (b != 0xFF);
+
+            do
+            {
+                b = await input.ReadByteAsync(cancellationToken).ConfigureAwait(false);
+            } while (b == 0xFF);
+
+            return (JpegMarker)b;
+        }
+
+        private async Task<ushort> ReadU16Async(CancellationToken cancellationToken)
+        {
+            byte hi = await input.ReadByteAsync(cancellationToken).ConfigureAwait(false);
+            byte lo = await input.ReadByteAsync(cancellationToken).ConfigureAwait(false);
+            return (ushort)((hi << 8) | lo);
+        }
+
+        private static ushort ReadU16(ReadOnlySpan<byte> s) => (ushort)((s[0] << 8) | s[1]);
+
+        private static int ParseExifOrientation(ReadOnlySpan<byte> tiff)
+        {
+            if (tiff.Length < 8) return 1;
+            bool little = tiff[0] == 0x49 && tiff[1] == 0x49;
+            bool big = tiff[0] == 0x4D && tiff[1] == 0x4D;
+            if (!little && !big) return 1;
+
+            if (ReadU16(tiff, little, 2) != 42) return 1;
+            uint ifd0 = ReadU32(tiff, little, 4);
+            if (ifd0 + 2 > tiff.Length) return 1;
+
+            int offset = (int)ifd0;
+            ushort count = ReadU16(tiff, little, offset);
+            offset += 2;
+            for (int i = 0; i < count; i++)
+            {
+                int entry = offset + (i * 12);
+                if (entry + 12 > tiff.Length) break;
+                ushort tag = ReadU16(tiff, little, entry);
+                if (tag != 0x0112) continue;
+                ushort type = ReadU16(tiff, little, entry + 2);
+                uint num = ReadU32(tiff, little, entry + 4);
+                if (num != 1) return 1;
+                if (type == 3)
+                {
+                    ushort val = ReadU16(tiff, little, entry + 8);
+                    return val;
+                }
+                if (type == 4)
+                {
+                    uint val = ReadU32(tiff, little, entry + 8);
+                    return (int)val;
+                }
+                return 1;
+            }
+
+            return 1;
+        }
+
+        private static ushort ReadU16(ReadOnlySpan<byte> tiff, bool little, int offset)
+        {
+            if (offset + 2 > tiff.Length) return 0;
+            return little
+                ? (ushort)(tiff[offset] | (tiff[offset + 1] << 8))
+                : (ushort)((tiff[offset] << 8) | tiff[offset + 1]);
+        }
+
+        private static uint ReadU32(ReadOnlySpan<byte> tiff, bool little, int offset)
+        {
+            if (offset + 4 > tiff.Length) return 0;
+            return little
+                ? (uint)(tiff[offset] | (tiff[offset + 1] << 8) | (tiff[offset + 2] << 16) | (tiff[offset + 3] << 24))
+                : (uint)((tiff[offset] << 24) | (tiff[offset + 1] << 16) | (tiff[offset + 2] << 8) | tiff[offset + 3]);
+        }
+
+        private readonly struct SegmentBuffer : IDisposable
+        {
+            private readonly byte[] buffer;
+            public readonly int Length;
+
+            public SegmentBuffer(byte[] buffer, int length)
+            {
+                this.buffer = buffer;
+                Length = length;
+            }
+
+            public ReadOnlySpan<byte> Span => buffer.AsSpan(0, Length);
+
+            public void Dispose()
+            {
+                ArrayPool<byte>.Shared.Return(buffer);
+            }
+        }
+    }
+
     private readonly record struct FrameHeader(int Width, int Height, byte Precision, int MaxH, int MaxV, int McuX, int McuY);
 
     private sealed class QuantizationTable
@@ -983,6 +2011,32 @@ public static class StaticJpegDecoder
     private readonly record struct ScanHeader(ScanComponent[] Components, byte Ss, byte Se, byte Ah, byte Al);
 
     private readonly record struct ScanComponent(byte ComponentId, byte DcTableId, byte AcTableId);
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void YCbCrToRgb(int y, int cb, int cr, Span<byte> dest)
+    {
+        int cbShift = cb - 128;
+        int crShift = cr - 128;
+
+        int r = y + ((91881 * crShift) >> 16);
+        int g = y - ((22554 * cbShift + 46802 * crShift) >> 16);
+        int b = y + ((116130 * cbShift) >> 16);
+
+        dest[0] = ClampToByte(r);
+        dest[1] = ClampToByte(g);
+        dest[2] = ClampToByte(b);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static byte ClampToByte(int v)
+    {
+        if ((uint)v <= 255u)
+        {
+            return (byte)v;
+        }
+
+        return v < 0 ? (byte)0 : (byte)255;
+    }
 
     private sealed class ComponentState
     {
@@ -1099,30 +2153,32 @@ public sealed class JpegDecoder
     public bool UseFloatingPointIdct { get; set; }
     public Image<Rgb24> Decode(Stream stream)
     {
-        if (stream == null) throw new ArgumentNullException(nameof(stream));
+        ArgumentNullException.ThrowIfNull(stream);
 
-        if (stream is MemoryStream ms)
-        {
-            if (ms.TryGetBuffer(out var buffer))
-            {
-                return Decode(buffer.AsSpan((int)ms.Position));
-            }
-            return Decode(ms.ToArray());
-        }
+        return DecodeAsync(stream, CancellationToken.None).GetAwaiter().GetResult();
+    }
 
-        using var ms2 = new MemoryStream();
-        stream.CopyTo(ms2);
-        return Decode(ms2.ToArray());
+    public async Task<Image<Rgb24>> DecodeAsync(Stream stream, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(stream);
+        var result = await StaticJpegDecoder.DecodeFromStreamAsync(stream, cancellationToken).ConfigureAwait(false);
+        return BuildImageFromJpeg(result.Image, result.ExifOrientation, result.ExifRaw);
     }
 
     public Image<Rgb24> Decode(ReadOnlySpan<byte> data)
     {
+        int orientation = TryReadExifOrientation(data, out var exifRaw);
+        var img = StaticJpegDecoder.Decode(data);
+        return BuildImageFromJpeg(img, orientation, exifRaw);
+    }
+
+    private Image<Rgb24> BuildImageFromJpeg(JpegImage img, int orientation, byte[]? exifRaw)
+    {
         var metadata = new ImageMetadata();
-        ExifOrientation = TryReadExifOrientation(data, out var exifRaw);
+        ExifOrientation = orientation;
         if (exifRaw != null) metadata.ExifRaw = exifRaw;
         metadata.Orientation = ExifOrientation;
 
-        var img = StaticJpegDecoder.Decode(data);
         Width = img.Width;
         Height = img.Height;
 

@@ -188,6 +188,7 @@ dotnet run -- <输入文件路径> [输出文件路径] [操作] [参数]
 - `--keep-metadata` : 在重新编码 JPEG 时尽量保留 EXIF/ICC 等基础元数据
 - `--jpeg-debug` : 启用 JPEG 解码调试输出
 - `--gif-frames` : 将动图 GIF 的每一帧导出为独立图片，方便调试与检查
+- `--stream` : 针对 JPEG 使用流式解码以降低内存占用
 
 ### 示例
 

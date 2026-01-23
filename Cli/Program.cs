@@ -17,7 +17,7 @@ class Program
             Console.WriteLine("支持输入: .jpg/.jpeg/.png/.bmp/.webp/.gif");
             Console.WriteLine("支持输出: .jpg/.jpeg/.png/.bmp/.webp/.gif");
             Console.WriteLine("操作: resize:WxH | resizebilinear:WxH | resizefit:WxH | grayscale");
-            Console.WriteLine("参数: --quality N | --subsample 420/444 | --keep-metadata | --fdct int/float | --idct int/float | --jpeg-debug | --gif-frames | --gray");
+            Console.WriteLine("参数: --quality N | --subsample 420/444 | --keep-metadata | --fdct int/float | --stream | --jpeg-debug | --gif-frames | --gray");
             return;
         }
         string inputPath = args[0];
@@ -32,6 +32,7 @@ class Program
         bool keepMetadata = false;
         bool gifFrames = false;
         bool useFloatIdct = false;
+        bool useStreamingDecoder = false;
         bool gray = false;
         var ops = new List<Action<ImageProcessingContext>>();
         for (int i = 1; i < args.Length; i++)
@@ -94,6 +95,11 @@ class Program
                 }
                 continue;
             }
+            if (string.Equals(a, "--stream", StringComparison.OrdinalIgnoreCase))
+            {
+                useStreamingDecoder = true;
+                continue;
+            }
             if (a.StartsWith("--idct=", StringComparison.OrdinalIgnoreCase))
             {
                 string v = a["--idct=".Length..].Trim();
@@ -152,247 +158,256 @@ class Program
         }
         var swTotal = Stopwatch.StartNew();
         string inExt = Path.GetExtension(inputPath).ToLowerInvariant();
-        if (gifFrames && inExt == ".gif")
+        try
         {
-            string baseOut = outputPath ?? Path.ChangeExtension(inputPath, ".png");
-            string dir = Path.GetDirectoryName(baseOut) ?? ".";
-            string nameNoExt = Path.GetFileNameWithoutExtension(baseOut);
-            string ext = Path.GetExtension(baseOut).ToLowerInvariant();
-            if (ext != ".bmp" && ext != ".png" && ext != ".jpg" && ext != ".jpeg" && ext != ".webp")
+            if (gifFrames && inExt == ".gif")
             {
-                ext = ".png";
-            }
-            var gifDec = new GifDecoder();
-            var frames = gifDec.DecodeAllFrames(inputPath);
-            int digits = Math.Max(3, frames.Count.ToString().Length);
-            for (int i = 0; i < frames.Count; i++)
-            {
-                string idx = i.ToString().PadLeft(digits, '0');
-                string path = Path.Combine(dir, $"{nameNoExt}_{idx}{ext}");
-                if (ext is ".jpg" or ".jpeg")
+                string baseOut = outputPath ?? Path.ChangeExtension(inputPath, ".png");
+                string dir = Path.GetDirectoryName(baseOut) ?? ".";
+                string nameNoExt = Path.GetFileNameWithoutExtension(baseOut);
+                string ext = Path.GetExtension(baseOut).ToLowerInvariant();
+                if (ext != ".bmp" && ext != ".png" && ext != ".jpg" && ext != ".jpeg" && ext != ".webp")
                 {
-                    int q = jpegQuality ?? 75;
-                    var frame = new ImageFrame(frames[i].Width, frames[i].Height, frames[i].Buffer);
-                    bool effectiveSubsample420 = subsample420 ?? true;
-                    frame.SaveAsJpeg(path, q, effectiveSubsample420);
+                    ext = ".png";
                 }
-                else
+                var gifDec = new GifDecoder();
+                var frames = gifDec.DecodeAllFrames(inputPath);
+                int digits = Math.Max(3, frames.Count.ToString().Length);
+                for (int i = 0; i < frames.Count; i++)
                 {
-                    if ((ext == ".bmp" || ext == ".png") && (gray || IsGrayRgb(frames[i])))
+                    string idx = i.ToString().PadLeft(digits, '0');
+                    string path = Path.Combine(dir, $"{nameNoExt}_{idx}{ext}");
+                    if (ext is ".jpg" or ".jpeg")
                     {
-                        var grayImage = ToGray8(frames[i]);
-                        Image.Save(grayImage, path);
+                        int q = jpegQuality ?? 75;
+                        var frame = new ImageFrame(frames[i].Width, frames[i].Height, frames[i].Buffer);
+                        bool effectiveSubsample420 = subsample420 ?? true;
+                        frame.SaveAsJpeg(path, q, effectiveSubsample420);
                     }
                     else
                     {
-                        if ((ext == ".bmp" || ext == ".png" || ext == ".webp") && (gray || IsGrayRgb(frames[i])))
+                        if ((ext == ".bmp" || ext == ".png") && (gray || IsGrayRgb(frames[i])))
                         {
                             var grayImage = ToGray8(frames[i]);
                             Image.Save(grayImage, path);
                         }
                         else
                         {
-                            Image.Save(frames[i], path);
+                            if ((ext == ".bmp" || ext == ".png" || ext == ".webp") && (gray || IsGrayRgb(frames[i])))
+                            {
+                                var grayImage = ToGray8(frames[i]);
+                                Image.Save(grayImage, path);
+                            }
+                            else
+                            {
+                                Image.Save(frames[i], path);
+                            }
                         }
                     }
                 }
+                swTotal.Stop();
+                Console.WriteLine($"✅ 导出 GIF 动画帧: 共 {frames.Count} 帧");
+                Console.WriteLine($"⏱️ 总耗时: {swTotal.ElapsedMilliseconds} ms");
+                return;
             }
-            swTotal.Stop();
-            Console.WriteLine($"✅ 导出 GIF 动画帧: 共 {frames.Count} 帧");
-            Console.WriteLine($"⏱️ 总耗时: {swTotal.ElapsedMilliseconds} ms");
-            return;
-        }
-        bool noOps = ops.Count == 0;
-        if (noOps)
-        {
-            if (outputPath == null)
-            {
-                string defExt = ".png";
-                outputPath = ResolveOutputPath(inputPath, outputPath, defExt);
-            }
-            string outExt2 = Path.GetExtension(outputPath).ToLowerInvariant();
-            if (inExt == ".gif" && outExt2 == ".webp")
-            {
-                var gifDec = new GifDecoder();
-                GifAnimation anim;
-                using (var fs = File.OpenRead(inputPath))
-                {
-                    anim = gifDec.DecodeAnimationRgb24(fs);
-                }
-
-                if (anim.Frames.Count == 0)
-                {
-                    var rgbaImage = Image.LoadRgba32(inputPath);
-                    Image.Save(rgbaImage, outputPath);
-                }
-                else if (anim.Frames.Count == 1)
-                {
-                    var rgbaImage = ToRgba32(anim.Frames[0]);
-                    WebpEncoderAdapterRgba.DefaultQuality = (jpegQuality ?? 75);
-                    Image.Save(rgbaImage, outputPath);
-                }
-                else
-                {
-                    int loop = anim.LoopCount;
-                    float qWebp = jpegQuality.HasValue ? jpegQuality.Value : 75f;
-                    WebpAnimationEncoder.EncodeRgb24(outputPath, anim.Frames, anim.FrameDurationsMs, loop, qWebp);
-                }
-            }
-            else
+            bool noOps = ops.Count == 0;
+            if (noOps)
             {
                 if (outputPath == null)
                 {
                     string defExt = ".png";
                     outputPath = ResolveOutputPath(inputPath, outputPath, defExt);
                 }
-                string outExt2b = Path.GetExtension(outputPath).ToLowerInvariant();
-                if (inExt is ".jpg" or ".jpeg" && outExt2b == ".bmp")
+                string outExt2 = Path.GetExtension(outputPath).ToLowerInvariant();
+                if (inExt == ".gif" && outExt2 == ".webp")
                 {
-                    var swDecode = Stopwatch.StartNew();
-                    var image = LoadRgb24(inputPath, useFloatIdct);
-                    swDecode.Stop();
-                    Console.WriteLine($"解码耗时: {swDecode.ElapsedMilliseconds} ms");
-                    bool isInputGray = IsGrayRgb(image);
-                    if ((outExt2b == ".bmp" || outExt2b == ".png") && (gray || isInputGray))
+                    var gifDec = new GifDecoder();
+                    GifAnimation anim;
+                    using (var fs = File.OpenRead(inputPath))
                     {
-                        var grayImage = ToGray8(image);
-                        Image.Save(grayImage, outputPath);
+                        anim = gifDec.DecodeAnimationRgb24(fs);
+                    }
+
+                    if (anim.Frames.Count == 0)
+                    {
+                        var rgbaImage = Image.LoadRgba32(inputPath);
+                        Image.Save(rgbaImage, outputPath);
+                    }
+                    else if (anim.Frames.Count == 1)
+                    {
+                        var rgbaImage = ToRgba32(anim.Frames[0]);
+                        WebpEncoderAdapterRgba.DefaultQuality = (jpegQuality ?? 75);
+                        Image.Save(rgbaImage, outputPath);
                     }
                     else
                     {
-                        Image.Save(image, outputPath);
-                    }
-                }
-                else if (inExt is ".jpg" or ".jpeg" && (outExt2b is ".jpg" or ".jpeg"))
-                {
-                    var swDecode = Stopwatch.StartNew();
-                    var image = LoadRgb24(inputPath, useFloatIdct);
-                    swDecode.Stop();
-                    Console.WriteLine($"解码耗时: {swDecode.ElapsedMilliseconds} ms");
-                    int q = jpegQuality ?? 75;
-                    bool isInputGray = IsGrayRgb(image);
-                    if (gray || isInputGray)
-                    {
-                        var grayImage = ToGray8(image);
-                        JpegEncoder.Encode(grayImage, outputPath, q, true, keepMetadata);
-                    }
-                    else
-                    {
-                        bool effectiveSubsample420 = subsample420 ?? true;
-                        JpegEncoder.Encode(image, outputPath, q, effectiveSubsample420, keepMetadata);
+                        int loop = anim.LoopCount;
+                        float qWebp = jpegQuality.HasValue ? jpegQuality.Value : 75f;
+                        WebpAnimationEncoder.EncodeRgb24(outputPath, anim.Frames, anim.FrameDurationsMs, loop, qWebp);
                     }
                 }
                 else
                 {
-                    var rgbaImage = LoadRgba32(inputPath, useFloatIdct);
-                    if (outExt2b is ".jpg" or ".jpeg")
+                    if (outputPath == null)
                     {
-                        int q = jpegQuality ?? 75;
-                        bool isInputGray = IsGrayRgba(rgbaImage);
-                        if (gray || isInputGray)
-                        {
-                            var rgb = new Image<Rgb24>(rgbaImage.Width, rgbaImage.Height, RgbaToRgb(rgbaImage.Buffer), rgbaImage.Metadata);
-                            var grayImage = ToGray8(rgb);
-                            JpegEncoder.Encode(grayImage, outputPath, q);
-                        }
-                        else
-                        {
-                            var rgbImage = new Image<Rgb24>(rgbaImage.Width, rgbaImage.Height, RgbaToRgb(rgbaImage.Buffer), rgbaImage.Metadata);
-                            bool effectiveSubsample420 = subsample420 ?? true;
-                            JpegEncoder.Encode(rgbImage, outputPath, q, effectiveSubsample420);
-                        }
+                        string defExt = ".png";
+                        outputPath = ResolveOutputPath(inputPath, outputPath, defExt);
                     }
-                    else
+                    string outExt2b = Path.GetExtension(outputPath).ToLowerInvariant();
+                    if (inExt is ".jpg" or ".jpeg" && outExt2b == ".bmp")
                     {
-                        if (outExt2b == ".webp")
+                        var swDecode = Stopwatch.StartNew();
+                        var image = LoadRgb24(inputPath, useFloatIdct, useStreamingDecoder);
+                        swDecode.Stop();
+                        Console.WriteLine($"解码耗时: {swDecode.ElapsedMilliseconds} ms");
+                        bool isInputGray = IsGrayRgb(image);
+                        if ((outExt2b == ".bmp" || outExt2b == ".png") && (gray || isInputGray))
                         {
-                            WebpEncoderAdapterRgba.DefaultQuality = (jpegQuality ?? 75);
-                        }
-                        bool isInputGray = IsGrayRgba(rgbaImage);
-                        if ((outExt2b == ".bmp" || outExt2b == ".png" || outExt2b == ".webp") && (gray || isInputGray))
-                        {
-                            var rgb = new Image<Rgb24>(rgbaImage.Width, rgbaImage.Height, RgbaToRgb(rgbaImage.Buffer), rgbaImage.Metadata);
-                            var grayImage = ToGray8(rgb);
+                            var grayImage = ToGray8(image);
                             Image.Save(grayImage, outputPath);
                         }
                         else
                         {
-                            Image.Save(rgbaImage, outputPath);
+                            Image.Save(image, outputPath);
                         }
                     }
-                }
-            }
-            swTotal.Stop();
-            Console.WriteLine($"✅ 写入完成: {outputPath}");
-            Console.WriteLine($"⏱️ 总耗时: {swTotal.ElapsedMilliseconds} ms");
-            return;
-        }
-        else
-        {
-            if (outputPath == null)
-            {
-                string defExt = ".bmp";
-                outputPath = ResolveOutputPath(inputPath, outputPath, defExt);
-            }
-            string outExt = Path.GetExtension(outputPath).ToLowerInvariant();
-                if (inExt == ".gif" && outExt == ".webp")
-            {
-                var gifDec = new GifDecoder();
-                GifAnimation anim;
-                using (var fs = File.OpenRead(inputPath))
-                {
-                    anim = gifDec.DecodeAnimationRgb24(fs);
-                }
-
-                var processed = new List<Image<Rgb24>>(anim.Frames.Count);
-                for (int i = 0; i < anim.Frames.Count; i++)
-                {
-                    var frame = anim.Frames[i];
-                    ImageExtensions.Mutate(frame, ctx =>
+                    else if (inExt is ".jpg" or ".jpeg" && (outExt2b is ".jpg" or ".jpeg"))
                     {
-                        foreach (var a in ops) a(ctx);
-                    });
-                    processed.Add(frame);
-                }
-
-                float qWebpOps = jpegQuality.HasValue ? jpegQuality.Value : 75f;
-                WebpAnimationEncoder.EncodeRgb24(outputPath, processed, anim.FrameDurationsMs, anim.LoopCount, qWebpOps);
-            }
-            else
-            {
-                var image = LoadRgb24(inputPath, useFloatIdct);
-                bool isInputGray = IsGrayRgb(image);
-                ImageExtensions.Mutate(image, ctx =>
-                {
-                    foreach (var a in ops) a(ctx);
-                });
-                if (outExt is ".jpg" or ".jpeg")
-                {
-                    int q = jpegQuality ?? 75;
-                    var frame = new ImageFrame(image.Width, image.Height, image.Buffer, image.Metadata);
-                    bool effectiveSubsample420 = subsample420 ?? true;
-                    frame.SaveAsJpeg(outputPath, q, effectiveSubsample420, keepMetadata);
-                }
-                else
-                {
-                    if (outExt == ".webp")
-                    {
-                        WebpEncoderAdapter.Quality = (jpegQuality ?? 75);
-                    }
-                    if ((outExt == ".bmp" || outExt == ".png" || outExt == ".webp") && (gray || isInputGray))
-                    {
-                        var grayImage = ToGray8(image);
-                        Image.Save(grayImage, outputPath);
+                        var swDecode = Stopwatch.StartNew();
+                        var image = LoadRgb24(inputPath, useFloatIdct, useStreamingDecoder);
+                        swDecode.Stop();
+                        Console.WriteLine($"解码耗时: {swDecode.ElapsedMilliseconds} ms");
+                        int q = jpegQuality ?? 75;
+                        bool isInputGray = IsGrayRgb(image);
+                        if (gray || isInputGray)
+                        {
+                            var grayImage = ToGray8(image);
+                            JpegEncoder.Encode(grayImage, outputPath, q, true, keepMetadata);
+                        }
+                        else
+                        {
+                            bool effectiveSubsample420 = subsample420 ?? true;
+                            JpegEncoder.Encode(image, outputPath, q, effectiveSubsample420, keepMetadata);
+                        }
                     }
                     else
                     {
-                        Image.Save(image, outputPath);
+                        var rgbaImage = LoadRgba32(inputPath, useFloatIdct, useStreamingDecoder);
+                        if (outExt2b is ".jpg" or ".jpeg")
+                        {
+                            int q = jpegQuality ?? 75;
+                            bool isInputGray = IsGrayRgba(rgbaImage);
+                            if (gray || isInputGray)
+                            {
+                                var rgb = new Image<Rgb24>(rgbaImage.Width, rgbaImage.Height, RgbaToRgb(rgbaImage.Buffer), rgbaImage.Metadata);
+                                var grayImage = ToGray8(rgb);
+                                JpegEncoder.Encode(grayImage, outputPath, q);
+                            }
+                            else
+                            {
+                                var rgbImage = new Image<Rgb24>(rgbaImage.Width, rgbaImage.Height, RgbaToRgb(rgbaImage.Buffer), rgbaImage.Metadata);
+                                bool effectiveSubsample420 = subsample420 ?? true;
+                                JpegEncoder.Encode(rgbImage, outputPath, q, effectiveSubsample420);
+                            }
+                        }
+                        else
+                        {
+                            if (outExt2b == ".webp")
+                            {
+                                WebpEncoderAdapterRgba.DefaultQuality = (jpegQuality ?? 75);
+                            }
+                            bool isInputGray = IsGrayRgba(rgbaImage);
+                            if ((outExt2b == ".bmp" || outExt2b == ".png" || outExt2b == ".webp") && (gray || isInputGray))
+                            {
+                                var rgb = new Image<Rgb24>(rgbaImage.Width, rgbaImage.Height, RgbaToRgb(rgbaImage.Buffer), rgbaImage.Metadata);
+                                var grayImage = ToGray8(rgb);
+                                Image.Save(grayImage, outputPath);
+                            }
+                            else
+                            {
+                                Image.Save(rgbaImage, outputPath);
+                            }
+                        }
                     }
                 }
+                swTotal.Stop();
+                Console.WriteLine($"✅ 写入完成: {outputPath}");
+                Console.WriteLine($"⏱️ 总耗时: {swTotal.ElapsedMilliseconds} ms");
+                return;
             }
+            else
+            {
+                if (outputPath == null)
+                {
+                    string defExt = ".bmp";
+                    outputPath = ResolveOutputPath(inputPath, outputPath, defExt);
+                }
+                string outExt = Path.GetExtension(outputPath).ToLowerInvariant();
+                    if (inExt == ".gif" && outExt == ".webp")
+                {
+                    var gifDec = new GifDecoder();
+                    GifAnimation anim;
+                    using (var fs = File.OpenRead(inputPath))
+                    {
+                        anim = gifDec.DecodeAnimationRgb24(fs);
+                    }
+
+                    var processed = new List<Image<Rgb24>>(anim.Frames.Count);
+                    for (int i = 0; i < anim.Frames.Count; i++)
+                    {
+                        var frame = anim.Frames[i];
+                        ImageExtensions.Mutate(frame, ctx =>
+                        {
+                            foreach (var a in ops) a(ctx);
+                        });
+                        processed.Add(frame);
+                    }
+
+                    float qWebpOps = jpegQuality.HasValue ? jpegQuality.Value : 75f;
+                    WebpAnimationEncoder.EncodeRgb24(outputPath, processed, anim.FrameDurationsMs, anim.LoopCount, qWebpOps);
+                }
+                else
+                {
+                    var image = LoadRgb24(inputPath, useFloatIdct, useStreamingDecoder);
+                    bool isInputGray = IsGrayRgb(image);
+                    ImageExtensions.Mutate(image, ctx =>
+                    {
+                        foreach (var a in ops) a(ctx);
+                    });
+                    if (outExt is ".jpg" or ".jpeg")
+                    {
+                        int q = jpegQuality ?? 75;
+                        var frame = new ImageFrame(image.Width, image.Height, image.Buffer, image.Metadata);
+                        bool effectiveSubsample420 = subsample420 ?? true;
+                        frame.SaveAsJpeg(outputPath, q, effectiveSubsample420, keepMetadata);
+                    }
+                    else
+                    {
+                        if (outExt == ".webp")
+                        {
+                            WebpEncoderAdapter.Quality = (jpegQuality ?? 75);
+                        }
+                        if ((outExt == ".bmp" || outExt == ".png" || outExt == ".webp") && (gray || isInputGray))
+                        {
+                            var grayImage = ToGray8(image);
+                            Image.Save(grayImage, outputPath);
+                        }
+                        else
+                        {
+                            Image.Save(image, outputPath);
+                        }
+                    }
+                }
+                swTotal.Stop();
+                Console.WriteLine($"✅ 写入完成: {outputPath}");
+                Console.WriteLine($"⏱️ 总耗时: {swTotal.ElapsedMilliseconds} ms");
+            }
+        }
+        catch (Exception ex)
+        {
             swTotal.Stop();
-            Console.WriteLine($"✅ 写入完成: {outputPath}");
-            Console.WriteLine($"⏱️ 总耗时: {swTotal.ElapsedMilliseconds} ms");
+            string prefix = useStreamingDecoder ? "流式解码失败" : "处理失败";
+            Console.Error.WriteLine($"{prefix}: {ex.GetType().Name}: {ex.Message}");
         }
     }
 
@@ -459,28 +474,56 @@ class Program
         return new Image<Gray8>(image.Width, image.Height, gray, image.Metadata);
     }
 
-    static Image<Rgb24> LoadRgb24(string path, bool useFloatIdct)
+    static Image<Rgb24> LoadRgb24(string path, bool useFloatIdct, bool useStreamingDecoder)
     {
-        if (!useFloatIdct) return Image.Load(path);
         string ext = Path.GetExtension(path);
-        if (!ext.Equals(".jpg", StringComparison.OrdinalIgnoreCase) && !ext.Equals(".jpeg", StringComparison.OrdinalIgnoreCase))
+        bool isJpeg = ext.Equals(".jpg", StringComparison.OrdinalIgnoreCase) || ext.Equals(".jpeg", StringComparison.OrdinalIgnoreCase);
+        if (useStreamingDecoder)
         {
-            return Image.Load(path);
+            if (!isJpeg)
+            {
+                Console.WriteLine("⚠️ --stream 当前仅对 JPEG 生效，已回退为常规解码");
+                return Image.Load(path);
+            }
+            try
+            {
+                long fileLength = new FileInfo(path).Length;
+                Console.WriteLine($"[stream] 开始解码: {Path.GetFileName(path)} ({fileLength} bytes)");
+                using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 20, FileOptions.SequentialScan);
+                var decoder = new JpegDecoder { UseFloatingPointIdct = useFloatIdct };
+                var sw = Stopwatch.StartNew();
+                var img = decoder.Decode(fs);
+                sw.Stop();
+                Console.WriteLine($"[stream] 解码完成: {sw.ElapsedMilliseconds} ms");
+                if (decoder.ExifOrientation != 1)
+                {
+                    var frame = new ImageFrame(img.Width, img.Height, img.Buffer, img.Metadata);
+                    frame = frame.ApplyExifOrientation(decoder.ExifOrientation);
+                    img.Update(frame.Width, frame.Height, frame.Pixels);
+                    img.Metadata.Orientation = 1;
+                }
+                return img;
+            }
+            catch (Exception ex)
+            {
+                throw new InvalidOperationException($"流式解码失败: {ex.Message}", ex);
+            }
         }
-        using var fs = File.OpenRead(path);
-        var decoder = new JpegDecoder { UseFloatingPointIdct = true };
-        var img = decoder.Decode(fs);
-        if (decoder.ExifOrientation != 1)
+        if (!useFloatIdct || !isJpeg) return Image.Load(path);
+        using var fs2 = File.OpenRead(path);
+        var decoder2 = new JpegDecoder { UseFloatingPointIdct = true };
+        var img2 = decoder2.Decode(fs2);
+        if (decoder2.ExifOrientation != 1)
         {
-            var frame = new ImageFrame(img.Width, img.Height, img.Buffer, img.Metadata);
-            frame = frame.ApplyExifOrientation(decoder.ExifOrientation);
-            img.Update(frame.Width, frame.Height, frame.Pixels);
-            img.Metadata.Orientation = 1;
+            var frame = new ImageFrame(img2.Width, img2.Height, img2.Buffer, img2.Metadata);
+            frame = frame.ApplyExifOrientation(decoder2.ExifOrientation);
+            img2.Update(frame.Width, frame.Height, frame.Pixels);
+            img2.Metadata.Orientation = 1;
         }
-        return img;
+        return img2;
     }
 
-    static Image<Rgba32> LoadRgba32(string path, bool useFloatIdct)
+    static Image<Rgba32> LoadRgba32(string path, bool useFloatIdct, bool useStreamingDecoder)
     {
         if (!useFloatIdct) return Image.LoadRgba32(path);
         string ext = Path.GetExtension(path);
@@ -488,7 +531,7 @@ class Program
         {
             return Image.LoadRgba32(path);
         }
-        var rgb = LoadRgb24(path, true);
+        var rgb = LoadRgb24(path, true, useStreamingDecoder);
         return ToRgba32(rgb);
     }
 

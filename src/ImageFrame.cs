@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using System.Runtime.InteropServices;
 using SharpImageConverter.Formats.Jpeg;
 using SharpImageConverter.Formats.Png;
 using SharpImageConverter.Formats.Webp;
@@ -75,53 +76,162 @@ public sealed class ImageFrame
     }
 
     /// <summary>
-    /// 从流加载图像（自动根据文件头识别格式）
+    /// 从字节数组加载图像（自动根据文件头识别格式）
+    /// </summary>
+    /// <param name="data">输入数据</param>
+    /// <returns>加载后的图像帧</returns>
+    public static ImageFrame Load(byte[] data)
+    {
+        ArgumentNullException.ThrowIfNull(data);
+        using var ms = new MemoryStream(data, writable: false);
+        return Load(ms);
+    }
+
+    /// <summary>
+    /// 从内存段加载图像（自动根据文件头识别格式）
+    /// </summary>
+    /// <param name="data">输入数据</param>
+    /// <returns>加载后的图像帧</returns>
+    public static ImageFrame Load(ReadOnlyMemory<byte> data)
+    {
+        if (MemoryMarshal.TryGetArray(data, out ArraySegment<byte> segment) && segment.Array != null)
+        {
+            using var ms = new MemoryStream(segment.Array, segment.Offset, segment.Count, writable: false);
+            return Load(ms);
+        }
+        return Load(data.ToArray());
+    }
+
+    /// <summary>
+    /// 从流加载图像（自动根据文件头识别格式，支持不可 Seek 的流，仅缓存头部用于嗅探）
     /// </summary>
     /// <param name="stream">输入数据流</param>
     /// <returns>加载后的图像帧</returns>
     public static ImageFrame Load(Stream stream)
     {
-        if (!stream.CanSeek)
+        ArgumentNullException.ThrowIfNull(stream);
+        const int headerSize = 12;
+        byte[] header = new byte[headerSize];
+        int read;
+        Stream decodeStream;
+        if (stream.CanSeek)
         {
-            // 如果流不支持 Seek，我们需要预读一部分数据来检测格式，但这比较麻烦。
-            // 简单的做法是要求流支持 Seek，或者包装在一个 MemoryStream 中（但这会消耗内存）。
-            // 考虑到大多数图像库的实现，我们假设流支持 Seek 或者用户提供的是 FileStream/MemoryStream。
-            // 如果不支持，我们可以抛出异常或者尝试复制到 MemoryStream。
-            // 为了“科学”的实现，如果不支持 Seek，我们先复制到 MemoryStream。
-            var ms = new MemoryStream();
-            stream.CopyTo(ms);
-            ms.Position = 0;
-            stream = ms;
+            long startPos = stream.Position;
+            read = ReadHeader(stream, header);
+            stream.Position = startPos;
+            decodeStream = stream;
         }
-
-        long startPos = stream.Position;
-        byte[] header = new byte[8];
-        int read = 0;
-        while (read < 8)
+        else
         {
-            int n = stream.Read(header, read, 8 - read);
-            if (n == 0) break;
-            read += n;
+            read = ReadHeader(stream, header);
+            decodeStream = new PrefixStream(header, read, stream);
         }
-        stream.Position = startPos; // 回退
-
         if (read < 2) throw new InvalidDataException("流数据过短");
 
         // Magic Number Detection
         if (header[0] == 0xFF && header[1] == 0xD8)
-            return LoadJpeg(stream);
+            return LoadJpeg(decodeStream);
         
-        if (header[0] == 0x89 && header[1] == 0x50 && header[2] == 0x4E && header[3] == 0x47 &&
+        if (read >= 8 &&
+            header[0] == 0x89 && header[1] == 0x50 && header[2] == 0x4E && header[3] == 0x47 &&
             header[4] == 0x0D && header[5] == 0x0A && header[6] == 0x1A && header[7] == 0x0A)
-            return LoadPng(stream);
+            return LoadPng(decodeStream);
             
         if (header[0] == 'B' && header[1] == 'M')
-            return LoadBmp(stream);
+            return LoadBmp(decodeStream);
             
-        if (header[0] == 'G' && header[1] == 'I' && header[2] == 'F')
-            return LoadGif(stream);
+        if (read >= 3 && header[0] == 'G' && header[1] == 'I' && header[2] == 'F')
+            return LoadGif(decodeStream);
 
         throw new NotSupportedException("无法识别的图像格式");
+    }
+
+    private static int ReadHeader(Stream stream, byte[] header)
+    {
+        int read = 0;
+        while (read < header.Length)
+        {
+            int n = stream.Read(header, read, header.Length - read);
+            if (n == 0) break;
+            read += n;
+        }
+        return read;
+    }
+
+    private sealed class PrefixStream : Stream
+    {
+        private readonly byte[] prefix;
+        private readonly int prefixLength;
+        private int prefixOffset;
+        private readonly Stream tail;
+
+        public PrefixStream(byte[] prefix, int prefixLength, Stream tail)
+        {
+            this.prefix = prefix;
+            this.prefixLength = prefixLength;
+            this.tail = tail;
+        }
+
+        public override bool CanRead => true;
+        public override bool CanSeek => false;
+        public override bool CanWrite => false;
+        public override long Length => throw new NotSupportedException();
+        public override long Position
+        {
+            get => throw new NotSupportedException();
+            set => throw new NotSupportedException();
+        }
+
+        public override int Read(byte[] buffer, int offset, int count)
+        {
+            int total = 0;
+            if (prefixOffset < prefixLength)
+            {
+                int available = prefixLength - prefixOffset;
+                int toCopy = Math.Min(available, count);
+                Buffer.BlockCopy(prefix, prefixOffset, buffer, offset, toCopy);
+                prefixOffset += toCopy;
+                total += toCopy;
+                if (total == count) return total;
+            }
+            int n = tail.Read(buffer, offset + total, count - total);
+            return total + n;
+        }
+
+        public override int Read(Span<byte> buffer)
+        {
+            int total = 0;
+            if (prefixOffset < prefixLength)
+            {
+                int available = prefixLength - prefixOffset;
+                int toCopy = Math.Min(available, buffer.Length);
+                prefix.AsSpan(prefixOffset, toCopy).CopyTo(buffer);
+                prefixOffset += toCopy;
+                total += toCopy;
+                if (total == buffer.Length) return total;
+            }
+            int n = tail.Read(buffer.Slice(total));
+            return total + n;
+        }
+
+        public override void Flush()
+        {
+        }
+
+        public override long Seek(long offset, SeekOrigin origin)
+        {
+            throw new NotSupportedException();
+        }
+
+        public override void SetLength(long value)
+        {
+            throw new NotSupportedException();
+        }
+
+        public override void Write(byte[] buffer, int offset, int count)
+        {
+            throw new NotSupportedException();
+        }
     }
 
     /// <summary>
