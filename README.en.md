@@ -189,6 +189,7 @@ Special cases:
 - `--keep-metadata` : When recompressing JPEG, try to preserve basic EXIF/ICC metadata
 - `--jpeg-debug` : Enable JPEG decoding debug output
 - `--gif-frames` : Export animated GIF frames as individual images for inspection/debugging
+- `--stream` : Use streaming decode for JPEG to reduce memory usage
 
 ### Examples
 

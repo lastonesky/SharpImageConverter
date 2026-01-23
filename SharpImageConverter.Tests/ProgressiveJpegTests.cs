@@ -3,6 +3,7 @@ using System.Collections;
 using System.IO;
 using System.Reflection;
 using System.Security.Cryptography;
+using System.Threading.Tasks;
 using SharpImageConverter;
 using SharpImageConverter.Formats.Jpeg;
 using Xunit;
@@ -29,6 +30,24 @@ public sealed class ProgressiveJpegTests
             string diag = GetDecoderDiagnostics(dec);
             throw new XunitException($"Decode failed: {ex.GetType().Name}: {ex.Message}\n{diag}");
         }
+    }
+
+    [Fact]
+    public async Task ProgressiveJpeg_StreamDecode_Matches_NonStreaming()
+    {
+        string path = Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "examples", "progressive.jpg");
+        byte[] data = File.ReadAllBytes(path);
+
+        var decSync = new JpegDecoder();
+        var imgSync = decSync.Decode(data);
+
+        using var ms = new MemoryStream(data);
+        var decStream = new JpegDecoder();
+        var imgStream = await decStream.DecodeAsync(ms);
+
+        Assert.Equal(imgSync.Width, imgStream.Width);
+        Assert.Equal(imgSync.Height, imgStream.Height);
+        Assert.Equal(Hash(imgSync.Buffer), Hash(imgStream.Buffer));
     }
 
     private static byte[] Hash(byte[] data)

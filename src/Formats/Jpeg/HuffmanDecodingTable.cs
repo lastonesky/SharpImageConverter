@@ -173,4 +173,43 @@ internal sealed class HuffmanDecodingTable
         ThrowHelper.ThrowInvalidData($"Invalid Huffman code (bytesConsumed={reader.BytesConsumed}, bitCount={reader.BitCount}, pendingMarker={reader.PendingMarker}).");
         return 0;
     }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public int Decode(ref JpegStreamBitReader reader)
+    {
+        uint c = reader.PeekBits(FastBits);
+        ushort f = fast[c];
+        if (f != 0)
+        {
+            int s = f >> 8;
+            reader.SkipBits(s);
+            return (byte)f;
+        }
+
+        return DecodeSlow(ref reader);
+    }
+
+    private int DecodeSlow(ref JpegStreamBitReader reader)
+    {
+        int code = 0;
+        for (int s = 1; s <= 16; s++)
+        {
+            code = (code << 1) | (int)reader.ReadBits(1);
+            int max = maxCode[s];
+            int min = minCode[s];
+            if (max >= 0 && code >= min && code <= max)
+            {
+                int idx = valPtr[s] + (code - min);
+                if ((uint)idx >= (uint)huffVal.Length)
+                {
+                    ThrowHelper.ThrowInvalidData($"Invalid Huffman table index (idx={idx}, s={s}, code={code}, bytesConsumed={reader.BytesConsumed}, bitCount={reader.BitCount}, pendingMarker={reader.PendingMarker}).");
+                }
+
+                return huffVal[idx];
+            }
+        }
+
+        ThrowHelper.ThrowInvalidData($"Invalid Huffman code (bytesConsumed={reader.BytesConsumed}, bitCount={reader.BitCount}, pendingMarker={reader.PendingMarker}).");
+        return 0;
+    }
 }

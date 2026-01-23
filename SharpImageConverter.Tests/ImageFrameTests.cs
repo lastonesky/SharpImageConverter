@@ -2,6 +2,7 @@ using Xunit;
 using System;
 using System.IO;
 using SharpImageConverter;
+using Tests.Helpers;
 
 namespace Jpeg2Bmp.Tests
 {
@@ -10,6 +11,11 @@ namespace Jpeg2Bmp.Tests
         private static string NewTemp(string ext)
         {
             return Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString("N") + ext);
+        }
+
+        private static string ExamplePath(string name)
+        {
+            return Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "examples", name);
         }
 
         [Fact]
@@ -44,6 +50,26 @@ namespace Jpeg2Bmp.Tests
             File.Delete(bmp);
             File.Delete(png);
             File.Delete(jpg);
+        }
+
+        [Fact]
+        public void ImageFrame_Load_NonSeekableStream_Matches_ByteArray()
+        {
+            string path = ExamplePath("Amish-Noka-Dresser.jpg");
+            byte[] data = File.ReadAllBytes(path);
+            var frameFromBytes = ImageFrame.Load(data);
+            using var nonSeek = new NonSeekableReadOnlyStream(data);
+            var frameFromStream = ImageFrame.Load(nonSeek);
+            Assert.Equal(frameFromBytes.Width, frameFromStream.Width);
+            Assert.Equal(frameFromBytes.Height, frameFromStream.Height);
+            BufferAssert.EqualExact(frameFromBytes.Pixels, frameFromStream.Pixels);
+        }
+
+        [Fact]
+        public void ImageFrame_Load_NonSeekableStream_TooShort_Throws()
+        {
+            using var nonSeek = new NonSeekableReadOnlyStream(new byte[] { 0xFF });
+            Assert.Throws<InvalidDataException>(() => ImageFrame.Load(nonSeek));
         }
 
         private static (int dx, int dy, int newW, int newH) Map(int x, int y, int w, int h, int orientation)
@@ -105,6 +131,61 @@ namespace Jpeg2Bmp.Tests
                 Assert.Equal(src.Pixels[s01 + 0], dst.Pixels[d01 + 0]);
                 Assert.Equal(src.Pixels[s01 + 1], dst.Pixels[d01 + 1]);
                 Assert.Equal(src.Pixels[s01 + 2], dst.Pixels[d01 + 2]);
+            }
+        }
+
+        private sealed class NonSeekableReadOnlyStream : Stream
+        {
+            private readonly Stream inner;
+
+            public NonSeekableReadOnlyStream(byte[] data)
+            {
+                inner = new MemoryStream(data, writable: false);
+            }
+
+            public override bool CanRead => true;
+            public override bool CanSeek => false;
+            public override bool CanWrite => false;
+            public override long Length => throw new NotSupportedException();
+            public override long Position
+            {
+                get => throw new NotSupportedException();
+                set => throw new NotSupportedException();
+            }
+
+            public override int Read(byte[] buffer, int offset, int count)
+            {
+                return inner.Read(buffer, offset, count);
+            }
+
+            public override int Read(Span<byte> buffer)
+            {
+                return inner.Read(buffer);
+            }
+
+            public override void Flush()
+            {
+            }
+
+            public override long Seek(long offset, SeekOrigin origin)
+            {
+                throw new NotSupportedException();
+            }
+
+            public override void SetLength(long value)
+            {
+                throw new NotSupportedException();
+            }
+
+            public override void Write(byte[] buffer, int offset, int count)
+            {
+                throw new NotSupportedException();
+            }
+
+            protected override void Dispose(bool disposing)
+            {
+                if (disposing) inner.Dispose();
+                base.Dispose(disposing);
             }
         }
     }
