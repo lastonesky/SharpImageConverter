@@ -143,6 +143,11 @@ public sealed class ImageFrame
         if (read >= 3 && header[0] == 'G' && header[1] == 'I' && header[2] == 'F')
             return LoadGif(decodeStream);
 
+        if (read >= 12 &&
+            header[0] == (byte)'R' && header[1] == (byte)'I' && header[2] == (byte)'F' && header[3] == (byte)'F' &&
+            header[8] == (byte)'W' && header[9] == (byte)'E' && header[10] == (byte)'B' && header[11] == (byte)'P')
+            return LoadWebp(decodeStream);
+
         throw new NotSupportedException("无法识别的图像格式");
     }
 
@@ -331,6 +336,19 @@ public sealed class ImageFrame
     public static ImageFrame LoadGif(Stream stream)
     {
         var dec = new SharpImageConverter.Formats.Gif.GifDecoder();
+        var img = dec.DecodeRgb24(stream);
+        return new ImageFrame(img.Width, img.Height, img.Buffer);
+    }
+
+    public static ImageFrame LoadWebp(string path)
+    {
+        using var fs = File.OpenRead(path);
+        return LoadWebp(fs);
+    }
+
+    public static ImageFrame LoadWebp(Stream stream)
+    {
+        var dec = new WebpDecoderAdapter();
         var img = dec.DecodeRgb24(stream);
         return new ImageFrame(img.Width, img.Height, img.Buffer);
     }

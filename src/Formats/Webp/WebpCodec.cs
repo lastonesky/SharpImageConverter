@@ -1,4 +1,6 @@
 using System;
+using System.Buffers;
+using System.IO;
 using System.Runtime.InteropServices;
 using System.Runtime.CompilerServices;
 
@@ -12,6 +14,18 @@ namespace SharpImageConverter.Formats.Webp
         [LibraryImport("libwebpdecoder")]
         [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
         private static partial IntPtr WebPDecodeRGBAInto(ReadOnlySpan<byte> data, nuint data_size, Span<byte> output_buffer, int output_buffer_size, int output_stride);
+        [LibraryImport("libwebpdecoder")]
+        [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+        private static partial IntPtr WebPINewDecoder(IntPtr output_buffer);
+        [LibraryImport("libwebpdecoder")]
+        [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+        private static partial void WebPIDelete(IntPtr idec);
+        [LibraryImport("libwebpdecoder")]
+        [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+        private static partial VP8StatusCode WebPIAppend(IntPtr idec, ReadOnlySpan<byte> data, nuint data_size);
+        [LibraryImport("libwebpdecoder")]
+        [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+        private static partial IntPtr WebPIDecGetRGB(IntPtr idec, out int last_y, out int width, out int height, out int stride);
         [LibraryImport("libwebp")]
         [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
         private static partial nuint WebPEncodeRGBA(ReadOnlySpan<byte> rgba, int width, int height, int stride, float quality_factor, out IntPtr output);
@@ -79,6 +93,66 @@ namespace SharpImageConverter.Formats.Webp
         public static byte[] DecodeRgba(byte[] data, out int width, out int height)
         {
             return DecodeRgba(data.AsSpan(), out width, out height);
+        }
+
+        public static byte[] DecodeRgbaFromStream(Stream stream, out int width, out int height)
+        {
+            ArgumentNullException.ThrowIfNull(stream);
+
+            try
+            {
+                IntPtr idec = WebPINewDecoder(IntPtr.Zero);
+                if (idec == IntPtr.Zero) throw new InvalidOperationException("WebP 流式解码器创建失败");
+                var buffer = ArrayPool<byte>.Shared.Rent(32 * 1024);
+                try
+                {
+                    VP8StatusCode status = VP8StatusCode.VP8_STATUS_SUSPENDED;
+                    int read;
+                    while ((read = stream.Read(buffer, 0, buffer.Length)) > 0)
+                    {
+                        status = WebPIAppend(idec, buffer.AsSpan(0, read), (nuint)read);
+                        if (status == VP8StatusCode.VP8_STATUS_OK) break;
+                        if (status != VP8StatusCode.VP8_STATUS_SUSPENDED && status != VP8StatusCode.VP8_STATUS_NOT_ENOUGH_DATA)
+                            throw new InvalidOperationException($"WebP 流式解码失败: {status}");
+                    }
+
+                    IntPtr output = WebPIDecGetRGB(idec, out _, out width, out height, out int stride);
+                    if (output == IntPtr.Zero || width <= 0 || height <= 0 || stride <= 0) throw new InvalidOperationException("WebP 流式解码失败");
+                    int rowBytes = checked(width * 4);
+                    int size = checked(rowBytes * height);
+                    var rgba = new byte[size];
+                    unsafe
+                    {
+                        if (stride == rowBytes)
+                        {
+                            new ReadOnlySpan<byte>((void*)output, size).CopyTo(rgba);
+                        }
+                        else
+                        {
+                            byte* src = (byte*)output;
+                            for (int y = 0; y < height; y++)
+                            {
+                                var srcRow = new ReadOnlySpan<byte>(src + (y * stride), rowBytes);
+                                srcRow.CopyTo(rgba.AsSpan(y * rowBytes, rowBytes));
+                            }
+                        }
+                    }
+                    return rgba;
+                }
+                finally
+                {
+                    ArrayPool<byte>.Shared.Return(buffer);
+                    WebPIDelete(idec);
+                }
+            }
+            catch (DllNotFoundException ex)
+            {
+                throw new InvalidOperationException("未能加载 WebP 原生库，请检查 runtimes 目录或平台匹配。", ex);
+            }
+            catch (EntryPointNotFoundException ex)
+            {
+                throw new InvalidOperationException("WebP 原生库版本不兼容，缺少所需入口点。", ex);
+            }
         }
 
         public static byte[] EncodeRgba(byte[] rgba, int width, int height, float quality)
@@ -151,6 +225,78 @@ namespace SharpImageConverter.Formats.Webp
         public static byte[] EncodeRgb(byte[] rgb, int width, int height, WebpEncoderOptions options)
         {
             return EncodeRgb(rgb, width, height, options.Quality);
+        }
+
+        public static void EncodeRgbaToStream(Stream stream, ReadOnlySpan<byte> rgba, int width, int height, float quality)
+        {
+            ArgumentNullException.ThrowIfNull(stream);
+            if (rgba.Length != checked(width * height * 4)) throw new ArgumentException("RGBA 像素长度不匹配", nameof(rgba));
+            try
+            {
+                nuint size = WebPEncodeRGBA(rgba, width, height, width * 4, quality, out IntPtr output);
+                int len = checked((int)size);
+                if (len <= 0 || output == IntPtr.Zero) throw new InvalidOperationException("WebP 编码失败");
+                try
+                {
+                    unsafe
+                    {
+                        stream.Write(new ReadOnlySpan<byte>((void*)output, len));
+                    }
+                }
+                finally
+                {
+                    WebPFree(output);
+                }
+            }
+            catch (DllNotFoundException ex)
+            {
+                throw new InvalidOperationException("未能加载 WebP 原生库，请检查 runtimes 目录或平台匹配。", ex);
+            }
+            catch (EntryPointNotFoundException ex)
+            {
+                throw new InvalidOperationException("WebP 原生库版本不兼容，缺少所需入口点。", ex);
+            }
+        }
+
+        public static void EncodeRgbToStream(Stream stream, ReadOnlySpan<byte> rgb, int width, int height, float quality)
+        {
+            ArgumentNullException.ThrowIfNull(stream);
+            if (rgb.Length != checked(width * height * 3)) throw new ArgumentException("RGB 像素长度不匹配", nameof(rgb));
+            try
+            {
+                nuint size = WebPEncodeRGB(rgb, width, height, width * 3, quality, out IntPtr output);
+                int len = checked((int)size);
+                if (len <= 0 || output == IntPtr.Zero) throw new InvalidOperationException("WebP 编码失败");
+                try
+                {
+                    unsafe
+                    {
+                        stream.Write(new ReadOnlySpan<byte>((void*)output, len));
+                    }
+                }
+                finally
+                {
+                    WebPFree(output);
+                }
+            }
+            catch (DllNotFoundException ex)
+            {
+                throw new InvalidOperationException("未能加载 WebP 原生库，请检查 runtimes 目录或平台匹配。", ex);
+            }
+            catch (EntryPointNotFoundException ex)
+            {
+                throw new InvalidOperationException("WebP 原生库版本不兼容，缺少所需入口点。", ex);
+            }
+        }
+
+        public static void EncodeRgbaToStream(Stream stream, ReadOnlySpan<byte> rgba, int width, int height, WebpEncoderOptions options)
+        {
+            EncodeRgbaToStream(stream, rgba, width, height, options.Quality);
+        }
+
+        public static void EncodeRgbToStream(Stream stream, ReadOnlySpan<byte> rgb, int width, int height, WebpEncoderOptions options)
+        {
+            EncodeRgbToStream(stream, rgb, width, height, options.Quality);
         }
 
         public static byte[] EncodeAnimatedRgba(byte[][] rgbaFrames, int width, int height, int[] frameDurationsMs, int loopCount, float quality)
@@ -255,6 +401,109 @@ namespace SharpImageConverter.Formats.Webp
                 throw new InvalidOperationException("WebP 原生库版本不兼容，缺少所需入口点。", ex);
             }
         }
+
+        public static void EncodeAnimatedRgbaToStream(Stream stream, byte[][] rgbaFrames, int width, int height, int[] frameDurationsMs, int loopCount, float quality)
+        {
+            ArgumentNullException.ThrowIfNull(stream);
+            ArgumentNullException.ThrowIfNull(rgbaFrames, nameof(rgbaFrames));
+            ArgumentNullException.ThrowIfNull(frameDurationsMs, nameof(frameDurationsMs));
+            if (rgbaFrames.Length == 0) throw new ArgumentOutOfRangeException(nameof(rgbaFrames));
+            if (rgbaFrames.Length != frameDurationsMs.Length) throw new ArgumentException("帧与时长数量不一致");
+            if (loopCount < 0) loopCount = 0;
+
+            try
+            {
+                if (rgbaFrames.Length == 1)
+                {
+                    EncodeRgbaToStream(stream, rgbaFrames[0], width, height, quality);
+                    return;
+                }
+
+                IntPtr mux = CreateEmptyMux();
+                if (mux == IntPtr.Zero) throw new InvalidOperationException("WebPMux 创建失败");
+
+                try
+                {
+                    var err = WebPMuxSetCanvasSize(mux, width, height);
+                    if (err != WebPMuxError.WEBP_MUX_OK) throw new InvalidOperationException($"WebPMuxSetCanvasSize 失败: {err}");
+
+                    var animParams = new WebPMuxAnimParams
+                    {
+                        bgcolor = 0u,
+                        loop_count = loopCount
+                    };
+                    err = WebPMuxSetAnimationParams(mux, ref animParams);
+                    if (err != WebPMuxError.WEBP_MUX_OK) throw new InvalidOperationException($"WebPMuxSetAnimationParams 失败: {err}");
+
+                    for (int i = 0; i < rgbaFrames.Length; i++)
+                    {
+                        var rgba = rgbaFrames[i];
+                        if (rgba.Length != checked(width * height * 4)) throw new ArgumentException("RGBA 帧尺寸不一致");
+
+                        int duration = frameDurationsMs[i];
+                        if (duration < 10) duration = 10;
+
+                        byte[] encoded = EncodeRgba(rgba, width, height, quality);
+
+                        unsafe
+                        {
+                            fixed (byte* p = encoded)
+                            {
+                                var frame = new WebPMuxFrameInfo
+                                {
+                                    bitstream = new WebPData { bytes = (IntPtr)p, size = (nuint)encoded.Length },
+                                    x_offset = 0,
+                                    y_offset = 0,
+                                    duration = duration,
+                                    id = WebPChunkId.WEBP_CHUNK_ANMF,
+                                    dispose_method = WebPMuxAnimDispose.WEBP_MUX_DISPOSE_BACKGROUND,
+                                    blend_method = WebPMuxAnimBlend.WEBP_MUX_NO_BLEND,
+                                    pad = 0u
+                                };
+
+                                err = WebPMuxPushFrame(mux, ref frame, copy_data: 1);
+                                if (err != WebPMuxError.WEBP_MUX_OK) throw new InvalidOperationException($"WebPMuxPushFrame 失败: {err}");
+                            }
+                        }
+                    }
+
+                    var assembled = new WebPData { bytes = IntPtr.Zero, size = 0 };
+                    err = WebPMuxAssemble(mux, ref assembled);
+                    if (err != WebPMuxError.WEBP_MUX_OK) throw new InvalidOperationException($"WebPMuxAssemble 失败: {err}");
+                    if (assembled.bytes == IntPtr.Zero || assembled.size == 0) throw new InvalidOperationException("WebPMuxAssemble 返回空数据");
+
+                    try
+                    {
+                        int len = checked((int)assembled.size);
+                        unsafe
+                        {
+                            stream.Write(new ReadOnlySpan<byte>((void*)assembled.bytes, len));
+                        }
+                    }
+                    finally
+                    {
+                        if (assembled.bytes != IntPtr.Zero)
+                        {
+                            WebPFree(assembled.bytes);
+                            assembled.bytes = IntPtr.Zero;
+                            assembled.size = 0;
+                        }
+                    }
+                }
+                finally
+                {
+                    WebPMuxDelete(mux);
+                }
+            }
+            catch (DllNotFoundException ex)
+            {
+                throw new InvalidOperationException("未能加载 WebP 原生库，请检查 runtimes 目录或平台匹配。", ex);
+            }
+            catch (EntryPointNotFoundException ex)
+            {
+                throw new InvalidOperationException("WebP 原生库版本不兼容，缺少所需入口点。", ex);
+            }
+        }
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -298,6 +547,18 @@ namespace SharpImageConverter.Formats.Webp
     {
         WEBP_MUX_BLEND = 0,
         WEBP_MUX_NO_BLEND = 1
+    }
+
+    internal enum VP8StatusCode : int
+    {
+        VP8_STATUS_OK = 0,
+        VP8_STATUS_OUT_OF_MEMORY = 1,
+        VP8_STATUS_INVALID_PARAM = 2,
+        VP8_STATUS_BITSTREAM_ERROR = 3,
+        VP8_STATUS_UNSUPPORTED_FEATURE = 4,
+        VP8_STATUS_SUSPENDED = 5,
+        VP8_STATUS_USER_ABORT = 6,
+        VP8_STATUS_NOT_ENOUGH_DATA = 7
     }
 
     [StructLayout(LayoutKind.Sequential)]
