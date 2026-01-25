@@ -25,17 +25,18 @@
 ### PNG 支持
 - 读取：
   - 支持关键块（IHDR, PLTE, IDAT, IEND）
-  - 透明度：解析 tRNS 与带 Alpha 的色彩类型（Grayscale+Alpha / Truecolor+Alpha），输出统一为 RGB24，不保留 Alpha
+  - 透明度：解析 tRNS 与带 Alpha 的色彩类型（Grayscale+Alpha / Truecolor+Alpha），支持 RGB24 与 RGBA32 输出（使用 RGBA 接口以保留 Alpha）
   - 支持所有过滤器（None, Sub, Up, Average, Paeth）
   - 支持 Adam7 隔行扫描
   - 支持灰度、真彩色、索引色；位深覆盖 1/2/4/8/16（转换时缩放到 8-bit）
 - 写入：
-  - 保存为 Truecolor PNG（RGB24）
+  - 保存为 Truecolor PNG（RGB24）与 Truecolor+Alpha PNG（RGBA32）
   - 使用 Zlib 压缩（Deflate），行过滤使用 Up（逐行差分），并在 Up 过滤过程里使用 SIMD 加速
   - 不写入调色板或其他元数据
 
 ### BMP 支持
-- 读写 24-bit RGB BMP
+- 读取：支持无压缩的 8/24/32 位 BMP（统一输出为 RGB24）
+- 写入：24-bit RGB BMP
 - 支持自动填充对齐
 
 ### GIF 支持

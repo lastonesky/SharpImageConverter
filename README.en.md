@@ -25,17 +25,18 @@ This library was originally created to address several practical issues we encou
 ### PNG
 - Read:
   - Core chunks: IHDR, PLTE, IDAT, IEND
-  - Transparency: parse tRNS and alpha color types (Grayscale+Alpha / Truecolor+Alpha); output unified as RGB24, alpha not preserved
+  - Transparency: parse tRNS and alpha color types (Grayscale+Alpha / Truecolor+Alpha); supports RGB24 and RGBA32 output (use RGBA APIs to preserve alpha)
   - All filters: None, Sub, Up, Average, Paeth
   - Adam7 interlacing
   - Grayscale, Truecolor, Indexed; bit depth 1/2/4/8/16 (normalized to 8-bit on conversion)
 - Write:
-  - Save as Truecolor PNG (RGB24)
+  - Save as Truecolor PNG (RGB24) and Truecolor+Alpha PNG (RGBA32)
   - Zlib (Deflate) compression using the Up filter (per-row differencing), with SIMD acceleration applied to the Up filtering step
   - No palette or additional metadata
 
 ### BMP
-- Read/Write 24-bit RGB BMP
+- Read: uncompressed 8/24/32-bit BMP (outputs unified as RGB24)
+- Write: 24-bit RGB BMP
 - Automatic row alignment padding
 
 ### GIF
