@@ -473,7 +473,7 @@ class Program
     static bool TryParseResizeOp(string op, string prefix, Func<int, int, Action<ImageProcessingContext>> factory, List<Action<ImageProcessingContext>> ops)
     {
         if (!op.StartsWith(prefix)) return false;
-        string sizePart = op.Substring(prefix.Length);
+        string sizePart = op[prefix.Length..];
         var parts = sizePart.Split(['x', '*'], StringSplitOptions.RemoveEmptyEntries);
         if (parts.Length == 2 && int.TryParse(parts[0], out int w) && int.TryParse(parts[1], out int h))
         {
@@ -631,14 +631,9 @@ class Program
         return candidate;
     }
 
-    private sealed class CliOptions
+    private sealed class CliOptions(string inputPath)
     {
-        public CliOptions(string inputPath)
-        {
-            InputPath = inputPath;
-        }
-
-        public string InputPath { get; }
+        public string InputPath { get; } = inputPath;
         public string? OutputPath { get; set; }
         public int? JpegQuality { get; set; }
         public bool? Subsample420 { get; set; }
@@ -647,6 +642,6 @@ class Program
         public bool UseFloatIdct { get; set; }
         public bool UseStreamingDecoder { get; set; }
         public bool Gray { get; set; }
-        public List<Action<ImageProcessingContext>> Operations { get; } = new();
+        public List<Action<ImageProcessingContext>> Operations { get; } = [];
     }
 }

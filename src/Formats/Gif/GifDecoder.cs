@@ -4,18 +4,11 @@ using SharpImageConverter.Core;
 
 namespace SharpImageConverter.Formats.Gif
 {
-    public sealed class GifAnimation
+    public sealed class GifAnimation(IReadOnlyList<Image<Rgb24>> frames, IReadOnlyList<int> frameDurationsMs, int loopCount)
     {
-        public System.Collections.Generic.IReadOnlyList<Image<Rgb24>> Frames { get; }
-        public System.Collections.Generic.IReadOnlyList<int> FrameDurationsMs { get; }
-        public int LoopCount { get; }
-
-        public GifAnimation(System.Collections.Generic.IReadOnlyList<Image<Rgb24>> frames, System.Collections.Generic.IReadOnlyList<int> frameDurationsMs, int loopCount)
-        {
-            Frames = frames;
-            FrameDurationsMs = frameDurationsMs;
-            LoopCount = loopCount;
-        }
+        public IReadOnlyList<Image<Rgb24>> Frames { get; } = frames;
+        public IReadOnlyList<int> FrameDurationsMs { get; } = frameDurationsMs;
+        public int LoopCount { get; } = loopCount;
     }
 
     /// <summary>
@@ -79,12 +72,10 @@ namespace SharpImageConverter.Formats.Gif
             int delayCs = 0;
             int loopCount = 1;
 
-            var frames = new System.Collections.Generic.List<Image<Rgb24>>();
-            var durations = new System.Collections.Generic.List<int>();
+            var frames = new List<Image<Rgb24>>();
+            var durations = new List<int>();
 
             byte[]? prevCanvas = null;
-            int lastIx = 0, lastIy = 0, lastIw = 0, lastIh = 0;
-
             while (true)
             {
                 int blockType = stream.ReadByte();
@@ -243,7 +234,10 @@ namespace SharpImageConverter.Formats.Gif
                         }
                     }
 
-                    lastIx = ix; lastIy = iy; lastIw = iw; lastIh = ih;
+                    int lastIx = ix;
+                    int lastIy = iy;
+                    int lastIw = iw;
+                    int lastIh = ih;
                     var frameBuf = new byte[canvas.Length];
                     Buffer.BlockCopy(canvas, 0, frameBuf, 0, canvas.Length);
                     frames.Add(new Image<Rgb24>(width, height, frameBuf));
@@ -298,7 +292,7 @@ namespace SharpImageConverter.Formats.Gif
         /// </summary>
         /// <param name="path">输入文件路径</param>
         /// <returns>帧列表（Rgb24）</returns>
-        public System.Collections.Generic.List<Image<Rgb24>> DecodeAllFrames(string path)
+        public List<Image<Rgb24>> DecodeAllFrames(string path)
         {
             using var fs = File.OpenRead(path);
             return DecodeAllFrames(fs);
@@ -309,10 +303,10 @@ namespace SharpImageConverter.Formats.Gif
         /// </summary>
         /// <param name="stream">输入流</param>
         /// <returns>帧列表（Rgb24）</returns>
-        public System.Collections.Generic.List<Image<Rgb24>> DecodeAllFrames(Stream stream)
+        public List<Image<Rgb24>> DecodeAllFrames(Stream stream)
         {
             var anim = DecodeAnimationRgb24(stream);
-            return new System.Collections.Generic.List<Image<Rgb24>>(anim.Frames);
+            return [.. anim.Frames];
         }
 
         /// <summary>
