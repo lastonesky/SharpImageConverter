@@ -34,7 +34,7 @@ public static class PngWriter
             ArraySegment<byte> segment = ms.GetBuffer();
             WriteChunk(stream, "IDAT", segment.Array, segment.Offset, segment.Count);
         }
-        WriteChunk(stream, "IEND", new byte[0]);
+        WriteChunk(stream, "IEND", []);
     }
     /// <summary>
     /// 写入 RGB24 PNG 文件（颜色类型 2）
@@ -45,10 +45,8 @@ public static class PngWriter
     /// <param name="rgb">RGB24 像素数据</param>
     public static void Write(string path, int width, int height, byte[] rgb)
     {
-        using (var fs = new FileStream(path, FileMode.Create, FileAccess.Write))
-        {
-            Write(fs, width, height, rgb);
-        }
+        using var fs = new FileStream(path, FileMode.Create, FileAccess.Write);
+        Write(fs, width, height, rgb);
     }
 
     /// <summary>
@@ -73,7 +71,7 @@ public static class PngWriter
             ArraySegment<byte> segment = ms.GetBuffer();
             WriteChunk(stream, "IDAT", segment.Array, segment.Offset, segment.Count);
         }
-        WriteChunk(stream, "IEND", new byte[0]);
+        WriteChunk(stream, "IEND", []);
     }
 
     /// <summary>
@@ -85,10 +83,8 @@ public static class PngWriter
     /// <param name="rgba">RGBA32 像素数据</param>
     public static void WriteRgba(string path, int width, int height, byte[] rgba)
     {
-        using (var fs = new FileStream(path, FileMode.Create, FileAccess.Write))
-        {
-            WriteRgba(fs, width, height, rgba);
-        }
+        using var fs = new FileStream(path, FileMode.Create, FileAccess.Write);
+        WriteRgba(fs, width, height, rgba);
     }
 
     /// <summary>
@@ -100,7 +96,7 @@ public static class PngWriter
     /// <param name="rgba">RGBA32 像素数据</param>
     public static void WriteRgba(Stream stream, int width, int height, byte[] rgba)
     {
-        stream.Write(new byte[] { 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A }, 0, 8);
+        stream.Write([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]);
         WriteChunk(stream, "IHDR", CreateIHDRRgba(width, height));
         int stride = width * 4;
         int rawSize = (stride + 1) * height;
@@ -113,7 +109,7 @@ public static class PngWriter
             ArraySegment<byte> segment = ms.GetBuffer();
             WriteChunk(stream, "IDAT", segment.Array, segment.Offset, segment.Count);
         }
-        WriteChunk(stream, "IEND", new byte[0]);
+        WriteChunk(stream, "IEND", []);
     }
 
     private static void WriteChunk(Stream s, string type, byte[] data)
@@ -176,29 +172,6 @@ public static class PngWriter
         return data;
     }
 
-    private static byte[] CreateIDAT(int width, int height, byte[] rgb)
-    {
-        int stride = width * 3;
-        int rawSize = (stride + 1) * height;
-        byte[] rawData = new byte[rawSize];
-        int rawIdx = 0;
-        int rgbIdx = 0;
-        byte[] prevRow = new byte[stride];
-        byte[] filtered = new byte[stride];
-
-        for (int y = 0; y < height; y++)
-        {
-            rawData[rawIdx++] = 2;
-            ApplyUpFilterSimd(rgb.AsSpan(rgbIdx, stride), prevRow, filtered);
-            Array.Copy(filtered, 0, rawData, rawIdx, stride);
-            rgbIdx += stride;
-            rawIdx += stride;
-            Array.Copy(rgb, rgbIdx - stride, prevRow, 0, stride);
-        }
-
-        return ZlibHelper.Compress(rawData);
-    }
-
     private static void WriteUpFilteredScanlines(Stream s, byte[] src, int width, int height, int bytesPerPixel)
     {
         int stride = width * bytesPerPixel;
@@ -243,13 +216,13 @@ public static class PngWriter
     }
     private static byte[] ToBigEndian(uint val)
     {
-        return new byte[]
-        {
+        return
+        [
             (byte)((val >> 24) & 0xFF),
             (byte)((val >> 16) & 0xFF),
             (byte)((val >> 8) & 0xFF),
             (byte)(val & 0xFF)
-        };
+        ];
     }
 }
 
@@ -322,7 +295,7 @@ internal sealed class PooledMemoryStream : Stream
             if (disposing)
             {
                 var buffer = _buffer;
-                _buffer = Array.Empty<byte>();
+                _buffer = [];
                 if (buffer.Length > 0)
                 {
                     ArrayPool<byte>.Shared.Return(buffer);

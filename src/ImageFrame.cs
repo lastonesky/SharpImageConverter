@@ -163,19 +163,12 @@ public sealed class ImageFrame
         return read;
     }
 
-    private sealed class PrefixStream : Stream
+    private sealed class PrefixStream(byte[] prefix, int prefixLength, Stream tail) : Stream
     {
-        private readonly byte[] prefix;
-        private readonly int prefixLength;
+        private readonly byte[] prefix = prefix;
+        private readonly int prefixLength = prefixLength;
         private int prefixOffset;
-        private readonly Stream tail;
-
-        public PrefixStream(byte[] prefix, int prefixLength, Stream tail)
-        {
-            this.prefix = prefix;
-            this.prefixLength = prefixLength;
-            this.tail = tail;
-        }
+        private readonly Stream tail = tail;
 
         public override bool CanRead => true;
         public override bool CanSeek => false;
@@ -215,7 +208,7 @@ public sealed class ImageFrame
                 total += toCopy;
                 if (total == buffer.Length) return total;
             }
-            int n = tail.Read(buffer.Slice(total));
+            int n = tail.Read(buffer[total..]);
             return total + n;
         }
 
@@ -312,8 +305,7 @@ public sealed class ImageFrame
     /// <returns>图像帧</returns>
     public static ImageFrame LoadBmp(Stream stream)
     {
-        int width, height;
-        byte[] rgb = BmpReader.Read(stream, out width, out height);
+        byte[] rgb = BmpReader.Read(stream, out int width, out int height);
         return new ImageFrame(width, height, rgb);
     }
 
@@ -335,7 +327,7 @@ public sealed class ImageFrame
     /// <returns>图像帧</returns>
     public static ImageFrame LoadGif(Stream stream)
     {
-        var dec = new SharpImageConverter.Formats.Gif.GifDecoder();
+        var dec = new Formats.Gif.GifDecoder();
         var img = dec.DecodeRgb24(stream);
         return new ImageFrame(img.Width, img.Height, img.Buffer);
     }
@@ -489,7 +481,7 @@ public sealed class ImageFrame
     /// <param name="stream">输出流</param>
     public void SaveAsGif(Stream stream)
     {
-        var encoder = new SharpImageConverter.Formats.Gif.GifEncoder();
+        var encoder = new Formats.Gif.GifEncoder();
         encoder.Encode(this, stream);
     }
 
@@ -508,8 +500,8 @@ public sealed class ImageFrame
 
     private static (byte[] pixels, int width, int height) ApplyExifOrientation(byte[] src, int width, int height, int orientation)
     {
-        int newW = width;
-        int newH = height;
+        int newW;
+        int newH;
         switch (orientation)
         {
             case 1:
