@@ -167,7 +167,7 @@ new ImageFrame(image.Width, image.Height, image.Buffer).SaveAsPng(output);
 
 ```bash
 # 在 Cli 目录下运行
-dotnet run -- <输入文件路径> [输出文件路径] [操作] [参数]
+dotnet run -- <输入文件或文件夹路径> [输出文件或文件夹路径] [操作] [参数]
 ```
 
 ### 支持格式
@@ -190,6 +190,15 @@ dotnet run -- <输入文件路径> [输出文件路径] [操作] [参数]
 - `--jpeg-debug` : 启用 JPEG 解码调试输出
 - `--gif-frames` : 将动图 GIF 的每一帧导出为独立图片，方便调试与检查
 - `--stream` : 针对 JPEG 使用流式解码以降低内存占用
+- `--idct int|float` : 选择 JPEG IDCT 实现（整数/浮点），仅对 JPEG 解码有效
+
+### 文件夹批量转换
+- 递归：`--recursive`（遍历子目录）
+- 指定输出格式：`--to bmp|png|jpg|webp` 或 `--out-ext .bmp|.png|.jpg|.webp`
+- 并行：`--parallel N`（默认使用逻辑 CPU 数；输出为 `.webp` 时为确保线程安全自动降为 1）
+- 跳过已存在：`--skip-existing`（目标文件已存在则跳过）
+- 输出位置：第二个参数为文件夹时，保持源目录的相对结构；未指定时输出到源文件所在目录
+- 默认扩展名：无操作默认 `.png`，存在操作默认 `.bmp`；显式指定优先生效
 
 ### 示例
 
@@ -202,6 +211,18 @@ dotnet run -- input.jpg output.png resize:800x600
 
 # 缩放适应并设置 JPEG 质量
 dotnet run -- big.png thumb.jpg resizefit:200x200 --quality 90
+
+# 批量：将整个文件夹转为 PNG（默认）
+dotnet run -- d:\images
+
+# 批量：指定输出文件夹与递归
+dotnet run -- d:\images d:\out --recursive
+
+# 批量：指定目标格式为 BMP，并设置并行度
+dotnet run -- d:\images d:\out --to bmp --parallel 8
+
+# 批量：跳过已存在文件
+dotnet run -- d:\images d:\out --skip-existing
 ```
 
 ## 许可证

@@ -17,17 +17,20 @@ class Program
             return;
         }
         string inputPath = args[0];
-        if (!File.Exists(inputPath))
+        bool isDir = Directory.Exists(inputPath);
+        bool isFile = File.Exists(inputPath);
+        if (!isDir && !isFile)
         {
             Console.Error.WriteLine($"输入文件不存在: {inputPath}");
             return;
         }
         // 参数解析与行为选项汇总
         var options = ParseOptions(args, inputPath);
+        options.IsDirectoryInput = isDir;
         var swTotal = Stopwatch.StartNew();
         try
         {
-            bool wroteFile = Process(options);
+            bool wroteFile = isDir ? ProcessDirectory(options) : Process(options);
             swTotal.Stop();
             if (wroteFile)
             {
@@ -45,11 +48,12 @@ class Program
 
     static void PrintUsage()
     {
-        Console.WriteLine("用法: dotnet run -- <输入文件路径> [输出文件路径] [操作] [--quality N]");
+        Console.WriteLine("用法: dotnet run -- <输入文件或文件夹路径> [输出文件或文件夹路径] [操作] [--quality N]");
         Console.WriteLine("支持输入: .jpg/.jpeg/.png/.bmp/.webp/.gif");
         Console.WriteLine("支持输出: .jpg/.jpeg/.png/.bmp/.webp/.gif");
         Console.WriteLine("操作: resize:WxH | resizebilinear:WxH | resizefit:WxH | grayscale");
-        Console.WriteLine("参数: --quality N | --subsample 420/444 | --keep-metadata | --fdct int/float | --stream | --jpeg-debug | --gif-frames | --gray");
+        Console.WriteLine("参数: --quality N | --subsample 420/444 | --keep-metadata | --idct int/float | --stream | --jpeg-debug | --gif-frames | --gray");
+        Console.WriteLine("文件夹选项: --recursive | --to bmp/png/jpg/webp | --parallel N | --skip-existing");
     }
 
     static CliOptions ParseOptions(string[] args, string inputPath)
@@ -83,6 +87,44 @@ class Program
                 options.KeepMetadata = true;
                 continue;
             }
+            if (string.Equals(a, "--recursive", StringComparison.OrdinalIgnoreCase))
+            {
+                options.Recursive = true;
+                continue;
+            }
+            if (string.Equals(a, "--skip-existing", StringComparison.OrdinalIgnoreCase))
+            {
+                options.SkipExisting = true;
+                continue;
+            }
+            if (string.Equals(a, "--parallel", StringComparison.OrdinalIgnoreCase))
+            {
+                if (i + 1 < args.Length && int.TryParse(args[i + 1], out int p))
+                {
+                    options.Parallelism = p;
+                    i++;
+                }
+                continue;
+            }
+            if (a.StartsWith("--to=", StringComparison.OrdinalIgnoreCase) || a.StartsWith("--out-ext=", StringComparison.OrdinalIgnoreCase))
+            {
+                string v = a.Contains('=') ? a[(a.IndexOf('=') + 1)..].Trim() : string.Empty;
+                if (!string.IsNullOrEmpty(v))
+                {
+                    options.OutputExtension = NormalizeOutputExtension(v.StartsWith(".") ? v : "." + v);
+                }
+                continue;
+            }
+            if (string.Equals(a, "--to", StringComparison.OrdinalIgnoreCase) || string.Equals(a, "--out-ext", StringComparison.OrdinalIgnoreCase))
+            {
+                if (i + 1 < args.Length)
+                {
+                    string v2 = args[i + 1].Trim();
+                    options.OutputExtension = NormalizeOutputExtension(v2.StartsWith(".") ? v2 : "." + v2);
+                    i++;
+                }
+                continue;
+            }
             if (TryParseQuality(args, ref i, out int? quality))
             {
                 options.JpegQuality = quality;
@@ -108,6 +150,72 @@ class Program
             }
         }
         return options;
+    }
+
+    static bool ProcessDirectory(CliOptions options)
+    {
+        string inputDir = options.InputPath;
+        string outDir = options.OutputPath ?? inputDir;
+        if (!Directory.Exists(outDir)) Directory.CreateDirectory(outDir);
+        var searchOption = options.Recursive ? SearchOption.AllDirectories : SearchOption.TopDirectoryOnly;
+        var exts = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { ".jpg", ".jpeg", ".png", ".bmp", ".webp", ".gif" };
+        var files = Directory.EnumerateFiles(inputDir, "*.*", searchOption).Where(f => exts.Contains(Path.GetExtension(f)));
+        string defaultExt = options.OutputExtension ?? (options.Operations.Count == 0 ? ".png" : ".bmp");
+        int parallel = options.Parallelism.HasValue && options.Parallelism.Value > 0 ? options.Parallelism.Value : Environment.ProcessorCount;
+        if (string.Equals(defaultExt, ".webp", StringComparison.OrdinalIgnoreCase)) parallel = 1;
+        int success = 0, fail = 0;
+        var locker = new object();
+        Parallel.ForEach(files, new ParallelOptions { MaxDegreeOfParallelism = parallel }, file =>
+        {
+            try
+            {
+                string rel = Path.GetRelativePath(inputDir, file);
+                string targetDir = options.OutputPath != null ? Path.Combine(outDir, Path.GetDirectoryName(rel) ?? ".") : Path.GetDirectoryName(file) ?? ".";
+                Directory.CreateDirectory(targetDir);
+                string nameNoExt = Path.GetFileNameWithoutExtension(file);
+                string desired = Path.Combine(targetDir, nameNoExt + defaultExt);
+                if (options.SkipExisting && File.Exists(desired))
+                {
+                    lock (locker) success++;
+                    return;
+                }
+                string resolved = ResolveOutputPath(file, desired, defaultExt);
+                var perFileOptions = CloneOptionsForFile(options, file, resolved);
+                bool wrote = Process(perFileOptions);
+                if (wrote)
+                {
+                    lock (locker) success++;
+                }
+                else
+                {
+                    lock (locker) success++;
+                }
+            }
+            catch
+            {
+                lock (locker) fail++;
+            }
+        });
+        Console.WriteLine($"✅ 转换完成: 成功 {success}，失败 {fail}");
+        options.OutputPath = outDir;
+        return true;
+    }
+
+    static CliOptions CloneOptionsForFile(CliOptions src, string inputFile, string outputFile)
+    {
+        var dst = new CliOptions(inputFile)
+        {
+            OutputPath = outputFile,
+            JpegQuality = src.JpegQuality,
+            Subsample420 = src.Subsample420,
+            KeepMetadata = src.KeepMetadata,
+            GifFrames = src.GifFrames,
+            UseFloatIdct = src.UseFloatIdct,
+            UseStreamingDecoder = src.UseStreamingDecoder,
+            Gray = src.Gray
+        };
+        foreach (var op in src.Operations) dst.Operations.Add(op);
+        return dst;
     }
 
     static bool Process(CliOptions options)
@@ -643,5 +751,10 @@ class Program
         public bool UseStreamingDecoder { get; set; }
         public bool Gray { get; set; }
         public List<Action<ImageProcessingContext>> Operations { get; } = [];
+        public bool IsDirectoryInput { get; set; }
+        public bool Recursive { get; set; }
+        public string? OutputExtension { get; set; }
+        public int? Parallelism { get; set; }
+        public bool SkipExisting { get; set; }
     }
 }

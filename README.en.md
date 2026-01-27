@@ -168,7 +168,7 @@ Located in the `Cli/` directory, providing convenient format conversion and simp
 
 ```bash
 # Run from the Cli directory
-dotnet run -- <input-path> [output-path] [operation] [options]
+dotnet run -- <input file or folder> [output file or folder] [operation] [options]
 ```
 
 ### Supported Formats
@@ -191,11 +191,20 @@ Special cases:
 - `--jpeg-debug` : Enable JPEG decoding debug output
 - `--gif-frames` : Export animated GIF frames as individual images for inspection/debugging
 - `--stream` : Use streaming decode for JPEG to reduce memory usage
+- `--idct int|float` : Choose JPEG IDCT implementation (integer/float), applies to JPEG decoding only
 
+### Folder Batch Conversion
+- Recursion: `--recursive` (traverse subdirectories)
+- Output format: `--to bmp|png|jpg|webp` or `--out-ext .bmp|.png|.jpg|.webp`
+- Parallelism: `--parallel N` (defaults to logical CPU count; for `.webp` output in directory mode, automatically reduces to 1 to ensure thread-safety)
+- Skip existing: `--skip-existing` (skip if target file already exists)
+- Output location: when the second argument is a folder, preserves the relative structure of the source directory; if not specified, outputs next to the source files
+- Default extension: `.png` when no operation; `.bmp` when operations are present; explicit `--to/--out-ext` takes precedence
 ### Examples
 
 ```bash
 # Convert format
+dotnet run -- input.png output.jpg
 dotnet run -- input.png output.jpg
 
 # Resize and convert
@@ -203,6 +212,18 @@ dotnet run -- input.jpg output.png resize:800x600
 
 # Resize to fit and set JPEG quality
 dotnet run -- big.png thumb.jpg resizefit:200x200 --quality 90
+
+# Batch: convert entire folder to PNG (default)
+dotnet run -- d:\images
+
+# Batch: specify output folder with recursion
+dotnet run -- d:\images d:\out --recursive
+
+# Batch: set output format to BMP and parallelism
+dotnet run -- d:\images d:\out --to bmp --parallel 8
+
+# Batch: skip existing files
+dotnet run -- d:\images d:\out --skip-existing
 ```
 
 ## License
