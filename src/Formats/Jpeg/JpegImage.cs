@@ -4,8 +4,24 @@ public enum JpegPixelFormat
 {
     Gray8,
     Rgb24,
-    Rgba32
+    Rgba32,
+    YCbCr24,
+    Cmyk32,
+    Ycck32,
+    Unknown32
 }
+
+public enum JpegColorSpace
+{
+    Gray,
+    Rgb,
+    YCbCr,
+    Cmyk,
+    Ycck,
+    Unknown4
+}
+
+public readonly record struct JpegColorInfo(JpegColorSpace ColorSpace, bool HasAdobeTransform, byte AdobeTransform, ReadOnlyMemory<byte>? IccProfile);
 
 public sealed class JpegImage
 {
@@ -13,11 +29,11 @@ public sealed class JpegImage
     private byte[]? rgba32Cache;
 
     public JpegImage(int width, int height, byte[] rgba32)
-        : this(width, height, JpegPixelFormat.Rgba32, 8, rgba32)
+        : this(width, height, JpegPixelFormat.Rgba32, 8, new JpegColorInfo(JpegColorSpace.Rgb, false, 0, null), rgba32)
     {
     }
 
-    public JpegImage(int width, int height, JpegPixelFormat pixelFormat, int bitsPerSample, byte[] pixelData)
+    public JpegImage(int width, int height, JpegPixelFormat pixelFormat, int bitsPerSample, JpegColorInfo colorInfo, byte[] pixelData)
     {
         if (width <= 0 || height <= 0)
         {
@@ -34,6 +50,10 @@ public sealed class JpegImage
             JpegPixelFormat.Gray8 => 1,
             JpegPixelFormat.Rgb24 => 3,
             JpegPixelFormat.Rgba32 => 4,
+            JpegPixelFormat.YCbCr24 => 3,
+            JpegPixelFormat.Cmyk32 => 4,
+            JpegPixelFormat.Ycck32 => 4,
+            JpegPixelFormat.Unknown32 => 4,
             _ => throw new ArgumentOutOfRangeException(nameof(pixelFormat))
         };
 
@@ -47,6 +67,7 @@ public sealed class JpegImage
         Height = height;
         PixelFormat = pixelFormat;
         BitsPerSample = bitsPerSample;
+        ColorInfo = colorInfo;
         this.pixelData = pixelData;
     }
 
@@ -54,6 +75,7 @@ public sealed class JpegImage
     public int Height { get; }
     public JpegPixelFormat PixelFormat { get; }
     public int BitsPerSample { get; }
+    public JpegColorInfo ColorInfo { get; }
 
     public ReadOnlySpan<byte> PixelData => pixelData;
     internal byte[] PixelDataArray => pixelData;
@@ -112,6 +134,123 @@ public sealed class JpegImage
             return dst;
         }
 
+        if (PixelFormat == JpegPixelFormat.YCbCr24)
+        {
+            ReadOnlySpan<byte> src = pixelData.AsSpan(0, checked(count * 3));
+            int si = 0;
+            for (int i = 0; i < count; i++)
+            {
+                byte y = src[si++];
+                byte cb = src[si++];
+                byte cr = src[si++];
+                // YCbCr -> RGB
+                YCbCrToRgb(y, cb, cr, out byte r, out byte g, out byte b);
+                int o = i * 4;
+                dst[o + 0] = r;
+                dst[o + 1] = g;
+                dst[o + 2] = b;
+                dst[o + 3] = 255;
+            }
+
+            return dst;
+        }
+
+        if (PixelFormat == JpegPixelFormat.Cmyk32)
+        {
+            ReadOnlySpan<byte> src = pixelData.AsSpan(0, checked(count * 4));
+            int si = 0;
+            bool invert = ColorInfo.HasAdobeTransform;
+            for (int i = 0; i < count; i++)
+            {
+                int c = src[si++];
+                int m = src[si++];
+                int y = src[si++];
+                int k = src[si++];
+                if (invert)
+                {
+                    // Adobe CMYK 反相存储 -> 还原为 CMYK
+                    c = 255 - c;
+                    m = 255 - m;
+                    y = 255 - y;
+                    k = 255 - k;
+                }
+
+                // CMYK -> RGB（K 作为黑版压暗因子参与乘法）
+                int invK = 255 - k;
+                int r = ((255 - c) * invK + 127) / 255;
+                int g = ((255 - m) * invK + 127) / 255;
+                int b = ((255 - y) * invK + 127) / 255;
+                int o = i * 4;
+                dst[o + 0] = (byte)r;
+                dst[o + 1] = (byte)g;
+                dst[o + 2] = (byte)b;
+                dst[o + 3] = 255;
+            }
+
+            return dst;
+        }
+
+        if (PixelFormat == JpegPixelFormat.Ycck32)
+        {
+            ReadOnlySpan<byte> src = pixelData.AsSpan(0, checked(count * 4));
+            int si = 0;
+            bool invert = ColorInfo.HasAdobeTransform;
+            for (int i = 0; i < count; i++)
+            {
+                int y = src[si++];
+                int cb = src[si++];
+                int cr = src[si++];
+                int k = src[si++];
+                if (invert)
+                {
+                    // Adobe YCCK 反相存储 -> 还原为 YCCK
+                    y = 255 - y;
+                    cb = 255 - cb;
+                    cr = 255 - cr;
+                    k = 255 - k;
+                }
+
+                // YCCK -> YCbCr -> RGB
+                YCbCrToRgb(y, cb, cr, out byte r, out byte g, out byte b);
+                // RGB -> 应用 K 压暗
+                int invK = 255 - k;
+                int r2 = (r * invK + 127) / 255;
+                int g2 = (g * invK + 127) / 255;
+                int b2 = (b * invK + 127) / 255;
+                int o = i * 4;
+                dst[o + 0] = (byte)r2;
+                dst[o + 1] = (byte)g2;
+                dst[o + 2] = (byte)b2;
+                dst[o + 3] = 255;
+            }
+
+            return dst;
+        }
+
         throw new InvalidOperationException($"Unsupported pixel format: {PixelFormat}.");
+    }
+
+    private static void YCbCrToRgb(int y, int cb, int cr, out byte r, out byte g, out byte b)
+    {
+        int cbShift = cb - 128;
+        int crShift = cr - 128;
+
+        int rr = y + ((91881 * crShift) >> 16);
+        int gg = y - ((22554 * cbShift + 46802 * crShift) >> 16);
+        int bb = y + ((116130 * cbShift) >> 16);
+
+        r = ClampToByte(rr);
+        g = ClampToByte(gg);
+        b = ClampToByte(bb);
+    }
+
+    private static byte ClampToByte(int v)
+    {
+        if ((uint)v <= 255u)
+        {
+            return (byte)v;
+        }
+
+        return v < 0 ? (byte)0 : (byte)255;
     }
 }

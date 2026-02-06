@@ -39,6 +39,8 @@ public static class StaticJpegDecoder
         private ushort restartInterval;
         private ComponentState[] components = Array.Empty<ComponentState>();
         private int queuedMarker = -1;
+        private bool hasAdobe;
+        private byte adobeTransform;
 
         public Parser(ReadOnlySpan<byte> data)
         {
@@ -72,6 +74,9 @@ public static class StaticJpegDecoder
                         break;
                     case JpegMarker.APP1:
                         ParseApp1();
+                        break;
+                    case JpegMarker.APP14:
+                        ParseApp14();
                         break;
                     case JpegMarker.COM:
                         SkipSegment();
@@ -156,6 +161,25 @@ public static class StaticJpegDecoder
             }
         }
 
+        private void ParseApp14()
+        {
+            ReadOnlySpan<byte> segment = ReadSegment(out _, out int segmentLength);
+            if (segmentLength < 12)
+            {
+                return;
+            }
+
+            if (segment[0] == (byte)'A' &&
+                segment[1] == (byte)'d' &&
+                segment[2] == (byte)'o' &&
+                segment[3] == (byte)'b' &&
+                segment[4] == (byte)'e')
+            {
+                hasAdobe = true;
+                adobeTransform = segment[11];
+            }
+        }
+
         private JpegImage ReconstructImage()
         {
             int width = frame.Width;
@@ -166,8 +190,10 @@ public static class StaticJpegDecoder
 
             int fullWidth = frame.McuX * maxH * 8;
             int fullHeight = frame.McuY * maxV * 8;
-            byte[] output = Array.Empty<byte>();
-            JpegPixelFormat pixelFormat = JpegPixelFormat.Gray8;
+            JpegColorSpace colorSpace = DetermineColorSpace(components.Length, hasAdobe, adobeTransform);
+            JpegPixelFormat pixelFormat = PixelFormatFromColorSpace(colorSpace);
+            int[] componentOrder = BuildComponentOrder(components, colorSpace);
+            int channelCount = componentOrder.Length;
 
             byte[][] planes = new byte[components.Length][];
             int[] planeStrides = new int[components.Length];
@@ -191,89 +217,16 @@ public static class StaticJpegDecoder
                 c.DecodeSpatial(plane.AsSpan(0, w * h), w, h, w, quantTables[c.QuantTableId].Table);
             }
 
-            if (components.Length == 1)
-            {
-                pixelFormat = JpegPixelFormat.Gray8;
-                output = new byte[width * height];
-                byte[] yPlane = planes[0];
-                int yStride = planeStrides[0];
-                for (int y = 0; y < height; y++)
-                {
-                    int rowOut = y * width;
-                    int rowY = y * yStride;
-                    for (int x = 0; x < width; x++)
-                    {
-                        byte lum = yPlane[rowY + x];
-                        output[rowOut + x] = lum;
-                    }
-                }
-            }
-            else if (components.Length >= 3)
-            {
-                pixelFormat = JpegPixelFormat.Rgb24;
-                output = new byte[width * height * 3];
-                int yIndex = FindComponentIndex(1);
-                int cbIndex = FindComponentIndex(2);
-                int crIndex = FindComponentIndex(3);
-
-                if (yIndex < 0 || cbIndex < 0 || crIndex < 0)
-                {
-                    yIndex = 0;
-                    cbIndex = 1;
-                    crIndex = 2;
-                }
-
-                byte[] yPlane = planes[yIndex];
-                byte[] cbPlane = planes[cbIndex];
-                byte[] crPlane = planes[crIndex];
-
-                int yStride = planeStrides[yIndex];
-                int cbStride = planeStrides[cbIndex];
-                int crStride = planeStrides[crIndex];
-
-                int yW = planeWidths[yIndex];
-                int yH = planeHeights[yIndex];
-                int cbW = planeWidths[cbIndex];
-                int cbH = planeHeights[cbIndex];
-                int crW = planeWidths[crIndex];
-                int crH = planeHeights[crIndex];
-
-                for (int y = 0; y < height; y++)
-                {
-                    int yy = (y * yH) / fullHeight;
-                    int cby = (y * cbH) / fullHeight;
-                    int cry = (y * crH) / fullHeight;
-
-                    int rowOut = y * width * 3;
-                    int rowY = yy * yStride;
-                    int rowCb = cby * cbStride;
-                    int rowCr = cry * crStride;
-
-                    for (int x = 0; x < width; x++)
-                    {
-                        int xx = (x * yW) / fullWidth;
-                        int cbx = (x * cbW) / fullWidth;
-                        int crx = (x * crW) / fullWidth;
-
-                        int Y = yPlane[rowY + xx];
-                        int Cb = cbPlane[rowCb + cbx];
-                        int Cr = crPlane[rowCr + crx];
-
-                        YCbCrToRgb(Y, Cb, Cr, output.AsSpan(rowOut + (x * 3), 3));
-                    }
-                }
-            }
-            else
-            {
-                ThrowHelper.ThrowNotSupported("Unsupported number of components.");
-            }
+            byte[] output = new byte[checked(width * height * channelCount)];
+            InterleaveComponents(planes, planeStrides, planeWidths, planeHeights, fullWidth, fullHeight, width, height, componentOrder, output);
 
             for (int i = 0; i < planes.Length; i++)
             {
                 ArrayPool<byte>.Shared.Return(planes[i]);
             }
 
-            return new JpegImage(width, height, pixelFormat, bitsPerSample, output);
+            var colorInfo = new JpegColorInfo(colorSpace, hasAdobe, adobeTransform, null);
+            return new JpegImage(width, height, pixelFormat, bitsPerSample, colorInfo, output);
         }
 
         private readonly int FindComponentIndex(byte id)
@@ -959,6 +912,157 @@ public static class StaticJpegDecoder
         private static ushort ReadU16(ReadOnlySpan<byte> s) => (ushort)((s[0] << 8) | s[1]);
     }
 
+    private static JpegColorSpace DetermineColorSpace(int componentCount, bool hasAdobe, byte adobeTransform)
+    {
+        if (componentCount == 1)
+        {
+            return JpegColorSpace.Gray;
+        }
+
+        if (componentCount == 3)
+        {
+            if (hasAdobe)
+            {
+                if (adobeTransform == 0)
+                {
+                    return JpegColorSpace.Rgb;
+                }
+
+                if (adobeTransform == 1)
+                {
+                    return JpegColorSpace.YCbCr;
+                }
+            }
+
+            return JpegColorSpace.YCbCr;
+        }
+
+        if (componentCount == 4)
+        {
+            if (hasAdobe)
+            {
+                if (adobeTransform == 0)
+                {
+                    return JpegColorSpace.Cmyk;
+                }
+
+                if (adobeTransform == 2)
+                {
+                    return JpegColorSpace.Ycck;
+                }
+            }
+
+            return JpegColorSpace.Unknown4;
+        }
+
+        ThrowHelper.ThrowNotSupported("Unsupported number of components.");
+        return JpegColorSpace.Unknown4;
+    }
+
+    private static JpegPixelFormat PixelFormatFromColorSpace(JpegColorSpace colorSpace)
+    {
+        return colorSpace switch
+        {
+            JpegColorSpace.Gray => JpegPixelFormat.Gray8,
+            JpegColorSpace.Rgb => JpegPixelFormat.Rgb24,
+            JpegColorSpace.YCbCr => JpegPixelFormat.YCbCr24,
+            JpegColorSpace.Cmyk => JpegPixelFormat.Cmyk32,
+            JpegColorSpace.Ycck => JpegPixelFormat.Ycck32,
+            JpegColorSpace.Unknown4 => JpegPixelFormat.Unknown32,
+            _ => throw new ArgumentOutOfRangeException(nameof(colorSpace))
+        };
+    }
+
+    private static int[] BuildComponentOrder(ComponentState[] components, JpegColorSpace colorSpace)
+    {
+        return colorSpace switch
+        {
+            JpegColorSpace.Gray => BuildComponentOrder(components, new byte[] { 1 }),
+            JpegColorSpace.Rgb => BuildComponentOrder(components, new byte[] { 1, 2, 3 }),
+            JpegColorSpace.YCbCr => BuildComponentOrder(components, new byte[] { 1, 2, 3 }),
+            JpegColorSpace.Cmyk => BuildComponentOrder(components, new byte[] { 1, 2, 3, 4 }),
+            JpegColorSpace.Ycck => BuildComponentOrder(components, new byte[] { 1, 2, 3, 4 }),
+            JpegColorSpace.Unknown4 => BuildSequentialOrder(components.Length),
+            _ => BuildSequentialOrder(components.Length)
+        };
+    }
+
+    private static int[] BuildComponentOrder(ComponentState[] components, ReadOnlySpan<byte> expectedIds)
+    {
+        int[] order = new int[expectedIds.Length];
+        for (int i = 0; i < expectedIds.Length; i++)
+        {
+            int index = FindComponentIndex(components, expectedIds[i]);
+            if (index < 0)
+            {
+                return BuildSequentialOrder(components.Length);
+            }
+
+            order[i] = index;
+        }
+
+        return order;
+    }
+
+    private static int[] BuildSequentialOrder(int count)
+    {
+        int[] order = new int[count];
+        for (int i = 0; i < count; i++)
+        {
+            order[i] = i;
+        }
+
+        return order;
+    }
+
+    private static int FindComponentIndex(ComponentState[] components, byte id)
+    {
+        for (int i = 0; i < components.Length; i++)
+        {
+            if (components[i].Id == id)
+            {
+                return i;
+            }
+        }
+
+        return -1;
+    }
+
+    private static void InterleaveComponents(
+        byte[][] planes,
+        int[] planeStrides,
+        int[] planeWidths,
+        int[] planeHeights,
+        int fullWidth,
+        int fullHeight,
+        int width,
+        int height,
+        int[] componentOrder,
+        byte[] output)
+    {
+        int channels = componentOrder.Length;
+        int outStride = width * channels;
+
+        for (int y = 0; y < height; y++)
+        {
+            int rowOut = y * outStride;
+            for (int x = 0; x < width; x++)
+            {
+                int outIndex = rowOut + x * channels;
+                for (int c = 0; c < channels; c++)
+                {
+                    int planeIndex = componentOrder[c];
+                    int planeW = planeWidths[planeIndex];
+                    int planeH = planeHeights[planeIndex];
+                    int px = (x * planeW) / fullWidth;
+                    int py = (y * planeH) / fullHeight;
+                    int srcIndex = (py * planeStrides[planeIndex]) + px;
+                    output[outIndex + c] = planes[planeIndex][srcIndex];
+                }
+            }
+        }
+    }
+
     private sealed class StreamingParser
     {
         private readonly JpegStreamInput input;
@@ -974,6 +1078,8 @@ public static class StaticJpegDecoder
         private int queuedMarker = -1;
         private byte[]? exifRaw;
         private int exifOrientation = 1;
+        private bool hasAdobe;
+        private byte adobeTransform;
 
         public StreamingParser(JpegStreamInput input)
         {
@@ -1005,6 +1111,9 @@ public static class StaticJpegDecoder
                         break;
                     case JpegMarker.APP1:
                         await ParseApp1Async(cancellationToken).ConfigureAwait(false);
+                        break;
+                    case JpegMarker.APP14:
+                        await ParseApp14Async(cancellationToken).ConfigureAwait(false);
                         break;
                     case JpegMarker.COM:
                         await SkipSegmentAsync(cancellationToken).ConfigureAwait(false);
@@ -1114,6 +1223,33 @@ public static class StaticJpegDecoder
             }
         }
 
+        private async Task ParseApp14Async(CancellationToken cancellationToken)
+        {
+            SegmentBuffer segment = await ReadSegmentAsync(cancellationToken).ConfigureAwait(false);
+            try
+            {
+                if (segment.Length < 12)
+                {
+                    return;
+                }
+
+                ReadOnlySpan<byte> span = segment.Span;
+                if (span[0] == (byte)'A' &&
+                    span[1] == (byte)'d' &&
+                    span[2] == (byte)'o' &&
+                    span[3] == (byte)'b' &&
+                    span[4] == (byte)'e')
+                {
+                    hasAdobe = true;
+                    adobeTransform = span[11];
+                }
+            }
+            finally
+            {
+                segment.Dispose();
+            }
+        }
+
         private JpegImage ReconstructImage()
         {
             int width = frame.Width;
@@ -1124,8 +1260,10 @@ public static class StaticJpegDecoder
 
             int fullWidth = frame.McuX * maxH * 8;
             int fullHeight = frame.McuY * maxV * 8;
-            byte[] output = Array.Empty<byte>();
-            JpegPixelFormat pixelFormat = JpegPixelFormat.Gray8;
+            JpegColorSpace colorSpace = DetermineColorSpace(components.Length, hasAdobe, adobeTransform);
+            JpegPixelFormat pixelFormat = PixelFormatFromColorSpace(colorSpace);
+            int[] componentOrder = BuildComponentOrder(components, colorSpace);
+            int channelCount = componentOrder.Length;
 
             byte[][] planes = new byte[components.Length][];
             int[] planeStrides = new int[components.Length];
@@ -1149,89 +1287,16 @@ public static class StaticJpegDecoder
                 c.DecodeSpatial(plane.AsSpan(0, w * h), w, h, w, quantTables[c.QuantTableId].Table);
             }
 
-            if (components.Length == 1)
-            {
-                pixelFormat = JpegPixelFormat.Gray8;
-                output = new byte[width * height];
-                byte[] yPlane = planes[0];
-                int yStride = planeStrides[0];
-                for (int y = 0; y < height; y++)
-                {
-                    int rowOut = y * width;
-                    int rowY = y * yStride;
-                    for (int x = 0; x < width; x++)
-                    {
-                        byte lum = yPlane[rowY + x];
-                        output[rowOut + x] = lum;
-                    }
-                }
-            }
-            else if (components.Length >= 3)
-            {
-                pixelFormat = JpegPixelFormat.Rgb24;
-                output = new byte[width * height * 3];
-                int yIndex = FindComponentIndex(1);
-                int cbIndex = FindComponentIndex(2);
-                int crIndex = FindComponentIndex(3);
-
-                if (yIndex < 0 || cbIndex < 0 || crIndex < 0)
-                {
-                    yIndex = 0;
-                    cbIndex = 1;
-                    crIndex = 2;
-                }
-
-                byte[] yPlane = planes[yIndex];
-                byte[] cbPlane = planes[cbIndex];
-                byte[] crPlane = planes[crIndex];
-
-                int yStride = planeStrides[yIndex];
-                int cbStride = planeStrides[cbIndex];
-                int crStride = planeStrides[crIndex];
-
-                int yW = planeWidths[yIndex];
-                int yH = planeHeights[yIndex];
-                int cbW = planeWidths[cbIndex];
-                int cbH = planeHeights[cbIndex];
-                int crW = planeWidths[crIndex];
-                int crH = planeHeights[crIndex];
-
-                for (int y = 0; y < height; y++)
-                {
-                    int yy = (y * yH) / fullHeight;
-                    int cby = (y * cbH) / fullHeight;
-                    int cry = (y * crH) / fullHeight;
-
-                    int rowOut = y * width * 3;
-                    int rowY = yy * yStride;
-                    int rowCb = cby * cbStride;
-                    int rowCr = cry * crStride;
-
-                    for (int x = 0; x < width; x++)
-                    {
-                        int xx = (x * yW) / fullWidth;
-                        int cbx = (x * cbW) / fullWidth;
-                        int crx = (x * crW) / fullWidth;
-
-                        int Y = yPlane[rowY + xx];
-                        int Cb = cbPlane[rowCb + cbx];
-                        int Cr = crPlane[rowCr + crx];
-
-                        YCbCrToRgb(Y, Cb, Cr, output.AsSpan(rowOut + (x * 3), 3));
-                    }
-                }
-            }
-            else
-            {
-                ThrowHelper.ThrowNotSupported("Unsupported number of components.");
-            }
+            byte[] output = new byte[checked(width * height * channelCount)];
+            InterleaveComponents(planes, planeStrides, planeWidths, planeHeights, fullWidth, fullHeight, width, height, componentOrder, output);
 
             for (int i = 0; i < planes.Length; i++)
             {
                 ArrayPool<byte>.Shared.Return(planes[i]);
             }
 
-            return new JpegImage(width, height, pixelFormat, bitsPerSample, output);
+            var colorInfo = new JpegColorInfo(colorSpace, hasAdobe, adobeTransform, null);
+            return new JpegImage(width, height, pixelFormat, bitsPerSample, colorInfo, output);
         }
 
         private int FindComponentIndex(byte id)
@@ -2205,6 +2270,10 @@ public sealed class JpegDecoder
             {
                 JpegPixelFormat.Gray8 => ExpandGray(img.PixelData, Width, Height),
                 JpegPixelFormat.Rgba32 => DropAlpha(img.PixelData, Width, Height),
+                JpegPixelFormat.YCbCr24 => DropAlpha(img.Rgba32, Width, Height),
+                JpegPixelFormat.Cmyk32 => DropAlpha(img.Rgba32, Width, Height),
+                JpegPixelFormat.Ycck32 => DropAlpha(img.Rgba32, Width, Height),
+                JpegPixelFormat.Unknown32 => DropAlpha(img.Rgba32, Width, Height),
                 _ => throw new InvalidOperationException("Unsupported pixel format.")
             };
             if (ExifOrientation != 1)
