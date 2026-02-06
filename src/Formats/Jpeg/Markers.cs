@@ -10,6 +10,7 @@ internal enum JpegMarker : byte
     SOS = 0xDA,
     APP0 = 0xE0,
     APP1 = 0xE1,
+    APP14 = 0xEE,
     COM = 0xFE,
     SOI = 0xD8,
     EOI = 0xD9,
