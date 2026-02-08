@@ -59,11 +59,9 @@ This library was originally created to address several practical issues we encou
 - `ImageFrame` as the intermediate structure for format conversion (currently `Rgb24`)
 - Always load as RGB, then encode according to output extension
 
-## What's New (v0.1.3)
+## What's New
 
-- PNG: Significantly smaller output size for many images (for example, a PNG that was around 110 MB can now shrink to about 30 MB, depending on image content), with a slight improvement in encoding speed.
-- JPEG: Noticeably faster decoding pipeline, plus a modest speedup on the encoding side.
-- BMP: Faster writing; on the same machine, writing a ~400 MB BMP now takes about 270 ms instead of roughly 400 ms.
+- See [CHANGELOG](CHANGELOG.md) for recent updates.
 
 ## Project Layout
 
