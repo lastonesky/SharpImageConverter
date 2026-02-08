@@ -59,11 +59,9 @@
 - 引入 `ImageFrame` 作为格式转换的中间数据结构（当前为 `Rgb24`）
 - 统一加载为 RGB，再根据输出扩展名选择编码器写回
 
-## What's New / 更新亮点（v0.1.3）
+## What's New / 更新亮点
 
-- PNG：在多数图片上显著降低压缩后体积（例如原先约 110 MB 的 PNG，现在可缩小到约 30 MB，具体效果取决于图像内容），同时略微提升压缩速度。
-- JPEG：大幅提升解码速度，并在编码路径上带来小幅性能提升。
-- BMP：写出路径经过优化，在同一环境下写出约 400 MB 的 BMP 文件，耗时从约 400 ms 降低到约 270 ms。
+- 详细更新日志请见 [CHANGELOG](CHANGELOG.md)。
 
 ## 目录结构
 
@@ -92,7 +90,7 @@ SharpImageConverter/
 ## 安装（NuGet）
 
 ```bash
-dotnet add package SharpImageConverter --version 0.1.4
+dotnet add package SharpImageConverter --version 0.1.5
 ```
 
 引用命名空间：
