@@ -44,19 +44,13 @@ public static class JpegEncoder
         public byte Length;
     }
 
-    private sealed class JpegBitWriter
+    private sealed class JpegBitWriter(Stream stream)
     {
-        private readonly Stream _stream;
+        private readonly Stream _stream = stream;
         private uint _bitBuffer;
         private int _bitCount;
-        private readonly byte[] _out;
+        private readonly byte[] _out = new byte[64 * 1024];
         private int _outPos;
-
-        public JpegBitWriter(Stream stream)
-        {
-            _stream = stream;
-            _out = new byte[64 * 1024];
-        }
 
         private void WriteByteBuffered(byte b)
         {
@@ -104,8 +98,8 @@ public static class JpegEncoder
         }
     }
 
-    private static readonly byte[] StdLumaQuant = new byte[]
-    {
+    private static readonly byte[] StdLumaQuant =
+    [
         16,11,10,16,24,40,51,61,
         12,12,14,19,26,58,60,55,
         14,13,16,24,40,57,69,56,
@@ -114,10 +108,10 @@ public static class JpegEncoder
         24,35,55,64,81,104,113,92,
         49,64,78,87,103,121,120,101,
         72,92,95,98,112,100,103,99
-    };
+    ];
 
-    private static readonly byte[] StdChromaQuant = new byte[]
-    {
+    private static readonly byte[] StdChromaQuant =
+    [
         17,18,24,47,99,99,99,99,
         18,21,26,66,99,99,99,99,
         24,26,56,99,99,99,99,99,
@@ -126,14 +120,14 @@ public static class JpegEncoder
         99,99,99,99,99,99,99,99,
         99,99,99,99,99,99,99,99,
         99,99,99,99,99,99,99,99
-    };
+    ];
 
-    private static readonly byte[] DcLumaCounts = new byte[] { 0, 1, 5, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0 };
-    private static readonly byte[] DcLumaSymbols = new byte[] { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11 };
+    private static readonly byte[] DcLumaCounts = [0, 1, 5, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0];
+    private static readonly byte[] DcLumaSymbols = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
 
-    private static readonly byte[] AcLumaCounts = new byte[] { 0, 2, 1, 3, 3, 2, 4, 3, 5, 5, 4, 4, 0, 0, 1, 0x7d };
-    private static readonly byte[] AcLumaSymbols = new byte[]
-    {
+    private static readonly byte[] AcLumaCounts = [0, 2, 1, 3, 3, 2, 4, 3, 5, 5, 4, 4, 0, 0, 1, 0x7d];
+    private static readonly byte[] AcLumaSymbols =
+    [
         0x01,0x02,0x03,0x00,0x04,0x11,0x05,0x12,0x21,0x31,0x41,0x06,0x13,0x51,0x61,0x07,
         0x22,0x71,0x14,0x32,0x81,0x91,0xA1,0x08,0x23,0x42,0xB1,0xC1,0x15,0x52,0xD1,0xF0,
         0x24,0x33,0x62,0x72,0x82,0x09,0x0A,0x16,0x17,0x18,0x19,0x1A,0x25,0x26,0x27,0x28,
@@ -145,14 +139,14 @@ public static class JpegEncoder
         0xC6,0xC7,0xC8,0xC9,0xCA,0xD2,0xD3,0xD4,0xD5,0xD6,0xD7,0xD8,0xD9,0xDA,0xE1,0xE2,
         0xE3,0xE4,0xE5,0xE6,0xE7,0xE8,0xE9,0xEA,0xF1,0xF2,0xF3,0xF4,0xF5,0xF6,0xF7,0xF8,
         0xF9,0xFA
-    };
+    ];
 
-    private static readonly byte[] DcChromaCounts = new byte[] { 0, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0 };
-    private static readonly byte[] DcChromaSymbols = new byte[] { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11 };
+    private static readonly byte[] DcChromaCounts = [0, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0];
+    private static readonly byte[] DcChromaSymbols = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
 
-    private static readonly byte[] AcChromaCounts = new byte[] { 0, 2, 1, 2, 4, 4, 3, 4, 7, 5, 4, 4, 0, 1, 2, 0x77 };
-    private static readonly byte[] AcChromaSymbols = new byte[]
-    {
+    private static readonly byte[] AcChromaCounts = [0, 2, 1, 2, 4, 4, 3, 4, 7, 5, 4, 4, 0, 1, 2, 0x77];
+    private static readonly byte[] AcChromaSymbols =
+    [
         0x00,0x01,0x02,0x03,0x11,0x04,0x05,0x21,0x31,0x06,0x12,0x41,0x51,0x07,0x61,0x71,
         0x13,0x22,0x32,0x81,0x08,0x14,0x42,0x91,0xA1,0xB1,0xC1,0x09,0x23,0x33,0x52,0xF0,
         0x15,0x62,0x72,0xD1,0x0A,0x16,0x24,0x34,0xE1,0x25,0xF1,0x17,0x18,0x19,0x1A,0x26,
@@ -164,7 +158,7 @@ public static class JpegEncoder
         0xC4,0xC5,0xC6,0xC7,0xC8,0xC9,0xCA,0xD2,0xD3,0xD4,0xD5,0xD6,0xD7,0xD8,0xD9,0xDA,
         0xE2,0xE3,0xE4,0xE5,0xE6,0xE7,0xE8,0xE9,0xEA,0xF2,0xF3,0xF4,0xF5,0xF6,0xF7,0xF8,
         0xF9,0xFA
-    };
+    ];
 
     /// <summary>
     /// 将 RGB24 编码为 JPEG 文件（默认使用 4:2:0 采样）
@@ -185,7 +179,7 @@ public static class JpegEncoder
     /// </summary>
     public static void Write(Stream stream, int width, int height, byte[] rgb24, int quality = 75)
     {
-        if (rgb24 == null) throw new ArgumentNullException(nameof(rgb24));
+        ArgumentNullException.ThrowIfNull(rgb24);
         if (rgb24.Length != checked(width * height * 3)) throw new ArgumentException("RGB24 像素长度不匹配", nameof(rgb24));
         if (quality < 1) quality = 1;
         if (quality > 100) quality = 100;
@@ -195,26 +189,11 @@ public static class JpegEncoder
     }
 
     /// <summary>
-    /// 将 RGB24 编码为 JPEG 文件，可选择 4:2:0 或 4:4:4 采样
-    /// </summary>
-    /// <param name="path">输出路径</param>
-    /// <param name="width">图像宽度</param>
-    /// <param name="height">图像高度</param>
-    /// <param name="rgb24">RGB24 像素数据</param>
-    /// <param name="quality">JPEG 质量（1-100）</param>
-    /// <param name="subsample420">是否使用 4:2:0 子采样（否则为 4:4:4）</param>
-    public static void Write(string path, int width, int height, byte[] rgb24, int quality, bool subsample420)
-    {
-        using var fs = new FileStream(path, FileMode.Create, FileAccess.Write);
-        Write(fs, width, height, rgb24, quality, subsample420);
-    }
-
-    /// <summary>
     /// 将 RGB24 编码为 JPEG 流，可选择 4:2:0 或 4:4:4 采样
     /// </summary>
     public static void Write(Stream stream, int width, int height, byte[] rgb24, int quality, bool subsample420)
     {
-        if (rgb24 == null) throw new ArgumentNullException(nameof(rgb24));
+        ArgumentNullException.ThrowIfNull(rgb24);
         if (rgb24.Length != checked(width * height * 3)) throw new ArgumentException("RGB24 像素长度不匹配", nameof(rgb24));
         if (quality < 1) quality = 1;
         if (quality > 100) quality = 100;
@@ -224,7 +203,7 @@ public static class JpegEncoder
 
     public static void Write(Stream stream, int width, int height, byte[] rgb24, int quality, bool subsample420, ImageMetadata? metadata, bool keepMetadata)
     {
-        if (rgb24 == null) throw new ArgumentNullException(nameof(rgb24));
+        ArgumentNullException.ThrowIfNull(rgb24);
         if (rgb24.Length != checked(width * height * 3)) throw new ArgumentException("RGB24 像素长度不匹配", nameof(rgb24));
         if (quality < 1) quality = 1;
         if (quality > 100) quality = 100;
@@ -240,7 +219,7 @@ public static class JpegEncoder
 
     public static void WriteGray8(Stream stream, int width, int height, byte[] gray8, int quality = 75)
     {
-        if (gray8 == null) throw new ArgumentNullException(nameof(gray8));
+        ArgumentNullException.ThrowIfNull(gray8);
         if (gray8.Length != checked(width * height)) throw new ArgumentException("Gray8 像素长度不匹配", nameof(gray8));
         if (quality < 1) quality = 1;
         if (quality > 100) quality = 100;
@@ -348,17 +327,17 @@ public static class JpegEncoder
                         height,
                         mx * 16,
                         my * 16,
-                        yBlocks.Slice(0, 64),
-                        yBlocks.Slice(64, 64),
-                        yBlocks.Slice(128, 64),
-                        yBlocks.Slice(192, 64),
+                        yBlocks[..64],
+                        yBlocks[64..128],
+                        yBlocks[128..192],
+                        yBlocks[192..256],
                         cbBlock,
                         crBlock);
 
-                    EncodeBlock(bw, yBlocks.Slice(0, 64), qYRecip, dcY, acY, ref prevYdc);
-                    EncodeBlock(bw, yBlocks.Slice(64, 64), qYRecip, dcY, acY, ref prevYdc);
-                    EncodeBlock(bw, yBlocks.Slice(128, 64), qYRecip, dcY, acY, ref prevYdc);
-                    EncodeBlock(bw, yBlocks.Slice(192, 64), qYRecip, dcY, acY, ref prevYdc);
+                    EncodeBlock(bw, yBlocks[..64], qYRecip, dcY, acY, ref prevYdc);
+                    EncodeBlock(bw, yBlocks[64..128], qYRecip, dcY, acY, ref prevYdc);
+                    EncodeBlock(bw, yBlocks[128..192], qYRecip, dcY, acY, ref prevYdc);
+                    EncodeBlock(bw, yBlocks[192..256], qYRecip, dcY, acY, ref prevYdc);
                     EncodeBlock(bw, cbBlock, qCRecip, dcC, acC, ref prevCbdc);
                     EncodeBlock(bw, crBlock, qCRecip, dcC, acC, ref prevCrdc);
                 }
@@ -915,10 +894,10 @@ public static class JpegEncoder
 
     private static void WriteIccProfile(Stream s, byte[] profile)
     {
-        byte[] sig = new byte[]
-        {
+        byte[] sig =
+        [
             (byte)'I',(byte)'C',(byte)'C',(byte)'_',(byte)'P',(byte)'R',(byte)'O',(byte)'F',(byte)'I',(byte)'L',(byte)'E',0x00
-        };
+        ];
 
         const int overhead = 14;
         int maxPayload = 0xFFFD - overhead;

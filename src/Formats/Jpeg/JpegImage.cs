@@ -40,10 +40,7 @@ public sealed class JpegImage
             throw new ArgumentOutOfRangeException(nameof(width));
         }
 
-        if (bitsPerSample <= 0)
-        {
-            throw new ArgumentOutOfRangeException(nameof(bitsPerSample));
-        }
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(bitsPerSample);
 
         int bytesPerPixel = pixelFormat switch
         {

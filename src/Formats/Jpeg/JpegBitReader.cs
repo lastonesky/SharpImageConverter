@@ -28,19 +28,19 @@ internal ref struct JpegBitReader
 
     public bool HasPendingMarker => pendingMarker >= 0;
 
-    public int PendingMarker
+    public readonly int PendingMarker
     {
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         get => pendingMarker;
     }
 
-    public int BytesConsumed
+    public readonly int BytesConsumed
     {
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         get => offset;
     }
 
-    public int BitCount
+    public readonly int BitCount
     {
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         get => bitCount;
@@ -209,18 +209,12 @@ internal ref struct JpegBitReader
     }
 }
 
-internal sealed class JpegStreamInput : IAsyncDisposable
+internal sealed class JpegStreamInput(Stream stream, int bufferSize = 16 * 1024) : IAsyncDisposable
 {
-    private readonly Stream stream;
-    private readonly byte[] buffer;
+    private readonly Stream stream = stream;
+    private readonly byte[] buffer = ArrayPool<byte>.Shared.Rent(bufferSize);
     private int bufferPos;
     private int bufferLen;
-
-    public JpegStreamInput(Stream stream, int bufferSize = 16 * 1024)
-    {
-        this.stream = stream;
-        buffer = ArrayPool<byte>.Shared.Rent(bufferSize);
-    }
 
     public async ValueTask<int> ReadAsync(Memory<byte> dest, CancellationToken cancellationToken)
     {
@@ -237,7 +231,7 @@ internal sealed class JpegStreamInput : IAsyncDisposable
                 continue;
             }
 
-            bufferLen = await stream.ReadAsync(buffer, 0, buffer.Length, cancellationToken).ConfigureAwait(false);
+            bufferLen = await stream.ReadAsync(buffer, cancellationToken).ConfigureAwait(false);
             bufferPos = 0;
             if (bufferLen == 0)
             {
@@ -261,7 +255,7 @@ internal sealed class JpegStreamInput : IAsyncDisposable
     {
         if (bufferPos >= bufferLen)
         {
-            bufferLen = await stream.ReadAsync(buffer, 0, buffer.Length, cancellationToken).ConfigureAwait(false);
+            bufferLen = await stream.ReadAsync(buffer, cancellationToken).ConfigureAwait(false);
             bufferPos = 0;
             if (bufferLen == 0)
             {
@@ -274,7 +268,13 @@ internal sealed class JpegStreamInput : IAsyncDisposable
 
     public byte ReadByteBlocking(CancellationToken cancellationToken)
     {
-        return ReadByteAsync(cancellationToken).GetAwaiter().GetResult();
+        ValueTask<byte> vt = ReadByteAsync(cancellationToken);
+        if (vt.IsCompletedSuccessfully)
+        {
+            return vt.Result;
+        }
+
+        return vt.AsTask().GetAwaiter().GetResult();
     }
 
     public ValueTask DisposeAsync()
@@ -284,42 +284,31 @@ internal sealed class JpegStreamInput : IAsyncDisposable
     }
 }
 
-internal struct JpegStreamBitReader
+internal struct JpegStreamBitReader(JpegStreamInput input, CancellationToken cancellationToken)
 {
-    private readonly JpegStreamInput input;
-    private readonly CancellationToken cancellationToken;
-    private uint bitBuffer;
-    private int bitCount;
-    private int pendingMarker;
-    private int padByteCount;
-    private int bytesConsumed;
+    private readonly JpegStreamInput input = input;
+    private readonly CancellationToken cancellationToken = cancellationToken;
+    private uint bitBuffer = 0;
+    private int bitCount = 0;
+    private int pendingMarker = -1;
+    private int padByteCount = 0;
+    private int bytesConsumed = 0;
 
-    public JpegStreamBitReader(JpegStreamInput input, CancellationToken cancellationToken)
-    {
-        this.input = input;
-        this.cancellationToken = cancellationToken;
-        bitBuffer = 0;
-        bitCount = 0;
-        pendingMarker = -1;
-        padByteCount = 0;
-        bytesConsumed = 0;
-    }
+    public readonly bool HasPendingMarker => pendingMarker >= 0;
 
-    public bool HasPendingMarker => pendingMarker >= 0;
-
-    public int PendingMarker
+    public readonly int PendingMarker
     {
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         get => pendingMarker;
     }
 
-    public int BytesConsumed
+    public readonly int BytesConsumed
     {
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         get => bytesConsumed;
     }
 
-    public int BitCount
+    public readonly int BitCount
     {
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         get => bitCount;
@@ -343,7 +332,6 @@ internal struct JpegStreamBitReader
         bitCount -= bitCount & 7;
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private bool TryReadByte(out byte value)
     {
         try
