@@ -50,10 +50,8 @@ public class PngDecoder
     /// <returns>按 RGB 顺序排列的字节数组（长度为 Width*Height*3）</returns>
     public byte[] DecodeToRGB(string path)
     {
-        using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read))
-        {
-            return DecodeToRGB(fs);
-        }
+        using var fs = new FileStream(path, FileMode.Open, FileAccess.Read);
+        return DecodeToRGB(fs);
     }
 
     /// <summary>
@@ -138,10 +136,8 @@ public class PngDecoder
     /// <returns>按 RGBA 顺序排列的字节数组（长度为 Width*Height*4）</returns>
     public byte[] DecodeToRGBA(string path)
     {
-        using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read))
-        {
-            return DecodeToRGBA(fs);
-        }
+        using var fs = new FileStream(path, FileMode.Open, FileAccess.Read);
+        return DecodeToRGBA(fs);
     }
 
     /// <summary>
@@ -204,7 +200,7 @@ public class PngDecoder
         return ProcessImageRgba(decompressed);
     }
 
-    private bool IsPngSignature(byte[] sig)
+    private static bool IsPngSignature(byte[] sig)
     {
         return sig[0] == 0x89 && sig[1] == 0x50 && sig[2] == 0x4E && sig[3] == 0x47 &&
                sig[4] == 0x0D && sig[5] == 0x0A && sig[6] == 0x1A && sig[7] == 0x0A;
@@ -307,10 +303,10 @@ public class PngDecoder
 
     private byte[] ProcessInterlacedRgba(byte[] rawData, int bpp)
     {
-        int[] startX = { 0, 4, 0, 2, 0, 1, 0 };
-        int[] startY = { 0, 0, 4, 0, 2, 0, 1 };
-        int[] stepX  = { 8, 8, 4, 4, 2, 2, 1 };
-        int[] stepY  = { 8, 8, 8, 4, 4, 2, 2 };
+        int[] startX = [0, 4, 0, 2, 0, 1, 0];
+        int[] startY = [0, 0, 4, 0, 2, 0, 1];
+        int[] stepX  = [8, 8, 4, 4, 2, 2, 1];
+        int[] stepY  = [8, 8, 8, 4, 4, 2, 2];
         byte[] finalImage = new byte[Width * Height * 4];
         int dataOffset = 0;
         for (int pass = 0; pass < 7; pass++)
@@ -379,9 +375,7 @@ public class PngDecoder
             {
                 Array.Copy(curRow, 0, recon, reconIdx, stride);
                 reconIdx += stride;
-                var tmp0 = prevRow;
-                prevRow = curRow;
-                curRow = tmp0;
+                (curRow, prevRow) = (prevRow, curRow);
                 continue;
             }
 
@@ -416,9 +410,7 @@ public class PngDecoder
 
             Array.Copy(curRow, 0, recon, reconIdx, stride);
             reconIdx += stride;
-            var tmp = prevRow;
-            prevRow = curRow;
-            curRow = tmp;
+            (curRow, prevRow) = (prevRow, curRow);
         }
 
         return recon;
@@ -451,7 +443,7 @@ public class PngDecoder
         }
     }
 
-    private byte PaethPredictor(byte a, byte b, byte c)
+    private static byte PaethPredictor(byte a, byte b, byte c)
     {
         int p = a + b - c;
         int pa = Math.Abs(p - a);
@@ -551,7 +543,7 @@ public class PngDecoder
                         break;
                     case 4: // Grayscale + Alpha
                         {
-                            int val = 0; 
+                            int val;
                             if (BitDepth == 8)
                             {
                                 val = row[bitOffset / 8];
@@ -720,7 +712,7 @@ public class PngDecoder
         return rgba;
     }
 
-    private int ReadBits(byte[] data, int rowStart, ref int bitOffset, int bits)
+    private static int ReadBits(byte[] data, int rowStart, ref int bitOffset, int bits)
     {
         int byteIdx = rowStart + bitOffset / 8;
         int bitShift = 8 - (bitOffset % 8) - bits;
@@ -729,7 +721,7 @@ public class PngDecoder
         return val;
     }
 
-    private int ScaleTo8Bit(int val, int depth)
+    private static int ScaleTo8Bit(int val, int depth)
     {
         if (depth == 1) return val * 255;
         if (depth == 2) return val * 85;
@@ -741,15 +733,15 @@ public class PngDecoder
 
     private int GetBitsPerPixel()
     {
-        switch (ColorType)
+        return ColorType switch
         {
-            case 0: return BitDepth;
-            case 2: return 3 * BitDepth;
-            case 3: return BitDepth;
-            case 4: return 2 * BitDepth;
-            case 6: return 4 * BitDepth;
-            default: throw new NotSupportedException("Invalid color type");
-        }
+            0 => BitDepth,
+            2 => 3 * BitDepth,
+            3 => BitDepth,
+            4 => 2 * BitDepth,
+            6 => 4 * BitDepth,
+            _ => throw new NotSupportedException("Invalid color type"),
+        };
     }
 
     // Helper for filtering
@@ -758,7 +750,7 @@ public class PngDecoder
         return (GetBitsPerPixel() + 7) / 8;
     }
 
-    private uint ReadBigEndianUint32(byte[] buffer, int offset)
+    private static uint ReadBigEndianUint32(byte[] buffer, int offset)
     {
         return (uint)((buffer[offset] << 24) | (buffer[offset + 1] << 16) | (buffer[offset + 2] << 8) | buffer[offset + 3]);
     }
