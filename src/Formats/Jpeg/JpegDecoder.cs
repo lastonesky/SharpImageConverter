@@ -180,7 +180,7 @@ public static class StaticJpegDecoder
             }
         }
 
-        private JpegImage ReconstructImage()
+        private readonly JpegImage ReconstructImage()
         {
             int width = frame.Width;
             int height = frame.Height;
@@ -227,19 +227,6 @@ public static class StaticJpegDecoder
 
             var colorInfo = new JpegColorInfo(colorSpace, hasAdobe, adobeTransform, null);
             return new JpegImage(width, height, pixelFormat, bitsPerSample, colorInfo, output);
-        }
-
-        private readonly int FindComponentIndex(byte id)
-        {
-            for (int i = 0; i < components.Length; i++)
-            {
-                if (components[i].Id == id)
-                {
-                    return i;
-                }
-            }
-
-            return -1;
         }
 
         private void ParseSosAndDecodeScan()
@@ -294,7 +281,7 @@ public static class StaticJpegDecoder
             }
 
             int entropyStart = segmentStart + segmentLength;
-            ReadOnlySpan<byte> entropyData = data.Slice(entropyStart);
+            ReadOnlySpan<byte> entropyData = data[entropyStart..];
             var scan = new ScanHeader(scanComponents, ss, se, ah, al);
 
             var reader = new JpegBitReader(entropyData);
@@ -488,7 +475,7 @@ public static class StaticJpegDecoder
             }
         }
 
-        private void DecodeProgressiveBlock(ref JpegBitReader reader, ComponentState comp, Span<short> block, int ss, int se, int ah, int al, ref int eobRun)
+        private readonly void DecodeProgressiveBlock(ref JpegBitReader reader, ComponentState comp, Span<short> block, int ss, int se, int ah, int al, ref int eobRun)
         {
             ReadOnlySpan<byte> zigzag = JpegConstants.ZigZag;
 
@@ -659,7 +646,7 @@ public static class StaticJpegDecoder
             }
         }
 
-        private ComponentState FindComponent(byte id)
+        private readonly ComponentState FindComponent(byte id)
         {
             for (int i = 0; i < components.Length; i++)
             {
@@ -977,11 +964,11 @@ public static class StaticJpegDecoder
     {
         return colorSpace switch
         {
-            JpegColorSpace.Gray => BuildComponentOrder(components, new byte[] { 1 }),
-            JpegColorSpace.Rgb => BuildComponentOrder(components, new byte[] { 1, 2, 3 }),
-            JpegColorSpace.YCbCr => BuildComponentOrder(components, new byte[] { 1, 2, 3 }),
-            JpegColorSpace.Cmyk => BuildComponentOrder(components, new byte[] { 1, 2, 3, 4 }),
-            JpegColorSpace.Ycck => BuildComponentOrder(components, new byte[] { 1, 2, 3, 4 }),
+            JpegColorSpace.Gray => BuildComponentOrder(components, [1]),
+            JpegColorSpace.Rgb => BuildComponentOrder(components, [1, 2, 3]),
+            JpegColorSpace.YCbCr => BuildComponentOrder(components, [1, 2, 3]),
+            JpegColorSpace.Cmyk => BuildComponentOrder(components, [1, 2, 3, 4]),
+            JpegColorSpace.Ycck => BuildComponentOrder(components, [1, 2, 3, 4]),
             JpegColorSpace.Unknown4 => BuildSequentialOrder(components.Length),
             _ => BuildSequentialOrder(components.Length)
         };
@@ -1074,7 +1061,7 @@ public static class StaticJpegDecoder
         private bool hasFrame;
         private bool isProgressive;
         private ushort restartInterval;
-        private ComponentState[] components = Array.Empty<ComponentState>();
+        private ComponentState[] components = [];
         private int queuedMarker = -1;
         private byte[]? exifRaw;
         private int exifOrientation = 1;
@@ -1297,19 +1284,6 @@ public static class StaticJpegDecoder
 
             var colorInfo = new JpegColorInfo(colorSpace, hasAdobe, adobeTransform, null);
             return new JpegImage(width, height, pixelFormat, bitsPerSample, colorInfo, output);
-        }
-
-        private int FindComponentIndex(byte id)
-        {
-            for (int i = 0; i < components.Length; i++)
-            {
-                if (components[i].Id == id)
-                {
-                    return i;
-                }
-            }
-
-            return -1;
         }
 
         private async Task ParseSosAndDecodeScanAsync(CancellationToken cancellationToken)
@@ -1849,7 +1823,7 @@ public static class StaticJpegDecoder
                         if (p + 128 > segment.Length) ThrowHelper.ThrowInvalidData("Invalid DQT length.");
                         for (int i = 0; i < 64; i++)
                         {
-                            quantTables[tq].Table[zigzag[i]] = ReadU16(span.Slice(p + (i * 2)));
+                            quantTables[tq].Table[zigzag[i]] = ReadU16(span[(p + (i * 2))..]);
                         }
 
                         p += 128;
@@ -2046,16 +2020,10 @@ public static class StaticJpegDecoder
                 : (uint)((tiff[offset] << 24) | (tiff[offset + 1] << 16) | (tiff[offset + 2] << 8) | tiff[offset + 3]);
         }
 
-        private readonly struct SegmentBuffer : IDisposable
+        private readonly struct SegmentBuffer(byte[] buffer, int length) : IDisposable
         {
-            private readonly byte[] buffer;
-            public readonly int Length;
-
-            public SegmentBuffer(byte[] buffer, int length)
-            {
-                this.buffer = buffer;
-                Length = length;
-            }
+            private readonly byte[] buffer = buffer;
+            public readonly int Length = length;
 
             public ReadOnlySpan<byte> Span => buffer.AsSpan(0, Length);
 
@@ -2077,49 +2045,15 @@ public static class StaticJpegDecoder
 
     private readonly record struct ScanComponent(byte ComponentId, byte DcTableId, byte AcTableId);
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static void YCbCrToRgb(int y, int cb, int cr, Span<byte> dest)
-    {
-        int cbShift = cb - 128;
-        int crShift = cr - 128;
-
-        int r = y + ((91881 * crShift) >> 16);
-        int g = y - ((22554 * cbShift + 46802 * crShift) >> 16);
-        int b = y + ((116130 * cbShift) >> 16);
-
-        dest[0] = ClampToByte(r);
-        dest[1] = ClampToByte(g);
-        dest[2] = ClampToByte(b);
-    }
-
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static byte ClampToByte(int v)
-    {
-        if ((uint)v <= 255u)
-        {
-            return (byte)v;
-        }
-
-        return v < 0 ? (byte)0 : (byte)255;
-    }
-
-    private sealed class ComponentState
+    private sealed class ComponentState(byte id, byte h, byte v, byte quantTableId)
     {
         private short[]? coefficientBuffer;
         private int coefficientLength;
 
-        public ComponentState(byte id, byte h, byte v, byte quantTableId)
-        {
-            Id = id;
-            H = h;
-            V = v;
-            QuantTableId = quantTableId;
-        }
-
-        public byte Id { get; }
-        public byte H { get; }
-        public byte V { get; }
-        public byte QuantTableId { get; }
+        public byte Id { get; } = id;
+        public byte H { get; } = h;
+        public byte V { get; } = v;
+        public byte QuantTableId { get; } = quantTableId;
 
         public byte DcTableId { get; private set; }
         public byte AcTableId { get; private set; }
@@ -2195,7 +2129,7 @@ public static class StaticJpegDecoder
                     int px = bx * 8;
                     if (px >= planeWidth) break;
 
-                    Span<byte> dest = plane.Slice((py * stride) + px);
+                    Span<byte> dest = plane[((py * stride) + px)..];
                     ReadOnlySpan<short> block = coefficientBuffer.AsSpan(((by * blocksX) + bx) * 64, 64);
                     //FloatingPointIDCT.Transform(block, quant, dest, stride);
                     FastIDCT.Transform(block, quant, dest, stride);
@@ -2290,8 +2224,8 @@ public sealed class JpegDecoder
     }
     private static (byte[] pixels, int width, int height) ApplyExifOrientation(byte[] src, int width, int height, int orientation)
     {
-        int newW = width;
-        int newH = height;
+        int newW;
+        int newH;
         switch (orientation)
         {
             case 1:
