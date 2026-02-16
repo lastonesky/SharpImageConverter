@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Buffers;
 using System.IO;
 using System.Text;
 using System.Numerics;
@@ -42,6 +43,15 @@ public class PngDecoder
 
     private byte[]? _palette;
     private byte[]? _transparency;
+    private const uint TypeIHDR = 0x49484452;
+    private const uint TypePLTE = 0x504C5445;
+    private const uint TypeIDAT = 0x49444154;
+    private const uint TypeTRNS = 0x74524E53;
+    private const uint TypeIEND = 0x49454E44;
+    private static readonly int[] Adam7StartX = [0, 4, 0, 2, 0, 1, 0];
+    private static readonly int[] Adam7StartY = [0, 0, 4, 0, 2, 0, 1];
+    private static readonly int[] Adam7StepX = [8, 8, 4, 4, 2, 2, 1];
+    private static readonly int[] Adam7StepY = [8, 8, 8, 4, 4, 2, 2];
 
     /// <summary>
     /// 解码 PNG 文件为 RGB24 像素数据
@@ -74,53 +84,73 @@ public class PngDecoder
 
         using var idatStream = new PooledMemoryStream(4096);
         bool endChunkFound = false;
+        byte[] lenBytes = new byte[4];
+        byte[] typeBytes = new byte[4];
+        byte[] crcBytes = new byte[4];
         while (!endChunkFound && stream.Position < stream.Length)
         {
-            byte[] lenBytes = new byte[4];
             if (stream.Read(lenBytes, 0, 4) != 4) break;
             uint length = ReadBigEndianUint32(lenBytes, 0);
 
-            byte[] typeBytes = new byte[4];
             if (stream.Read(typeBytes, 0, 4) != 4) break;
-            string type = Encoding.ASCII.GetString(typeBytes);
+            uint type = ReadBigEndianUint32(typeBytes, 0);
 
-            byte[] data = new byte[length];
-            if (length > 0)
+            byte[] data;
+            byte[]? rented = null;
+            int dataLength = (int)length;
+            if (dataLength > 0)
             {
-                if (stream.Read(data, 0, (int)length) != length) throw new InvalidDataException("Unexpected EOF in chunk data");
+                if (type == TypeIHDR || type == TypePLTE || type == TypeTRNS)
+                {
+                    data = new byte[dataLength];
+                }
+                else
+                {
+                    rented = ArrayPool<byte>.Shared.Rent(dataLength);
+                    data = rented;
+                }
+                if (stream.Read(data, 0, dataLength) != dataLength) throw new InvalidDataException("Unexpected EOF in chunk data");
+            }
+            else
+            {
+                data = Array.Empty<byte>();
             }
 
-            byte[] crcBytes = new byte[4];
             if (stream.Read(crcBytes, 0, 4) != 4) break;
             uint fileCrc = ReadBigEndianUint32(crcBytes, 0);
 
             uint calcCrc = Crc32.Compute(typeBytes);
-            calcCrc = Crc32.Update(calcCrc, data, 0, (int)length);
+            if (dataLength > 0) calcCrc = Crc32.Update(calcCrc, data, 0, dataLength);
             if (calcCrc != fileCrc)
             {
-                Console.WriteLine($"Warning: CRC mismatch in chunk {type}. Expected {fileCrc:X8}, got {calcCrc:X8}");
+                string typeName = Encoding.ASCII.GetString(typeBytes);
+                Console.WriteLine($"Warning: CRC mismatch in chunk {typeName}. Expected {fileCrc:X8}, got {calcCrc:X8}");
             }
 
             switch (type)
             {
-                case "IHDR":
+                case TypeIHDR:
                     ParseIHDR(data);
                     break;
-                case "PLTE":
+                case TypePLTE:
                     _palette = data;
                     break;
-                case "IDAT":
-                    idatStream.Write(data, 0, data.Length);
+                case TypeIDAT:
+                    idatStream.Write(data, 0, dataLength);
                     break;
-                case "tRNS":
+                case TypeTRNS:
                     _transparency = data;
                     break;
-                case "IEND":
+                case TypeIEND:
                     endChunkFound = true;
                     break;
                 default:
-                    // Skip ancillary chunks
                     break;
+            }
+
+            if (rented != null)
+            {
+                ArrayPool<byte>.Shared.Return(rented);
             }
         }
 
@@ -159,40 +189,59 @@ public class PngDecoder
         if (!IsPngSignature(sig)) throw new InvalidDataException("Not a PNG file");
         using var idatStream = new PooledMemoryStream(4096);
         bool endChunkFound = false;
+        byte[] lenBytes = new byte[4];
+        byte[] typeBytes = new byte[4];
+        byte[] crcBytes = new byte[4];
         while (!endChunkFound && stream.Position < stream.Length)
         {
-            byte[] lenBytes = new byte[4];
             if (stream.Read(lenBytes, 0, 4) != 4) break;
             uint length = ReadBigEndianUint32(lenBytes, 0);
-            byte[] typeBytes = new byte[4];
             if (stream.Read(typeBytes, 0, 4) != 4) break;
-            string type = Encoding.ASCII.GetString(typeBytes);
-            byte[] data = new byte[length];
-            if (length > 0)
+            uint type = ReadBigEndianUint32(typeBytes, 0);
+            byte[] data;
+            byte[]? rented = null;
+            int dataLength = (int)length;
+            if (dataLength > 0)
             {
-                if (stream.Read(data, 0, (int)length) != length) throw new InvalidDataException("Unexpected EOF in chunk data");
+                if (type == TypeIHDR || type == TypePLTE || type == TypeTRNS)
+                {
+                    data = new byte[dataLength];
+                }
+                else
+                {
+                    rented = ArrayPool<byte>.Shared.Rent(dataLength);
+                    data = rented;
+                }
+                if (stream.Read(data, 0, dataLength) != dataLength) throw new InvalidDataException("Unexpected EOF in chunk data");
             }
-            byte[] crcBytes = new byte[4];
+            else
+            {
+                data = Array.Empty<byte>();
+            }
             if (stream.Read(crcBytes, 0, 4) != 4) break;
             switch (type)
             {
-                case "IHDR":
+                case TypeIHDR:
                     ParseIHDR(data);
                     break;
-                case "PLTE":
+                case TypePLTE:
                     _palette = data;
                     break;
-                case "IDAT":
-                    idatStream.Write(data, 0, data.Length);
+                case TypeIDAT:
+                    idatStream.Write(data, 0, dataLength);
                     break;
-                case "tRNS":
+                case TypeTRNS:
                     _transparency = data;
                     break;
-                case "IEND":
+                case TypeIEND:
                     endChunkFound = true;
                     break;
                 default:
                     break;
+            }
+            if (rented != null)
+            {
+                ArrayPool<byte>.Shared.Return(rented);
             }
         }
         ArraySegment<byte> idatSegment = idatStream.GetBuffer();
@@ -260,10 +309,10 @@ public class PngDecoder
         // Pass 6: start (1,0), step (2,2)
         // Pass 7: start (0,1), step (1,2)
         
-        int[] startX = { 0, 4, 0, 2, 0, 1, 0 };
-        int[] startY = { 0, 0, 4, 0, 2, 0, 1 };
-        int[] stepX  = { 8, 8, 4, 4, 2, 2, 1 };
-        int[] stepY  = { 8, 8, 8, 4, 4, 2, 2 };
+        int[] startX = Adam7StartX;
+        int[] startY = Adam7StartY;
+        int[] stepX = Adam7StepX;
+        int[] stepY = Adam7StepY;
 
         // Final image buffer (RGBA or RGB)
         // We will decode everything to RGB first for simplicity, 
@@ -303,10 +352,10 @@ public class PngDecoder
 
     private byte[] ProcessInterlacedRgba(byte[] rawData, int bpp)
     {
-        int[] startX = [0, 4, 0, 2, 0, 1, 0];
-        int[] startY = [0, 0, 4, 0, 2, 0, 1];
-        int[] stepX  = [8, 8, 4, 4, 2, 2, 1];
-        int[] stepY  = [8, 8, 8, 4, 4, 2, 2];
+        int[] startX = Adam7StartX;
+        int[] startY = Adam7StartY;
+        int[] stepX = Adam7StepX;
+        int[] stepY = Adam7StepY;
         byte[] finalImage = new byte[Width * Height * 4];
         int dataOffset = 0;
         for (int pass = 0; pass < 7; pass++)
@@ -362,55 +411,63 @@ public class PngDecoder
         int reconIdx = 0;
         int rawIdx = 0;
 
-        byte[] prevRow = new byte[stride];
-        byte[] curRow = new byte[stride];
-
-        for (int y = 0; y < h; y++)
+        byte[] prevRow = ArrayPool<byte>.Shared.Rent(stride);
+        byte[] curRow = ArrayPool<byte>.Shared.Rent(stride);
+        try
         {
-            byte filterType = rawData[rawIdx++];
-            Array.Copy(rawData, rawIdx, curRow, 0, stride);
-            rawIdx += stride;
-
-            if (filterType == 0)
+            Array.Clear(prevRow, 0, stride);
+            for (int y = 0; y < h; y++)
             {
+                byte filterType = rawData[rawIdx++];
+                Array.Copy(rawData, rawIdx, curRow, 0, stride);
+                rawIdx += stride;
+
+                if (filterType == 0)
+                {
+                    Array.Copy(curRow, 0, recon, reconIdx, stride);
+                    reconIdx += stride;
+                    (curRow, prevRow) = (prevRow, curRow);
+                    continue;
+                }
+
+                if (filterType == 2)
+                {
+                    ApplyUpFilterDecodeSimd(curRow, prevRow, stride);
+                }
+                else
+                {
+                    for (int i = 0; i < stride; i++)
+                    {
+                        byte x = curRow[i];
+                        byte a = (i >= bpp) ? curRow[i - bpp] : (byte)0;
+                        byte b = prevRow[i];
+                        byte c = (i >= bpp) ? prevRow[i - bpp] : (byte)0;
+
+                        switch (filterType)
+                        {
+                            case 1:
+                                x += a;
+                                break;
+                            case 3:
+                                x += (byte)((a + b) / 2);
+                                break;
+                            case 4:
+                                x += PaethPredictor(a, b, c);
+                                break;
+                        }
+                        curRow[i] = x;
+                    }
+                }
+
                 Array.Copy(curRow, 0, recon, reconIdx, stride);
                 reconIdx += stride;
                 (curRow, prevRow) = (prevRow, curRow);
-                continue;
             }
-
-            if (filterType == 2)
-            {
-                ApplyUpFilterDecodeSimd(curRow, prevRow, stride);
-            }
-            else
-            {
-                for (int i = 0; i < stride; i++)
-                {
-                    byte x = curRow[i];
-                    byte a = (i >= bpp) ? curRow[i - bpp] : (byte)0;
-                    byte b = prevRow[i];
-                    byte c = (i >= bpp) ? prevRow[i - bpp] : (byte)0;
-
-                    switch (filterType)
-                    {
-                        case 1:
-                            x += a;
-                            break;
-                        case 3:
-                            x += (byte)((a + b) / 2);
-                            break;
-                        case 4:
-                            x += PaethPredictor(a, b, c);
-                            break;
-                    }
-                    curRow[i] = x;
-                }
-            }
-
-            Array.Copy(curRow, 0, recon, reconIdx, stride);
-            reconIdx += stride;
-            (curRow, prevRow) = (prevRow, curRow);
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(prevRow);
+            ArrayPool<byte>.Shared.Return(curRow);
         }
 
         return recon;
