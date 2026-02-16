@@ -211,7 +211,6 @@ public static class StaticJpegDecoder
                 planeStrides[i] = w;
 
                 byte[] plane = ArrayPool<byte>.Shared.Rent(w * h);
-                Array.Clear(plane, 0, w * h);
                 planes[i] = plane;
 
                 c.DecodeSpatial(plane.AsSpan(0, w * h), w, h, w, quantTables[c.QuantTableId].Table);
@@ -307,16 +306,18 @@ public static class StaticJpegDecoder
         {
             bool interleaved = scan.Components.Length > 1;
 
+            var scanComponents = new ComponentState[scan.Components.Length];
             for (int i = 0; i < scan.Components.Length; i++)
             {
                 ScanComponent sc = scan.Components[i];
                 ComponentState comp = FindComponent(sc.ComponentId);
                 if (!comp.HasCoefficients)
                 {
-                    comp.EnsureCoefficientBuffer();
+                    comp.EnsureCoefficientBuffer(isProgressive);
                 }
 
                 comp.AssignTables(sc.DcTableId, sc.AcTableId);
+                scanComponents[i] = comp;
             }
 
             int expectedRst = (int)JpegMarker.RST0;
@@ -329,10 +330,9 @@ public static class StaticJpegDecoder
                 {
                     for (int mx = 0; mx < frame.McuX; mx++)
                     {
-                        for (int ci = 0; ci < scan.Components.Length; ci++)
+                        for (int ci = 0; ci < scanComponents.Length; ci++)
                         {
-                            ScanComponent sc = scan.Components[ci];
-                            ComponentState comp = FindComponent(sc.ComponentId);
+                            ComponentState comp = scanComponents[ci];
                             for (int v = 0; v < comp.V; v++)
                             {
                                 for (int h = 0; h < comp.H; h++)
@@ -361,7 +361,7 @@ public static class StaticJpegDecoder
             }
             else
             {
-                ComponentState comp = FindComponent(scan.Components[0].ComponentId);
+                ComponentState comp = scanComponents[0];
                 int compWidth = (frame.Width * comp.H + frame.MaxH - 1) / frame.MaxH;
                 int compHeight = (frame.Height * comp.V + frame.MaxV - 1) / frame.MaxV;
                 int blocksX = (compWidth + 7) / 8;
@@ -1029,24 +1029,44 @@ public static class StaticJpegDecoder
     {
         int channels = componentOrder.Length;
         int outStride = width * channels;
-
-        for (int y = 0; y < height; y++)
+        int mapLength = width * channels;
+        int[] xMap = ArrayPool<int>.Shared.Rent(mapLength);
+        try
         {
-            int rowOut = y * outStride;
-            for (int x = 0; x < width; x++)
+            for (int c = 0; c < channels; c++)
             {
-                int outIndex = rowOut + x * channels;
+                int planeIndex = componentOrder[c];
+                int planeW = planeWidths[planeIndex];
+                int baseIndex = c * width;
+                for (int x = 0; x < width; x++)
+                {
+                    xMap[baseIndex + x] = (x * planeW) / fullWidth;
+                }
+            }
+
+            for (int y = 0; y < height; y++)
+            {
+                int rowOut = y * outStride;
                 for (int c = 0; c < channels; c++)
                 {
                     int planeIndex = componentOrder[c];
-                    int planeW = planeWidths[planeIndex];
                     int planeH = planeHeights[planeIndex];
-                    int px = (x * planeW) / fullWidth;
                     int py = (y * planeH) / fullHeight;
-                    int srcIndex = (py * planeStrides[planeIndex]) + px;
-                    output[outIndex + c] = planes[planeIndex][srcIndex];
+                    int srcRow = py * planeStrides[planeIndex];
+                    byte[] plane = planes[planeIndex];
+                    int mapBase = c * width;
+                    int outIndex = rowOut + c;
+                    for (int x = 0; x < width; x++)
+                    {
+                        output[outIndex] = plane[srcRow + xMap[mapBase + x]];
+                        outIndex += channels;
+                    }
                 }
             }
+        }
+        finally
+        {
+            ArrayPool<int>.Shared.Return(xMap);
         }
     }
 
@@ -1268,7 +1288,6 @@ public static class StaticJpegDecoder
                 planeStrides[i] = w;
 
                 byte[] plane = ArrayPool<byte>.Shared.Rent(w * h);
-                Array.Clear(plane, 0, w * h);
                 planes[i] = plane;
 
                 c.DecodeSpatial(plane.AsSpan(0, w * h), w, h, w, quantTables[c.QuantTableId].Table);
@@ -1362,16 +1381,18 @@ public static class StaticJpegDecoder
         {
             bool interleaved = scan.Components.Length > 1;
 
+            var scanComponents = new ComponentState[scan.Components.Length];
             for (int i = 0; i < scan.Components.Length; i++)
             {
                 ScanComponent sc = scan.Components[i];
                 ComponentState comp = FindComponent(sc.ComponentId);
                 if (!comp.HasCoefficients)
                 {
-                    comp.EnsureCoefficientBuffer();
+                    comp.EnsureCoefficientBuffer(isProgressive);
                 }
 
                 comp.AssignTables(sc.DcTableId, sc.AcTableId);
+                scanComponents[i] = comp;
             }
 
             int expectedRst = (int)JpegMarker.RST0;
@@ -1384,10 +1405,9 @@ public static class StaticJpegDecoder
                 {
                     for (int mx = 0; mx < frame.McuX; mx++)
                     {
-                        for (int ci = 0; ci < scan.Components.Length; ci++)
+                        for (int ci = 0; ci < scanComponents.Length; ci++)
                         {
-                            ScanComponent sc = scan.Components[ci];
-                            ComponentState comp = FindComponent(sc.ComponentId);
+                            ComponentState comp = scanComponents[ci];
                             for (int v = 0; v < comp.V; v++)
                             {
                                 for (int h = 0; h < comp.H; h++)
@@ -1416,7 +1436,7 @@ public static class StaticJpegDecoder
             }
             else
             {
-                ComponentState comp = FindComponent(scan.Components[0].ComponentId);
+                ComponentState comp = scanComponents[0];
                 int compWidth = (frame.Width * comp.H + frame.MaxH - 1) / frame.MaxH;
                 int compHeight = (frame.Height * comp.V + frame.MaxV - 1) / frame.MaxV;
                 int blocksX = (compWidth + 7) / 8;
@@ -2081,12 +2101,15 @@ public static class StaticJpegDecoder
             DcPredictor = 0;
         }
 
-        public void EnsureCoefficientBuffer()
+        public void EnsureCoefficientBuffer(bool clear)
         {
             int blocks = BlocksX * BlocksY;
             coefficientLength = blocks * 64;
             coefficientBuffer = ArrayPool<short>.Shared.Rent(coefficientLength);
-            Array.Clear(coefficientBuffer, 0, coefficientLength);
+            if (clear)
+            {
+                Array.Clear(coefficientBuffer, 0, coefficientLength);
+            }
         }
 
         public Span<short> GetBlockSpan(int blockIndex)
