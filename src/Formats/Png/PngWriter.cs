@@ -1,7 +1,6 @@
 using System;
 using System.Buffers;
 using System.IO;
-using System.Text;
 using System.Numerics;
 
 namespace SharpImageConverter.Formats.Png;
@@ -11,6 +10,10 @@ namespace SharpImageConverter.Formats.Png;
 /// </summary>
 public static class PngWriter
 {
+    private static readonly byte[] PngSignature = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+    private static readonly byte[] TypeIHDR = [(byte)'I', (byte)'H', (byte)'D', (byte)'R'];
+    private static readonly byte[] TypeIDAT = [(byte)'I', (byte)'D', (byte)'A', (byte)'T'];
+    private static readonly byte[] TypeIEND = [(byte)'I', (byte)'E', (byte)'N', (byte)'D'];
     public static void WriteGray(string path, int width, int height, byte[] gray)
     {
         using (var fs = new FileStream(path, FileMode.Create, FileAccess.Write))
@@ -21,8 +24,8 @@ public static class PngWriter
 
     public static void WriteGray(Stream stream, int width, int height, byte[] gray)
     {
-        stream.Write(new byte[] { 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A }, 0, 8);
-        WriteChunk(stream, "IHDR", CreateIHDRGray(width, height));
+        stream.Write(PngSignature, 0, PngSignature.Length);
+        WriteChunk(stream, TypeIHDR, CreateIHDRGray(width, height));
         int stride = width;
         int rawSize = (stride + 1) * height;
         using (var ms = new PooledMemoryStream(rawSize))
@@ -32,9 +35,9 @@ public static class PngWriter
                 WriteUpFilteredScanlines(s, gray, width, height, 1);
             }, ms);
             ArraySegment<byte> segment = ms.GetBuffer();
-            WriteChunk(stream, "IDAT", segment.Array, segment.Offset, segment.Count);
+            WriteChunk(stream, TypeIDAT, segment.Array, segment.Offset, segment.Count);
         }
-        WriteChunk(stream, "IEND", []);
+        WriteChunk(stream, TypeIEND, []);
     }
     /// <summary>
     /// 写入 RGB24 PNG 文件（颜色类型 2）
@@ -58,8 +61,8 @@ public static class PngWriter
     /// <param name="rgb">RGB24 像素数据</param>
     public static void Write(Stream stream, int width, int height, byte[] rgb)
     {
-        stream.Write(new byte[] { 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A }, 0, 8);
-        WriteChunk(stream, "IHDR", CreateIHDR(width, height));
+        stream.Write(PngSignature, 0, PngSignature.Length);
+        WriteChunk(stream, TypeIHDR, CreateIHDR(width, height));
         int stride = width * 3;
         int rawSize = (stride + 1) * height;
         using (var ms = new PooledMemoryStream(rawSize))
@@ -69,9 +72,9 @@ public static class PngWriter
                 WriteUpFilteredScanlines(s, rgb, width, height, 3);
             }, ms);
             ArraySegment<byte> segment = ms.GetBuffer();
-            WriteChunk(stream, "IDAT", segment.Array, segment.Offset, segment.Count);
+            WriteChunk(stream, TypeIDAT, segment.Array, segment.Offset, segment.Count);
         }
-        WriteChunk(stream, "IEND", []);
+        WriteChunk(stream, TypeIEND, []);
     }
 
     /// <summary>
@@ -96,8 +99,8 @@ public static class PngWriter
     /// <param name="rgba">RGBA32 像素数据</param>
     public static void WriteRgba(Stream stream, int width, int height, byte[] rgba)
     {
-        stream.Write([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]);
-        WriteChunk(stream, "IHDR", CreateIHDRRgba(width, height));
+        stream.Write(PngSignature, 0, PngSignature.Length);
+        WriteChunk(stream, TypeIHDR, CreateIHDRRgba(width, height));
         int stride = width * 4;
         int rawSize = (stride + 1) * height;
         using (var ms = new PooledMemoryStream(rawSize))
@@ -107,30 +110,31 @@ public static class PngWriter
                 WriteUpFilteredScanlines(s, rgba, width, height, 4);
             }, ms);
             ArraySegment<byte> segment = ms.GetBuffer();
-            WriteChunk(stream, "IDAT", segment.Array, segment.Offset, segment.Count);
+            WriteChunk(stream, TypeIDAT, segment.Array, segment.Offset, segment.Count);
         }
-        WriteChunk(stream, "IEND", []);
+        WriteChunk(stream, TypeIEND, []);
     }
 
-    private static void WriteChunk(Stream s, string type, byte[] data)
+    private static void WriteChunk(Stream s, byte[] type, byte[] data)
     {
         WriteChunk(s, type, data, 0, data.Length);
     }
 
-    private static void WriteChunk(Stream s, string type, byte[] data, int offset, int count)
+    private static void WriteChunk(Stream s, byte[] type, byte[] data, int offset, int count)
     {
-        byte[] lenBytes = ToBigEndian((uint)count);
-        s.Write(lenBytes, 0, 4);
-        byte[] typeBytes = Encoding.ASCII.GetBytes(type);
-        s.Write(typeBytes, 0, 4);
+        Span<byte> lenBytes = stackalloc byte[4];
+        WriteBigEndian((uint)count, lenBytes);
+        s.Write(lenBytes);
+        s.Write(type, 0, 4);
         if (count > 0)
         {
             s.Write(data, offset, count);
         }
-        uint crc = Crc32.Compute(typeBytes);
+        uint crc = Crc32.Compute(type);
         crc = Crc32.Update(crc, data, offset, count);
-        byte[] crcBytes = ToBigEndian(crc);
-        s.Write(crcBytes, 0, 4);
+        Span<byte> crcBytes = stackalloc byte[4];
+        WriteBigEndian(crc, crcBytes);
+        s.Write(crcBytes);
     }
 
     private static byte[] CreateIHDR(int width, int height)
@@ -175,16 +179,25 @@ public static class PngWriter
     private static void WriteUpFilteredScanlines(Stream s, byte[] src, int width, int height, int bytesPerPixel)
     {
         int stride = width * bytesPerPixel;
-        byte[] prevRow = new byte[stride];
-        byte[] filtered = new byte[stride];
-        int srcIdx = 0;
-        for (int y = 0; y < height; y++)
+        byte[] prevRow = ArrayPool<byte>.Shared.Rent(stride);
+        byte[] filtered = ArrayPool<byte>.Shared.Rent(stride);
+        try
         {
-            s.WriteByte(2);
-            ApplyUpFilterSimd(src.AsSpan(srcIdx, stride), prevRow, filtered);
-            s.Write(filtered, 0, stride);
-            Array.Copy(src, srcIdx, prevRow, 0, stride);
-            srcIdx += stride;
+            Array.Clear(prevRow, 0, stride);
+            int srcIdx = 0;
+            for (int y = 0; y < height; y++)
+            {
+                s.WriteByte(2);
+                ApplyUpFilterSimd(src.AsSpan(srcIdx, stride), prevRow, filtered);
+                s.Write(filtered, 0, stride);
+                Array.Copy(src, srcIdx, prevRow, 0, stride);
+                srcIdx += stride;
+            }
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(prevRow);
+            ArrayPool<byte>.Shared.Return(filtered);
         }
     }
     private static void ApplyUpFilterSimd(ReadOnlySpan<byte> current, byte[] prevRow, byte[] destination)
@@ -223,6 +236,14 @@ public static class PngWriter
             (byte)((val >> 8) & 0xFF),
             (byte)(val & 0xFF)
         ];
+    }
+
+    private static void WriteBigEndian(uint val, Span<byte> dest)
+    {
+        dest[0] = (byte)((val >> 24) & 0xFF);
+        dest[1] = (byte)((val >> 16) & 0xFF);
+        dest[2] = (byte)((val >> 8) & 0xFF);
+        dest[3] = (byte)(val & 0xFF);
     }
 }
 
