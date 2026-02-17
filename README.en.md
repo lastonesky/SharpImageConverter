@@ -90,7 +90,7 @@ Requirements:
 ## Install (NuGet)
 
 ```bash
-dotnet add package SharpImageConverter --version 0.1.4
+dotnet add package SharpImageConverter --version 0.1.6.1-preview
 ```
 
 Namespaces:
@@ -188,7 +188,8 @@ Special cases:
 - `--keep-metadata` : When recompressing JPEG, try to preserve basic EXIF/ICC metadata
 - `--jpeg-debug` : Enable JPEG decoding debug output
 - `--gif-frames` : Export animated GIF frames as individual images for inspection/debugging
-- `--stream` : Use streaming decode for JPEG to reduce memory usage
+- `--gray` : Force grayscale output (applies to JPEG/PNG/BMP/WebP)
+- `--stream` : Use streaming decode for JPEG to reduce memory usage; other formats fall back to normal decode
 - `--idct int|float` : Choose JPEG IDCT implementation (integer/float), applies to JPEG decoding only
 
 ### Folder Batch Conversion
@@ -202,7 +203,6 @@ Special cases:
 
 ```bash
 # Convert format
-dotnet run -- input.png output.jpg
 dotnet run -- input.png output.jpg
 
 # Resize and convert
