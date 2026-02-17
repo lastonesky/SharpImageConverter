@@ -11,7 +11,7 @@ public static class BmpWriter
 {
     public static void Write8(string path, int width, int height, byte[] gray)
     {
-        using var fs = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None);
+        using var fs = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None, 1 << 20, FileOptions.SequentialScan);
         Write8(fs, width, height, gray);
     }
 
@@ -82,7 +82,7 @@ public static class BmpWriter
     /// <param name="rgb">RGB24 像素数据</param>
     public static void Write24(string path, int width, int height, byte[] rgb)
     {
-        using var fs = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None);
+        using var fs = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None, 1 << 20, FileOptions.SequentialScan);
         Write24(fs, width, height, rgb);
     }
 
@@ -123,28 +123,35 @@ public static class BmpWriter
         byte[] row = ArrayPool<byte>.Shared.Rent(rowStride);
         try
         {
-            for (int y = height - 1; y >= 0; y--)
+            int padding = rowStride - srcRowSize;
+            unsafe
             {
-                int srcBase = y * srcRowSize;
-                int dstIndex = 0;
-                int srcIndex = srcBase;
-                int srcEnd = srcBase + srcRowSize;
-                while (srcIndex < srcEnd)
+                fixed (byte* pRgb = rgb)
+                fixed (byte* pRow = row)
                 {
-                    byte r = rgb[srcIndex + 0];
-                    byte g = rgb[srcIndex + 1];
-                    byte b = rgb[srcIndex + 2];
-                    row[dstIndex + 0] = b;
-                    row[dstIndex + 1] = g;
-                    row[dstIndex + 2] = r;
-                    srcIndex += 3;
-                    dstIndex += 3;
+                    for (int y = height - 1; y >= 0; y--)
+                    {
+                        byte* src = pRgb + (y * srcRowSize);
+                        byte* dst = pRow;
+                        byte* srcEnd = src + srcRowSize;
+                        while (src < srcEnd)
+                        {
+                            byte r = src[0];
+                            byte g = src[1];
+                            byte b = src[2];
+                            dst[0] = b;
+                            dst[1] = g;
+                            dst[2] = r;
+                            src += 3;
+                            dst += 3;
+                        }
+                        if (padding > 0)
+                        {
+                            new Span<byte>(dst, padding).Clear();
+                        }
+                        stream.Write(row, 0, rowStride);
+                    }
                 }
-                while (dstIndex < rowStride)
-                {
-                    row[dstIndex++] = 0;
-                }
-                stream.Write(row, 0, rowStride);
             }
         }
         finally
