@@ -1,4 +1,5 @@
 using System;
+using System.Buffers;
 using System.IO;
 using SharpImageConverter.Core;
 
@@ -16,6 +17,9 @@ namespace SharpImageConverter.Formats.Gif
     /// </summary>
     public class GifDecoder : IImageDecoder
     {
+        private static readonly int[] InterlaceStart = { 0, 4, 2, 1 };
+        private static readonly int[] InterlaceInc = { 8, 8, 4, 2 };
+
         public GifAnimation DecodeAnimationRgb24(string path)
         {
             using var fs = File.OpenRead(path);
@@ -53,6 +57,7 @@ namespace SharpImageConverter.Formats.Gif
             }
 
             byte[] canvas = new byte[width * height * 3];
+            int canvasStride = width * 3;
             byte bgR = 0, bgG = 0, bgB = 0;
             if (hasGct && bgIndex < gctColors)
             {
@@ -76,6 +81,10 @@ namespace SharpImageConverter.Formats.Gif
             var durations = new List<int>();
 
             byte[]? prevCanvas = null;
+            byte[] lct = new byte[768];
+            byte[] desc = new byte[9];
+            byte[] gce = new byte[4];
+            var pool = ArrayPool<byte>.Shared;
             while (true)
             {
                 int blockType = stream.ReadByte();
@@ -93,7 +102,6 @@ namespace SharpImageConverter.Formats.Gif
                             stream.ReadByte();
                             continue;
                         }
-                        byte[] gce = new byte[4];
                         ReadExact(stream, gce, 4);
                         disposal = (gce[0] >> 2) & 0x07;
                         bool hasTrans = (gce[0] & 1) != 0;
@@ -137,7 +145,6 @@ namespace SharpImageConverter.Formats.Gif
                 }
                 else if (blockType == 0x2C)
                 {
-                    byte[] desc = new byte[9];
                     if (stream.Read(desc, 0, 9) != 9) throw new EndOfStreamException();
                     int ix = desc[0] | (desc[1] << 8);
                     int iy = desc[2] | (desc[3] << 8);
@@ -148,7 +155,6 @@ namespace SharpImageConverter.Formats.Gif
                     bool interlace = (imgPacked & 0x40) != 0;
                     int lctSize = 1 << ((imgPacked & 0x07) + 1);
 
-                    byte[] lct = new byte[768];
                     int lctColors = 0;
                     if (hasLct)
                     {
@@ -166,30 +172,63 @@ namespace SharpImageConverter.Formats.Gif
                     int paletteColors = hasLct ? lctColors : gctColors;
 
                     int lzwMinCodeSize = stream.ReadByte();
-                    byte[] indices = new byte[iw * ih];
+                    int indexCount = iw * ih;
+                    byte[] indices = pool.Rent(indexCount);
                     var lzw = new LzwDecoder(stream);
-                    lzw.Decode(indices, iw, ih, lzwMinCodeSize);
-
-                    if (disposal == 3)
-                        prevCanvas = (byte[])canvas.Clone();
-
-                    if (interlace)
+                    try
                     {
-                        int[] start = { 0, 4, 2, 1 };
-                        int[] inc = { 8, 8, 4, 2 };
-                        int ptr = 0;
-                        for (int pass = 0; pass < 4; pass++)
+                        lzw.Decode(indices, iw, ih, lzwMinCodeSize);
+
+                        if (disposal == 3)
+                            prevCanvas = (byte[])canvas.Clone();
+
+                        if (interlace)
                         {
-                            for (int y = start[pass]; y < ih; y += inc[pass])
+                            int ptr = 0;
+                            for (int pass = 0; pass < 4; pass++)
                             {
-                                int rowOffset = (iy + y) * width * 3;
-                                int lineStart = ptr;
+                                int startY = InterlaceStart[pass];
+                                int incY = InterlaceInc[pass];
+                                for (int y = startY; y < ih; y += incY)
+                                {
+                                    int dstY = iy + y;
+                                    int rowOffset = dstY * canvasStride;
+                                    int lineStart = ptr;
+                                    for (int x = 0; x < iw; x++)
+                                    {
+                                        int dstX = ix + x;
+                                        if (dstX < width && dstY < height)
+                                        {
+                                            byte idx = indices[lineStart + x];
+                                            if (transIndex != -1 && idx == transIndex)
+                                            {
+                                            }
+                                            else if (idx < paletteColors)
+                                            {
+                                                int pIdx = idx * 3;
+                                                int dIdx = rowOffset + dstX * 3;
+                                                canvas[dIdx + 0] = palette[pIdx];
+                                                canvas[dIdx + 1] = palette[pIdx + 1];
+                                                canvas[dIdx + 2] = palette[pIdx + 2];
+                                            }
+                                        }
+                                    }
+                                    ptr += iw;
+                                }
+                            }
+                        }
+                        else
+                        {
+                            for (int y = 0; y < ih; y++)
+                            {
+                                int dstY = iy + y;
+                                int rowOffset = dstY * canvasStride;
                                 for (int x = 0; x < iw; x++)
                                 {
                                     int dstX = ix + x;
-                                    if (dstX < width && (iy + y) < height)
+                                    if (dstX < width && dstY < height)
                                     {
-                                        byte idx = indices[lineStart + x];
+                                        byte idx = indices[y * iw + x];
                                         if (transIndex != -1 && idx == transIndex)
                                         {
                                         }
@@ -203,75 +242,53 @@ namespace SharpImageConverter.Formats.Gif
                                         }
                                     }
                                 }
-                                ptr += iw;
                             }
                         }
-                    }
-                    else
-                    {
-                        for (int y = 0; y < ih; y++)
+
+                        int lastIx = ix;
+                        int lastIy = iy;
+                        int lastIw = iw;
+                        int lastIh = ih;
+                        var frameBuf = new byte[canvas.Length];
+                        Buffer.BlockCopy(canvas, 0, frameBuf, 0, canvas.Length);
+                        frames.Add(new Image<Rgb24>(width, height, frameBuf));
+
+                        int ms = delayCs * 10;
+                        durations.Add(ms < 10 ? 10 : ms);
+
+                        if (disposal == 2)
                         {
-                            int rowOffset = (iy + y) * width * 3;
-                            for (int x = 0; x < iw; x++)
+                            for (int y = 0; y < lastIh; y++)
                             {
-                                int dstX = ix + x;
-                                if (dstX < width && (iy + y) < height)
+                                int dstY = lastIy + y;
+                                int rowOffset = dstY * canvasStride;
+                                for (int x = 0; x < lastIw; x++)
                                 {
-                                    byte idx = indices[y * iw + x];
-                                    if (transIndex != -1 && idx == transIndex)
+                                    int dstX = lastIx + x;
+                                    if (dstX < width && dstY < height)
                                     {
-                                    }
-                                    else if (idx < paletteColors)
-                                    {
-                                        int pIdx = idx * 3;
                                         int dIdx = rowOffset + dstX * 3;
-                                        canvas[dIdx + 0] = palette[pIdx];
-                                        canvas[dIdx + 1] = palette[pIdx + 1];
-                                        canvas[dIdx + 2] = palette[pIdx + 2];
+                                        canvas[dIdx + 0] = bgR;
+                                        canvas[dIdx + 1] = bgG;
+                                        canvas[dIdx + 2] = bgB;
                                     }
                                 }
                             }
                         }
-                    }
-
-                    int lastIx = ix;
-                    int lastIy = iy;
-                    int lastIw = iw;
-                    int lastIh = ih;
-                    var frameBuf = new byte[canvas.Length];
-                    Buffer.BlockCopy(canvas, 0, frameBuf, 0, canvas.Length);
-                    frames.Add(new Image<Rgb24>(width, height, frameBuf));
-
-                    int ms = delayCs * 10;
-                    durations.Add(ms < 10 ? 10 : ms);
-
-                    if (disposal == 2)
-                    {
-                        for (int y = 0; y < lastIh; y++)
+                        else if (disposal == 3 && prevCanvas != null)
                         {
-                            int rowOffset = (lastIy + y) * width * 3;
-                            for (int x = 0; x < lastIw; x++)
-                            {
-                                int dstX = lastIx + x;
-                                if (dstX < width && (lastIy + y) < height)
-                                {
-                                    int dIdx = rowOffset + dstX * 3;
-                                    canvas[dIdx + 0] = bgR;
-                                    canvas[dIdx + 1] = bgG;
-                                    canvas[dIdx + 2] = bgB;
-                                }
-                            }
+                            Buffer.BlockCopy(prevCanvas, 0, canvas, 0, canvas.Length);
+                            prevCanvas = null;
                         }
-                    }
-                    else if (disposal == 3 && prevCanvas != null)
-                    {
-                        Buffer.BlockCopy(prevCanvas, 0, canvas, 0, canvas.Length);
-                        prevCanvas = null;
-                    }
 
-                    transIndex = -1;
-                    disposal = 0;
-                    delayCs = 0;
+                        transIndex = -1;
+                        disposal = 0;
+                        delayCs = 0;
+                    }
+                    finally
+                    {
+                        pool.Return(indices);
+                    }
                 }
                 else
                 {
@@ -364,6 +381,7 @@ namespace SharpImageConverter.Formats.Gif
 
             // Canvas
             byte[] canvas = new byte[width * height * 3];
+            int canvasStride = width * 3;
             // Fill with background color if needed?
             // Usually we start black or BG.
             if (hasGct && bgIndex < gctColors)
@@ -383,7 +401,10 @@ namespace SharpImageConverter.Formats.Gif
             int transIndex = -1;
             // int disposal = 0; 
             // We only decode the first frame for now, so disposal doesn't matter much unless we want to support animation later.
-
+            byte[] desc = new byte[9];
+            byte[] lct = new byte[768];
+            byte[] gce = new byte[4];
+            var pool = ArrayPool<byte>.Shared;
             while (true)
             {
                 int blockType = stream.ReadByte();
@@ -401,7 +422,6 @@ namespace SharpImageConverter.Formats.Gif
                             SkipBlock(stream, size); 
                             continue;
                         }
-                        byte[] gce = new byte[4];
                         ReadExact(stream, gce, 4);
                         // disposal = (gce[0] >> 2) & 0x07;
                         bool hasTrans = (gce[0] & 1) != 0;
@@ -418,7 +438,6 @@ namespace SharpImageConverter.Formats.Gif
                 }
                 else if (blockType == 0x2C) // Image Separator
                 {
-                    byte[] desc = new byte[9];
                     if (stream.Read(desc, 0, 9) != 9) throw new EndOfStreamException();
                     int ix = desc[0] | (desc[1] << 8);
                     int iy = desc[2] | (desc[3] << 8);
@@ -430,7 +449,6 @@ namespace SharpImageConverter.Formats.Gif
                     bool interlace = (imgPacked & 0x40) != 0;
                     int lctSize = 1 << ((imgPacked & 0x07) + 1);
                     
-                    byte[] lct = new byte[768];
                     int lctColors = 0;
                     if (hasLct)
                     {
@@ -449,36 +467,62 @@ namespace SharpImageConverter.Formats.Gif
                     int paletteColors = hasLct ? lctColors : gctColors;
 
                     int lzwMinCodeSize = stream.ReadByte();
-                    
-                    byte[] indices = new byte[iw * ih];
+                    int indexCount = iw * ih;
+                    byte[] indices = pool.Rent(indexCount);
                     var lzw = new LzwDecoder(stream);
-                    lzw.Decode(indices, iw, ih, lzwMinCodeSize);
-
-                    // Render to canvas
-                    if (interlace)
+                    try
                     {
-                        // Pass 1: Row 0, 8, 16...
-                        // Pass 2: Row 4, 12...
-                        // Pass 3: Row 2, 6...
-                        // Pass 4: Row 1, 3...
-                        int[] start = { 0, 4, 2, 1 };
-                        int[] inc = { 8, 8, 4, 2 };
-                        int ptr = 0;
-                        for (int pass = 0; pass < 4; pass++)
+                        lzw.Decode(indices, iw, ih, lzwMinCodeSize);
+
+                        if (interlace)
                         {
-                            for (int y = start[pass]; y < ih; y += inc[pass])
+                            int ptr = 0;
+                            for (int pass = 0; pass < 4; pass++)
                             {
-                                int rowOffset = (iy + y) * width * 3;
-                                int lineStart = ptr;
+                                int startY = InterlaceStart[pass];
+                                int incY = InterlaceInc[pass];
+                                for (int y = startY; y < ih; y += incY)
+                                {
+                                    int dstY = iy + y;
+                                    int rowOffset = dstY * canvasStride;
+                                    int lineStart = ptr;
+                                    for (int x = 0; x < iw; x++)
+                                    {
+                                        int dstX = ix + x;
+                                        if (dstX < width && dstY < height)
+                                        {
+                                            byte idx = indices[lineStart + x];
+                                            if (transIndex != -1 && idx == transIndex)
+                                            {
+                                            }
+                                            else if (idx < paletteColors)
+                                            {
+                                                int pIdx = idx * 3;
+                                                int dIdx = rowOffset + dstX * 3;
+                                                canvas[dIdx + 0] = palette[pIdx];
+                                                canvas[dIdx + 1] = palette[pIdx + 1];
+                                                canvas[dIdx + 2] = palette[pIdx + 2];
+                                            }
+                                        }
+                                    }
+                                    ptr += iw;
+                                }
+                            }
+                        }
+                        else
+                        {
+                            for (int y = 0; y < ih; y++)
+                            {
+                                int dstY = iy + y;
+                                int rowOffset = dstY * canvasStride;
                                 for (int x = 0; x < iw; x++)
                                 {
                                     int dstX = ix + x;
-                                    if (dstX < width && (iy + y) < height)
+                                    if (dstX < width && dstY < height)
                                     {
-                                        byte idx = indices[lineStart + x];
+                                        byte idx = indices[y * iw + x];
                                         if (transIndex != -1 && idx == transIndex)
                                         {
-                                            // Transparent, keep background
                                         }
                                         else if (idx < paletteColors)
                                         {
@@ -490,44 +534,14 @@ namespace SharpImageConverter.Formats.Gif
                                         }
                                     }
                                 }
-                                ptr += iw; // In interlaced, indices are sequential, rows are not. Wait.
-                                // LZW outputs a continuous stream of pixels.
-                                // Interlaced means the stream corresponds to Pass 1 rows, then Pass 2 rows...
-                                // So ptr increments by iw is correct logic IF we iterate y in pass order.
-                                // BUT my loops are nested: pass -> y.
-                                // So `ptr` should increment by `iw` for each row processed.
                             }
                         }
                     }
-                    else
+                    finally
                     {
-                        for (int y = 0; y < ih; y++)
-                        {
-                            int rowOffset = (iy + y) * width * 3;
-                            for (int x = 0; x < iw; x++)
-                            {
-                                int dstX = ix + x;
-                                if (dstX < width && (iy + y) < height)
-                                {
-                                    byte idx = indices[y * iw + x];
-                                    if (transIndex != -1 && idx == transIndex)
-                                    {
-                                        // Skip
-                                    }
-                                    else if (idx < paletteColors)
-                                    {
-                                        int pIdx = idx * 3;
-                                        int dIdx = rowOffset + dstX * 3;
-                                        canvas[dIdx + 0] = palette[pIdx];
-                                        canvas[dIdx + 1] = palette[pIdx + 1];
-                                        canvas[dIdx + 2] = palette[pIdx + 2];
-                                    }
-                                }
-                            }
+                        pool.Return(indices);
                     }
-                }
 
-                // For single-frame decode, return immediately
                     return new Image<Rgb24>(width, height, canvas);
                 }
                 else
@@ -585,6 +599,7 @@ namespace SharpImageConverter.Formats.Gif
                 }
             }
             byte[] canvas = new byte[width * height * 4];
+            int canvasStride = width * 4;
             byte bgR = 0, bgG = 0, bgB = 0;
             if (hasGct && bgIndex < gctColors)
             {
@@ -600,6 +615,10 @@ namespace SharpImageConverter.Formats.Gif
                 }
             }
             int transIndex = -1;
+            byte[] desc = new byte[9];
+            byte[] lct = new byte[768];
+            byte[] gce = new byte[4];
+            var pool = ArrayPool<byte>.Shared;
             while (true)
             {
                 int blockType = stream.ReadByte();
@@ -616,7 +635,6 @@ namespace SharpImageConverter.Formats.Gif
                             stream.ReadByte();
                             continue;
                         }
-                        byte[] gce = new byte[4];
                         ReadExact(stream, gce, 4);
                         bool hasTrans = (gce[0] & 1) != 0;
                         transIndex = hasTrans ? gce[3] : -1;
@@ -631,7 +649,6 @@ namespace SharpImageConverter.Formats.Gif
                 }
                 else if (blockType == 0x2C)
                 {
-                    byte[] desc = new byte[9];
                     if (stream.Read(desc, 0, 9) != 9) throw new EndOfStreamException();
                     int ix = desc[0] | (desc[1] << 8);
                     int iy = desc[2] | (desc[3] << 8);
@@ -641,7 +658,6 @@ namespace SharpImageConverter.Formats.Gif
                     bool hasLct = (imgPacked & 0x80) != 0;
                     bool interlace = (imgPacked & 0x40) != 0;
                     int lctSize = 1 << ((imgPacked & 0x07) + 1);
-                    byte[] lct = new byte[768];
                     int lctColors = 0;
                     if (hasLct)
                     {
@@ -658,26 +674,62 @@ namespace SharpImageConverter.Formats.Gif
                     byte[] palette = hasLct ? lct : gct;
                     int paletteColors = hasLct ? lctColors : gctColors;
                     int lzwMinCodeSize = stream.ReadByte();
-                    byte[] indices = new byte[iw * ih];
+                    int indexCount = iw * ih;
+                    byte[] indices = pool.Rent(indexCount);
                     var lzw = new LzwDecoder(stream);
-                    lzw.Decode(indices, iw, ih, lzwMinCodeSize);
-                    if (interlace)
+                    try
                     {
-                        int[] start = { 0, 4, 2, 1 };
-                        int[] inc = { 8, 8, 4, 2 };
-                        int ptr = 0;
-                        for (int pass = 0; pass < 4; pass++)
+                        lzw.Decode(indices, iw, ih, lzwMinCodeSize);
+                        if (interlace)
                         {
-                            for (int y = start[pass]; y < ih; y += inc[pass])
+                            int ptr = 0;
+                            for (int pass = 0; pass < 4; pass++)
                             {
-                                int rowOffset = (iy + y) * width * 4;
-                                int lineStart = ptr;
+                                int startY = InterlaceStart[pass];
+                                int incY = InterlaceInc[pass];
+                                for (int y = startY; y < ih; y += incY)
+                                {
+                                    int dstY = iy + y;
+                                    int rowOffset = dstY * canvasStride;
+                                    int lineStart = ptr;
+                                    for (int x = 0; x < iw; x++)
+                                    {
+                                        int dstX = ix + x;
+                                        if (dstX < width && dstY < height)
+                                        {
+                                            byte idx = indices[lineStart + x];
+                                            if (transIndex != -1 && idx == transIndex)
+                                            {
+                                                int dIdx = rowOffset + dstX * 4;
+                                                canvas[dIdx + 3] = 0;
+                                            }
+                                            else if (idx < paletteColors)
+                                            {
+                                                int pIdx = idx * 3;
+                                                int dIdx = rowOffset + dstX * 4;
+                                                canvas[dIdx + 0] = palette[pIdx];
+                                                canvas[dIdx + 1] = palette[pIdx + 1];
+                                                canvas[dIdx + 2] = palette[pIdx + 2];
+                                                canvas[dIdx + 3] = 255;
+                                            }
+                                        }
+                                    }
+                                    ptr += iw;
+                                }
+                            }
+                        }
+                        else
+                        {
+                            for (int y = 0; y < ih; y++)
+                            {
+                                int dstY = iy + y;
+                                int rowOffset = dstY * canvasStride;
                                 for (int x = 0; x < iw; x++)
                                 {
                                     int dstX = ix + x;
-                                    if (dstX < width && (iy + y) < height)
+                                    if (dstX < width && dstY < height)
                                     {
-                                        byte idx = indices[lineStart + x];
+                                        byte idx = indices[y * iw + x];
                                         if (transIndex != -1 && idx == transIndex)
                                         {
                                             int dIdx = rowOffset + dstX * 4;
@@ -694,38 +746,12 @@ namespace SharpImageConverter.Formats.Gif
                                         }
                                     }
                                 }
-                                ptr += iw;
                             }
                         }
                     }
-                    else
+                    finally
                     {
-                        for (int y = 0; y < ih; y++)
-                        {
-                            int rowOffset = (iy + y) * width * 4;
-                            for (int x = 0; x < iw; x++)
-                            {
-                                int dstX = ix + x;
-                                if (dstX < width && (iy + y) < height)
-                                {
-                                    byte idx = indices[y * iw + x];
-                                    if (transIndex != -1 && idx == transIndex)
-                                    {
-                                        int dIdx = rowOffset + dstX * 4;
-                                        canvas[dIdx + 3] = 0;
-                                    }
-                                    else if (idx < paletteColors)
-                                    {
-                                        int pIdx = idx * 3;
-                                        int dIdx = rowOffset + dstX * 4;
-                                        canvas[dIdx + 0] = palette[pIdx];
-                                        canvas[dIdx + 1] = palette[pIdx + 1];
-                                        canvas[dIdx + 2] = palette[pIdx + 2];
-                                        canvas[dIdx + 3] = 255;
-                                    }
-                                }
-                            }
-                        }
+                        pool.Return(indices);
                     }
                     return new Image<Rgba32>(width, height, canvas);
                 }
