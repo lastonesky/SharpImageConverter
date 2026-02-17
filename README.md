@@ -90,7 +90,7 @@ SharpImageConverter/
 ## 安装（NuGet）
 
 ```bash
-dotnet add package SharpImageConverter --version 0.1.5
+dotnet add package SharpImageConverter --version 0.1.6.1-preview
 ```
 
 引用命名空间：
@@ -187,7 +187,8 @@ dotnet run -- <输入文件或文件夹路径> [输出文件或文件夹路径] 
 - `--keep-metadata` : 在重新编码 JPEG 时尽量保留 EXIF/ICC 等基础元数据
 - `--jpeg-debug` : 启用 JPEG 解码调试输出
 - `--gif-frames` : 将动图 GIF 的每一帧导出为独立图片，方便调试与检查
-- `--stream` : 针对 JPEG 使用流式解码以降低内存占用
+- `--gray` : 强制输出为灰度（对 JPEG/PNG/BMP/WebP 生效）
+- `--stream` : 针对 JPEG 使用流式解码以降低内存占用，其他格式会回退为常规解码
 - `--idct int|float` : 选择 JPEG IDCT 实现（整数/浮点），仅对 JPEG 解码有效
 
 ### 文件夹批量转换
