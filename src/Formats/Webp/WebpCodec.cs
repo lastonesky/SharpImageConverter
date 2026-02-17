@@ -6,8 +6,18 @@ using System.Runtime.CompilerServices;
 
 namespace SharpImageConverter.Formats.Webp
 {
-    internal static partial class WebpCodec
+    internal static unsafe partial class WebpCodec
     {
+        private sealed class WebPWriterState
+        {
+            public WebPWriterState(Stream stream)
+            {
+                Stream = stream;
+            }
+
+            public Stream Stream { get; }
+            public Exception? Error { get; set; }
+        }
         [LibraryImport("libwebpdecoder")]
         [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
         private static partial int WebPGetInfo(ReadOnlySpan<byte> data, nuint data_size, out int width, out int height);
@@ -35,6 +45,27 @@ namespace SharpImageConverter.Formats.Webp
         [LibraryImport("libwebp")]
         [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
         private static partial void WebPFree(IntPtr ptr);
+        [LibraryImport("libwebp", EntryPoint = "WebPConfigInitInternal")]
+        [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+        private static partial int WebPConfigInitInternal(ref WebPConfig config, WebPPreset preset, float quality, int version);
+        [LibraryImport("libwebp")]
+        [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+        private static partial int WebPValidateConfig(ref WebPConfig config);
+        [LibraryImport("libwebp", EntryPoint = "WebPPictureInitInternal")]
+        [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+        private static partial int WebPPictureInitInternal(ref WebPPicture picture, int version);
+        [LibraryImport("libwebp")]
+        [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+        private static partial void WebPPictureFree(ref WebPPicture picture);
+        [LibraryImport("libwebp")]
+        [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+        private static partial int WebPPictureImportRGB(ref WebPPicture picture, ReadOnlySpan<byte> rgb, int rgb_stride);
+        [LibraryImport("libwebp")]
+        [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+        private static partial int WebPPictureImportRGBA(ref WebPPicture picture, ReadOnlySpan<byte> rgba, int rgba_stride);
+        [LibraryImport("libwebp")]
+        [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+        private static partial int WebPEncode(ref WebPConfig config, ref WebPPicture picture);
         [LibraryImport("libwebpmux", EntryPoint = "WebPNewInternal")]
         [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
         private static partial IntPtr WebPNewInternal(int version);
@@ -55,6 +86,9 @@ namespace SharpImageConverter.Formats.Webp
         private static partial WebPMuxError WebPMuxAssemble(IntPtr mux, ref WebPData assembled_data);
 
         private static readonly int[] MuxAbiVersionsToTry = [0x0109, 0x0108, 0x0107, 0x0106, 0x0105, 0x0104, 0x0103, 0x0102, 0x0101, 0x0100];
+        private static readonly int[] EncoderAbiVersionsToTry = [0x020F, 0x020E, 0x020D, 0x020C, 0x020B, 0x020A, 0x0209, 0x0208, 0x0207, 0x0206, 0x0205, 0x0204, 0x0203, 0x0202, 0x0201, 0x0200];
+        private static readonly WebPWriterFunction WriterCallback = WriteToManagedStream;
+        private static readonly IntPtr WriterCallbackPtr = Marshal.GetFunctionPointerForDelegate(WriterCallback);
 
         private static IntPtr CreateEmptyMux()
         {
@@ -65,6 +99,102 @@ namespace SharpImageConverter.Formats.Webp
             }
 
             throw new InvalidOperationException("WebPNewInternal 创建失败（ABI 版本不匹配或库不兼容）");
+        }
+
+        private static void InitConfig(ref WebPConfig config, float quality)
+        {
+            for (int i = 0; i < EncoderAbiVersionsToTry.Length; i++)
+            {
+                if (WebPConfigInitInternal(ref config, WebPPreset.WEBP_PRESET_DEFAULT, quality, EncoderAbiVersionsToTry[i]) != 0)
+                {
+                    config.quality = quality;
+                    config.method = 4;
+                    if (WebPValidateConfig(ref config) == 0) throw new InvalidOperationException("WebP 编码参数无效");
+                    return;
+                }
+            }
+            throw new InvalidOperationException("WebPConfigInitInternal 创建失败（ABI 版本不匹配或库不兼容）");
+        }
+
+        private static void InitPicture(ref WebPPicture picture)
+        {
+            for (int i = 0; i < EncoderAbiVersionsToTry.Length; i++)
+            {
+                if (WebPPictureInitInternal(ref picture, EncoderAbiVersionsToTry[i]) != 0) return;
+            }
+            throw new InvalidOperationException("WebPPictureInitInternal 创建失败（ABI 版本不匹配或库不兼容）");
+        }
+
+        private static byte[] EncodeWithConfig(ReadOnlySpan<byte> pixels, int width, int height, int stride, bool hasAlpha, float quality)
+        {
+            using var ms = new MemoryStream();
+            EncodeWithConfigToStream(ms, pixels, width, height, stride, hasAlpha, quality);
+            return ms.ToArray();
+        }
+
+        private static void EncodeWithConfigToStream(Stream stream, ReadOnlySpan<byte> pixels, int width, int height, int stride, bool hasAlpha, float quality)
+        {
+            WebPConfig config = default;
+            WebPPicture picture = default;
+            GCHandle handle = default;
+            WebPWriterState? state = null;
+            try
+            {
+                InitConfig(ref config, quality);
+                InitPicture(ref picture);
+                picture.width = width;
+                picture.height = height;
+                picture.writer = WriterCallbackPtr;
+                state = new WebPWriterState(stream);
+                handle = GCHandle.Alloc(state);
+                picture.custom_ptr = GCHandle.ToIntPtr(handle);
+                int ok = hasAlpha
+                    ? WebPPictureImportRGBA(ref picture, pixels, stride)
+                    : WebPPictureImportRGB(ref picture, pixels, stride);
+                if (ok == 0) throw new InvalidOperationException("WebP 图像导入失败");
+                if (WebPEncode(ref config, ref picture) == 0) throw new InvalidOperationException($"WebP 编码失败: {(WebPEncodingError)picture.error_code}");
+                if (state.Error != null) throw new InvalidOperationException($"WebP 写入失败: {state.Error.GetType().Name}: {state.Error.Message}", state.Error);
+            }
+            finally
+            {
+                WebPPictureFree(ref picture);
+                if (handle.IsAllocated) handle.Free();
+            }
+        }
+
+        private unsafe static int WriteToManagedStream(byte* data, nuint data_size, IntPtr picture)
+        {
+            try
+            {
+                if (data_size == 0) return 1;
+                var pic = (WebPPicture*)picture;
+                var handle = GCHandle.FromIntPtr(pic->custom_ptr);
+                var state = (WebPWriterState)handle.Target!;
+                var stream = state.Stream;
+                nuint remaining = data_size;
+                byte* p = data;
+                while (remaining > 0)
+                {
+                    int chunk = remaining > int.MaxValue ? int.MaxValue : (int)remaining;
+                    stream.Write(new ReadOnlySpan<byte>(p, chunk));
+                    p += chunk;
+                    remaining -= (nuint)chunk;
+                }
+                return 1;
+            }
+            catch (Exception ex)
+            {
+                try
+                {
+                    var pic = (WebPPicture*)picture;
+                    var handle = GCHandle.FromIntPtr(pic->custom_ptr);
+                    if (handle.Target is WebPWriterState state) state.Error = ex;
+                }
+                catch
+                {
+                }
+                return 0;
+            }
         }
 
         public static byte[] DecodeRgba(ReadOnlySpan<byte> data, out int width, out int height)
@@ -159,22 +289,7 @@ namespace SharpImageConverter.Formats.Webp
         {
             try
             {
-                nuint size = WebPEncodeRGBA(rgba, width, height, width * 4, quality, out IntPtr output);
-                int len = checked((int)size);
-                if (len <= 0 || output == IntPtr.Zero) throw new InvalidOperationException("WebP 编码失败");
-                try
-                {
-                    unsafe
-                    {
-                        var result = new byte[len];
-                        new ReadOnlySpan<byte>((void*)output, len).CopyTo(result);
-                        return result;
-                    }
-                }
-                finally
-                {
-                    WebPFree(output);
-                }
+                return EncodeWithConfig(rgba, width, height, width * 4, true, quality);
             }
             catch (DllNotFoundException ex)
             {
@@ -190,22 +305,7 @@ namespace SharpImageConverter.Formats.Webp
         {
             try
             {
-                nuint size = WebPEncodeRGB(rgb, width, height, width * 3, quality, out IntPtr output);
-                int len = checked((int)size);
-                if (len <= 0 || output == IntPtr.Zero) throw new InvalidOperationException("WebP 编码失败");
-                try
-                {
-                    unsafe
-                    {
-                        var result = new byte[len];
-                        new ReadOnlySpan<byte>((void*)output, len).CopyTo(result);
-                        return result;
-                    }
-                }
-                finally
-                {
-                    WebPFree(output);
-                }
+                return EncodeWithConfig(rgb, width, height, width * 3, false, quality);
             }
             catch (DllNotFoundException ex)
             {
@@ -233,20 +333,7 @@ namespace SharpImageConverter.Formats.Webp
             if (rgba.Length != checked(width * height * 4)) throw new ArgumentException("RGBA 像素长度不匹配", nameof(rgba));
             try
             {
-                nuint size = WebPEncodeRGBA(rgba, width, height, width * 4, quality, out IntPtr output);
-                int len = checked((int)size);
-                if (len <= 0 || output == IntPtr.Zero) throw new InvalidOperationException("WebP 编码失败");
-                try
-                {
-                    unsafe
-                    {
-                        stream.Write(new ReadOnlySpan<byte>((void*)output, len));
-                    }
-                }
-                finally
-                {
-                    WebPFree(output);
-                }
+                EncodeWithConfigToStream(stream, rgba, width, height, width * 4, true, quality);
             }
             catch (DllNotFoundException ex)
             {
@@ -264,20 +351,7 @@ namespace SharpImageConverter.Formats.Webp
             if (rgb.Length != checked(width * height * 3)) throw new ArgumentException("RGB 像素长度不匹配", nameof(rgb));
             try
             {
-                nuint size = WebPEncodeRGB(rgb, width, height, width * 3, quality, out IntPtr output);
-                int len = checked((int)size);
-                if (len <= 0 || output == IntPtr.Zero) throw new InvalidOperationException("WebP 编码失败");
-                try
-                {
-                    unsafe
-                    {
-                        stream.Write(new ReadOnlySpan<byte>((void*)output, len));
-                    }
-                }
-                finally
-                {
-                    WebPFree(output);
-                }
+                EncodeWithConfigToStream(stream, rgb, width, height, width * 3, false, quality);
             }
             catch (DllNotFoundException ex)
             {
@@ -561,6 +635,40 @@ namespace SharpImageConverter.Formats.Webp
         VP8_STATUS_NOT_ENOUGH_DATA = 7
     }
 
+    internal enum WebPPreset : int
+    {
+        WEBP_PRESET_DEFAULT = 0,
+        WEBP_PRESET_PICTURE = 1,
+        WEBP_PRESET_PHOTO = 2,
+        WEBP_PRESET_DRAWING = 3,
+        WEBP_PRESET_ICON = 4,
+        WEBP_PRESET_TEXT = 5
+    }
+
+    internal enum WebPEncCSP : int
+    {
+        WEBP_YUV420 = 0,
+        WEBP_YUV420A = 4,
+        WEBP_CSP_UV_MASK = 3,
+        WEBP_CSP_ALPHA_BIT = 4
+    }
+
+    internal enum WebPEncodingError : int
+    {
+        VP8_ENC_OK = 0,
+        VP8_ENC_ERROR_OUT_OF_MEMORY = 1,
+        VP8_ENC_ERROR_BITSTREAM_OUT_OF_MEMORY = 2,
+        VP8_ENC_ERROR_NULL_PARAMETER = 3,
+        VP8_ENC_ERROR_INVALID_CONFIGURATION = 4,
+        VP8_ENC_ERROR_BAD_DIMENSION = 5,
+        VP8_ENC_ERROR_PARTITION0_OVERFLOW = 6,
+        VP8_ENC_ERROR_PARTITION_OVERFLOW = 7,
+        VP8_ENC_ERROR_BAD_WRITE = 8,
+        VP8_ENC_ERROR_FILE_TOO_BIG = 9,
+        VP8_ENC_ERROR_USER_ABORT = 10,
+        VP8_ENC_ERROR_LAST = 11
+    }
+
     [StructLayout(LayoutKind.Sequential)]
     internal struct WebPMuxAnimParams
     {
@@ -580,4 +688,77 @@ namespace SharpImageConverter.Formats.Webp
         public WebPMuxAnimBlend blend_method;
         public uint pad;
     }
+
+    [StructLayout(LayoutKind.Sequential, Pack = 8)]
+    internal struct WebPConfig
+    {
+        public int lossless;
+        public float quality;
+        public int method;
+        public int image_hint;
+        public int target_size;
+        public float target_PSNR;
+        public int segments;
+        public int sns_strength;
+        public int filter_strength;
+        public int filter_sharpness;
+        public int filter_type;
+        public int autofilter;
+        public int alpha_compression;
+        public int alpha_filtering;
+        public int alpha_quality;
+        public int pass;
+        public int show_compressed;
+        public int preprocessing;
+        public int partitions;
+        public int partition_limit;
+        public int emulate_jpeg_size;
+        public int thread_level;
+        public int low_memory;
+        public int near_lossless;
+        public int exact;
+        public int use_delta_palette;
+        public int use_sharp_yuv;
+        public int qmin;
+        public int qmax;
+    }
+
+    [StructLayout(LayoutKind.Sequential, Pack = 8)]
+    internal unsafe struct WebPPicture
+    {
+        public int use_argb;
+        public WebPEncCSP colorspace;
+        public int width;
+        public int height;
+        public byte* y;
+        public byte* u;
+        public byte* v;
+        public int y_stride;
+        public int uv_stride;
+        public byte* a;
+        public int a_stride;
+        public fixed uint pad1[2];
+        public uint* argb;
+        public int argb_stride;
+        public fixed uint pad2[3];
+        public IntPtr writer;
+        public IntPtr custom_ptr;
+        public int extra_info_type;
+        public byte* extra_info;
+        public IntPtr stats;
+        public WebPEncodingError error_code;
+        public IntPtr progress_hook;
+        public IntPtr user_data;
+        public fixed uint pad3[3];
+        public byte* pad4;
+        public byte* pad5;
+        public fixed uint pad6[8];
+        public IntPtr memory_;
+        public IntPtr memory_argb_;
+        public IntPtr pad7_0;
+        public IntPtr pad7_1;
+    }
+
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    internal unsafe delegate int WebPWriterFunction(byte* data, nuint data_size, IntPtr picture);
 }
