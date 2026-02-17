@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 
 namespace SharpImageConverter.Formats.Gif;
@@ -9,6 +10,10 @@ namespace SharpImageConverter.Formats.Gif;
 /// </summary>
 public class Quantizer
 {
+    private const int LUT_BITS = 5;              // 每通道 5bit
+    private const int LUT_SIZE = 1 << LUT_BITS;  // 32
+    private const int LUT_MASK = LUT_SIZE - 1;   // 31
+
     private class Node
     {
         public Node?[] Children = new Node?[8];
@@ -80,11 +85,22 @@ public class Quantizer
     /// <returns>调色板与索引数组</returns>
     public (byte[] Palette, byte[] Indices) Quantize(byte[] pixels, int width, int height)
     {
-        // 1. Build Octree
+        var (palette, indices) = QuantizeInternal(pixels, width, height, out _, out _, out _, false);
+        return (palette, indices);
+    }
+
+    private (byte[] Palette, byte[] Indices) QuantizeInternal(byte[] pixels, int width, int height, out long ticksTraverse, out long ticksBuildPalette, out long ticksMap, bool timing)
+    {
+        long t0 = 0;
+        long t1 = 0;
+        long t2 = 0;
+        long t3 = 0;
+        if (timing) t0 = Stopwatch.GetTimestamp();
+
         _root = new Node(0);
         _levels = new List<Node>[8];
         for (int i = 0; i < 8; i++) _levels[i] = new List<Node>();
-        
+
         for (int i = 0; i < pixels.Length; i += 3)
         {
             InsertColor(pixels[i], pixels[i + 1], pixels[i + 2]);
@@ -94,14 +110,14 @@ public class Quantizer
             }
         }
 
-        // 3. Build Palette
+        if (timing) t1 = Stopwatch.GetTimestamp();
+
         var leaves = _root.GetLeaves().ToList();
-        // Sort by pixel count for better ordering (optional)
         leaves.Sort((a, b) => b.PixelCount.CompareTo(a.PixelCount));
-        
+
         int paletteSize = Math.Min(leaves.Count, MaxColors);
         byte[] palette = new byte[paletteSize * 3];
-        
+
         for (int i = 0; i < paletteSize; i++)
         {
             var node = leaves[i];
@@ -114,43 +130,76 @@ public class Quantizer
             }
         }
 
-        // 4. Map Pixels
+        if (timing) t2 = Stopwatch.GetTimestamp();
+
         byte[] indices = new byte[width * height];
         int pIdx = 0;
-        
-        // Use Nearest Neighbor search instead of Tree traversal for better quality and error handling
+        byte[] lut = BuildColorLut(palette, paletteSize);
         for (int i = 0; i < pixels.Length; i += 3)
         {
-            indices[pIdx++] = GetNearestColorIndex(palette, pixels[i], pixels[i + 1], pixels[i + 2], paletteSize);
+            int r = pixels[i] >> (8 - LUT_BITS);
+            int g = pixels[i + 1] >> (8 - LUT_BITS);
+            int b = pixels[i + 2] >> (8 - LUT_BITS);
+
+            int lutIndex = (r << (LUT_BITS * 2)) | (g << LUT_BITS) | b;
+
+            indices[pIdx++] = lut[lutIndex];
         }
+
+        if (timing) t3 = Stopwatch.GetTimestamp();
+
+        ticksTraverse = timing ? t1 - t0 : 0;
+        ticksBuildPalette = timing ? t2 - t1 : 0;
+        ticksMap = timing ? t3 - t2 : 0;
 
         return (palette, indices);
     }
-
-    private static byte GetNearestColorIndex(byte[] palette, byte r, byte g, byte b, int paletteCount)
+    private static byte[] BuildColorLut(byte[] palette, int paletteCount)
     {
-        int minDist = int.MaxValue;
-        int bestIndex = 0;
+        int lutLength = LUT_SIZE * LUT_SIZE * LUT_SIZE;
+        byte[] lut = new byte[lutLength];
 
-        for (int i = 0; i < paletteCount; i++)
+        for (int r = 0; r < LUT_SIZE; r++)
         {
-            int pr = palette[i * 3 + 0];
-            int pg = palette[i * 3 + 1];
-            int pb = palette[i * 3 + 2];
-
-            int dr = pr - r;
-            int dg = pg - g;
-            int db = pb - b;
-
-            int dist = dr * dr + dg * dg + db * db;
-            if (dist < minDist)
+            for (int g = 0; g < LUT_SIZE; g++)
             {
-                minDist = dist;
-                bestIndex = i;
-                if (minDist == 0) break; // Exact match
+                for (int b = 0; b < LUT_SIZE; b++)
+                {
+                    // 恢复到 0~255 范围（取桶中心值）
+                    int rr = (r << (8 - LUT_BITS)) + (1 << (7 - LUT_BITS));
+                    int gg = (g << (8 - LUT_BITS)) + (1 << (7 - LUT_BITS));
+                    int bb = (b << (8 - LUT_BITS)) + (1 << (7 - LUT_BITS));
+
+                    int minDist = int.MaxValue;
+                    int bestIndex = 0;
+
+                    for (int i = 0; i < paletteCount; i++)
+                    {
+                        int pr = palette[i * 3 + 0];
+                        int pg = palette[i * 3 + 1];
+                        int pb = palette[i * 3 + 2];
+
+                        int dr = pr - rr;
+                        int dg = pg - gg;
+                        int db = pb - bb;
+
+                        int dist = dr * dr + dg * dg + db * db;
+
+                        if (dist < minDist)
+                        {
+                            minDist = dist;
+                            bestIndex = i;
+                            if (dist == 0) break;
+                        }
+                    }
+
+                    int index = (r << (LUT_BITS * 2)) | (g << LUT_BITS) | b;
+                    lut[index] = (byte)bestIndex;
+                }
             }
         }
-        return (byte)bestIndex;
+
+        return lut;
     }
 
     private int _leafCount = 0;
