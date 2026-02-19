@@ -72,14 +72,7 @@ public class PngDecoder
     public byte[] DecodeToRGB(Stream stream)
     {
         byte[] sig = new byte[8];
-        int readCount = 0;
-        while (readCount < 8)
-        {
-            int n = stream.Read(sig, readCount, 8 - readCount);
-            if (n == 0) break;
-            readCount += n;
-        }
-        if (readCount != 8) throw new InvalidDataException("File too short");
+        ReadExact(stream, sig, 0, 8);
         if (!IsPngSignature(sig)) throw new InvalidDataException("Not a PNG file");
 
         using var idatStream = new PooledMemoryStream(4096);
@@ -87,12 +80,12 @@ public class PngDecoder
         byte[] lenBytes = new byte[4];
         byte[] typeBytes = new byte[4];
         byte[] crcBytes = new byte[4];
-        while (!endChunkFound && stream.Position < stream.Length)
+        while (!endChunkFound)
         {
-            if (stream.Read(lenBytes, 0, 4) != 4) break;
+            if (!TryReadExact(stream, lenBytes, 0, 4)) break;
             uint length = ReadBigEndianUint32(lenBytes, 0);
-
-            if (stream.Read(typeBytes, 0, 4) != 4) break;
+            if (length > int.MaxValue) throw new InvalidDataException("Chunk too large");
+            ReadExact(stream, typeBytes, 0, 4);
             uint type = ReadBigEndianUint32(typeBytes, 0);
 
             byte[] data;
@@ -109,14 +102,14 @@ public class PngDecoder
                     rented = ArrayPool<byte>.Shared.Rent(dataLength);
                     data = rented;
                 }
-                if (stream.Read(data, 0, dataLength) != dataLength) throw new InvalidDataException("Unexpected EOF in chunk data");
+                ReadExact(stream, data, 0, dataLength);
             }
             else
             {
                 data = Array.Empty<byte>();
             }
 
-            if (stream.Read(crcBytes, 0, 4) != 4) break;
+            ReadExact(stream, crcBytes, 0, 4);
             uint fileCrc = ReadBigEndianUint32(crcBytes, 0);
 
             uint calcCrc = Crc32.Compute(typeBytes);
@@ -178,25 +171,19 @@ public class PngDecoder
     public byte[] DecodeToRGBA(Stream stream)
     {
         byte[] sig = new byte[8];
-        int readCount = 0;
-        while (readCount < 8)
-        {
-            int n = stream.Read(sig, readCount, 8 - readCount);
-            if (n == 0) break;
-            readCount += n;
-        }
-        if (readCount != 8) throw new InvalidDataException("File too short");
+        ReadExact(stream, sig, 0, 8);
         if (!IsPngSignature(sig)) throw new InvalidDataException("Not a PNG file");
         using var idatStream = new PooledMemoryStream(4096);
         bool endChunkFound = false;
         byte[] lenBytes = new byte[4];
         byte[] typeBytes = new byte[4];
         byte[] crcBytes = new byte[4];
-        while (!endChunkFound && stream.Position < stream.Length)
+        while (!endChunkFound)
         {
-            if (stream.Read(lenBytes, 0, 4) != 4) break;
+            if (!TryReadExact(stream, lenBytes, 0, 4)) break;
             uint length = ReadBigEndianUint32(lenBytes, 0);
-            if (stream.Read(typeBytes, 0, 4) != 4) break;
+            if (length > int.MaxValue) throw new InvalidDataException("Chunk too large");
+            ReadExact(stream, typeBytes, 0, 4);
             uint type = ReadBigEndianUint32(typeBytes, 0);
             byte[] data;
             byte[]? rented = null;
@@ -212,13 +199,13 @@ public class PngDecoder
                     rented = ArrayPool<byte>.Shared.Rent(dataLength);
                     data = rented;
                 }
-                if (stream.Read(data, 0, dataLength) != dataLength) throw new InvalidDataException("Unexpected EOF in chunk data");
+                ReadExact(stream, data, 0, dataLength);
             }
             else
             {
                 data = Array.Empty<byte>();
             }
-            if (stream.Read(crcBytes, 0, 4) != 4) break;
+            ReadExact(stream, crcBytes, 0, 4);
             switch (type)
             {
                 case TypeIHDR:
@@ -247,6 +234,28 @@ public class PngDecoder
         ArraySegment<byte> idatSegment = idatStream.GetBuffer();
         byte[] decompressed = ZlibHelper.Decompress(idatSegment.Array, idatSegment.Offset, idatSegment.Count);
         return ProcessImageRgba(decompressed);
+    }
+
+    private static bool TryReadExact(Stream stream, byte[] buffer, int offset, int count)
+    {
+        int read = 0;
+        while (read < count)
+        {
+            int n = stream.Read(buffer, offset + read, count - read);
+            if (n == 0)
+            {
+                if (read == 0) return false;
+                throw new InvalidDataException("Unexpected EOF");
+            }
+            read += n;
+        }
+        return true;
+    }
+
+    private static void ReadExact(Stream stream, byte[] buffer, int offset, int count)
+    {
+        if (!TryReadExact(stream, buffer, offset, count))
+            throw new InvalidDataException("Unexpected EOF");
     }
 
     private static bool IsPngSignature(byte[] sig)

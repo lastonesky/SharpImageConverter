@@ -1,4 +1,5 @@
 using System;
+using System.Buffers;
 using System.IO;
 
 namespace SharpImageConverter.Formats.Bmp;
@@ -77,6 +78,7 @@ public static class BmpReader
         int pixelSize = bpp / 8;
 
         byte[]? palette = null;
+        byte[]? paletteRgb = null;
         int paletteEntries = 0;
 
         // 如果 stream 支持 Seek，则跳转到 dataOffset。
@@ -98,12 +100,30 @@ public static class BmpReader
             paletteEntries = Math.Min(256, maxEntries);
             palette = new byte[paletteEntries * 4];
             stream.ReadExactly(palette, 0, palette.Length);
+            paletteRgb = new byte[paletteEntries * 3];
+            int palSrc = 0;
+            int palDst = 0;
+            for (int i = 0; i < paletteEntries; i++)
+            {
+                paletteRgb[palDst + 0] = palette[palSrc + 2];
+                paletteRgb[palDst + 1] = palette[palSrc + 1];
+                paletteRgb[palDst + 2] = palette[palSrc + 0];
+                palSrc += 4;
+                palDst += 3;
+            }
 
             int remaining = paletteBytes - palette.Length;
             if (remaining > 0)
             {
-                byte[] temp = new byte[remaining];
-                stream.ReadExactly(temp, 0, remaining);
+                byte[] temp = ArrayPool<byte>.Shared.Rent(remaining);
+                try
+                {
+                    stream.ReadExactly(temp, 0, remaining);
+                }
+                finally
+                {
+                    ArrayPool<byte>.Shared.Return(temp);
+                }
             }
         }
         else
@@ -116,50 +136,111 @@ public static class BmpReader
                 }
                 else
                 {
-                    byte[] temp = new byte[bytesUntilPixelData];
-                    stream.ReadExactly(temp, 0, bytesUntilPixelData);
+                    byte[] temp = ArrayPool<byte>.Shared.Rent(bytesUntilPixelData);
+                    try
+                    {
+                        stream.ReadExactly(temp, 0, bytesUntilPixelData);
+                    }
+                    finally
+                    {
+                        ArrayPool<byte>.Shared.Return(temp);
+                    }
                 }
             }
         }
 
-        byte[] row = new byte[rowStride];
-        for (int rowIndex = 0; rowIndex < height; rowIndex++)
+        byte[] row = ArrayPool<byte>.Shared.Rent(rowStride);
+        try
         {
-            stream.ReadExactly(row, 0, rowStride);
-            int dstY = bottomUp ? (height - 1 - rowIndex) : rowIndex;
-            int dstOffset = dstY * width * 3;
-
-            for (int x = 0; x < width; x++)
+            if (bpp == 8)
             {
-                int src = x * pixelSize;
-                int dst = dstOffset + x * 3;
-
-                byte r, g, b;
-
-                if (bpp == 8)
+                if (paletteRgb == null || paletteEntries == 0)
+                    throw new InvalidDataException("8-bit BMP palette is missing.");
+                unsafe
                 {
-                    int index = row[src];
-                    if (palette == null || paletteEntries == 0)
-                        throw new InvalidDataException("8-bit BMP palette is missing.");
-                    if (index >= paletteEntries)
-                        index = 0;
-                    int palOffset = index * 4;
-                    b = palette[palOffset + 0];
-                    g = palette[palOffset + 1];
-                    r = palette[palOffset + 2];
+                    fixed (byte* pRow = row)
+                    fixed (byte* pDst = rgb)
+                    fixed (byte* pPal = paletteRgb)
+                    {
+                        for (int rowIndex = 0; rowIndex < height; rowIndex++)
+                        {
+                            stream.ReadExactly(row, 0, rowStride);
+                            int dstY = bottomUp ? (height - 1 - rowIndex) : rowIndex;
+                            byte* dst = pDst + (dstY * width * 3);
+                            byte* src = pRow;
+                            for (int x = 0; x < width; x++)
+                            {
+                                int index = src[x];
+                                if (index >= paletteEntries)
+                                    index = 0;
+                                int palOffset = index * 3;
+                                dst[0] = pPal[palOffset + 0];
+                                dst[1] = pPal[palOffset + 1];
+                                dst[2] = pPal[palOffset + 2];
+                                dst += 3;
+                            }
+                        }
+                    }
                 }
-                else
-                {
-                    // BMP is BGR(A)
-                    b = row[src];
-                    g = row[src + 1];
-                    r = row[src + 2];
-                }
-
-                rgb[dst] = r;
-                rgb[dst + 1] = g;
-                rgb[dst + 2] = b;
             }
+            else if (bpp == 24)
+            {
+                int srcRowSize = width * 3;
+                unsafe
+                {
+                    fixed (byte* pRow = row)
+                    fixed (byte* pDst = rgb)
+                    {
+                        for (int rowIndex = 0; rowIndex < height; rowIndex++)
+                        {
+                            stream.ReadExactly(row, 0, rowStride);
+                            int dstY = bottomUp ? (height - 1 - rowIndex) : rowIndex;
+                            byte* src = pRow;
+                            byte* dst = pDst + (dstY * width * 3);
+                            byte* srcEnd = src + srcRowSize;
+                            while (src < srcEnd)
+                            {
+                                dst[0] = src[2];
+                                dst[1] = src[1];
+                                dst[2] = src[0];
+                                src += 3;
+                                dst += 3;
+                            }
+                        }
+                    }
+                }
+            }
+            else
+            {
+                int srcRowSize = width * 4;
+                unsafe
+                {
+                    fixed (byte* pRow = row)
+                    fixed (byte* pDst = rgb)
+                    {
+                        for (int rowIndex = 0; rowIndex < height; rowIndex++)
+                        {
+                            stream.ReadExactly(row, 0, rowStride);
+                            int dstY = bottomUp ? (height - 1 - rowIndex) : rowIndex;
+                            byte* src = pRow;
+                            byte* dst = pDst + (dstY * width * 3);
+                            byte* srcEnd = src + srcRowSize;
+                            while (src < srcEnd)
+                            {
+                                dst[0] = src[2];
+                                dst[1] = src[1];
+                                dst[2] = src[0];
+                                src += 4;
+                                dst += 3;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(row);
         }
 
         return rgb;
