@@ -38,6 +38,7 @@ namespace SharpImageConverter.Processing
         {
             int sw = _image.Width, sh = _image.Height;
             if (sw <= 0 || sh <= 0 || width <= 0 || height <= 0) return this;
+            if (sw == width && sh == height) return this;
 
             bool isUpscale = width > sw || height > sh;
             if (isUpscale)
@@ -56,37 +57,58 @@ namespace SharpImageConverter.Processing
         /// <returns>上下文自身</returns>
         public ImageProcessingContext ResizeBilinear(int width, int height)
         {
+            int sw = _image.Width, sh = _image.Height;
+            if (sw <= 0 || sh <= 0 || width <= 0 || height <= 0) return this;
+            if (sw == width && sh == height) return this;
             var src = _image.Buffer;
             var dst = new byte[width * height * 3];
-            int sw = _image.Width, sh = _image.Height;
-            double scaleX = sw <= 1 ? 0 : (double)(sw - 1) / Math.Max(1, width - 1);
-            double scaleY = sh <= 1 ? 0 : (double)(sh - 1) / Math.Max(1, height - 1);
+            float scaleX = sw <= 1 ? 0f : (float)(sw - 1) / Math.Max(1, width - 1);
+            float scaleY = sh <= 1 ? 0f : (float)(sh - 1) / Math.Max(1, height - 1);
+            int[] x0Index = new int[width];
+            int[] x1Index = new int[width];
+            float[] wx0Arr = new float[width];
+            float[] wx1Arr = new float[width];
+            for (int x = 0; x < width; x++)
+            {
+                float sxf = x * scaleX;
+                int x0 = (int)sxf;
+                int x1 = x0 + 1;
+                if (x1 >= sw) x1 = sw - 1;
+                float tx = sxf - x0;
+                x0Index[x] = x0 * 3;
+                x1Index[x] = x1 * 3;
+                wx1Arr[x] = tx;
+                wx0Arr[x] = 1f - tx;
+            }
             for (int y = 0; y < height; y++)
             {
-                double syf = y * scaleY;
+                float syf = y * scaleY;
                 int y0 = (int)syf;
                 int y1 = y0 + 1; if (y1 >= sh) y1 = sh - 1;
-                double ty = syf - y0;
+                float ty = syf - y0;
+                float wy1 = ty;
+                float wy0 = 1f - ty;
+                int row0 = y0 * sw * 3;
+                int row1 = y1 * sw * 3;
+                int dRow = y * width * 3;
                 for (int x = 0; x < width; x++)
                 {
-                    double sxf = x * scaleX;
-                    int x0 = (int)sxf;
-                    int x1 = x0 + 1; if (x1 >= sw) x1 = sw - 1;
-                    double tx = sxf - x0;
-                    int s00 = (y0 * sw + x0) * 3;
-                    int s10 = (y0 * sw + x1) * 3;
-                    int s01 = (y1 * sw + x0) * 3;
-                    int s11 = (y1 * sw + x1) * 3;
-                    int d = (y * width + x) * 3;
-                    double r0 = src[s00 + 0] * (1 - tx) + src[s10 + 0] * tx;
-                    double r1 = src[s01 + 0] * (1 - tx) + src[s11 + 0] * tx;
-                    dst[d + 0] = (byte)(r0 * (1 - ty) + r1 * ty + 0.5);
-                    double g0 = src[s00 + 1] * (1 - tx) + src[s10 + 1] * tx;
-                    double g1 = src[s01 + 1] * (1 - tx) + src[s11 + 1] * tx;
-                    dst[d + 1] = (byte)(g0 * (1 - ty) + g1 * ty + 0.5);
-                    double b0 = src[s00 + 2] * (1 - tx) + src[s10 + 2] * tx;
-                    double b1 = src[s01 + 2] * (1 - tx) + src[s11 + 2] * tx;
-                    dst[d + 2] = (byte)(b0 * (1 - ty) + b1 * ty + 0.5);
+                    int s00 = row0 + x0Index[x];
+                    int s10 = row0 + x1Index[x];
+                    int s01 = row1 + x0Index[x];
+                    int s11 = row1 + x1Index[x];
+                    int d = dRow + x * 3;
+                    float wx0 = wx0Arr[x];
+                    float wx1 = wx1Arr[x];
+                    float r0 = src[s00 + 0] * wx0 + src[s10 + 0] * wx1;
+                    float r1 = src[s01 + 0] * wx0 + src[s11 + 0] * wx1;
+                    dst[d + 0] = (byte)(r0 * wy0 + r1 * wy1 + 0.5f);
+                    float g0 = src[s00 + 1] * wx0 + src[s10 + 1] * wx1;
+                    float g1 = src[s01 + 1] * wx0 + src[s11 + 1] * wx1;
+                    dst[d + 1] = (byte)(g0 * wy0 + g1 * wy1 + 0.5f);
+                    float b0 = src[s00 + 2] * wx0 + src[s10 + 2] * wx1;
+                    float b1 = src[s01 + 2] * wx0 + src[s11 + 2] * wx1;
+                    dst[d + 2] = (byte)(b0 * wy0 + b1 * wy1 + 0.5f);
                 }
             }
             _image.Update(width, height, dst);
@@ -247,14 +269,14 @@ namespace SharpImageConverter.Processing
                 float wy3 = yWeight[yOff + 3];
 
                 int dBase = y * width * 3;
+                Span<int> sxBuf0 = stackalloc int[4 * Vector<float>.Count];
+                Span<float> wxBuf0 = stackalloc float[4 * Vector<float>.Count];
 
                 int x = 0;
                 int vecLimit = width - (width % vecSize);
                 for (; x < vecLimit; x += vecSize)
                 {
                     int xOff0 = x * 4;
-                    Span<int> sxBuf0 = stackalloc int[4 * Vector<float>.Count];
-                    Span<float> wxBuf0 = stackalloc float[4 * Vector<float>.Count];
 
                     for (int i = 0; i < vecSize; i++)
                     {
@@ -272,7 +294,6 @@ namespace SharpImageConverter.Processing
 
                     for (int c = 0; c < 3; c++)
                     {
-                        var vRes = Vector<float>.Zero;
                         for (int i = 0; i < vecSize; i++)
                         {
                             int sx0 = sxBuf0[i * 4 + 0];
