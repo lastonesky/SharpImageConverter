@@ -1,4 +1,5 @@
 using System;
+using System.Buffers;
 using System.Numerics;
 using System.Threading.Tasks;
 using SharpImageConverter.Core;
@@ -64,52 +65,66 @@ namespace SharpImageConverter.Processing
             var dst = new byte[width * height * 3];
             float scaleX = sw <= 1 ? 0f : (float)(sw - 1) / Math.Max(1, width - 1);
             float scaleY = sh <= 1 ? 0f : (float)(sh - 1) / Math.Max(1, height - 1);
-            int[] x0Index = new int[width];
-            int[] x1Index = new int[width];
-            float[] wx0Arr = new float[width];
-            float[] wx1Arr = new float[width];
-            for (int x = 0; x < width; x++)
+            var poolInt = ArrayPool<int>.Shared;
+            var poolFloat = ArrayPool<float>.Shared;
+            int[] x0IndexArr = poolInt.Rent(width);
+            int[] x1IndexArr = poolInt.Rent(width);
+            float[] wx0Arr = poolFloat.Rent(width);
+            float[] wx1Arr = poolFloat.Rent(width);
+            try
             {
-                float sxf = x * scaleX;
-                int x0 = (int)sxf;
-                int x1 = x0 + 1;
-                if (x1 >= sw) x1 = sw - 1;
-                float tx = sxf - x0;
-                x0Index[x] = x0 * 3;
-                x1Index[x] = x1 * 3;
-                wx1Arr[x] = tx;
-                wx0Arr[x] = 1f - tx;
-            }
-            for (int y = 0; y < height; y++)
-            {
-                float syf = y * scaleY;
-                int y0 = (int)syf;
-                int y1 = y0 + 1; if (y1 >= sh) y1 = sh - 1;
-                float ty = syf - y0;
-                float wy1 = ty;
-                float wy0 = 1f - ty;
-                int row0 = y0 * sw * 3;
-                int row1 = y1 * sw * 3;
-                int dRow = y * width * 3;
+                var x0Index = x0IndexArr;
+                var x1Index = x1IndexArr;
                 for (int x = 0; x < width; x++)
                 {
-                    int s00 = row0 + x0Index[x];
-                    int s10 = row0 + x1Index[x];
-                    int s01 = row1 + x0Index[x];
-                    int s11 = row1 + x1Index[x];
-                    int d = dRow + x * 3;
-                    float wx0 = wx0Arr[x];
-                    float wx1 = wx1Arr[x];
-                    float r0 = src[s00 + 0] * wx0 + src[s10 + 0] * wx1;
-                    float r1 = src[s01 + 0] * wx0 + src[s11 + 0] * wx1;
-                    dst[d + 0] = (byte)(r0 * wy0 + r1 * wy1 + 0.5f);
-                    float g0 = src[s00 + 1] * wx0 + src[s10 + 1] * wx1;
-                    float g1 = src[s01 + 1] * wx0 + src[s11 + 1] * wx1;
-                    dst[d + 1] = (byte)(g0 * wy0 + g1 * wy1 + 0.5f);
-                    float b0 = src[s00 + 2] * wx0 + src[s10 + 2] * wx1;
-                    float b1 = src[s01 + 2] * wx0 + src[s11 + 2] * wx1;
-                    dst[d + 2] = (byte)(b0 * wy0 + b1 * wy1 + 0.5f);
+                    float sxf = x * scaleX;
+                    int x0 = (int)sxf;
+                    int x1 = x0 + 1;
+                    if (x1 >= sw) x1 = sw - 1;
+                    float tx = sxf - x0;
+                    x0Index[x] = x0 * 3;
+                    x1Index[x] = x1 * 3;
+                    wx1Arr[x] = tx;
+                    wx0Arr[x] = 1f - tx;
                 }
+                for (int y = 0; y < height; y++)
+                {
+                    float syf = y * scaleY;
+                    int y0 = (int)syf;
+                    int y1 = y0 + 1; if (y1 >= sh) y1 = sh - 1;
+                    float ty = syf - y0;
+                    float wy1 = ty;
+                    float wy0 = 1f - ty;
+                    int row0 = y0 * sw * 3;
+                    int row1 = y1 * sw * 3;
+                    int dRow = y * width * 3;
+                    for (int x = 0; x < width; x++)
+                    {
+                        int s00 = row0 + x0Index[x];
+                        int s10 = row0 + x1Index[x];
+                        int s01 = row1 + x0Index[x];
+                        int s11 = row1 + x1Index[x];
+                        int d = dRow + x * 3;
+                        float wx0 = wx0Arr[x];
+                        float wx1 = wx1Arr[x];
+                        float r0 = src[s00 + 0] * wx0 + src[s10 + 0] * wx1;
+                        float r1 = src[s01 + 0] * wx0 + src[s11 + 0] * wx1;
+                        dst[d + 0] = (byte)(r0 * wy0 + r1 * wy1 + 0.5f);
+                        float g0 = src[s00 + 1] * wx0 + src[s10 + 1] * wx1;
+                        float g1 = src[s01 + 1] * wx0 + src[s11 + 1] * wx1;
+                        dst[d + 1] = (byte)(g0 * wy0 + g1 * wy1 + 0.5f);
+                        float b0 = src[s00 + 2] * wx0 + src[s10 + 2] * wx1;
+                        float b1 = src[s01 + 2] * wx0 + src[s11 + 2] * wx1;
+                        dst[d + 2] = (byte)(b0 * wy0 + b1 * wy1 + 0.5f);
+                    }
+                }
+            }
+            finally
+            {
+                poolInt.Return(x0IndexArr);
+                poolInt.Return(x1IndexArr);
+                poolFloat.Return(wx0Arr);
+                poolFloat.Return(wx1Arr);
             }
             _image.Update(width, height, dst);
             return this;
@@ -218,8 +233,10 @@ namespace SharpImageConverter.Processing
             float scaleX = (float)sw / width;
             float scaleY = (float)sh / height;
 
-            int[] xIndex = new int[width * 4];
-            float[] xWeight = new float[width * 4];
+            var poolInt = ArrayPool<int>.Shared;
+            var poolFloat = ArrayPool<float>.Shared;
+            int[] xIndex = poolInt.Rent(width * 4);
+            float[] xWeight = poolFloat.Rent(width * 4);
             for (int x = 0; x < width; x++)
             {
                 float gx = (x + 0.5f) * scaleX - 0.5f;
@@ -236,75 +253,128 @@ namespace SharpImageConverter.Processing
                 }
             }
 
-            int[] yIndex = new int[height * 4];
-            float[] yWeight = new float[height * 4];
-            for (int y = 0; y < height; y++)
+            int[] yIndex = poolInt.Rent(height * 4);
+            float[] yWeight = poolFloat.Rent(height * 4);
+            try
             {
-                float gy = (y + 0.5f) * scaleY - 0.5f;
-                int iy = (int)MathF.Floor(gy);
-                float t = gy - iy;
-                for (int k = -1; k <= 2; k++)
+                for (int y = 0; y < height; y++)
                 {
-                    int idx = y * 4 + (k + 1);
-                    int sy = iy + k;
-                    if (sy < 0) sy = 0;
-                    else if (sy >= sh) sy = sh - 1;
-                    yIndex[idx] = sy;
-                    yWeight[idx] = CubicF(t - k);
-                }
-            }
-
-            int vecSize = Vector<float>.Count;
-
-            Parallel.For(0, height, y =>
-            {
-                int yOff = y * 4;
-                int sy0 = yIndex[yOff + 0];
-                int sy1 = yIndex[yOff + 1];
-                int sy2 = yIndex[yOff + 2];
-                int sy3 = yIndex[yOff + 3];
-                float wy0 = yWeight[yOff + 0];
-                float wy1 = yWeight[yOff + 1];
-                float wy2 = yWeight[yOff + 2];
-                float wy3 = yWeight[yOff + 3];
-
-                int dBase = y * width * 3;
-                Span<int> sxBuf0 = stackalloc int[4 * Vector<float>.Count];
-                Span<float> wxBuf0 = stackalloc float[4 * Vector<float>.Count];
-
-                int x = 0;
-                int vecLimit = width - (width % vecSize);
-                for (; x < vecLimit; x += vecSize)
-                {
-                    int xOff0 = x * 4;
-
-                    for (int i = 0; i < vecSize; i++)
+                    float gy = (y + 0.5f) * scaleY - 0.5f;
+                    int iy = (int)MathF.Floor(gy);
+                    float t = gy - iy;
+                    for (int k = -1; k <= 2; k++)
                     {
-                        int xo = x + i;
-                        int xOff = xo * 4;
-                        sxBuf0[i * 4 + 0] = xIndex[xOff + 0];
-                        sxBuf0[i * 4 + 1] = xIndex[xOff + 1];
-                        sxBuf0[i * 4 + 2] = xIndex[xOff + 2];
-                        sxBuf0[i * 4 + 3] = xIndex[xOff + 3];
-                        wxBuf0[i * 4 + 0] = xWeight[xOff + 0];
-                        wxBuf0[i * 4 + 1] = xWeight[xOff + 1];
-                        wxBuf0[i * 4 + 2] = xWeight[xOff + 2];
-                        wxBuf0[i * 4 + 3] = xWeight[xOff + 3];
+                        int idx = y * 4 + (k + 1);
+                        int sy = iy + k;
+                        if (sy < 0) sy = 0;
+                        else if (sy >= sh) sy = sh - 1;
+                        yIndex[idx] = sy;
+                        yWeight[idx] = CubicF(t - k);
                     }
+                }
 
-                    for (int c = 0; c < 3; c++)
+                int vecSize = Vector<float>.Count;
+
+                Parallel.For(0, height, y =>
+                {
+                    int yOff = y * 4;
+                    int sy0 = yIndex[yOff + 0];
+                    int sy1 = yIndex[yOff + 1];
+                    int sy2 = yIndex[yOff + 2];
+                    int sy3 = yIndex[yOff + 3];
+                    float wy0 = yWeight[yOff + 0];
+                    float wy1 = yWeight[yOff + 1];
+                    float wy2 = yWeight[yOff + 2];
+                    float wy3 = yWeight[yOff + 3];
+
+                    int dBase = y * width * 3;
+                    Span<int> sxBuf0 = stackalloc int[4 * Vector<float>.Count];
+                    Span<float> wxBuf0 = stackalloc float[4 * Vector<float>.Count];
+
+                    int x = 0;
+                    int vecLimit = width - (width % vecSize);
+                    for (; x < vecLimit; x += vecSize)
                     {
+                        int xOff0 = x * 4;
+
                         for (int i = 0; i < vecSize; i++)
                         {
-                            int sx0 = sxBuf0[i * 4 + 0];
-                            int sx1 = sxBuf0[i * 4 + 1];
-                            int sx2 = sxBuf0[i * 4 + 2];
-                            int sx3 = sxBuf0[i * 4 + 3];
-                            float wx0 = wxBuf0[i * 4 + 0];
-                            float wx1 = wxBuf0[i * 4 + 1];
-                            float wx2 = wxBuf0[i * 4 + 2];
-                            float wx3 = wxBuf0[i * 4 + 3];
+                            int xo = x + i;
+                            int xOff = xo * 4;
+                            sxBuf0[i * 4 + 0] = xIndex[xOff + 0];
+                            sxBuf0[i * 4 + 1] = xIndex[xOff + 1];
+                            sxBuf0[i * 4 + 2] = xIndex[xOff + 2];
+                            sxBuf0[i * 4 + 3] = xIndex[xOff + 3];
+                            wxBuf0[i * 4 + 0] = xWeight[xOff + 0];
+                            wxBuf0[i * 4 + 1] = xWeight[xOff + 1];
+                            wxBuf0[i * 4 + 2] = xWeight[xOff + 2];
+                            wxBuf0[i * 4 + 3] = xWeight[xOff + 3];
+                        }
 
+                        for (int c = 0; c < 3; c++)
+                        {
+                            for (int i = 0; i < vecSize; i++)
+                            {
+                                int sx0 = sxBuf0[i * 4 + 0];
+                                int sx1 = sxBuf0[i * 4 + 1];
+                                int sx2 = sxBuf0[i * 4 + 2];
+                                int sx3 = sxBuf0[i * 4 + 3];
+                                float wx0 = wxBuf0[i * 4 + 0];
+                                float wx1 = wxBuf0[i * 4 + 1];
+                                float wx2 = wxBuf0[i * 4 + 2];
+                                float wx3 = wxBuf0[i * 4 + 3];
+
+                                float row0 =
+                                    wx0 * src[(sy0 * sw + sx0) * 3 + c] +
+                                    wx1 * src[(sy0 * sw + sx1) * 3 + c] +
+                                    wx2 * src[(sy0 * sw + sx2) * 3 + c] +
+                                    wx3 * src[(sy0 * sw + sx3) * 3 + c];
+                                float row1 =
+                                    wx0 * src[(sy1 * sw + sx0) * 3 + c] +
+                                    wx1 * src[(sy1 * sw + sx1) * 3 + c] +
+                                    wx2 * src[(sy1 * sw + sx2) * 3 + c] +
+                                    wx3 * src[(sy1 * sw + sx3) * 3 + c];
+                                float row2 =
+                                    wx0 * src[(sy2 * sw + sx0) * 3 + c] +
+                                    wx1 * src[(sy2 * sw + sx1) * 3 + c] +
+                                    wx2 * src[(sy2 * sw + sx2) * 3 + c] +
+                                    wx3 * src[(sy2 * sw + sx3) * 3 + c];
+                                float row3 =
+                                    wx0 * src[(sy3 * sw + sx0) * 3 + c] +
+                                    wx1 * src[(sy3 * sw + sx1) * 3 + c] +
+                                    wx2 * src[(sy3 * sw + sx2) * 3 + c] +
+                                    wx3 * src[(sy3 * sw + sx3) * 3 + c];
+
+                                float val =
+                                    wy0 * row0 +
+                                    wy1 * row1 +
+                                    wy2 * row2 +
+                                    wy3 * row3;
+
+                                if (val < 0f) val = 0f;
+                                else if (val > 255f) val = 255f;
+
+                                int d = dBase + (x + i) * 3 + c;
+                                dst[d] = (byte)(val + 0.5f);
+                            }
+                        }
+                    }
+
+                    for (; x < width; x++)
+                    {
+                        int xOff = x * 4;
+                        int sx0 = xIndex[xOff + 0];
+                        int sx1 = xIndex[xOff + 1];
+                        int sx2 = xIndex[xOff + 2];
+                        int sx3 = xIndex[xOff + 3];
+                        float wx0 = xWeight[xOff + 0];
+                        float wx1 = xWeight[xOff + 1];
+                        float wx2 = xWeight[xOff + 2];
+                        float wx3 = xWeight[xOff + 3];
+                        int d = dBase + x * 3;
+
+                        for (int c = 0; c < 3; c++)
+                        {
                             float row0 =
                                 wx0 * src[(sy0 * sw + sx0) * 3 + c] +
                                 wx1 * src[(sy0 * sw + sx1) * 3 + c] +
@@ -334,61 +404,18 @@ namespace SharpImageConverter.Processing
 
                             if (val < 0f) val = 0f;
                             else if (val > 255f) val = 255f;
-
-                            int d = dBase + (x + i) * 3 + c;
-                            dst[d] = (byte)(val + 0.5f);
+                            dst[d + c] = (byte)(val + 0.5f);
                         }
                     }
-                }
-
-                for (; x < width; x++)
-                {
-                    int xOff = x * 4;
-                    int sx0 = xIndex[xOff + 0];
-                    int sx1 = xIndex[xOff + 1];
-                    int sx2 = xIndex[xOff + 2];
-                    int sx3 = xIndex[xOff + 3];
-                    float wx0 = xWeight[xOff + 0];
-                    float wx1 = xWeight[xOff + 1];
-                    float wx2 = xWeight[xOff + 2];
-                    float wx3 = xWeight[xOff + 3];
-                    int d = dBase + x * 3;
-
-                    for (int c = 0; c < 3; c++)
-                    {
-                        float row0 =
-                            wx0 * src[(sy0 * sw + sx0) * 3 + c] +
-                            wx1 * src[(sy0 * sw + sx1) * 3 + c] +
-                            wx2 * src[(sy0 * sw + sx2) * 3 + c] +
-                            wx3 * src[(sy0 * sw + sx3) * 3 + c];
-                        float row1 =
-                            wx0 * src[(sy1 * sw + sx0) * 3 + c] +
-                            wx1 * src[(sy1 * sw + sx1) * 3 + c] +
-                            wx2 * src[(sy1 * sw + sx2) * 3 + c] +
-                            wx3 * src[(sy1 * sw + sx3) * 3 + c];
-                        float row2 =
-                            wx0 * src[(sy2 * sw + sx0) * 3 + c] +
-                            wx1 * src[(sy2 * sw + sx1) * 3 + c] +
-                            wx2 * src[(sy2 * sw + sx2) * 3 + c] +
-                            wx3 * src[(sy2 * sw + sx3) * 3 + c];
-                        float row3 =
-                            wx0 * src[(sy3 * sw + sx0) * 3 + c] +
-                            wx1 * src[(sy3 * sw + sx1) * 3 + c] +
-                            wx2 * src[(sy3 * sw + sx2) * 3 + c] +
-                            wx3 * src[(sy3 * sw + sx3) * 3 + c];
-
-                        float val =
-                            wy0 * row0 +
-                            wy1 * row1 +
-                            wy2 * row2 +
-                            wy3 * row3;
-
-                        if (val < 0f) val = 0f;
-                        else if (val > 255f) val = 255f;
-                        dst[d + c] = (byte)(val + 0.5f);
-                    }
-                }
-            });
+                });
+            }
+            finally
+            {
+                poolInt.Return(xIndex);
+                poolInt.Return(yIndex);
+                poolFloat.Return(xWeight);
+                poolFloat.Return(yWeight);
+            }
 
             _image.Update(width, height, dst);
             return this;

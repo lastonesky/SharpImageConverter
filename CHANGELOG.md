@@ -1,5 +1,9 @@
+## 0.1.6.2-preview
+- 优化GIF/PNG的网络流处理能力和图片缩放方法中的内存分配方式
+## 0.1.6.1-preview
+- 优化缩放处理方法
 ## 0.1.6
-- 重点优化了GIF编码的性能和JPEG解码的性能
+- 重点优化了GIF编码的性能和JPEG编码的性能
 ## 0.1.5
 - JPEG解码添加了CMYK和YCCK的颜色支持 (Added CMYK and YCCK color support in JPEG decoder)
 ## 0.1.5-preview

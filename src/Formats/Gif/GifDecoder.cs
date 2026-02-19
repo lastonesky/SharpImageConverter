@@ -29,11 +29,11 @@ namespace SharpImageConverter.Formats.Gif
         public GifAnimation DecodeAnimationRgb24(Stream stream)
         {
             byte[] sig = new byte[6];
-            if (stream.Read(sig, 0, 6) != 6) throw new InvalidDataException("Invalid GIF header");
+            ReadExact(stream, sig, 0, 6);
             if (sig[0] != 'G' || sig[1] != 'I' || sig[2] != 'F') throw new InvalidDataException("Not a GIF file");
 
             byte[] lsd = new byte[7];
-            if (stream.Read(lsd, 0, 7) != 7) throw new InvalidDataException("Invalid LSD");
+            ReadExact(stream, lsd, 0, 7);
             int width = lsd[0] | (lsd[1] << 8);
             int height = lsd[2] | (lsd[3] << 8);
             byte packed = lsd[4];
@@ -46,14 +46,8 @@ namespace SharpImageConverter.Formats.Gif
             if (hasGct)
             {
                 gctColors = gctSize;
-                int read = 0;
                 int toRead = gctColors * 3;
-                while (read < toRead)
-                {
-                    var n = stream.Read(gct, read, toRead - read);
-                    if (n == 0) throw new EndOfStreamException();
-                    read += n;
-                }
+                ReadExact(stream, gct, 0, toRead);
             }
 
             byte[] canvas = new byte[width * height * 3];
@@ -96,13 +90,14 @@ namespace SharpImageConverter.Formats.Gif
                     if (label == 0xF9)
                     {
                         int size = stream.ReadByte();
+                        if (size < 0) throw new EndOfStreamException();
                         if (size != 4)
                         {
-                            if (size > 0) stream.Seek(size, SeekOrigin.Current);
+                            if (size > 0) SkipBytes(stream, size);
                             stream.ReadByte();
                             continue;
                         }
-                        ReadExact(stream, gce, 4);
+                        ReadExact(stream, gce, 0, 4);
                         disposal = (gce[0] >> 2) & 0x07;
                         bool hasTrans = (gce[0] & 1) != 0;
                         delayCs = gce[1] | (gce[2] << 8);
@@ -112,8 +107,9 @@ namespace SharpImageConverter.Formats.Gif
                     else if (label == 0xFF)
                     {
                         int size = stream.ReadByte();
+                        if (size < 0) throw new EndOfStreamException();
                         byte[] app = new byte[size];
-                        if (size > 0) ReadExact(stream, app, size);
+                        if (size > 0) ReadExact(stream, app, 0, size);
                         string appId = System.Text.Encoding.ASCII.GetString(app, 0, app.Length);
                         if (appId == "NETSCAPE2.0" || appId == "ANIMEXTS1.0")
                         {
@@ -122,7 +118,7 @@ namespace SharpImageConverter.Formats.Gif
                             if (subLen > 0)
                             {
                                 var sub = new byte[subLen];
-                                ReadExact(stream, sub, subLen);
+                                ReadExact(stream, sub, 0, subLen);
                                 if (subLen >= 3 && sub[0] == 1)
                                 {
                                     int rep = sub[1] | (sub[2] << 8);
@@ -139,13 +135,14 @@ namespace SharpImageConverter.Formats.Gif
                     else
                     {
                         int size = stream.ReadByte();
-                        if (size > 0) stream.Seek(size, SeekOrigin.Current);
+                        if (size < 0) throw new EndOfStreamException();
+                        if (size > 0) SkipBytes(stream, size);
                         SkipBlocks(stream);
                     }
                 }
                 else if (blockType == 0x2C)
                 {
-                    if (stream.Read(desc, 0, 9) != 9) throw new EndOfStreamException();
+                    ReadExact(stream, desc, 0, 9);
                     int ix = desc[0] | (desc[1] << 8);
                     int iy = desc[2] | (desc[3] << 8);
                     int iw = desc[4] | (desc[5] << 8);
@@ -159,19 +156,14 @@ namespace SharpImageConverter.Formats.Gif
                     if (hasLct)
                     {
                         lctColors = lctSize;
-                        int read = 0;
                         int toRead = lctColors * 3;
-                        while (read < toRead)
-                        {
-                            int n = stream.Read(lct, read, toRead - read);
-                            if (n == 0) throw new EndOfStreamException();
-                            read += n;
-                        }
+                        ReadExact(stream, lct, 0, toRead);
                     }
                     byte[] palette = hasLct ? lct : gct;
                     int paletteColors = hasLct ? lctColors : gctColors;
 
                     int lzwMinCodeSize = stream.ReadByte();
+                    if (lzwMinCodeSize < 0) throw new EndOfStreamException();
                     int indexCount = iw * ih;
                     byte[] indices = pool.Rent(indexCount);
                     var lzw = new LzwDecoder(stream);
@@ -346,12 +338,12 @@ namespace SharpImageConverter.Formats.Gif
         {
             // Header
             byte[] sig = new byte[6];
-            if (stream.Read(sig, 0, 6) != 6) throw new InvalidDataException("Invalid GIF header");
+            ReadExact(stream, sig, 0, 6);
             if (sig[0] != 'G' || sig[1] != 'I' || sig[2] != 'F') throw new InvalidDataException("Not a GIF file");
             
             // Logical Screen Descriptor
             byte[] lsd = new byte[7];
-            if (stream.Read(lsd, 0, 7) != 7) throw new InvalidDataException("Invalid LSD");
+            ReadExact(stream, lsd, 0, 7);
             
             int width = lsd[0] | (lsd[1] << 8);
             int height = lsd[2] | (lsd[3] << 8);
@@ -369,14 +361,8 @@ namespace SharpImageConverter.Formats.Gif
             if (hasGct)
             {
                 gctColors = gctSize;
-                int read = 0;
                 int toRead = gctColors * 3;
-                while (read < toRead)
-                {
-                    var n = stream.Read(gct, read, toRead - read);
-                    if (n == 0) throw new EndOfStreamException();
-                    read += n;
-                }
+                ReadExact(stream, gct, 0, toRead);
             }
 
             // Canvas
@@ -415,14 +401,14 @@ namespace SharpImageConverter.Formats.Gif
                     int label = stream.ReadByte();
                     if (label == 0xF9) // Graphic Control
                     {
-                        int size = stream.ReadByte(); // Should be 4
+                        int size = stream.ReadByte();
+                        if (size < 0) throw new EndOfStreamException();
                         if (size != 4) 
                         {
-                            // Skip
                             SkipBlock(stream, size); 
                             continue;
                         }
-                        ReadExact(stream, gce, 4);
+                        ReadExact(stream, gce, 0, 4);
                         // disposal = (gce[0] >> 2) & 0x07;
                         bool hasTrans = (gce[0] & 1) != 0;
                         if (hasTrans) transIndex = gce[3];
@@ -438,7 +424,7 @@ namespace SharpImageConverter.Formats.Gif
                 }
                 else if (blockType == 0x2C) // Image Separator
                 {
-                    if (stream.Read(desc, 0, 9) != 9) throw new EndOfStreamException();
+                    ReadExact(stream, desc, 0, 9);
                     int ix = desc[0] | (desc[1] << 8);
                     int iy = desc[2] | (desc[3] << 8);
                     int iw = desc[4] | (desc[5] << 8);
@@ -453,20 +439,15 @@ namespace SharpImageConverter.Formats.Gif
                     if (hasLct)
                     {
                         lctColors = lctSize;
-                        int read = 0;
                         int toRead = lctColors * 3;
-                        while (read < toRead)
-                        {
-                            int n = stream.Read(lct, read, toRead - read);
-                            if (n == 0) throw new EndOfStreamException();
-                            read += n;
-                        }
+                        ReadExact(stream, lct, 0, toRead);
                     }
 
                     byte[] palette = hasLct ? lct : gct;
                     int paletteColors = hasLct ? lctColors : gctColors;
 
                     int lzwMinCodeSize = stream.ReadByte();
+                    if (lzwMinCodeSize < 0) throw new EndOfStreamException();
                     int indexCount = iw * ih;
                     byte[] indices = pool.Rent(indexCount);
                     var lzw = new LzwDecoder(stream);
@@ -574,10 +555,10 @@ namespace SharpImageConverter.Formats.Gif
     public Image<Rgba32> DecodeRgba32(Stream stream)
     {
             byte[] sig = new byte[6];
-            if (stream.Read(sig, 0, 6) != 6) throw new InvalidDataException("Invalid GIF header");
+            ReadExact(stream, sig, 0, 6);
             if (sig[0] != 'G' || sig[1] != 'I' || sig[2] != 'F') throw new InvalidDataException("Not a GIF file");
             byte[] lsd = new byte[7];
-            if (stream.Read(lsd, 0, 7) != 7) throw new InvalidDataException("Invalid LSD");
+            ReadExact(stream, lsd, 0, 7);
             int width = lsd[0] | (lsd[1] << 8);
             int height = lsd[2] | (lsd[3] << 8);
             byte packed = lsd[4];
@@ -589,14 +570,8 @@ namespace SharpImageConverter.Formats.Gif
             if (hasGct)
             {
                 gctColors = gctSize;
-                int read = 0;
                 int toRead = gctColors * 3;
-                while (read < toRead)
-                {
-                    var n = stream.Read(gct, read, toRead - read);
-                    if (n == 0) throw new EndOfStreamException();
-                    read += n;
-                }
+                ReadExact(stream, gct, 0, toRead);
             }
             byte[] canvas = new byte[width * height * 4];
             int canvasStride = width * 4;
@@ -629,13 +604,14 @@ namespace SharpImageConverter.Formats.Gif
                     if (label == 0xF9)
                     {
                         int size = stream.ReadByte();
+                        if (size < 0) throw new EndOfStreamException();
                         if (size != 4)
                         {
-                            if (size > 0) stream.Seek(size, SeekOrigin.Current);
+                            if (size > 0) SkipBytes(stream, size);
                             stream.ReadByte();
                             continue;
                         }
-                        ReadExact(stream, gce, 4);
+                        ReadExact(stream, gce, 0, 4);
                         bool hasTrans = (gce[0] & 1) != 0;
                         transIndex = hasTrans ? gce[3] : -1;
                         stream.ReadByte();
@@ -643,13 +619,14 @@ namespace SharpImageConverter.Formats.Gif
                     else
                     {
                         int size = stream.ReadByte();
-                        if (size > 0) stream.Seek(size, SeekOrigin.Current);
+                        if (size < 0) throw new EndOfStreamException();
+                        if (size > 0) SkipBytes(stream, size);
                         SkipBlocks(stream);
                     }
                 }
                 else if (blockType == 0x2C)
                 {
-                    if (stream.Read(desc, 0, 9) != 9) throw new EndOfStreamException();
+                    ReadExact(stream, desc, 0, 9);
                     int ix = desc[0] | (desc[1] << 8);
                     int iy = desc[2] | (desc[3] << 8);
                     int iw = desc[4] | (desc[5] << 8);
@@ -662,18 +639,13 @@ namespace SharpImageConverter.Formats.Gif
                     if (hasLct)
                     {
                         lctColors = lctSize;
-                        int read = 0;
                         int toRead = lctColors * 3;
-                        while (read < toRead)
-                        {
-                            int n = stream.Read(lct, read, toRead - read);
-                            if (n == 0) throw new EndOfStreamException();
-                            read += n;
-                        }
+                        ReadExact(stream, lct, 0, toRead);
                     }
                     byte[] palette = hasLct ? lct : gct;
                     int paletteColors = hasLct ? lctColors : gctColors;
                     int lzwMinCodeSize = stream.ReadByte();
+                    if (lzwMinCodeSize < 0) throw new EndOfStreamException();
                     int indexCount = iw * ih;
                     byte[] indices = pool.Rent(indexCount);
                     var lzw = new LzwDecoder(stream);
@@ -762,12 +734,12 @@ namespace SharpImageConverter.Formats.Gif
             return new Image<Rgba32>(width, height, canvas);
     }
 
-        private void ReadExact(Stream s, byte[] buf, int count)
+        private void ReadExact(Stream s, byte[] buf, int offset, int count)
         {
             int read = 0;
             while (read < count)
             {
-                int n = s.Read(buf, read, count - read);
+                int n = s.Read(buf, offset + read, count - read);
                 if (n == 0) throw new EndOfStreamException();
                 read += n;
             }
@@ -778,39 +750,38 @@ namespace SharpImageConverter.Formats.Gif
             while (true)
             {
                 int len = s.ReadByte();
-                if (len <= 0) break;
-                s.Seek(len, SeekOrigin.Current);
+                if (len < 0) throw new EndOfStreamException();
+                if (len == 0) break;
+                SkipBytes(s, len);
             }
         }
 
         private void SkipBlock(Stream s, int size)
         {
-            // Skip fixed size then skip sub-blocks?
-            // Usually extension blocks are: [Label] [FixedSize] [FixedBytes] [SubBlocks...]
-            // My code handled Label and FixedSize.
-            // But if I called SkipBlock(stream, size), I assume I just read 'size' bytes.
-            // But then comes sub-blocks!
-            // Wait, standard extensions:
-            // 21 F9 04 [4 bytes] 00 (Terminator)
-            // 21 FF 0B [11 bytes] [SubBlocks...] 00
-            // My logic:
-            // if 0xF9: Read 4, then ReadByte() (Terminator). Correct.
-            // else: SkipBlocks.
-            // SkipBlocks handles [len] [data] ... 00.
-            // BUT for 0xFF (Application), we read size (e.g. 11), we must consume it first!
-            // The `SkipBlocks` logic is for Data Sub-blocks.
-            // The `SkipBlock` helper I added needs to be careful.
-            // If I encounter unknown extension:
-            // Read Size (byte). Read Size bytes. Then SkipBlocks (Sub-blocks).
-            
-            // Correction in main loop:
-            // ...
-            // else 
-            // {
-            //    int size = stream.ReadByte();
-            //    if (size > 0) stream.Seek(size, SeekOrigin.Current);
-            //    SkipBlocks(stream);
-            // }
+            if (size < 0) throw new EndOfStreamException();
+            if (size > 0) SkipBytes(s, size);
+            SkipBlocks(s);
+        }
+
+        private void SkipBytes(Stream s, int count)
+        {
+            if (count <= 0) return;
+            byte[] buffer = ArrayPool<byte>.Shared.Rent(Math.Min(4096, count));
+            try
+            {
+                int remaining = count;
+                while (remaining > 0)
+                {
+                    int toRead = Math.Min(buffer.Length, remaining);
+                    int read = s.Read(buffer, 0, toRead);
+                    if (read == 0) throw new EndOfStreamException();
+                    remaining -= read;
+                }
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(buffer);
+            }
         }
     }
 }

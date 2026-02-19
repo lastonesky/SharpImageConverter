@@ -61,9 +61,9 @@ public static class BmpWriter
             {
                 int srcBase = y * width;
                 Array.Copy(gray, srcBase, row, 0, width);
-                for (int i = width; i < rowStride; i++)
+                if (rowStride > width)
                 {
-                    row[i] = 0;
+                    Array.Clear(row, width, rowStride - width);
                 }
                 stream.Write(row, 0, rowStride);
             }
