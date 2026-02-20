@@ -19,7 +19,7 @@ namespace SharpImageConverter.Formats.Png
         {
             var dec = new PngDecoder();
             var rgb = dec.DecodeToRGB(path);
-            return new Image<Rgb24>(dec.Width, dec.Height, rgb);
+            return new Image<Rgb24>(dec.Width, dec.Height, rgb, dec.Metadata);
         }
 
         /// <summary>
@@ -31,7 +31,7 @@ namespace SharpImageConverter.Formats.Png
         {
             var dec = new PngDecoder();
             var rgb = dec.DecodeToRGB(stream);
-            return new Image<Rgb24>(dec.Width, dec.Height, rgb);
+            return new Image<Rgb24>(dec.Width, dec.Height, rgb, dec.Metadata);
         }
     }
 
@@ -49,7 +49,7 @@ namespace SharpImageConverter.Formats.Png
         {
             var dec = new PngDecoder();
             var rgba = dec.DecodeToRGBA(path);
-            return new Image<Rgba32>(dec.Width, dec.Height, rgba);
+            return new Image<Rgba32>(dec.Width, dec.Height, rgba, dec.Metadata);
         }
 
         /// <summary>
@@ -61,7 +61,7 @@ namespace SharpImageConverter.Formats.Png
         {
             var dec = new PngDecoder();
             var rgba = dec.DecodeToRGBA(stream);
-            return new Image<Rgba32>(dec.Width, dec.Height, rgba);
+            return new Image<Rgba32>(dec.Width, dec.Height, rgba, dec.Metadata);
         }
     }
 
@@ -77,7 +77,7 @@ namespace SharpImageConverter.Formats.Png
         /// <param name="image">Rgb24 图像</param>
         public void EncodeRgb24(string path, Image<Rgb24> image)
         {
-            PngWriter.Write(path, image.Width, image.Height, image.Buffer);
+            PngWriter.Write(path, image.Width, image.Height, image.Buffer, image.Metadata);
         }
 
         /// <summary>
@@ -87,7 +87,7 @@ namespace SharpImageConverter.Formats.Png
         /// <param name="image">Rgb24 图像</param>
         public void EncodeRgb24(Stream stream, Image<Rgb24> image)
         {
-            PngWriter.Write(stream, image.Width, image.Height, image.Buffer);
+            PngWriter.Write(stream, image.Width, image.Height, image.Buffer, image.Metadata);
         }
     }
 
@@ -103,7 +103,7 @@ namespace SharpImageConverter.Formats.Png
         /// <param name="image">Rgba32 图像</param>
         public void EncodeRgba32(string path, Image<Rgba32> image)
         {
-            PngWriter.WriteRgba(path, image.Width, image.Height, image.Buffer);
+            PngWriter.WriteRgba(path, image.Width, image.Height, image.Buffer, image.Metadata);
         }
 
         /// <summary>
@@ -113,7 +113,7 @@ namespace SharpImageConverter.Formats.Png
         /// <param name="image">Rgba32 图像</param>
         public void EncodeRgba32(Stream stream, Image<Rgba32> image)
         {
-            PngWriter.WriteRgba(stream, image.Width, image.Height, image.Buffer);
+            PngWriter.WriteRgba(stream, image.Width, image.Height, image.Buffer, image.Metadata);
         }
     }
 }

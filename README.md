@@ -32,7 +32,7 @@
 - 写入：
   - 保存为 Truecolor PNG（RGB24）与 Truecolor+Alpha PNG（RGBA32）
   - 使用 Zlib 压缩（Deflate），行过滤使用 Up（逐行差分），并在 Up 过滤过程里使用 SIMD 加速
-  - 不写入调色板或其他元数据
+  - 可写入 EXIF/iCCP/sRGB 元数据
 
 ### BMP 支持
 - 读取：支持无压缩的 8/24/32 位 BMP（统一输出为 RGB24）
@@ -52,7 +52,7 @@
 ### WebP 支持
 - 读取/写入 WebP（通过 `runtimes/` 下的原生 `libwebp`）
 - 统一解码为 RGB24，再根据输出扩展名选择编码器写回
-- 当前 WebP 编码质量固定为 75（后续可扩展为命令行参数/Options）
+- WebP 编码质量与并发策略可配置
 - WebP 实现依赖 Google 的 libwebp 及相关组件（BSD-3-Clause License），其版权与许可信息详见 `THIRD-PARTY-NOTICES.md`
 
 ### 中间格式

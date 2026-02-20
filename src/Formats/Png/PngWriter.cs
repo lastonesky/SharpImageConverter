@@ -2,6 +2,7 @@ using System;
 using System.Buffers;
 using System.IO;
 using System.Numerics;
+using SharpImageConverter.Metadata;
 
 namespace SharpImageConverter.Formats.Png;
 
@@ -14,18 +15,22 @@ public static class PngWriter
     private static readonly byte[] TypeIHDR = [(byte)'I', (byte)'H', (byte)'D', (byte)'R'];
     private static readonly byte[] TypeIDAT = [(byte)'I', (byte)'D', (byte)'A', (byte)'T'];
     private static readonly byte[] TypeIEND = [(byte)'I', (byte)'E', (byte)'N', (byte)'D'];
-    public static void WriteGray(string path, int width, int height, byte[] gray)
+    private static readonly byte[] TypeEXIF = [(byte)'e', (byte)'X', (byte)'I', (byte)'f'];
+    private static readonly byte[] TypeICCP = [(byte)'i', (byte)'C', (byte)'C', (byte)'P'];
+    private static readonly byte[] TypeSRGB = [(byte)'s', (byte)'R', (byte)'G', (byte)'B'];
+    public static void WriteGray(string path, int width, int height, byte[] gray, ImageMetadata? metadata = null)
     {
         using (var fs = new FileStream(path, FileMode.Create, FileAccess.Write))
         {
-            WriteGray(fs, width, height, gray);
+            WriteGray(fs, width, height, gray, metadata);
         }
     }
 
-    public static void WriteGray(Stream stream, int width, int height, byte[] gray)
+    public static void WriteGray(Stream stream, int width, int height, byte[] gray, ImageMetadata? metadata = null)
     {
         stream.Write(PngSignature, 0, PngSignature.Length);
         WriteChunk(stream, TypeIHDR, CreateIHDRGray(width, height));
+        WriteMetadata(stream, metadata);
         int stride = width;
         int rawSize = (stride + 1) * height;
         using (var ms = new PooledMemoryStream(rawSize))
@@ -46,10 +51,10 @@ public static class PngWriter
     /// <param name="width">宽度</param>
     /// <param name="height">高度</param>
     /// <param name="rgb">RGB24 像素数据</param>
-    public static void Write(string path, int width, int height, byte[] rgb)
+    public static void Write(string path, int width, int height, byte[] rgb, ImageMetadata? metadata = null)
     {
         using var fs = new FileStream(path, FileMode.Create, FileAccess.Write);
-        Write(fs, width, height, rgb);
+        Write(fs, width, height, rgb, metadata);
     }
 
     /// <summary>
@@ -59,10 +64,11 @@ public static class PngWriter
     /// <param name="width">宽度</param>
     /// <param name="height">高度</param>
     /// <param name="rgb">RGB24 像素数据</param>
-    public static void Write(Stream stream, int width, int height, byte[] rgb)
+    public static void Write(Stream stream, int width, int height, byte[] rgb, ImageMetadata? metadata = null)
     {
         stream.Write(PngSignature, 0, PngSignature.Length);
         WriteChunk(stream, TypeIHDR, CreateIHDR(width, height));
+        WriteMetadata(stream, metadata);
         int stride = width * 3;
         int rawSize = (stride + 1) * height;
         using (var ms = new PooledMemoryStream(rawSize))
@@ -84,10 +90,10 @@ public static class PngWriter
     /// <param name="width">宽度</param>
     /// <param name="height">高度</param>
     /// <param name="rgba">RGBA32 像素数据</param>
-    public static void WriteRgba(string path, int width, int height, byte[] rgba)
+    public static void WriteRgba(string path, int width, int height, byte[] rgba, ImageMetadata? metadata = null)
     {
         using var fs = new FileStream(path, FileMode.Create, FileAccess.Write);
-        WriteRgba(fs, width, height, rgba);
+        WriteRgba(fs, width, height, rgba, metadata);
     }
 
     /// <summary>
@@ -97,10 +103,11 @@ public static class PngWriter
     /// <param name="width">宽度</param>
     /// <param name="height">高度</param>
     /// <param name="rgba">RGBA32 像素数据</param>
-    public static void WriteRgba(Stream stream, int width, int height, byte[] rgba)
+    public static void WriteRgba(Stream stream, int width, int height, byte[] rgba, ImageMetadata? metadata = null)
     {
         stream.Write(PngSignature, 0, PngSignature.Length);
         WriteChunk(stream, TypeIHDR, CreateIHDRRgba(width, height));
+        WriteMetadata(stream, metadata);
         int stride = width * 4;
         int rawSize = (stride + 1) * height;
         using (var ms = new PooledMemoryStream(rawSize))
@@ -135,6 +142,40 @@ public static class PngWriter
         Span<byte> crcBytes = stackalloc byte[4];
         WriteBigEndian(crc, crcBytes);
         s.Write(crcBytes);
+    }
+
+    private static void WriteMetadata(Stream stream, ImageMetadata? metadata)
+    {
+        if (metadata == null) return;
+        if (metadata.ExifRaw != null && metadata.ExifRaw.Length > 0)
+        {
+            byte[] exif = metadata.ExifRaw;
+            if (exif.Length >= 6 &&
+                exif[0] == (byte)'E' && exif[1] == (byte)'x' && exif[2] == (byte)'i' && exif[3] == (byte)'f' &&
+                exif[4] == 0 && exif[5] == 0)
+            {
+                var raw = new byte[exif.Length - 6];
+                Buffer.BlockCopy(exif, 6, raw, 0, raw.Length);
+                exif = raw;
+            }
+            WriteChunk(stream, TypeEXIF, exif);
+        }
+        if (metadata.IccProfile != null && metadata.IccProfile.Length > 0)
+        {
+            byte[] compressed = ZlibHelper.Compress(metadata.IccProfile);
+            byte[] nameBytes = System.Text.Encoding.ASCII.GetBytes("ICC Profile");
+            int payloadLen = nameBytes.Length + 1 + 1 + compressed.Length;
+            byte[] payload = new byte[payloadLen];
+            Buffer.BlockCopy(nameBytes, 0, payload, 0, nameBytes.Length);
+            payload[nameBytes.Length] = 0;
+            payload[nameBytes.Length + 1] = 0;
+            Buffer.BlockCopy(compressed, 0, payload, nameBytes.Length + 2, compressed.Length);
+            WriteChunk(stream, TypeICCP, payload);
+        }
+        if (metadata.IccProfile == null && metadata.IccProfileKind == IccProfileKind.SRgb)
+        {
+            WriteChunk(stream, TypeSRGB, new byte[] { 0 });
+        }
     }
 
     private static byte[] CreateIHDR(int width, int height)
