@@ -8,6 +8,7 @@ namespace SharpImageConverter.Formats.Webp
 {
     internal static unsafe partial class WebpCodec
     {
+        private static readonly object EncodeLock = new object();
         private sealed class WebPWriterState
         {
             public WebPWriterState(Stream stream)
@@ -162,6 +163,19 @@ namespace SharpImageConverter.Formats.Webp
             }
         }
 
+        private static void ExecuteWithConcurrency(WebpConcurrencyStrategy strategy, Action action)
+        {
+            if (strategy == WebpConcurrencyStrategy.Parallel)
+            {
+                action();
+                return;
+            }
+            lock (EncodeLock)
+            {
+                action();
+            }
+        }
+
         private unsafe static int WriteToManagedStream(byte* data, nuint data_size, IntPtr picture)
         {
             try
@@ -289,7 +303,12 @@ namespace SharpImageConverter.Formats.Webp
         {
             try
             {
-                return EncodeWithConfig(rgba, width, height, width * 4, true, quality);
+                byte[]? result = null;
+                ExecuteWithConcurrency(WebpConcurrencyStrategy.Auto, () =>
+                {
+                    result = EncodeWithConfig(rgba, width, height, width * 4, true, quality);
+                });
+                return result!;
             }
             catch (DllNotFoundException ex)
             {
@@ -305,7 +324,12 @@ namespace SharpImageConverter.Formats.Webp
         {
             try
             {
-                return EncodeWithConfig(rgb, width, height, width * 3, false, quality);
+                byte[]? result = null;
+                ExecuteWithConcurrency(WebpConcurrencyStrategy.Auto, () =>
+                {
+                    result = EncodeWithConfig(rgb, width, height, width * 3, false, quality);
+                });
+                return result!;
             }
             catch (DllNotFoundException ex)
             {
@@ -319,12 +343,44 @@ namespace SharpImageConverter.Formats.Webp
 
         public static byte[] EncodeRgba(byte[] rgba, int width, int height, WebpEncoderOptions options)
         {
-            return EncodeRgba(rgba, width, height, options.Quality);
+            try
+            {
+                byte[]? result = null;
+                ExecuteWithConcurrency(options.ConcurrencyStrategy, () =>
+                {
+                    result = EncodeWithConfig(rgba, width, height, width * 4, true, options.Quality);
+                });
+                return result!;
+            }
+            catch (DllNotFoundException ex)
+            {
+                throw new InvalidOperationException("未能加载 WebP 原生库，请检查 runtimes 目录或平台匹配。", ex);
+            }
+            catch (EntryPointNotFoundException ex)
+            {
+                throw new InvalidOperationException("WebP 原生库版本不兼容，缺少所需入口点。", ex);
+            }
         }
 
         public static byte[] EncodeRgb(byte[] rgb, int width, int height, WebpEncoderOptions options)
         {
-            return EncodeRgb(rgb, width, height, options.Quality);
+            try
+            {
+                byte[]? result = null;
+                ExecuteWithConcurrency(options.ConcurrencyStrategy, () =>
+                {
+                    result = EncodeWithConfig(rgb, width, height, width * 3, false, options.Quality);
+                });
+                return result!;
+            }
+            catch (DllNotFoundException ex)
+            {
+                throw new InvalidOperationException("未能加载 WebP 原生库，请检查 runtimes 目录或平台匹配。", ex);
+            }
+            catch (EntryPointNotFoundException ex)
+            {
+                throw new InvalidOperationException("WebP 原生库版本不兼容，缺少所需入口点。", ex);
+            }
         }
 
         public static void EncodeRgbaToStream(Stream stream, ReadOnlySpan<byte> rgba, int width, int height, float quality)
@@ -333,7 +389,10 @@ namespace SharpImageConverter.Formats.Webp
             if (rgba.Length != checked(width * height * 4)) throw new ArgumentException("RGBA 像素长度不匹配", nameof(rgba));
             try
             {
-                EncodeWithConfigToStream(stream, rgba, width, height, width * 4, true, quality);
+                lock (EncodeLock)
+                {
+                    EncodeWithConfigToStream(stream, rgba, width, height, width * 4, true, quality);
+                }
             }
             catch (DllNotFoundException ex)
             {
@@ -351,7 +410,10 @@ namespace SharpImageConverter.Formats.Webp
             if (rgb.Length != checked(width * height * 3)) throw new ArgumentException("RGB 像素长度不匹配", nameof(rgb));
             try
             {
-                EncodeWithConfigToStream(stream, rgb, width, height, width * 3, false, quality);
+                lock (EncodeLock)
+                {
+                    EncodeWithConfigToStream(stream, rgb, width, height, width * 3, false, quality);
+                }
             }
             catch (DllNotFoundException ex)
             {
@@ -365,15 +427,66 @@ namespace SharpImageConverter.Formats.Webp
 
         public static void EncodeRgbaToStream(Stream stream, ReadOnlySpan<byte> rgba, int width, int height, WebpEncoderOptions options)
         {
-            EncodeRgbaToStream(stream, rgba, width, height, options.Quality);
+            ArgumentNullException.ThrowIfNull(stream);
+            if (rgba.Length != checked(width * height * 4)) throw new ArgumentException("RGBA 像素长度不匹配", nameof(rgba));
+            try
+            {
+                if (options.ConcurrencyStrategy == WebpConcurrencyStrategy.Parallel)
+                {
+                    EncodeWithConfigToStream(stream, rgba, width, height, width * 4, true, options.Quality);
+                }
+                else
+                {
+                    lock (EncodeLock)
+                    {
+                        EncodeWithConfigToStream(stream, rgba, width, height, width * 4, true, options.Quality);
+                    }
+                }
+            }
+            catch (DllNotFoundException ex)
+            {
+                throw new InvalidOperationException("未能加载 WebP 原生库，请检查 runtimes 目录或平台匹配。", ex);
+            }
+            catch (EntryPointNotFoundException ex)
+            {
+                throw new InvalidOperationException("WebP 原生库版本不兼容，缺少所需入口点。", ex);
+            }
         }
 
         public static void EncodeRgbToStream(Stream stream, ReadOnlySpan<byte> rgb, int width, int height, WebpEncoderOptions options)
         {
-            EncodeRgbToStream(stream, rgb, width, height, options.Quality);
+            ArgumentNullException.ThrowIfNull(stream);
+            if (rgb.Length != checked(width * height * 3)) throw new ArgumentException("RGB 像素长度不匹配", nameof(rgb));
+            try
+            {
+                if (options.ConcurrencyStrategy == WebpConcurrencyStrategy.Parallel)
+                {
+                    EncodeWithConfigToStream(stream, rgb, width, height, width * 3, false, options.Quality);
+                }
+                else
+                {
+                    lock (EncodeLock)
+                    {
+                        EncodeWithConfigToStream(stream, rgb, width, height, width * 3, false, options.Quality);
+                    }
+                }
+            }
+            catch (DllNotFoundException ex)
+            {
+                throw new InvalidOperationException("未能加载 WebP 原生库，请检查 runtimes 目录或平台匹配。", ex);
+            }
+            catch (EntryPointNotFoundException ex)
+            {
+                throw new InvalidOperationException("WebP 原生库版本不兼容，缺少所需入口点。", ex);
+            }
         }
 
         public static byte[] EncodeAnimatedRgba(byte[][] rgbaFrames, int width, int height, int[] frameDurationsMs, int loopCount, float quality)
+        {
+            return EncodeAnimatedRgba(rgbaFrames, width, height, frameDurationsMs, loopCount, new WebpEncoderOptions(quality, WebpConcurrencyStrategy.Auto));
+        }
+
+        public static byte[] EncodeAnimatedRgba(byte[][] rgbaFrames, int width, int height, int[] frameDurationsMs, int loopCount, WebpEncoderOptions options)
         {
             ArgumentNullException.ThrowIfNull(rgbaFrames, nameof(rgbaFrames));
             ArgumentNullException.ThrowIfNull(frameDurationsMs, nameof(frameDurationsMs));
@@ -383,88 +496,94 @@ namespace SharpImageConverter.Formats.Webp
 
             try
             {
-                if (rgbaFrames.Length == 1)
+                byte[]? result = null;
+                ExecuteWithConcurrency(options.ConcurrencyStrategy, () =>
                 {
-                    return EncodeRgba(rgbaFrames[0], width, height, quality);
-                }
-
-                IntPtr mux = CreateEmptyMux();
-                if (mux == IntPtr.Zero) throw new InvalidOperationException("WebPMux 创建失败");
-
-                try
-                {
-                    var err = WebPMuxSetCanvasSize(mux, width, height);
-                    if (err != WebPMuxError.WEBP_MUX_OK) throw new InvalidOperationException($"WebPMuxSetCanvasSize 失败: {err}");
-
-                    var animParams = new WebPMuxAnimParams
+                    if (rgbaFrames.Length == 1)
                     {
-                        bgcolor = 0u,
-                        loop_count = loopCount
-                    };
-                    err = WebPMuxSetAnimationParams(mux, ref animParams);
-                    if (err != WebPMuxError.WEBP_MUX_OK) throw new InvalidOperationException($"WebPMuxSetAnimationParams 失败: {err}");
-
-                    for (int i = 0; i < rgbaFrames.Length; i++)
-                    {
-                        var rgba = rgbaFrames[i];
-                        if (rgba.Length != checked(width * height * 4)) throw new ArgumentException("RGBA 帧尺寸不一致");
-
-                        int duration = frameDurationsMs[i];
-                        if (duration < 10) duration = 10;
-
-                        byte[] encoded = EncodeRgba(rgba, width, height, quality);
-
-                        unsafe
-                        {
-                            fixed (byte* p = encoded)
-                            {
-                                var frame = new WebPMuxFrameInfo
-                                {
-                                    bitstream = new WebPData { bytes = (IntPtr)p, size = (nuint)encoded.Length },
-                                    x_offset = 0,
-                                    y_offset = 0,
-                                    duration = duration,
-                                    id = WebPChunkId.WEBP_CHUNK_ANMF,
-                                    dispose_method = WebPMuxAnimDispose.WEBP_MUX_DISPOSE_BACKGROUND,
-                                    blend_method = WebPMuxAnimBlend.WEBP_MUX_NO_BLEND,
-                                    pad = 0u
-                                };
-
-                                err = WebPMuxPushFrame(mux, ref frame, copy_data: 1);
-                                if (err != WebPMuxError.WEBP_MUX_OK) throw new InvalidOperationException($"WebPMuxPushFrame 失败: {err}");
-                            }
-                        }
+                        result = EncodeRgba(rgbaFrames[0], width, height, options);
+                        return;
                     }
 
-                    var assembled = new WebPData { bytes = IntPtr.Zero, size = 0 };
-                    err = WebPMuxAssemble(mux, ref assembled);
-                    if (err != WebPMuxError.WEBP_MUX_OK) throw new InvalidOperationException($"WebPMuxAssemble 失败: {err}");
-                    if (assembled.bytes == IntPtr.Zero || assembled.size == 0) throw new InvalidOperationException("WebPMuxAssemble 返回空数据");
+                    IntPtr mux = CreateEmptyMux();
+                    if (mux == IntPtr.Zero) throw new InvalidOperationException("WebPMux 创建失败");
 
                     try
                     {
-                        int len = checked((int)assembled.size);
-                        unsafe
+                        var err = WebPMuxSetCanvasSize(mux, width, height);
+                        if (err != WebPMuxError.WEBP_MUX_OK) throw new InvalidOperationException($"WebPMuxSetCanvasSize 失败: {err}");
+
+                        var animParams = new WebPMuxAnimParams
                         {
-                            var result = new byte[len];
-                            new ReadOnlySpan<byte>((void*)assembled.bytes, len).CopyTo(result);
-                            return result;
+                            bgcolor = 0u,
+                            loop_count = loopCount
+                        };
+                        err = WebPMuxSetAnimationParams(mux, ref animParams);
+                        if (err != WebPMuxError.WEBP_MUX_OK) throw new InvalidOperationException($"WebPMuxSetAnimationParams 失败: {err}");
+
+                        for (int i = 0; i < rgbaFrames.Length; i++)
+                        {
+                            var rgba = rgbaFrames[i];
+                            if (rgba.Length != checked(width * height * 4)) throw new ArgumentException("RGBA 帧尺寸不一致");
+
+                            int duration = frameDurationsMs[i];
+                            if (duration < 10) duration = 10;
+
+                            byte[] encoded = EncodeRgba(rgba, width, height, options);
+
+                            unsafe
+                            {
+                                fixed (byte* p = encoded)
+                                {
+                                    var frame = new WebPMuxFrameInfo
+                                    {
+                                        bitstream = new WebPData { bytes = (IntPtr)p, size = (nuint)encoded.Length },
+                                        x_offset = 0,
+                                        y_offset = 0,
+                                        duration = duration,
+                                        id = WebPChunkId.WEBP_CHUNK_ANMF,
+                                        dispose_method = WebPMuxAnimDispose.WEBP_MUX_DISPOSE_BACKGROUND,
+                                        blend_method = WebPMuxAnimBlend.WEBP_MUX_NO_BLEND,
+                                        pad = 0u
+                                    };
+
+                                    err = WebPMuxPushFrame(mux, ref frame, copy_data: 1);
+                                    if (err != WebPMuxError.WEBP_MUX_OK) throw new InvalidOperationException($"WebPMuxPushFrame 失败: {err}");
+                                }
+                            }
+                        }
+
+                        var assembled = new WebPData { bytes = IntPtr.Zero, size = 0 };
+                        err = WebPMuxAssemble(mux, ref assembled);
+                        if (err != WebPMuxError.WEBP_MUX_OK) throw new InvalidOperationException($"WebPMuxAssemble 失败: {err}");
+                        if (assembled.bytes == IntPtr.Zero || assembled.size == 0) throw new InvalidOperationException("WebPMuxAssemble 返回空数据");
+
+                        try
+                        {
+                            int len = checked((int)assembled.size);
+                            unsafe
+                            {
+                                var bytes = new byte[len];
+                                new ReadOnlySpan<byte>((void*)assembled.bytes, len).CopyTo(bytes);
+                                result = bytes;
+                            }
+                        }
+                        finally
+                        {
+                            if (assembled.bytes != IntPtr.Zero)
+                            {
+                                WebPFree(assembled.bytes);
+                                assembled.bytes = IntPtr.Zero;
+                                assembled.size = 0;
+                            }
                         }
                     }
                     finally
                     {
-                        if (assembled.bytes != IntPtr.Zero)
-                        {
-                            WebPFree(assembled.bytes);
-                            assembled.bytes = IntPtr.Zero;
-                            assembled.size = 0;
-                        }
+                        WebPMuxDelete(mux);
                     }
-                }
-                finally
-                {
-                    WebPMuxDelete(mux);
-                }
+                });
+                return result!;
             }
             catch (DllNotFoundException ex)
             {
@@ -478,6 +597,11 @@ namespace SharpImageConverter.Formats.Webp
 
         public static void EncodeAnimatedRgbaToStream(Stream stream, byte[][] rgbaFrames, int width, int height, int[] frameDurationsMs, int loopCount, float quality)
         {
+            EncodeAnimatedRgbaToStream(stream, rgbaFrames, width, height, frameDurationsMs, loopCount, new WebpEncoderOptions(quality, WebpConcurrencyStrategy.Auto));
+        }
+
+        public static void EncodeAnimatedRgbaToStream(Stream stream, byte[][] rgbaFrames, int width, int height, int[] frameDurationsMs, int loopCount, WebpEncoderOptions options)
+        {
             ArgumentNullException.ThrowIfNull(stream);
             ArgumentNullException.ThrowIfNull(rgbaFrames, nameof(rgbaFrames));
             ArgumentNullException.ThrowIfNull(frameDurationsMs, nameof(frameDurationsMs));
@@ -487,87 +611,90 @@ namespace SharpImageConverter.Formats.Webp
 
             try
             {
-                if (rgbaFrames.Length == 1)
+                ExecuteWithConcurrency(options.ConcurrencyStrategy, () =>
                 {
-                    EncodeRgbaToStream(stream, rgbaFrames[0], width, height, quality);
-                    return;
-                }
-
-                IntPtr mux = CreateEmptyMux();
-                if (mux == IntPtr.Zero) throw new InvalidOperationException("WebPMux 创建失败");
-
-                try
-                {
-                    var err = WebPMuxSetCanvasSize(mux, width, height);
-                    if (err != WebPMuxError.WEBP_MUX_OK) throw new InvalidOperationException($"WebPMuxSetCanvasSize 失败: {err}");
-
-                    var animParams = new WebPMuxAnimParams
+                    if (rgbaFrames.Length == 1)
                     {
-                        bgcolor = 0u,
-                        loop_count = loopCount
-                    };
-                    err = WebPMuxSetAnimationParams(mux, ref animParams);
-                    if (err != WebPMuxError.WEBP_MUX_OK) throw new InvalidOperationException($"WebPMuxSetAnimationParams 失败: {err}");
-
-                    for (int i = 0; i < rgbaFrames.Length; i++)
-                    {
-                        var rgba = rgbaFrames[i];
-                        if (rgba.Length != checked(width * height * 4)) throw new ArgumentException("RGBA 帧尺寸不一致");
-
-                        int duration = frameDurationsMs[i];
-                        if (duration < 10) duration = 10;
-
-                        byte[] encoded = EncodeRgba(rgba, width, height, quality);
-
-                        unsafe
-                        {
-                            fixed (byte* p = encoded)
-                            {
-                                var frame = new WebPMuxFrameInfo
-                                {
-                                    bitstream = new WebPData { bytes = (IntPtr)p, size = (nuint)encoded.Length },
-                                    x_offset = 0,
-                                    y_offset = 0,
-                                    duration = duration,
-                                    id = WebPChunkId.WEBP_CHUNK_ANMF,
-                                    dispose_method = WebPMuxAnimDispose.WEBP_MUX_DISPOSE_BACKGROUND,
-                                    blend_method = WebPMuxAnimBlend.WEBP_MUX_NO_BLEND,
-                                    pad = 0u
-                                };
-
-                                err = WebPMuxPushFrame(mux, ref frame, copy_data: 1);
-                                if (err != WebPMuxError.WEBP_MUX_OK) throw new InvalidOperationException($"WebPMuxPushFrame 失败: {err}");
-                            }
-                        }
+                        EncodeRgbaToStream(stream, rgbaFrames[0], width, height, options);
+                        return;
                     }
 
-                    var assembled = new WebPData { bytes = IntPtr.Zero, size = 0 };
-                    err = WebPMuxAssemble(mux, ref assembled);
-                    if (err != WebPMuxError.WEBP_MUX_OK) throw new InvalidOperationException($"WebPMuxAssemble 失败: {err}");
-                    if (assembled.bytes == IntPtr.Zero || assembled.size == 0) throw new InvalidOperationException("WebPMuxAssemble 返回空数据");
+                    IntPtr mux = CreateEmptyMux();
+                    if (mux == IntPtr.Zero) throw new InvalidOperationException("WebPMux 创建失败");
 
                     try
                     {
-                        int len = checked((int)assembled.size);
-                        unsafe
+                        var err = WebPMuxSetCanvasSize(mux, width, height);
+                        if (err != WebPMuxError.WEBP_MUX_OK) throw new InvalidOperationException($"WebPMuxSetCanvasSize 失败: {err}");
+
+                        var animParams = new WebPMuxAnimParams
                         {
-                            stream.Write(new ReadOnlySpan<byte>((void*)assembled.bytes, len));
+                            bgcolor = 0u,
+                            loop_count = loopCount
+                        };
+                        err = WebPMuxSetAnimationParams(mux, ref animParams);
+                        if (err != WebPMuxError.WEBP_MUX_OK) throw new InvalidOperationException($"WebPMuxSetAnimationParams 失败: {err}");
+
+                        for (int i = 0; i < rgbaFrames.Length; i++)
+                        {
+                            var rgba = rgbaFrames[i];
+                            if (rgba.Length != checked(width * height * 4)) throw new ArgumentException("RGBA 帧尺寸不一致");
+
+                            int duration = frameDurationsMs[i];
+                            if (duration < 10) duration = 10;
+
+                            byte[] encoded = EncodeRgba(rgba, width, height, options);
+
+                            unsafe
+                            {
+                                fixed (byte* p = encoded)
+                                {
+                                    var frame = new WebPMuxFrameInfo
+                                    {
+                                        bitstream = new WebPData { bytes = (IntPtr)p, size = (nuint)encoded.Length },
+                                        x_offset = 0,
+                                        y_offset = 0,
+                                        duration = duration,
+                                        id = WebPChunkId.WEBP_CHUNK_ANMF,
+                                        dispose_method = WebPMuxAnimDispose.WEBP_MUX_DISPOSE_BACKGROUND,
+                                        blend_method = WebPMuxAnimBlend.WEBP_MUX_NO_BLEND,
+                                        pad = 0u
+                                    };
+
+                                    err = WebPMuxPushFrame(mux, ref frame, copy_data: 1);
+                                    if (err != WebPMuxError.WEBP_MUX_OK) throw new InvalidOperationException($"WebPMuxPushFrame 失败: {err}");
+                                }
+                            }
+                        }
+
+                        var assembled = new WebPData { bytes = IntPtr.Zero, size = 0 };
+                        err = WebPMuxAssemble(mux, ref assembled);
+                        if (err != WebPMuxError.WEBP_MUX_OK) throw new InvalidOperationException($"WebPMuxAssemble 失败: {err}");
+                        if (assembled.bytes == IntPtr.Zero || assembled.size == 0) throw new InvalidOperationException("WebPMuxAssemble 返回空数据");
+
+                        try
+                        {
+                            int len = checked((int)assembled.size);
+                            unsafe
+                            {
+                                stream.Write(new ReadOnlySpan<byte>((void*)assembled.bytes, len));
+                            }
+                        }
+                        finally
+                        {
+                            if (assembled.bytes != IntPtr.Zero)
+                            {
+                                WebPFree(assembled.bytes);
+                                assembled.bytes = IntPtr.Zero;
+                                assembled.size = 0;
+                            }
                         }
                     }
                     finally
                     {
-                        if (assembled.bytes != IntPtr.Zero)
-                        {
-                            WebPFree(assembled.bytes);
-                            assembled.bytes = IntPtr.Zero;
-                            assembled.size = 0;
-                        }
+                        WebPMuxDelete(mux);
                     }
-                }
-                finally
-                {
-                    WebPMuxDelete(mux);
-                }
+                });
             }
             catch (DllNotFoundException ex)
             {

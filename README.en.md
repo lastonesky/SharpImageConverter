@@ -32,7 +32,7 @@ This library was originally created to address several practical issues we encou
 - Write:
   - Save as Truecolor PNG (RGB24) and Truecolor+Alpha PNG (RGBA32)
   - Zlib (Deflate) compression using the Up filter (per-row differencing), with SIMD acceleration applied to the Up filtering step
-  - No palette or additional metadata
+  - Write EXIF/iCCP/sRGB metadata when available
 
 ### BMP
 - Read: uncompressed 8/24/32-bit BMP (outputs unified as RGB24)
@@ -52,7 +52,7 @@ This library was originally created to address several practical issues we encou
 ### WebP
 - Read/Write WebP via native libwebp under `runtimes/`
 - Unified decode to RGB24; select encoder based on output file extension
-- Current WebP encode quality is fixed to 75 (may become configurable later)
+- WebP encode quality and concurrency strategy are configurable
 - WebP implementation relies on Google's libwebp and related components (BSD-3-Clause License); see `THIRD-PARTY-NOTICES.md` for copyright and license details
 
 ### Intermediate Format

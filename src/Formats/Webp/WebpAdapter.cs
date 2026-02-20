@@ -6,20 +6,26 @@ using System.Collections.Generic;
 
 namespace SharpImageConverter.Formats.Webp
 {
-    /// <summary>
-    /// WebP 编码器选项
-    /// </summary>
+    public enum WebpConcurrencyStrategy
+    {
+        Auto = 0,
+        Serial = 1,
+        Parallel = 2
+    }
+
     public readonly struct WebpEncoderOptions
     {
         public float Quality { get; }
+        public WebpConcurrencyStrategy ConcurrencyStrategy { get; }
 
-        public WebpEncoderOptions(float quality)
+        public WebpEncoderOptions(float quality, WebpConcurrencyStrategy concurrencyStrategy = WebpConcurrencyStrategy.Auto)
         {
             if (quality < 0f || quality > 100f) throw new ArgumentOutOfRangeException(nameof(quality));
             Quality = quality;
+            ConcurrencyStrategy = concurrencyStrategy;
         }
 
-        public static WebpEncoderOptions Default => new WebpEncoderOptions(75f);
+        public static WebpEncoderOptions Default => new WebpEncoderOptions(75f, WebpConcurrencyStrategy.Auto);
     }
 
     internal static class WebpStreamDecoder
@@ -104,7 +110,13 @@ namespace SharpImageConverter.Formats.Webp
         public static float Quality
         {
             get => _defaultOptions.Quality;
-            set => _defaultOptions = new WebpEncoderOptions(value);
+            set => _defaultOptions = new WebpEncoderOptions(value, _defaultOptions.ConcurrencyStrategy);
+        }
+
+        public static WebpConcurrencyStrategy ConcurrencyStrategy
+        {
+            get => _defaultOptions.ConcurrencyStrategy;
+            set => _defaultOptions = new WebpEncoderOptions(_defaultOptions.Quality, value);
         }
 
         internal static WebpEncoderOptions DefaultOptions => _defaultOptions;
@@ -141,13 +153,19 @@ namespace SharpImageConverter.Formats.Webp
         public static float Quality
         {
             get => _defaultOptions.Quality;
-            set => _defaultOptions = new WebpEncoderOptions(value);
+            set => _defaultOptions = new WebpEncoderOptions(value, _defaultOptions.ConcurrencyStrategy);
         }
 
         public static float DefaultQuality
         {
             get => Quality;
             set => Quality = value;
+        }
+
+        public static WebpConcurrencyStrategy ConcurrencyStrategy
+        {
+            get => _defaultOptions.ConcurrencyStrategy;
+            set => _defaultOptions = new WebpEncoderOptions(_defaultOptions.Quality, value);
         }
 
         internal static WebpEncoderOptions DefaultOptions => _defaultOptions;
@@ -184,6 +202,11 @@ namespace SharpImageConverter.Formats.Webp
 
         public static void EncodeRgb24(Stream stream, IReadOnlyList<Image<Rgb24>> frames, IReadOnlyList<int> frameDurationsMs, int loopCount, float quality = 75f)
         {
+            EncodeRgb24(stream, frames, frameDurationsMs, loopCount, new WebpEncoderOptions(quality, WebpConcurrencyStrategy.Auto));
+        }
+
+        public static void EncodeRgb24(Stream stream, IReadOnlyList<Image<Rgb24>> frames, IReadOnlyList<int> frameDurationsMs, int loopCount, WebpEncoderOptions options)
+        {
             ArgumentNullException.ThrowIfNull(stream, nameof(stream));
             ArgumentNullException.ThrowIfNull(frames, nameof(frames));
             ArgumentNullException.ThrowIfNull(frameDurationsMs, nameof(frameDurationsMs));
@@ -216,7 +239,7 @@ namespace SharpImageConverter.Formats.Webp
                 durations[fi] = d < 10 ? 10 : d;
             }
 
-            WebpCodec.EncodeAnimatedRgbaToStream(stream, rgbaFrames, width, height, durations, loopCount, quality);
+            WebpCodec.EncodeAnimatedRgbaToStream(stream, rgbaFrames, width, height, durations, loopCount, options);
         }
     }
 }

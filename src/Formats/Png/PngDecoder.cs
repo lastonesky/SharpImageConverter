@@ -4,6 +4,7 @@ using System.Buffers;
 using System.IO;
 using System.Text;
 using System.Numerics;
+using SharpImageConverter.Metadata;
 
 namespace SharpImageConverter.Formats.Png;
 
@@ -43,11 +44,16 @@ public class PngDecoder
 
     private byte[]? _palette;
     private byte[]? _transparency;
+    private ImageMetadata _metadata = new ImageMetadata();
+    public ImageMetadata Metadata => _metadata;
     private const uint TypeIHDR = 0x49484452;
     private const uint TypePLTE = 0x504C5445;
     private const uint TypeIDAT = 0x49444154;
     private const uint TypeTRNS = 0x74524E53;
     private const uint TypeIEND = 0x49454E44;
+    private const uint TypeEXIF = 0x65584966;
+    private const uint TypeICCP = 0x69434350;
+    private const uint TypeSRGB = 0x73524742;
     private static readonly int[] Adam7StartX = [0, 4, 0, 2, 0, 1, 0];
     private static readonly int[] Adam7StartY = [0, 0, 4, 0, 2, 0, 1];
     private static readonly int[] Adam7StepX = [8, 8, 4, 4, 2, 2, 1];
@@ -71,6 +77,9 @@ public class PngDecoder
     /// <returns>按 RGB 顺序排列的字节数组（长度为 Width*Height*3）</returns>
     public byte[] DecodeToRGB(Stream stream)
     {
+        _palette = null;
+        _transparency = null;
+        _metadata = new ImageMetadata();
         byte[] sig = new byte[8];
         ReadExact(stream, sig, 0, 8);
         if (!IsPngSignature(sig)) throw new InvalidDataException("Not a PNG file");
@@ -93,7 +102,7 @@ public class PngDecoder
             int dataLength = (int)length;
             if (dataLength > 0)
             {
-                if (type == TypeIHDR || type == TypePLTE || type == TypeTRNS)
+                if (type == TypeIHDR || type == TypePLTE || type == TypeTRNS || type == TypeEXIF || type == TypeICCP || type == TypeSRGB)
                 {
                     data = new byte[dataLength];
                 }
@@ -134,6 +143,15 @@ public class PngDecoder
                 case TypeTRNS:
                     _transparency = data;
                     break;
+                case TypeEXIF:
+                    ParseExifChunk(data);
+                    break;
+                case TypeICCP:
+                    ParseIccpChunk(data);
+                    break;
+                case TypeSRGB:
+                    ParseSrgbChunk();
+                    break;
                 case TypeIEND:
                     endChunkFound = true;
                     break;
@@ -170,6 +188,9 @@ public class PngDecoder
     /// <returns>按 RGBA 顺序排列的字节数组（长度为 Width*Height*4）</returns>
     public byte[] DecodeToRGBA(Stream stream)
     {
+        _palette = null;
+        _transparency = null;
+        _metadata = new ImageMetadata();
         byte[] sig = new byte[8];
         ReadExact(stream, sig, 0, 8);
         if (!IsPngSignature(sig)) throw new InvalidDataException("Not a PNG file");
@@ -190,7 +211,7 @@ public class PngDecoder
             int dataLength = (int)length;
             if (dataLength > 0)
             {
-                if (type == TypeIHDR || type == TypePLTE || type == TypeTRNS)
+                if (type == TypeIHDR || type == TypePLTE || type == TypeTRNS || type == TypeEXIF || type == TypeICCP || type == TypeSRGB)
                 {
                     data = new byte[dataLength];
                 }
@@ -219,6 +240,15 @@ public class PngDecoder
                     break;
                 case TypeTRNS:
                     _transparency = data;
+                    break;
+                case TypeEXIF:
+                    ParseExifChunk(data);
+                    break;
+                case TypeICCP:
+                    ParseIccpChunk(data);
+                    break;
+                case TypeSRGB:
+                    ParseSrgbChunk();
                     break;
                 case TypeIEND:
                     endChunkFound = true;
@@ -256,6 +286,50 @@ public class PngDecoder
     {
         if (!TryReadExact(stream, buffer, offset, count))
             throw new InvalidDataException("Unexpected EOF");
+    }
+
+    private void ParseExifChunk(byte[] data)
+    {
+        if (data.Length == 0) return;
+        if (data.Length >= 6 &&
+            data[0] == (byte)'E' && data[1] == (byte)'x' && data[2] == (byte)'i' && data[3] == (byte)'f' &&
+            data[4] == 0 && data[5] == 0)
+        {
+            _metadata.ExifRaw = data;
+            return;
+        }
+        var exif = new byte[data.Length + 6];
+        exif[0] = (byte)'E';
+        exif[1] = (byte)'x';
+        exif[2] = (byte)'i';
+        exif[3] = (byte)'f';
+        exif[4] = 0;
+        exif[5] = 0;
+        Buffer.BlockCopy(data, 0, exif, 6, data.Length);
+        _metadata.ExifRaw = exif;
+    }
+
+    private void ParseIccpChunk(byte[] data)
+    {
+        int nullIdx = Array.IndexOf(data, (byte)0);
+        if (nullIdx < 0 || nullIdx + 2 > data.Length) return;
+        byte compression = data[nullIdx + 1];
+        if (compression != 0) return;
+        int payloadOffset = nullIdx + 2;
+        int payloadLen = data.Length - payloadOffset;
+        if (payloadLen <= 0) return;
+        byte[] profile = ZlibHelper.Decompress(data, payloadOffset, payloadLen);
+        if (profile.Length == 0) return;
+        _metadata.IccProfile = profile;
+        _metadata.IccProfileKind = IccProfileKind.Unknown;
+    }
+
+    private void ParseSrgbChunk()
+    {
+        if (_metadata.IccProfile == null)
+        {
+            _metadata.IccProfileKind = IccProfileKind.SRgb;
+        }
     }
 
     private static bool IsPngSignature(byte[] sig)
