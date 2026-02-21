@@ -2,6 +2,7 @@ using Xunit;
 using System;
 using System.IO;
 using SharpImageConverter;
+using SharpImageConverter.Formats.Png;
 using Tests.Helpers;
 
 namespace Jpeg2Bmp.Tests
@@ -70,6 +71,40 @@ namespace Jpeg2Bmp.Tests
         {
             using var nonSeek = new NonSeekableReadOnlyStream(new byte[] { 0xFF });
             Assert.Throws<InvalidDataException>(() => ImageFrame.Load(nonSeek));
+        }
+
+        [Fact]
+        public void ImageFrame_Load_InvalidHeader_Throws()
+        {
+            byte[] data = [0x00, 0x11, 0x22, 0x33, 0x44];
+            Assert.Throws<NotSupportedException>(() => ImageFrame.Load(data));
+        }
+
+        [Fact]
+        public void ImageFrame_Load_ChunkedStream_Matches_ByteArray()
+        {
+            var img = TestImageFactory.CreateChecker(32, 32, (10, 20, 30), (200, 210, 220), 4);
+            using var ms = new MemoryStream();
+            PngWriter.Write(ms, img.Width, img.Height, img.Buffer, img.Metadata);
+            byte[] data = ms.ToArray();
+
+            var frameFromBytes = ImageFrame.Load(data);
+            using var chunked = new ChunkedReadOnlyStream(data, 7);
+            var frameFromStream = ImageFrame.Load(chunked);
+            Assert.Equal(frameFromBytes.Width, frameFromStream.Width);
+            Assert.Equal(frameFromBytes.Height, frameFromStream.Height);
+            BufferAssert.EqualExact(frameFromBytes.Pixels, frameFromStream.Pixels);
+        }
+
+        [Fact]
+        public void ImageFrame_Load_ChunkedStream_Truncated_Throws()
+        {
+            var img = TestImageFactory.CreateChecker(16, 16, (10, 20, 30), (200, 210, 220), 2);
+            using var ms = new MemoryStream();
+            PngWriter.Write(ms, img.Width, img.Height, img.Buffer, img.Metadata);
+            byte[] data = ms.ToArray();
+            using var chunked = new ChunkedReadOnlyStream(data, 5, data.Length / 2);
+            Assert.ThrowsAny<Exception>(() => ImageFrame.Load(chunked));
         }
 
         private static (int dx, int dy, int newW, int newH) Map(int x, int y, int w, int h, int orientation)
@@ -186,6 +221,70 @@ namespace Jpeg2Bmp.Tests
             {
                 if (disposing) inner.Dispose();
                 base.Dispose(disposing);
+            }
+        }
+
+        private sealed class ChunkedReadOnlyStream : Stream
+        {
+            private readonly byte[] data;
+            private readonly int maxChunk;
+            private readonly int maxBytes;
+            private int position;
+
+            public ChunkedReadOnlyStream(byte[] data, int maxChunk, int? maxBytes = null)
+            {
+                this.data = data;
+                this.maxChunk = maxChunk > 0 ? maxChunk : 1;
+                this.maxBytes = Math.Min(maxBytes ?? data.Length, data.Length);
+            }
+
+            public override bool CanRead => true;
+            public override bool CanSeek => false;
+            public override bool CanWrite => false;
+            public override long Length => throw new NotSupportedException();
+            public override long Position
+            {
+                get => throw new NotSupportedException();
+                set => throw new NotSupportedException();
+            }
+
+            public override int Read(byte[] buffer, int offset, int count)
+            {
+                if (position >= maxBytes) return 0;
+                int remaining = maxBytes - position;
+                int take = Math.Min(count, Math.Min(maxChunk, remaining));
+                Buffer.BlockCopy(data, position, buffer, offset, take);
+                position += take;
+                return take;
+            }
+
+            public override int Read(Span<byte> buffer)
+            {
+                if (position >= maxBytes) return 0;
+                int remaining = maxBytes - position;
+                int take = Math.Min(buffer.Length, Math.Min(maxChunk, remaining));
+                data.AsSpan(position, take).CopyTo(buffer);
+                position += take;
+                return take;
+            }
+
+            public override void Flush()
+            {
+            }
+
+            public override long Seek(long offset, SeekOrigin origin)
+            {
+                throw new NotSupportedException();
+            }
+
+            public override void SetLength(long value)
+            {
+                throw new NotSupportedException();
+            }
+
+            public override void Write(byte[] buffer, int offset, int count)
+            {
+                throw new NotSupportedException();
             }
         }
     }

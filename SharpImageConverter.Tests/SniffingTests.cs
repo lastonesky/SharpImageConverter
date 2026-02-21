@@ -35,6 +35,18 @@ namespace SharpImageConverter.Tests
         }
 
         [Fact]
+        public void Webp_IsMatch_By_Header()
+        {
+            var fmt = new WebpFormat();
+            using var ms = new MemoryStream(new byte[]
+            {
+                (byte)'R',(byte)'I',(byte)'F',(byte)'F',0x00,0x00,0x00,0x00,
+                (byte)'W',(byte)'E',(byte)'B',(byte)'P'
+            });
+            Assert.True(fmt.IsMatch(ms));
+        }
+
+        [Fact]
         public void Random_Header_Is_Not_Match()
         {
             using var ms = new MemoryStream(new byte[] { 0x00, 0x11, 0x22, 0x33 });
