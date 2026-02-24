@@ -1,4 +1,5 @@
 using System;
+using System.Buffers;
 using System.IO;
 using System.IO.Compression;
 using SharpImageConverter.Formats.Png;
@@ -14,27 +15,51 @@ public static class ZlibHelper
 
     public static byte[] Decompress(byte[] data, int offset, int count)
     {
+        return Decompress(data, offset, count, 0);
+    }
+
+    public static byte[] Decompress(byte[] data, int offset, int count, int expectedDecompressedSize)
+    {
         if (data == null || count < 6)
             throw new ArgumentException("Invalid Zlib data");
+
         byte cmf = data[offset];
         byte flg = data[offset + 1];
         if ((cmf & 0x0F) != 8)
             throw new NotSupportedException("Only Deflate compression is supported");
-        if (((cmf * 256 + flg) % 31) != 0)
+        if ((flg & 0x20) != 0)
+            throw new NotSupportedException("Preset dictionary is not supported");
+        if ((((cmf << 8) | flg) % 31) != 0)
             throw new InvalidDataException("Invalid Zlib header check");
-        using (var ms = new MemoryStream(data, offset + 2, count - 6))
-        using (var ds = new DeflateStream(ms, CompressionMode.Decompress))
-        using (var outMs = new MemoryStream())
+
+        int end = offset + count;
+        uint expectedAdler = (uint)((data[end - 4] << 24) | (data[end - 3] << 16) | (data[end - 2] << 8) | data[end - 1]);
+
+        using var ms = new MemoryStream(data, offset + 2, count - 6, false);
+        using var ds = new DeflateStream(ms, CompressionMode.Decompress);
+        using var outMs = expectedDecompressedSize > 0 ? new MemoryStream(expectedDecompressedSize) : new MemoryStream();
+
+        uint adler = 1u;
+        byte[] buffer = ArrayPool<byte>.Shared.Rent(128 * 1024);
+        try
         {
-            ds.CopyTo(outMs);
-            byte[] decompressed = outMs.ToArray();
-            int end = offset + count;
-            uint expectedAdler = (uint)((data[end - 4] << 24) | (data[end - 3] << 16) | (data[end - 2] << 8) | data[end - 1]);
-            uint actualAdler = Adler32.Compute(decompressed, 0, decompressed.Length);
-            if (expectedAdler != actualAdler)
-                throw new InvalidDataException($"Adler32 Checksum failed. Expected {expectedAdler:X8}, got {actualAdler:X8}");
-            return decompressed;
+            while (true)
+            {
+                int read = ds.Read(buffer, 0, buffer.Length);
+                if (read <= 0) break;
+                outMs.Write(buffer, 0, read);
+                adler = Adler32.Update(adler, buffer, 0, read);
+            }
         }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(buffer);
+        }
+
+        if (expectedAdler != adler)
+            throw new InvalidDataException($"Adler32 Checksum failed. Expected {expectedAdler:X8}, got {adler:X8}");
+
+        return outMs.ToArray();
     }
 
     public static byte[] Compress(byte[] data)

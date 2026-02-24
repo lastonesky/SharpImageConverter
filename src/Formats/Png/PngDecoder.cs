@@ -42,6 +42,8 @@ public class PngDecoder
     /// </summary>
     public byte InterlaceMethod { get; private set; }
 
+    public bool ValidateChunkCrc { get; set; }
+
     private byte[]? _palette;
     private byte[]? _transparency;
     private ImageMetadata _metadata = new ImageMetadata();
@@ -119,14 +121,16 @@ public class PngDecoder
             }
 
             ReadExact(stream, crcBytes, 0, 4);
-            uint fileCrc = ReadBigEndianUint32(crcBytes, 0);
-
-            uint calcCrc = Crc32.Compute(typeBytes);
-            if (dataLength > 0) calcCrc = Crc32.Update(calcCrc, data, 0, dataLength);
-            if (calcCrc != fileCrc)
+            if (ValidateChunkCrc)
             {
-                string typeName = Encoding.ASCII.GetString(typeBytes);
-                Console.WriteLine($"Warning: CRC mismatch in chunk {typeName}. Expected {fileCrc:X8}, got {calcCrc:X8}");
+                uint fileCrc = ReadBigEndianUint32(crcBytes, 0);
+                uint calcCrc = Crc32.Compute(typeBytes);
+                if (dataLength > 0) calcCrc = Crc32.Update(calcCrc, data, 0, dataLength);
+                if (calcCrc != fileCrc)
+                {
+                    string typeName = Encoding.ASCII.GetString(typeBytes);
+                    throw new InvalidDataException($"CRC mismatch in chunk {typeName}. Expected {fileCrc:X8}, got {calcCrc:X8}");
+                }
             }
 
             switch (type)
@@ -166,7 +170,8 @@ public class PngDecoder
         }
 
         ArraySegment<byte> idatSegment = idatStream.GetBuffer();
-        byte[] decompressed = ZlibHelper.Decompress(idatSegment.Array, idatSegment.Offset, idatSegment.Count);
+        int expectedDecompressedSize = GetExpectedDecompressedSize();
+        byte[] decompressed = ZlibHelper.Decompress(idatSegment.Array, idatSegment.Offset, idatSegment.Count, expectedDecompressedSize);
         return ProcessImage(decompressed);
     }
 
@@ -227,6 +232,17 @@ public class PngDecoder
                 data = Array.Empty<byte>();
             }
             ReadExact(stream, crcBytes, 0, 4);
+            if (ValidateChunkCrc)
+            {
+                uint fileCrc = ReadBigEndianUint32(crcBytes, 0);
+                uint calcCrc = Crc32.Compute(typeBytes);
+                if (dataLength > 0) calcCrc = Crc32.Update(calcCrc, data, 0, dataLength);
+                if (calcCrc != fileCrc)
+                {
+                    string typeName = Encoding.ASCII.GetString(typeBytes);
+                    throw new InvalidDataException($"CRC mismatch in chunk {typeName}. Expected {fileCrc:X8}, got {calcCrc:X8}");
+                }
+            }
             switch (type)
             {
                 case TypeIHDR:
@@ -262,7 +278,8 @@ public class PngDecoder
             }
         }
         ArraySegment<byte> idatSegment = idatStream.GetBuffer();
-        byte[] decompressed = ZlibHelper.Decompress(idatSegment.Array, idatSegment.Offset, idatSegment.Count);
+        int expectedDecompressedSize = GetExpectedDecompressedSize();
+        byte[] decompressed = ZlibHelper.Decompress(idatSegment.Array, idatSegment.Offset, idatSegment.Count, expectedDecompressedSize);
         return ProcessImageRgba(decompressed);
     }
 
@@ -336,6 +353,36 @@ public class PngDecoder
     {
         return sig[0] == 0x89 && sig[1] == 0x50 && sig[2] == 0x4E && sig[3] == 0x47 &&
                sig[4] == 0x0D && sig[5] == 0x0A && sig[6] == 0x1A && sig[7] == 0x0A;
+    }
+
+    private int GetExpectedDecompressedSize()
+    {
+        int bitsPerPixel = GetBitsPerPixel();
+        if (Width <= 0 || Height <= 0) return 0;
+
+        if (InterlaceMethod == 0)
+        {
+            long stride = ((long)Width * bitsPerPixel + 7) / 8;
+            long total = (stride + 1) * Height;
+            if ((ulong)total > int.MaxValue) return 0;
+            return (int)total;
+        }
+
+        long sum = 0;
+        int[] startX = Adam7StartX;
+        int[] startY = Adam7StartY;
+        int[] stepX = Adam7StepX;
+        int[] stepY = Adam7StepY;
+        for (int pass = 0; pass < 7; pass++)
+        {
+            int passW = (Width - startX[pass] + stepX[pass] - 1) / stepX[pass];
+            int passH = (Height - startY[pass] + stepY[pass] - 1) / stepY[pass];
+            if (passW <= 0 || passH <= 0) continue;
+            long stride = ((long)passW * bitsPerPixel + 7) / 8;
+            sum += (stride + 1) * passH;
+            if ((ulong)sum > int.MaxValue) return 0;
+        }
+        return (int)sum;
     }
 
     private void ParseIHDR(byte[] data)
@@ -452,7 +499,7 @@ public class PngDecoder
             Array.Copy(rawData, dataOffset, passData, 0, passSize);
             dataOffset += passSize;
             byte[] decodedPass = Unfilter(passData, passW, passH, bpp, stride);
-            byte[] rgbaPass = ConvertToRGBA(decodedPass, passW, passH);
+            byte[] rgbaPass = (ColorType == 6 && BitDepth == 8) ? decodedPass : ConvertToRGBA(decodedPass, passW, passH);
             for (int y = 0; y < passH; y++)
             {
                 for (int x = 0; x < passW; x++)
@@ -475,8 +522,12 @@ public class PngDecoder
     {
         int stride = (w * GetBitsPerPixel() + 7) / 8;
         byte[] decoded = Unfilter(rawData, w, h, bpp, stride);
-        
-        // Convert to RGB 24-bit
+
+        if (ColorType == 2 && BitDepth == 8 && decoded.Length == w * h * 3)
+        {
+            return decoded;
+        }
+
         return ConvertToRGB(decoded, w, h);
     }
 
@@ -484,6 +535,12 @@ public class PngDecoder
     {
         int stride = (w * GetBitsPerPixel() + 7) / 8;
         byte[] decoded = Unfilter(rawData, w, h, bpp, stride);
+
+        if (ColorType == 6 && BitDepth == 8 && decoded.Length == w * h * 4)
+        {
+            return decoded;
+        }
+
         return ConvertToRGBA(decoded, w, h);
     }
 
@@ -600,19 +657,59 @@ public class PngDecoder
         // This is complex because we need to convert the partial pass (which might be packed differently depending on color type)
         // into the final RGB buffer.
         // It's easier if we convert the pass to RGB first, then scatter.
-        
+
+        if (ColorType == 2 && BitDepth == 8)
+        {
+            for (int y = 0; y < h; y++)
+            {
+                for (int x = 0; x < w; x++)
+                {
+                    int finalY = sy + y * dy;
+                    int finalX = sx + x * dx;
+
+                    int srcIdx = (y * w + x) * 3;
+                    int dstIdx = (finalY * Width + finalX) * 3;
+
+                    finalImage[dstIdx] = decodedPass[srcIdx];
+                    finalImage[dstIdx + 1] = decodedPass[srcIdx + 1];
+                    finalImage[dstIdx + 2] = decodedPass[srcIdx + 2];
+                }
+            }
+            return;
+        }
+
+        if (ColorType == 6 && BitDepth == 8)
+        {
+            for (int y = 0; y < h; y++)
+            {
+                for (int x = 0; x < w; x++)
+                {
+                    int finalY = sy + y * dy;
+                    int finalX = sx + x * dx;
+
+                    int srcIdx = (y * w + x) * 4;
+                    int dstIdx = (finalY * Width + finalX) * 3;
+
+                    finalImage[dstIdx] = decodedPass[srcIdx];
+                    finalImage[dstIdx + 1] = decodedPass[srcIdx + 1];
+                    finalImage[dstIdx + 2] = decodedPass[srcIdx + 2];
+                }
+            }
+            return;
+        }
+
         byte[] rgbPass = ConvertToRGB(decodedPass, w, h);
-        
+
         for (int y = 0; y < h; y++)
         {
             for (int x = 0; x < w; x++)
             {
                 int finalY = sy + y * dy;
                 int finalX = sx + x * dx;
-                
+
                 int srcIdx = (y * w + x) * 3;
                 int dstIdx = (finalY * Width + finalX) * 3;
-                
+
                 finalImage[dstIdx] = rgbPass[srcIdx];
                 finalImage[dstIdx + 1] = rgbPass[srcIdx + 1];
                 finalImage[dstIdx + 2] = rgbPass[srcIdx + 2];
@@ -622,6 +719,159 @@ public class PngDecoder
 
     private byte[] ConvertToRGB(byte[] data, int w, int h)
     {
+        if (BitDepth == 8)
+        {
+            if (ColorType == 0)
+            {
+                byte[] rgb0 = new byte[w * h * 3];
+                int src = 0;
+                int dst = 0;
+                int end = w * h;
+                for (int i = 0; i < end; i++)
+                {
+                    byte v = data[src++];
+                    rgb0[dst++] = v;
+                    rgb0[dst++] = v;
+                    rgb0[dst++] = v;
+                }
+                return rgb0;
+            }
+
+            if (ColorType == 2)
+            {
+                byte[] rgb2 = new byte[w * h * 3];
+                Buffer.BlockCopy(data, 0, rgb2, 0, rgb2.Length);
+                return rgb2;
+            }
+
+            if (ColorType == 4)
+            {
+                byte[] rgb4 = new byte[w * h * 3];
+                int src = 0;
+                int dst = 0;
+                int end = w * h;
+                for (int i = 0; i < end; i++)
+                {
+                    byte v = data[src];
+                    src += 2;
+                    rgb4[dst++] = v;
+                    rgb4[dst++] = v;
+                    rgb4[dst++] = v;
+                }
+                return rgb4;
+            }
+
+            if (ColorType == 6)
+            {
+                byte[] rgb6 = new byte[w * h * 3];
+                int src = 0;
+                int dst = 0;
+                int end = w * h;
+                for (int i = 0; i < end; i++)
+                {
+                    rgb6[dst++] = data[src++];
+                    rgb6[dst++] = data[src++];
+                    rgb6[dst++] = data[src++];
+                    src++;
+                }
+                return rgb6;
+            }
+
+            if (ColorType == 3)
+            {
+                byte[] rgb3 = new byte[w * h * 3];
+                int src = 0;
+                int dst = 0;
+                int end = w * h;
+                for (int i = 0; i < end; i++)
+                {
+                    int index = data[src++];
+                    if (_palette != null)
+                    {
+                        int p = index * 3;
+                        if (p + 2 < _palette.Length)
+                        {
+                            rgb3[dst++] = _palette[p];
+                            rgb3[dst++] = _palette[p + 1];
+                            rgb3[dst++] = _palette[p + 2];
+                            continue;
+                        }
+                    }
+                    dst += 3;
+                }
+                return rgb3;
+            }
+        }
+
+        if (BitDepth == 16)
+        {
+            if (ColorType == 0)
+            {
+                byte[] rgb016 = new byte[w * h * 3];
+                int src = 0;
+                int dst = 0;
+                int end = w * h;
+                for (int i = 0; i < end; i++)
+                {
+                    byte v = data[src];
+                    src += 2;
+                    rgb016[dst++] = v;
+                    rgb016[dst++] = v;
+                    rgb016[dst++] = v;
+                }
+                return rgb016;
+            }
+
+            if (ColorType == 2)
+            {
+                byte[] rgb216 = new byte[w * h * 3];
+                int src = 0;
+                int dst = 0;
+                int end = w * h;
+                for (int i = 0; i < end; i++)
+                {
+                    rgb216[dst++] = data[src];
+                    rgb216[dst++] = data[src + 2];
+                    rgb216[dst++] = data[src + 4];
+                    src += 6;
+                }
+                return rgb216;
+            }
+
+            if (ColorType == 6)
+            {
+                byte[] rgb616 = new byte[w * h * 3];
+                int src = 0;
+                int dst = 0;
+                int end = w * h;
+                for (int i = 0; i < end; i++)
+                {
+                    rgb616[dst++] = data[src];
+                    rgb616[dst++] = data[src + 2];
+                    rgb616[dst++] = data[src + 4];
+                    src += 8;
+                }
+                return rgb616;
+            }
+
+            if (ColorType == 4)
+            {
+                byte[] rgb416 = new byte[w * h * 3];
+                int src = 0;
+                int dst = 0;
+                int end = w * h;
+                for (int i = 0; i < end; i++)
+                {
+                    byte v = data[src];
+                    src += 4;
+                    rgb416[dst++] = v;
+                    rgb416[dst++] = v;
+                    rgb416[dst++] = v;
+                }
+                return rgb416;
+            }
+        }
+
         byte[] rgb = new byte[w * h * 3];
         int dstIdx = 0;
 
@@ -730,6 +980,195 @@ public class PngDecoder
 
     private byte[] ConvertToRGBA(byte[] data, int w, int h)
     {
+        if (BitDepth == 8)
+        {
+            if (ColorType == 0)
+            {
+                byte[] rgba0 = new byte[w * h * 4];
+                int src = 0;
+                int dst = 0;
+                int end = w * h;
+                int ts = -1;
+                if (_transparency != null && _transparency.Length >= 2)
+                {
+                    ts = (_transparency[0] << 8) | _transparency[1];
+                }
+                for (int i = 0; i < end; i++)
+                {
+                    byte v = data[src++];
+                    rgba0[dst++] = v;
+                    rgba0[dst++] = v;
+                    rgba0[dst++] = v;
+                    rgba0[dst++] = (ts >= 0 && v == ts) ? (byte)0 : (byte)255;
+                }
+                return rgba0;
+            }
+
+            if (ColorType == 2)
+            {
+                byte[] rgba2 = new byte[w * h * 4];
+                int src = 0;
+                int dst = 0;
+                int end = w * h;
+                bool hasTrns = _transparency != null && _transparency.Length >= 6;
+                byte tr = 0, tg = 0, tb = 0;
+                if (hasTrns)
+                {
+                    tr = _transparency![1];
+                    tg = _transparency![3];
+                    tb = _transparency![5];
+                }
+                for (int i = 0; i < end; i++)
+                {
+                    byte r = data[src++];
+                    byte g = data[src++];
+                    byte b = data[src++];
+                    rgba2[dst++] = r;
+                    rgba2[dst++] = g;
+                    rgba2[dst++] = b;
+                    rgba2[dst++] = (hasTrns && r == tr && g == tg && b == tb) ? (byte)0 : (byte)255;
+                }
+                return rgba2;
+            }
+
+            if (ColorType == 3)
+            {
+                byte[] rgba3 = new byte[w * h * 4];
+                int src = 0;
+                int dst = 0;
+                int end = w * h;
+                bool hasTrns = _transparency != null;
+                for (int i = 0; i < end; i++)
+                {
+                    int index = data[src++];
+                    byte r = 0, g = 0, b = 0;
+                    if (_palette != null)
+                    {
+                        int p = index * 3;
+                        if (p + 2 < _palette.Length)
+                        {
+                            r = _palette[p];
+                            g = _palette[p + 1];
+                            b = _palette[p + 2];
+                        }
+                    }
+                    rgba3[dst++] = r;
+                    rgba3[dst++] = g;
+                    rgba3[dst++] = b;
+                    rgba3[dst++] = (hasTrns && index < _transparency!.Length) ? _transparency![index] : (byte)255;
+                }
+                return rgba3;
+            }
+
+            if (ColorType == 4)
+            {
+                byte[] rgba4 = new byte[w * h * 4];
+                int src = 0;
+                int dst = 0;
+                int end = w * h;
+                for (int i = 0; i < end; i++)
+                {
+                    byte v = data[src++];
+                    byte a = data[src++];
+                    rgba4[dst++] = v;
+                    rgba4[dst++] = v;
+                    rgba4[dst++] = v;
+                    rgba4[dst++] = a;
+                }
+                return rgba4;
+            }
+
+            if (ColorType == 6)
+            {
+                byte[] rgba6 = new byte[w * h * 4];
+                Buffer.BlockCopy(data, 0, rgba6, 0, rgba6.Length);
+                return rgba6;
+            }
+        }
+
+        if (BitDepth == 16)
+        {
+            if (ColorType == 0)
+            {
+                byte[] rgba016 = new byte[w * h * 4];
+                int src = 0;
+                int dst = 0;
+                int end = w * h;
+                int ts = -1;
+                if (_transparency != null && _transparency.Length >= 2)
+                {
+                    int t = (_transparency[0] << 8) | _transparency[1];
+                    ts = t >> 8;
+                }
+                for (int i = 0; i < end; i++)
+                {
+                    byte v = data[src];
+                    src += 2;
+                    rgba016[dst++] = v;
+                    rgba016[dst++] = v;
+                    rgba016[dst++] = v;
+                    rgba016[dst++] = (ts >= 0 && v == ts) ? (byte)0 : (byte)255;
+                }
+                return rgba016;
+            }
+
+            if (ColorType == 2)
+            {
+                byte[] rgba216 = new byte[w * h * 4];
+                int src = 0;
+                int dst = 0;
+                int end = w * h;
+                for (int i = 0; i < end; i++)
+                {
+                    byte r = data[src];
+                    byte g = data[src + 2];
+                    byte b = data[src + 4];
+                    rgba216[dst++] = r;
+                    rgba216[dst++] = g;
+                    rgba216[dst++] = b;
+                    rgba216[dst++] = 255;
+                    src += 6;
+                }
+                return rgba216;
+            }
+
+            if (ColorType == 6)
+            {
+                byte[] rgba616 = new byte[w * h * 4];
+                int src = 0;
+                int dst = 0;
+                int end = w * h;
+                for (int i = 0; i < end; i++)
+                {
+                    rgba616[dst++] = data[src];
+                    rgba616[dst++] = data[src + 2];
+                    rgba616[dst++] = data[src + 4];
+                    rgba616[dst++] = data[src + 6];
+                    src += 8;
+                }
+                return rgba616;
+            }
+
+            if (ColorType == 4)
+            {
+                byte[] rgba416 = new byte[w * h * 4];
+                int src = 0;
+                int dst = 0;
+                int end = w * h;
+                for (int i = 0; i < end; i++)
+                {
+                    byte v = data[src];
+                    byte a = data[src + 2];
+                    src += 4;
+                    rgba416[dst++] = v;
+                    rgba416[dst++] = v;
+                    rgba416[dst++] = v;
+                    rgba416[dst++] = a;
+                }
+                return rgba416;
+            }
+        }
+
         byte[] rgba = new byte[w * h * 4];
         int dstIdx = 0;
         int stride = (w * GetBitsPerPixel() + 7) / 8;
