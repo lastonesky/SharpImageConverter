@@ -67,6 +67,19 @@ namespace Jpeg2Bmp.Tests
         }
 
         [Fact]
+        public void ImageFrame_Load_Webp_NonSeekableStream_Matches_ByteArray()
+        {
+            string path = ExamplePath("video-001.cmyk.webp");
+            byte[] data = File.ReadAllBytes(path);
+            var frameFromBytes = ImageFrame.Load(data);
+            using var nonSeek = new NonSeekableReadOnlyStream(data);
+            var frameFromStream = ImageFrame.Load(nonSeek);
+            Assert.Equal(frameFromBytes.Width, frameFromStream.Width);
+            Assert.Equal(frameFromBytes.Height, frameFromStream.Height);
+            BufferAssert.EqualExact(frameFromBytes.Pixels, frameFromStream.Pixels);
+        }
+
+        [Fact]
         public void ImageFrame_Load_NonSeekableStream_TooShort_Throws()
         {
             using var nonSeek = new NonSeekableReadOnlyStream(new byte[] { 0xFF });
