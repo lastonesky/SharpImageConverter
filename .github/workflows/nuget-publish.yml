@@ -1,0 +1,44 @@
+name: nuget-publish
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: windows-latest
+    env:
+      NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Restore
+        run: dotnet restore .\SharpImageConvert.slnx
+
+      - name: Test
+        run: dotnet test .\SharpImageConvert.slnx -c Release --no-build
+
+      - name: Pack
+        run: dotnet pack .\src\SharpImageConverter.csproj -c Release -o .\artifacts\nuget
+
+      - name: Push (nupkg)
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:NUGET_API_KEY)) { throw "NUGET_API_KEY 未设置" }
+          dotnet nuget push .\artifacts\nuget\*.nupkg --api-key $env:NUGET_API_KEY --source https://api.nuget.org/v3/index.json --skip-duplicate
+
+      - name: Push (snupkg)
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:NUGET_API_KEY)) { throw "NUGET_API_KEY 未设置" }
+          dotnet nuget push .\artifacts\nuget\*.snupkg --api-key $env:NUGET_API_KEY --source https://api.nuget.org/v3/index.json --skip-duplicate

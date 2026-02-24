@@ -245,48 +245,41 @@ namespace SharpImageConverter.Formats.Webp
 
             try
             {
-                IntPtr idec = WebPINewDecoder(IntPtr.Zero);
-                if (idec == IntPtr.Zero) throw new InvalidOperationException("WebP 流式解码器创建失败");
-                var buffer = ArrayPool<byte>.Shared.Rent(32 * 1024);
+                if (stream.CanSeek)
+                {
+                    long remainingLong = stream.Length - stream.Position;
+                    if (remainingLong <= 0) throw new InvalidDataException("WebP 流数据为空");
+                    if (remainingLong > int.MaxValue) throw new InvalidDataException("WebP 流数据过大");
+                    int remaining = (int)remainingLong;
+                    byte[] data = new byte[remaining];
+                    int offset = 0;
+                    while (offset < remaining)
+                    {
+                        int n = stream.Read(data, offset, remaining - offset);
+                        if (n == 0) throw new EndOfStreamException("WebP 流数据不完整");
+                        offset += n;
+                    }
+                    return DecodeRgba(data, out width, out height);
+                }
+
+                var poolBuf = ArrayPool<byte>.Shared.Rent(32 * 1024);
                 try
                 {
-                    VP8StatusCode status = VP8StatusCode.VP8_STATUS_SUSPENDED;
-                    int read;
-                    while ((read = stream.Read(buffer, 0, buffer.Length)) > 0)
+                    using var ms = new SharpImageConverter.Formats.Png.PooledMemoryStream(64 * 1024);
+                    int n;
+                    while ((n = stream.Read(poolBuf, 0, poolBuf.Length)) > 0)
                     {
-                        status = WebPIAppend(idec, buffer.AsSpan(0, read), (nuint)read);
-                        if (status == VP8StatusCode.VP8_STATUS_OK) break;
-                        if (status != VP8StatusCode.VP8_STATUS_SUSPENDED && status != VP8StatusCode.VP8_STATUS_NOT_ENOUGH_DATA)
-                            throw new InvalidOperationException($"WebP 流式解码失败: {status}");
+                        ms.Write(poolBuf, 0, n);
                     }
-
-                    IntPtr output = WebPIDecGetRGB(idec, out _, out width, out height, out int stride);
-                    if (output == IntPtr.Zero || width <= 0 || height <= 0 || stride <= 0) throw new InvalidOperationException("WebP 流式解码失败");
-                    int rowBytes = checked(width * 4);
-                    int size = checked(rowBytes * height);
-                    var rgba = new byte[size];
-                    unsafe
-                    {
-                        if (stride == rowBytes)
-                        {
-                            new ReadOnlySpan<byte>((void*)output, size).CopyTo(rgba);
-                        }
-                        else
-                        {
-                            byte* src = (byte*)output;
-                            for (int y = 0; y < height; y++)
-                            {
-                                var srcRow = new ReadOnlySpan<byte>(src + (y * stride), rowBytes);
-                                srcRow.CopyTo(rgba.AsSpan(y * rowBytes, rowBytes));
-                            }
-                        }
-                    }
-                    return rgba;
+                    var seg = ms.GetBuffer();
+                    if (seg.Count <= 0) throw new InvalidDataException("WebP 流数据为空");
+                    byte[] data = new byte[seg.Count];
+                    Buffer.BlockCopy(seg.Array!, seg.Offset, data, 0, seg.Count);
+                    return DecodeRgba(data, out width, out height);
                 }
                 finally
                 {
-                    ArrayPool<byte>.Shared.Return(buffer);
-                    WebPIDelete(idec);
+                    ArrayPool<byte>.Shared.Return(poolBuf);
                 }
             }
             catch (DllNotFoundException ex)
