@@ -243,6 +243,18 @@ public class Quantizer
         }
 
         int vecSize = Vector<int>.Count;
+        int limit = paletteCount - (paletteCount % vecSize);
+        int vecBlocks = limit / vecSize;
+        Vector<int>[] palRVectors = new Vector<int>[vecBlocks];
+        Vector<int>[] palGVectors = new Vector<int>[vecBlocks];
+        Vector<int>[] palBVectors = new Vector<int>[vecBlocks];
+        for (int i = 0; i < limit; i += vecSize)
+        {
+            int block = i / vecSize;
+            palRVectors[block] = new Vector<int>(palR, i);
+            palGVectors[block] = new Vector<int>(palG, i);
+            palBVectors[block] = new Vector<int>(palB, i);
+        }
         Parallel.For(0, LUT_SIZE, r =>
         {
             int rr = (r << (8 - LUT_BITS)) + (1 << (7 - LUT_BITS));
@@ -260,12 +272,11 @@ public class Quantizer
                     int bestIndex = 0;
 
                     int i = 0;
-                    int limit = paletteCount - (paletteCount % vecSize);
-                    for (; i < limit; i += vecSize)
+                    for (int block = 0; block < vecBlocks; block++)
                     {
-                        var vr = new Vector<int>(palR, i);
-                        var vg = new Vector<int>(palG, i);
-                        var vb = new Vector<int>(palB, i);
+                        var vr = palRVectors[block];
+                        var vg = palGVectors[block];
+                        var vb = palBVectors[block];
                         var dr = vr - vrr;
                         var dg = vg - vgg;
                         var db = vb - vbb;
@@ -276,13 +287,14 @@ public class Quantizer
                             if (d < minDist)
                             {
                                 minDist = d;
-                                bestIndex = i + lane;
+                                bestIndex = (block * vecSize) + lane;
                                 if (d == 0) break;
                             }
                         }
                         if (minDist == 0) break;
                     }
 
+                    i = limit;
                     for (; i < paletteCount; i++)
                     {
                         int dr = palR[i] - rr;
