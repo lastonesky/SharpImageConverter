@@ -93,16 +93,10 @@ public static class ZlibHelper
         output.WriteByte((byte)(adler & 0xFF));
     }
 
-    private sealed class Adler32Stream : Stream
+    private sealed class Adler32Stream(Stream baseStream) : Stream
     {
-        private readonly Stream _baseStream;
-        private uint _adler;
-
-        public Adler32Stream(Stream baseStream)
-        {
-            _baseStream = baseStream;
-            _adler = 1u;
-        }
+        private readonly Stream _baseStream = baseStream;
+        private uint _adler = 1u;
 
         public uint Adler => _adler;
 

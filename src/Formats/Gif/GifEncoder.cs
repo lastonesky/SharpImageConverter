@@ -17,8 +17,8 @@ public class GifEncoder
     public void Encode(ImageFrame image, Stream stream)
     {
         // 1. Quantize
-        var quantizer = new Quantizer();
-        var (palette, indices) = quantizer.Quantize(image.Pixels, image.Width, image.Height);
+        
+        var (palette, indices) = Quantizer.Quantize(image.Pixels, image.Width, image.Height);
 
         // 2. Write Header
         WriteAscii(stream, "GIF89a");
@@ -152,8 +152,7 @@ public class GifEncoder
         for (int i = 0; i < frames.Count; i++)
         {
             var frame = frames[i];
-            var quantizer = new Quantizer();
-            var (palette, indices) = quantizer.Quantize(frame.Pixels, frame.Width, frame.Height);
+            var (palette, indices) = Quantizer.Quantize(frame.Pixels, frame.Width, frame.Height);
             int palCount = palette.Length / 3;
             int depth = 0;
             while ((1 << (depth + 1)) < palCount) depth++;
@@ -290,7 +289,7 @@ public class GifEncoder
             pi += 3;
         }
         var quantizer = new Quantizer();
-        var (pal, indsOpaque) = quantizer.Quantize(opaque, width, height);
+        var (pal, indsOpaque) = Quantizer.Quantize(opaque, width, height);
         int palCount = pal.Length / 3;
         depth = 0;
         while ((1 << (depth + 1)) < (palCount + 1)) depth++;

@@ -23,13 +23,13 @@ public class Quantizer
     /// <param name="width">宽度</param>
     /// <param name="height">高度</param>
     /// <returns>调色板与索引数组</returns>
-    public (byte[] Palette, byte[] Indices) Quantize(byte[] pixels, int width, int height)
+    public static (byte[] Palette, byte[] Indices) Quantize(byte[] pixels, int width, int height)
     {
         var (palette, indices) = QuantizeInternal(pixels, width, height, out _, out _, out _, false);
         return (palette, indices);
     }
 
-    private (byte[] Palette, byte[] Indices) QuantizeInternal(byte[] pixels, int width, int height, out long ticksTraverse, out long ticksBuildPalette, out long ticksMap, bool timing)
+    private static (byte[] Palette, byte[] Indices) QuantizeInternal(byte[] pixels, int width, int height, out long ticksTraverse, out long ticksBuildPalette, out long ticksMap, bool timing)
     {
         long t0 = 0;
         long t1 = 0;
