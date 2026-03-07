@@ -8,17 +8,17 @@ namespace SharpImageConverter.Formats.Jpeg;
 
 public static class StaticJpegDecoder
 {
-    public static JpegImage Decode(ReadOnlySpan<byte> data)
+    public static JpegImage Decode(ReadOnlySpan<byte> data, bool useFloatingPointIdct = false)
     {
-        var parser = new Parser(data);
+        var parser = new Parser(data, useFloatingPointIdct);
         return parser.Decode();
     }
 
-    public static async Task<StreamingDecodeResult> DecodeFromStreamAsync(Stream stream, CancellationToken cancellationToken = default)
+    public static async Task<StreamingDecodeResult> DecodeFromStreamAsync(Stream stream, CancellationToken cancellationToken = default, bool useFloatingPointIdct = false)
     {
-        if (stream == null) throw new ArgumentNullException(nameof(stream));
+        ArgumentNullException.ThrowIfNull(stream);
         await using var input = new JpegStreamInput(stream);
-        var parser = new StreamingParser(input);
+        var parser = new StreamingParser(input, useFloatingPointIdct);
         return await parser.DecodeAsync(cancellationToken).ConfigureAwait(false);
     }
 
@@ -41,11 +41,14 @@ public static class StaticJpegDecoder
         private int queuedMarker = -1;
         private bool hasAdobe;
         private byte adobeTransform;
+        private IccProfileCollector? iccCollector;
+        private readonly bool useFloatingPointIdct;
 
-        public Parser(ReadOnlySpan<byte> data)
+        public Parser(ReadOnlySpan<byte> data, bool useFloatingPointIdct)
         {
             this.data = data;
             offset = 0;
+            this.useFloatingPointIdct = useFloatingPointIdct;
 
             for (int i = 0; i < 4; i++)
             {
@@ -74,6 +77,9 @@ public static class StaticJpegDecoder
                         break;
                     case JpegMarker.APP1:
                         ParseApp1();
+                        break;
+                    case JpegMarker.APP2:
+                        ParseApp2();
                         break;
                     case JpegMarker.APP14:
                         ParseApp14();
@@ -180,6 +186,18 @@ public static class StaticJpegDecoder
             }
         }
 
+        private void ParseApp2()
+        {
+            ReadOnlySpan<byte> segment = ReadSegment(out _, out int segmentLength);
+            if (segmentLength < 14)
+            {
+                return;
+            }
+
+            iccCollector ??= new IccProfileCollector();
+            iccCollector.Add(segment);
+        }
+
         private readonly JpegImage ReconstructImage()
         {
             int width = frame.Width;
@@ -213,7 +231,7 @@ public static class StaticJpegDecoder
                 byte[] plane = ArrayPool<byte>.Shared.Rent(w * h);
                 planes[i] = plane;
 
-                c.DecodeSpatial(plane.AsSpan(0, w * h), w, h, w, quantTables[c.QuantTableId].Table);
+                c.DecodeSpatial(plane.AsSpan(0, w * h), w, h, w, quantTables[c.QuantTableId].Table, useFloatingPointIdct);
             }
 
             byte[] output = new byte[checked(width * height * channelCount)];
@@ -224,7 +242,8 @@ public static class StaticJpegDecoder
                 ArrayPool<byte>.Shared.Return(planes[i]);
             }
 
-            var colorInfo = new JpegColorInfo(colorSpace, hasAdobe, adobeTransform, null);
+            byte[]? iccProfile = iccCollector?.GetProfile();
+            var colorInfo = new JpegColorInfo(colorSpace, hasAdobe, adobeTransform, iccProfile);
             return new JpegImage(width, height, pixelFormat, bitsPerSample, colorInfo, output);
         }
 
@@ -1030,7 +1049,9 @@ public static class StaticJpegDecoder
         int channels = componentOrder.Length;
         int outStride = width * channels;
         int mapLength = width * channels;
-        int[] xMap = ArrayPool<int>.Shared.Rent(mapLength);
+        int[] x0Map = ArrayPool<int>.Shared.Rent(mapLength);
+        int[] x1Map = ArrayPool<int>.Shared.Rent(mapLength);
+        byte[] xWeightMap = ArrayPool<byte>.Shared.Rent(mapLength);
         try
         {
             for (int c = 0; c < channels; c++)
@@ -1040,7 +1061,10 @@ public static class StaticJpegDecoder
                 int baseIndex = c * width;
                 for (int x = 0; x < width; x++)
                 {
-                    xMap[baseIndex + x] = (x * planeW) / fullWidth;
+                    ComputeLinearSample(x, width, planeW, fullWidth, out int sx0, out int sx1, out byte xWeight);
+                    x0Map[baseIndex + x] = sx0;
+                    x1Map[baseIndex + x] = sx1;
+                    xWeightMap[baseIndex + x] = xWeight;
                 }
             }
 
@@ -1051,14 +1075,22 @@ public static class StaticJpegDecoder
                 {
                     int planeIndex = componentOrder[c];
                     int planeH = planeHeights[planeIndex];
-                    int py = (y * planeH) / fullHeight;
-                    int srcRow = py * planeStrides[planeIndex];
+                    ComputeLinearSample(y, height, planeH, fullHeight, out int sy0, out int sy1, out byte yWeight);
+                    int srcRow0 = sy0 * planeStrides[planeIndex];
+                    int srcRow1 = sy1 * planeStrides[planeIndex];
                     byte[] plane = planes[planeIndex];
                     int mapBase = c * width;
                     int outIndex = rowOut + c;
                     for (int x = 0; x < width; x++)
                     {
-                        output[outIndex] = plane[srcRow + xMap[mapBase + x]];
+                        int mapIndex = mapBase + x;
+                        int sx0 = x0Map[mapIndex];
+                        int sx1 = x1Map[mapIndex];
+                        int wx = xWeightMap[mapIndex];
+                        int top = ((plane[srcRow0 + sx0] * (256 - wx)) + (plane[srcRow0 + sx1] * wx) + 128) >> 8;
+                        int bottom = ((plane[srcRow1 + sx0] * (256 - wx)) + (plane[srcRow1 + sx1] * wx) + 128) >> 8;
+                        int value = ((top * (256 - yWeight)) + (bottom * yWeight) + 128) >> 8;
+                        output[outIndex] = (byte)value;
                         outIndex += channels;
                     }
                 }
@@ -1066,8 +1098,43 @@ public static class StaticJpegDecoder
         }
         finally
         {
-            ArrayPool<int>.Shared.Return(xMap);
+            ArrayPool<int>.Shared.Return(x0Map);
+            ArrayPool<int>.Shared.Return(x1Map);
+            ArrayPool<byte>.Shared.Return(xWeightMap);
         }
+    }
+
+    private static void ComputeLinearSample(int dstIndex, int dstLength, int srcLength, int fullLength, out int index0, out int index1, out byte weight1)
+    {
+        if (srcLength <= 1 || fullLength <= 0 || dstLength <= 1)
+        {
+            index0 = 0;
+            index1 = 0;
+            weight1 = 0;
+            return;
+        }
+
+        float srcPos = (((dstIndex + 0.5f) * srcLength) / fullLength) - 0.5f;
+        int i0 = (int)MathF.Floor(srcPos);
+        float frac = srcPos - i0;
+
+        if (i0 < 0)
+        {
+            i0 = 0;
+            frac = 0f;
+        }
+        else if (i0 >= srcLength - 1)
+        {
+            i0 = srcLength - 1;
+            frac = 0f;
+        }
+
+        index0 = i0;
+        index1 = i0 < srcLength - 1 ? i0 + 1 : i0;
+        int w = (int)(frac * 256f + 0.5f);
+        if (w < 0) w = 0;
+        if (w > 255) w = 255;
+        weight1 = (byte)w;
     }
 
     private sealed class StreamingParser
@@ -1087,10 +1154,13 @@ public static class StaticJpegDecoder
         private int exifOrientation = 1;
         private bool hasAdobe;
         private byte adobeTransform;
+        private IccProfileCollector? iccCollector;
+        private readonly bool useFloatingPointIdct;
 
-        public StreamingParser(JpegStreamInput input)
+        public StreamingParser(JpegStreamInput input, bool useFloatingPointIdct)
         {
             this.input = input;
+            this.useFloatingPointIdct = useFloatingPointIdct;
             for (int i = 0; i < 4; i++)
             {
                 quantTables[i] = new QuantizationTable();
@@ -1118,6 +1188,9 @@ public static class StaticJpegDecoder
                         break;
                     case JpegMarker.APP1:
                         await ParseApp1Async(cancellationToken).ConfigureAwait(false);
+                        break;
+                    case JpegMarker.APP2:
+                        await ParseApp2Async(cancellationToken).ConfigureAwait(false);
                         break;
                     case JpegMarker.APP14:
                         await ParseApp14Async(cancellationToken).ConfigureAwait(false);
@@ -1257,6 +1330,25 @@ public static class StaticJpegDecoder
             }
         }
 
+        private async Task ParseApp2Async(CancellationToken cancellationToken)
+        {
+            SegmentBuffer segment = await ReadSegmentAsync(cancellationToken).ConfigureAwait(false);
+            try
+            {
+                if (segment.Length < 14)
+                {
+                    return;
+                }
+
+                iccCollector ??= new IccProfileCollector();
+                iccCollector.Add(segment.Span);
+            }
+            finally
+            {
+                segment.Dispose();
+            }
+        }
+
         private JpegImage ReconstructImage()
         {
             int width = frame.Width;
@@ -1290,7 +1382,7 @@ public static class StaticJpegDecoder
                 byte[] plane = ArrayPool<byte>.Shared.Rent(w * h);
                 planes[i] = plane;
 
-                c.DecodeSpatial(plane.AsSpan(0, w * h), w, h, w, quantTables[c.QuantTableId].Table);
+                c.DecodeSpatial(plane.AsSpan(0, w * h), w, h, w, quantTables[c.QuantTableId].Table, useFloatingPointIdct);
             }
 
             byte[] output = new byte[checked(width * height * channelCount)];
@@ -1301,7 +1393,8 @@ public static class StaticJpegDecoder
                 ArrayPool<byte>.Shared.Return(planes[i]);
             }
 
-            var colorInfo = new JpegColorInfo(colorSpace, hasAdobe, adobeTransform, null);
+            byte[]? iccProfile = iccCollector?.GetProfile();
+            var colorInfo = new JpegColorInfo(colorSpace, hasAdobe, adobeTransform, iccProfile);
             return new JpegImage(width, height, pixelFormat, bitsPerSample, colorInfo, output);
         }
 
@@ -2063,6 +2156,95 @@ public static class StaticJpegDecoder
 
     private readonly record struct ScanHeader(ScanComponent[] Components, byte Ss, byte Se, byte Ah, byte Al);
 
+    private sealed class IccProfileCollector
+    {
+        private int totalChunkCount;
+        private byte[][]? chunks;
+        private int collectedCount;
+
+        public void Add(ReadOnlySpan<byte> segment)
+        {
+            if (segment.Length < 14)
+            {
+                return;
+            }
+
+            if (segment[0] != (byte)'I' ||
+                segment[1] != (byte)'C' ||
+                segment[2] != (byte)'C' ||
+                segment[3] != (byte)'_' ||
+                segment[4] != (byte)'P' ||
+                segment[5] != (byte)'R' ||
+                segment[6] != (byte)'O' ||
+                segment[7] != (byte)'F' ||
+                segment[8] != (byte)'I' ||
+                segment[9] != (byte)'L' ||
+                segment[10] != (byte)'E' ||
+                segment[11] != 0)
+            {
+                return;
+            }
+
+            int sequenceNo = segment[12];
+            int count = segment[13];
+            if (sequenceNo <= 0 || count <= 0 || sequenceNo > count)
+            {
+                return;
+            }
+
+            if (totalChunkCount == 0)
+            {
+                totalChunkCount = count;
+                chunks = new byte[count][];
+            }
+            else if (totalChunkCount != count || chunks is null)
+            {
+                return;
+            }
+
+            int idx = sequenceNo - 1;
+            if (chunks[idx] != null)
+            {
+                return;
+            }
+
+            byte[] payload = segment[14..].ToArray();
+            chunks[idx] = payload;
+            collectedCount++;
+        }
+
+        public byte[]? GetProfile()
+        {
+            if (totalChunkCount == 0 || chunks is null || collectedCount != totalChunkCount)
+            {
+                return null;
+            }
+
+            int totalLength = 0;
+            for (int i = 0; i < chunks.Length; i++)
+            {
+                byte[]? chunk = chunks[i];
+                if (chunk is null)
+                {
+                    return null;
+                }
+
+                totalLength += chunk.Length;
+            }
+
+            byte[] profile = new byte[totalLength];
+            int offset = 0;
+            for (int i = 0; i < chunks.Length; i++)
+            {
+                byte[] chunk = chunks[i]!;
+                Buffer.BlockCopy(chunk, 0, profile, offset, chunk.Length);
+                offset += chunk.Length;
+            }
+
+            return profile;
+        }
+    }
+
     private readonly record struct ScanComponent(byte ComponentId, byte DcTableId, byte AcTableId);
 
     private sealed class ComponentState(byte id, byte h, byte v, byte quantTableId)
@@ -2132,7 +2314,7 @@ public static class StaticJpegDecoder
         /// <param name="planeHeight">平面高度（像素）</param>
         /// <param name="stride">平面行跨度（字节）</param>
         /// <param name="quant">对应的量化表</param>
-        public void DecodeSpatial(Span<byte> plane, int planeWidth, int planeHeight, int stride, ushort[] quant)
+        public void DecodeSpatial(Span<byte> plane, int planeWidth, int planeHeight, int stride, ushort[] quant, bool useFloatingPointIdct)
         {
             if (coefficientBuffer is null)
             {
@@ -2154,8 +2336,14 @@ public static class StaticJpegDecoder
 
                     Span<byte> dest = plane[((py * stride) + px)..];
                     ReadOnlySpan<short> block = coefficientBuffer.AsSpan(((by * blocksX) + bx) * 64, 64);
-                    //FloatingPointIDCT.Transform(block, quant, dest, stride);
-                    FastIDCT.Transform(block, quant, dest, stride);
+                    if (useFloatingPointIdct)
+                    {
+                        FloatingPointIDCT.Transform(block, quant, dest, stride);
+                    }
+                    else
+                    {
+                        FastIDCT.Transform(block, quant, dest, stride);
+                    }
                 }
             }
 
@@ -2183,14 +2371,14 @@ public sealed class JpegDecoder
     public async Task<Image<Rgb24>> DecodeAsync(Stream stream, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(stream);
-        var result = await StaticJpegDecoder.DecodeFromStreamAsync(stream, cancellationToken).ConfigureAwait(false);
+        var result = await StaticJpegDecoder.DecodeFromStreamAsync(stream, cancellationToken, UseFloatingPointIdct).ConfigureAwait(false);
         return BuildImageFromJpeg(result.Image, result.ExifOrientation, result.ExifRaw);
     }
 
     public Image<Rgb24> Decode(ReadOnlySpan<byte> data)
     {
         int orientation = TryReadExifOrientation(data, out var exifRaw);
-        var img = StaticJpegDecoder.Decode(data);
+        var img = StaticJpegDecoder.Decode(data, UseFloatingPointIdct);
         return BuildImageFromJpeg(img, orientation, exifRaw);
     }
 
