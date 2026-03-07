@@ -6,9 +6,13 @@ namespace SharpImageConverter.Formats.Gif;
 /// <summary>
 /// LZW 编码器，用于 GIF 图像数据压缩。
 /// </summary>
-public class LzwEncoder
+/// <remarks>
+/// 初始化 LZW 编码器
+/// </remarks>
+/// <param name="stream">输出流</param>
+public class LzwEncoder(Stream stream)
 {
-    private readonly Stream _stream;
+    private readonly Stream _stream = stream;
     private int _codeSize;
     private int _clearCode;
     private int _endCode;
@@ -28,15 +32,6 @@ public class LzwEncoder
     private const int MAX_BLOCK_SIZE = 255;
     private readonly byte[] _packet = new byte[256];
     private int _packetSize = 0;
-
-    /// <summary>
-    /// 初始化 LZW 编码器
-    /// </summary>
-    /// <param name="stream">输出流</param>
-    public LzwEncoder(Stream stream)
-    {
-        _stream = stream;
-    }
 
     /// <summary>
     /// 对像素索引数据进行 LZW 编码

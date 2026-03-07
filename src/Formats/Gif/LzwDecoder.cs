@@ -3,9 +3,9 @@ using System.IO;
 
 namespace SharpImageConverter.Formats.Gif
 {
-    internal sealed class LzwDecoder
+    internal sealed class LzwDecoder(Stream stream)
     {
-        private readonly Stream _stream;
+        private readonly Stream _stream = stream;
         private readonly byte[] _blockBuffer = new byte[256];
         private int _blockLength;
         private int _blockIndex;
@@ -16,11 +16,6 @@ namespace SharpImageConverter.Formats.Gif
         private readonly int[] _prefix = new int[4096];
         private readonly byte[] _suffix = new byte[4096];
         private readonly byte[] _pixelStack = new byte[4096 + 1];
-
-        public LzwDecoder(Stream stream)
-        {
-            _stream = stream;
-        }
 
         public void Decode(byte[] pixels, int width, int height, int dataSize)
         {

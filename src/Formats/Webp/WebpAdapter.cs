@@ -25,7 +25,7 @@ namespace SharpImageConverter.Formats.Webp
             ConcurrencyStrategy = concurrencyStrategy;
         }
 
-        public static WebpEncoderOptions Default => new WebpEncoderOptions(75f, WebpConcurrencyStrategy.Auto);
+        public static WebpEncoderOptions Default => new(75f, WebpConcurrencyStrategy.Auto);
     }
 
     internal static class WebpStreamDecoder
