@@ -1,6 +1,6 @@
 dotnet run ../examples/5_star_base.jpg d:\out1.gif
 dotnet run ../examples/Amish-Noka-Dresser.jpg d:\out2.bmp
-dotnet run ../examples/progressive.jpg d:\out3.png
+dotnet run -c Release ../examples/progressive.jpg d:\out3.png
 dotnet run ../examples/video-001.cmyk.jpeg d:\out4.webp
 dotnet run ../examples/5_star_base.jpg d:\out5.bmp --gray
 dotnet run d:\out5.bmp d:\out6.jpg
