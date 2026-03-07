@@ -21,12 +21,19 @@ public enum JpegColorSpace
     Unknown4
 }
 
+public enum JpegCmykConversionMode
+{
+    Fast,
+    Accurate
+}
+
 public readonly record struct JpegColorInfo(JpegColorSpace ColorSpace, bool HasAdobeTransform, byte AdobeTransform, ReadOnlyMemory<byte>? IccProfile);
 
 public sealed class JpegImage
 {
     private readonly byte[] pixelData;
     private byte[]? rgba32Cache;
+    public static JpegCmykConversionMode CmykConversionMode { get; set; } = JpegCmykConversionMode.Fast;
 
     public JpegImage(int width, int height, byte[] rgba32)
         : this(width, height, JpegPixelFormat.Rgba32, 8, new JpegColorInfo(JpegColorSpace.Rgb, false, 0, null), rgba32)
@@ -86,8 +93,15 @@ public sealed class JpegImage
                 return pixelData;
             }
 
-            rgba32Cache ??= ConvertToRgba32();
-            return rgba32Cache;
+            byte[]? cache = System.Threading.Volatile.Read(ref rgba32Cache);
+            if (cache != null)
+            {
+                return cache;
+            }
+
+            byte[] converted = ConvertToRgba32();
+            System.Threading.Interlocked.CompareExchange(ref rgba32Cache, converted, null);
+            return rgba32Cache!;
         }
     }
 
@@ -157,6 +171,7 @@ public sealed class JpegImage
             ReadOnlySpan<byte> src = pixelData.AsSpan(0, checked(count * 4));
             int si = 0;
             bool invert = ColorInfo.HasAdobeTransform;
+            bool accurate = CmykConversionMode == JpegCmykConversionMode.Accurate;
             for (int i = 0; i < count; i++)
             {
                 int c = src[si++];
@@ -172,15 +187,11 @@ public sealed class JpegImage
                     k = 255 - k;
                 }
 
-                // CMYK -> RGB（K 作为黑版压暗因子参与乘法）
-                int invK = 255 - k;
-                int r = ((255 - c) * invK + 127) / 255;
-                int g = ((255 - m) * invK + 127) / 255;
-                int b = ((255 - y) * invK + 127) / 255;
+                ConvertCmykToRgb(c, m, y, k, accurate, out byte r, out byte g, out byte b);
                 int o = i * 4;
-                dst[o + 0] = (byte)r;
-                dst[o + 1] = (byte)g;
-                dst[o + 2] = (byte)b;
+                dst[o + 0] = r;
+                dst[o + 1] = g;
+                dst[o + 2] = b;
                 dst[o + 3] = 255;
             }
 
@@ -192,6 +203,7 @@ public sealed class JpegImage
             ReadOnlySpan<byte> src = pixelData.AsSpan(0, checked(count * 4));
             int si = 0;
             bool invert = ColorInfo.HasAdobeTransform;
+            bool accurate = CmykConversionMode == JpegCmykConversionMode.Accurate;
             for (int i = 0; i < count; i++)
             {
                 int y = src[si++];
@@ -207,17 +219,11 @@ public sealed class JpegImage
                     k = 255 - k;
                 }
 
-                // YCCK -> YCbCr -> RGB
-                YCbCrToRgb(y, cb, cr, out byte r, out byte g, out byte b);
-                // RGB -> 应用 K 压暗
-                int invK = 255 - k;
-                int r2 = (r * invK + 127) / 255;
-                int g2 = (g * invK + 127) / 255;
-                int b2 = (b * invK + 127) / 255;
+                ConvertYcckToRgb(y, cb, cr, k, accurate, out byte r, out byte g, out byte b);
                 int o = i * 4;
-                dst[o + 0] = (byte)r2;
-                dst[o + 1] = (byte)g2;
-                dst[o + 2] = (byte)b2;
+                dst[o + 0] = r;
+                dst[o + 1] = g;
+                dst[o + 2] = b;
                 dst[o + 3] = 255;
             }
 
@@ -228,6 +234,7 @@ public sealed class JpegImage
         {
             ReadOnlySpan<byte> src = pixelData.AsSpan(0, checked(count * 4));
             GuessUnknown32(src, count, out bool treatAsYcck, out bool invert);
+            bool accurate = CmykConversionMode == JpegCmykConversionMode.Accurate;
 
             int si = 0;
             if (treatAsYcck)
@@ -246,15 +253,11 @@ public sealed class JpegImage
                         k = 255 - k;
                     }
 
-                    YCbCrToRgb(y, cb, cr, out byte r, out byte g, out byte b);
-                    int invK = 255 - k;
-                    int r2 = (r * invK + 127) / 255;
-                    int g2 = (g * invK + 127) / 255;
-                    int b2 = (b * invK + 127) / 255;
+                    ConvertYcckToRgb(y, cb, cr, k, accurate, out byte r, out byte g, out byte b);
                     int o = i * 4;
-                    dst[o + 0] = (byte)r2;
-                    dst[o + 1] = (byte)g2;
-                    dst[o + 2] = (byte)b2;
+                    dst[o + 0] = r;
+                    dst[o + 1] = g;
+                    dst[o + 2] = b;
                     dst[o + 3] = 255;
                 }
 
@@ -276,14 +279,11 @@ public sealed class JpegImage
                         k = 255 - k;
                     }
 
-                    int invK = 255 - k;
-                    int r = ((255 - c) * invK + 127) / 255;
-                    int g = ((255 - m) * invK + 127) / 255;
-                    int b = ((255 - y) * invK + 127) / 255;
+                    ConvertCmykToRgb(c, m, y, k, accurate, out byte r, out byte g, out byte b);
                     int o = i * 4;
-                    dst[o + 0] = (byte)r;
-                    dst[o + 1] = (byte)g;
-                    dst[o + 2] = (byte)b;
+                    dst[o + 0] = r;
+                    dst[o + 1] = g;
+                    dst[o + 2] = b;
                     dst[o + 3] = 255;
                 }
 
@@ -306,6 +306,67 @@ public sealed class JpegImage
         r = ClampToByte(rr);
         g = ClampToByte(gg);
         b = ClampToByte(bb);
+    }
+
+    private static void YCbCrToRgbAccurate(int y, int cb, int cr, out byte r, out byte g, out byte b)
+    {
+        float yv = y;
+        float cbv = cb - 128f;
+        float crv = cr - 128f;
+        int rr = (int)MathF.Round(yv + (1.402f * crv));
+        int gg = (int)MathF.Round(yv - (0.344136f * cbv) - (0.714136f * crv));
+        int bb = (int)MathF.Round(yv + (1.772f * cbv));
+        r = ClampToByte(rr);
+        g = ClampToByte(gg);
+        b = ClampToByte(bb);
+    }
+
+    private static void ConvertCmykToRgb(int c, int m, int y, int k, bool accurate, out byte r, out byte g, out byte b)
+    {
+        if (!accurate)
+        {
+            int invK = 255 - k;
+            int rr = ((255 - c) * invK + 127) / 255;
+            int gg = ((255 - m) * invK + 127) / 255;
+            int bb = ((255 - y) * invK + 127) / 255;
+            r = (byte)rr;
+            g = (byte)gg;
+            b = (byte)bb;
+            return;
+        }
+
+        float cf = c / 255f;
+        float mf = m / 255f;
+        float yf = y / 255f;
+        float kf = k / 255f;
+        float rf = (1f - cf) * (1f - kf);
+        float gf = (1f - mf) * (1f - kf);
+        float bf = (1f - yf) * (1f - kf);
+        r = ClampToByte((int)MathF.Round(rf * 255f));
+        g = ClampToByte((int)MathF.Round(gf * 255f));
+        b = ClampToByte((int)MathF.Round(bf * 255f));
+    }
+
+    private static void ConvertYcckToRgb(int y, int cb, int cr, int k, bool accurate, out byte r, out byte g, out byte b)
+    {
+        if (accurate)
+        {
+            YCbCrToRgbAccurate(y, cb, cr, out byte r0, out byte g0, out byte b0);
+            float kf = 1f - (k / 255f);
+            r = ClampToByte((int)MathF.Round(r0 * kf));
+            g = ClampToByte((int)MathF.Round(g0 * kf));
+            b = ClampToByte((int)MathF.Round(b0 * kf));
+            return;
+        }
+
+        YCbCrToRgb(y, cb, cr, out byte r1, out byte g1, out byte b1);
+        int invK = 255 - k;
+        int rr = (r1 * invK + 127) / 255;
+        int gg = (g1 * invK + 127) / 255;
+        int bb = (b1 * invK + 127) / 255;
+        r = (byte)rr;
+        g = (byte)gg;
+        b = (byte)bb;
     }
 
     private static byte ClampToByte(int v)
