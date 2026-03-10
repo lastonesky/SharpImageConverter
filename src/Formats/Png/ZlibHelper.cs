@@ -23,6 +23,15 @@ public static class ZlibHelper
         if (data == null || count < 6)
             throw new ArgumentException("Invalid Zlib data");
 
+        // 如果已知解压大小，直接分配最终数组并解压，避免 MemoryStream 的扩容和 ToArray 复制
+        if (expectedDecompressedSize > 0)
+        {
+            var result = new byte[expectedDecompressedSize];
+            DecompressTo(data, offset, count, result);
+            return result;
+        }
+
+        // ... existing fallback logic for unknown size ...
         byte cmf = data[offset];
         byte flg = data[offset + 1];
         if ((cmf & 0x0F) != 8)
@@ -37,7 +46,7 @@ public static class ZlibHelper
 
         using var ms = new MemoryStream(data, offset + 2, count - 6, false);
         using var ds = new DeflateStream(ms, CompressionMode.Decompress);
-        using var outMs = expectedDecompressedSize > 0 ? new MemoryStream(expectedDecompressedSize) : new MemoryStream();
+        using var outMs = new MemoryStream();
 
         uint adler = 1u;
         byte[] buffer = ArrayPool<byte>.Shared.Rent(128 * 1024);
@@ -60,6 +69,64 @@ public static class ZlibHelper
             throw new InvalidDataException($"Adler32 Checksum failed. Expected {expectedAdler:X8}, got {adler:X8}");
 
         return outMs.ToArray();
+    }
+
+    /// <summary>
+    /// 解压数据到指定的 Span 中
+    /// </summary>
+    public static void DecompressTo(byte[] data, int offset, int count, Span<byte> destination)
+    {
+        if (data == null || count < 6)
+            throw new ArgumentException("Invalid Zlib data");
+
+        byte cmf = data[offset];
+        byte flg = data[offset + 1];
+        if ((cmf & 0x0F) != 8)
+            throw new NotSupportedException("Only Deflate compression is supported");
+        if ((flg & 0x20) != 0)
+            throw new NotSupportedException("Preset dictionary is not supported");
+        if ((((cmf << 8) | flg) % 31) != 0)
+            throw new InvalidDataException("Invalid Zlib header check");
+
+        int end = offset + count;
+        uint expectedAdler = (uint)((data[end - 4] << 24) | (data[end - 3] << 16) | (data[end - 2] << 8) | data[end - 1]);
+
+        using var ms = new MemoryStream(data, offset + 2, count - 6, false);
+        using var ds = new DeflateStream(ms, CompressionMode.Decompress);
+
+        uint adler = 1u;
+        int totalRead = 0;
+        
+        // 分块读取以计算 Adler32，同时写入 destination
+        byte[] tempBuffer = ArrayPool<byte>.Shared.Rent(32 * 1024);
+        try
+        {
+            while (true)
+            {
+                int read = ds.Read(tempBuffer, 0, tempBuffer.Length);
+                if (read <= 0) break;
+                
+                if (totalRead + read > destination.Length)
+                    throw new InvalidDataException("Decompressed data exceeds destination size");
+
+                // 复制到目标 Span
+                new ReadOnlySpan<byte>(tempBuffer, 0, read).CopyTo(destination.Slice(totalRead));
+                
+                // 更新校验和
+                adler = Adler32.Update(adler, tempBuffer, 0, read);
+                totalRead += read;
+            }
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(tempBuffer);
+        }
+
+        if (totalRead < destination.Length)
+             throw new InvalidDataException($"Decompressed data size mismatch. Expected {destination.Length}, got {totalRead}");
+
+        if (expectedAdler != adler)
+            throw new InvalidDataException($"Adler32 Checksum failed. Expected {expectedAdler:X8}, got {adler:X8}");
     }
 
     public static byte[] Compress(byte[] data)

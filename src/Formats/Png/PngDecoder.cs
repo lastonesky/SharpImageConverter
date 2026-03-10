@@ -171,8 +171,17 @@ public class PngDecoder
 
         ArraySegment<byte> idatSegment = idatStream.GetBuffer();
         int expectedDecompressedSize = GetExpectedDecompressedSize();
-        byte[] decompressed = ZlibHelper.Decompress(idatSegment.Array, idatSegment.Offset, idatSegment.Count, expectedDecompressedSize);
-        return ProcessImage(decompressed);
+        
+        byte[] decompressed = ArrayPool<byte>.Shared.Rent(expectedDecompressedSize);
+        try
+        {
+            ZlibHelper.DecompressTo(idatSegment.Array, idatSegment.Offset, idatSegment.Count, decompressed.AsSpan(0, expectedDecompressedSize));
+            return ProcessImage(decompressed);
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(decompressed);
+        }
     }
 
     /// <summary>
@@ -279,8 +288,17 @@ public class PngDecoder
         }
         ArraySegment<byte> idatSegment = idatStream.GetBuffer();
         int expectedDecompressedSize = GetExpectedDecompressedSize();
-        byte[] decompressed = ZlibHelper.Decompress(idatSegment.Array, idatSegment.Offset, idatSegment.Count, expectedDecompressedSize);
-        return ProcessImageRgba(decompressed);
+        
+        byte[] decompressed = ArrayPool<byte>.Shared.Rent(expectedDecompressedSize);
+        try
+        {
+            ZlibHelper.DecompressTo(idatSegment.Array, idatSegment.Offset, idatSegment.Count, decompressed.AsSpan(0, expectedDecompressedSize));
+            return ProcessImageRgba(decompressed);
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(decompressed);
+        }
     }
 
     private static bool TryReadExact(Stream stream, byte[] buffer, int offset, int count)
