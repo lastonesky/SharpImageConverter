@@ -66,11 +66,16 @@ namespace SharpImageConverter.Processing
             float scaleX = sw <= 1 ? 0f : (float)(sw - 1) / Math.Max(1, width - 1);
             float scaleY = sh <= 1 ? 0f : (float)(sh - 1) / Math.Max(1, height - 1);
             var poolInt = ArrayPool<int>.Shared;
-            var poolFloat = ArrayPool<float>.Shared;
+            
+            // Fixed point precision
+            const int Shift = 11;
+            const int Scale = 1 << Shift;
+            const int RoundingOffset = 1 << (2 * Shift - 1);
+
             int[] x0IndexArr = poolInt.Rent(width);
             int[] x1IndexArr = poolInt.Rent(width);
-            float[] wx0Arr = poolFloat.Rent(width);
-            float[] wx1Arr = poolFloat.Rent(width);
+            int[] wx0Arr = poolInt.Rent(width);
+            int[] wx1Arr = poolInt.Rent(width);
             try
             {
                 var x0Index = x0IndexArr;
@@ -84,8 +89,9 @@ namespace SharpImageConverter.Processing
                     float tx = sxf - x0;
                     x0Index[x] = x0 * 3;
                     x1Index[x] = x1 * 3;
-                    wx1Arr[x] = tx;
-                    wx0Arr[x] = 1f - tx;
+                    int wx1 = (int)(tx * Scale + 0.5f);
+                    wx1Arr[x] = wx1;
+                    wx0Arr[x] = Scale - wx1;
                 }
                 for (int y = 0; y < height; y++)
                 {
@@ -93,8 +99,9 @@ namespace SharpImageConverter.Processing
                     int y0 = (int)syf;
                     int y1 = y0 + 1; if (y1 >= sh) y1 = sh - 1;
                     float ty = syf - y0;
-                    float wy1 = ty;
-                    float wy0 = 1f - ty;
+                    int wy1 = (int)(ty * Scale + 0.5f);
+                    int wy0 = Scale - wy1;
+                    
                     int row0 = y0 * sw * 3;
                     int row1 = y1 * sw * 3;
                     int dRow = y * width * 3;
@@ -105,17 +112,23 @@ namespace SharpImageConverter.Processing
                         int s01 = row1 + x0Index[x];
                         int s11 = row1 + x1Index[x];
                         int d = dRow + x * 3;
-                        float wx0 = wx0Arr[x];
-                        float wx1 = wx1Arr[x];
-                        float r0 = src[s00 + 0] * wx0 + src[s10 + 0] * wx1;
-                        float r1 = src[s01 + 0] * wx0 + src[s11 + 0] * wx1;
-                        dst[d + 0] = (byte)(r0 * wy0 + r1 * wy1 + 0.5f);
-                        float g0 = src[s00 + 1] * wx0 + src[s10 + 1] * wx1;
-                        float g1 = src[s01 + 1] * wx0 + src[s11 + 1] * wx1;
-                        dst[d + 1] = (byte)(g0 * wy0 + g1 * wy1 + 0.5f);
-                        float b0 = src[s00 + 2] * wx0 + src[s10 + 2] * wx1;
-                        float b1 = src[s01 + 2] * wx0 + src[s11 + 2] * wx1;
-                        dst[d + 2] = (byte)(b0 * wy0 + b1 * wy1 + 0.5f);
+                        int wx0 = wx0Arr[x];
+                        int wx1 = wx1Arr[x];
+                        
+                        // R
+                        int r0 = src[s00 + 0] * wx0 + src[s10 + 0] * wx1;
+                        int r1 = src[s01 + 0] * wx0 + src[s11 + 0] * wx1;
+                        dst[d + 0] = (byte)((r0 * wy0 + r1 * wy1 + RoundingOffset) >> (2 * Shift));
+                        
+                        // G
+                        int g0 = src[s00 + 1] * wx0 + src[s10 + 1] * wx1;
+                        int g1 = src[s01 + 1] * wx0 + src[s11 + 1] * wx1;
+                        dst[d + 1] = (byte)((g0 * wy0 + g1 * wy1 + RoundingOffset) >> (2 * Shift));
+                        
+                        // B
+                        int b0 = src[s00 + 2] * wx0 + src[s10 + 2] * wx1;
+                        int b1 = src[s01 + 2] * wx0 + src[s11 + 2] * wx1;
+                        dst[d + 2] = (byte)((b0 * wy0 + b1 * wy1 + RoundingOffset) >> (2 * Shift));
                     }
                 }
             }
@@ -123,8 +136,8 @@ namespace SharpImageConverter.Processing
             {
                 poolInt.Return(x0IndexArr);
                 poolInt.Return(x1IndexArr);
-                poolFloat.Return(wx0Arr);
-                poolFloat.Return(wx1Arr);
+                poolInt.Return(wx0Arr);
+                poolInt.Return(wx1Arr);
             }
             _image.Update(width, height, dst);
             return this;
