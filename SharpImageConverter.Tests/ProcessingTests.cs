@@ -1,6 +1,7 @@
 using Xunit;
 using SharpImageConverter.Core;
 using SharpImageConverter.Processing;
+using System.Numerics;
 using Tests.Helpers;
 
 namespace Jpeg2Bmp.Tests
@@ -91,6 +92,38 @@ namespace Jpeg2Bmp.Tests
             ImageExtensions.Mutate(tall, ctx => ctx.ResizeToFit(320, 240));
             Assert.Equal(120, tall.Width);
             Assert.Equal(240, tall.Height);
+        }
+    }
+
+    public class SimdAlignedBufferTests
+    {
+        [Fact]
+        public void AlignedBuffer_ByteAlignment_IsHonored()
+        {
+            using var buf = SimdHelper.AllocateAlignedBytes(123, alignment: 64);
+            Assert.True(SimdHelper.IsAligned((nuint)buf.Address, 64));
+            Assert.Equal(123, buf.Length);
+        }
+
+        [Fact]
+        public void CopyToAlignedBytes_CanPadToVectorWidth()
+        {
+            byte[] src = new byte[123];
+            for (int i = 0; i < src.Length; i++) src[i] = (byte)i;
+
+            using var buf = SimdHelper.CopyToAlignedBytes(src, alignment: 64, padToMultiple: Vector<byte>.Count, padValue: 0xA5);
+            Assert.True(SimdHelper.IsAligned((nuint)buf.Address, 64));
+            Assert.Equal(SimdHelper.RoundUpToMultiple(src.Length, Vector<byte>.Count), buf.Length);
+            Assert.Equal(src.Length, buf.Span.Slice(0, src.Length).ToArray().Length);
+
+            for (int i = 0; i < src.Length; i++)
+            {
+                Assert.Equal(src[i], buf.Span[i]);
+            }
+            for (int i = src.Length; i < buf.Length; i++)
+            {
+                Assert.Equal(0xA5, buf.Span[i]);
+            }
         }
     }
 }
