@@ -3,7 +3,7 @@ using System.Collections.Generic;
 using System.Buffers;
 using System.IO;
 using System.Text;
-using System.Numerics;
+using SharpImageConverter.Core;
 using SharpImageConverter.Metadata;
 
 namespace SharpImageConverter.Formats.Png;
@@ -633,29 +633,7 @@ public class PngDecoder
 
     private static void ApplyUpFilterDecodeSimd(byte[] curRow, byte[] prevRow, int length)
     {
-        Span<byte> curSpan = curRow;
-        Span<byte> prevSpan = prevRow;
-        int i = 0;
-        if (Vector.IsHardwareAccelerated && length >= Vector<byte>.Count)
-        {
-            int simdCount = Vector<byte>.Count;
-            var mask = new Vector<ushort>(0xFF);
-            for (; i <= length - simdCount; i += simdCount)
-            {
-                var curVec = new Vector<byte>(curSpan.Slice(i));
-                var prevVec = new Vector<byte>(prevSpan.Slice(i));
-                Vector.Widen(curVec, out Vector<ushort> curLow, out Vector<ushort> curHigh);
-                Vector.Widen(prevVec, out Vector<ushort> prevLow, out Vector<ushort> prevHigh);
-                var resLow = (curLow + prevLow) & mask;
-                var resHigh = (curHigh + prevHigh) & mask;
-                var result = Vector.Narrow(resLow, resHigh);
-                result.CopyTo(curSpan.Slice(i));
-            }
-        }
-        for (; i < length; i++)
-        {
-            curSpan[i] = (byte)(curSpan[i] + prevSpan[i]);
-        }
+        SimdHelper.AddBytesInPlace(curRow.AsSpan(0, length), prevRow.AsSpan(0, length));
     }
 
     private static byte PaethPredictor(byte a, byte b, byte c)
