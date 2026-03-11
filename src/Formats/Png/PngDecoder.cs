@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Buffers;
 using System.IO;
+using System.Numerics;
 using System.Text;
 using SharpImageConverter.Core;
 using SharpImageConverter.Metadata;
@@ -569,63 +570,61 @@ public class PngDecoder
         int reconIdx = 0;
         int rawIdx = 0;
 
-        byte[] prevRow = ArrayPool<byte>.Shared.Rent(stride);
-        byte[] curRow = ArrayPool<byte>.Shared.Rent(stride);
-        try
+        using var prevRow = SimdHelper.AllocateAlignedBytes(stride, alignment: SimdHelper.DefaultAlignment, clear: true, padToMultiple: Vector<byte>.Count);
+        using var curRow = SimdHelper.AllocateAlignedBytes(stride, alignment: SimdHelper.DefaultAlignment, clear: false, padToMultiple: Vector<byte>.Count);
+
+        var prev = prevRow;
+        var cur = curRow;
+
+        for (int y = 0; y < h; y++)
         {
-            Array.Clear(prevRow, 0, stride);
-            for (int y = 0; y < h; y++)
+            byte filterType = rawData[rawIdx++];
+            rawData.AsSpan(rawIdx, stride).CopyTo(cur.Span.Slice(0, stride));
+            rawIdx += stride;
+
+            Span<byte> curSpan = cur.Span.Slice(0, stride);
+            ReadOnlySpan<byte> prevSpan = prev.Span.Slice(0, stride);
+
+            if (filterType == 0)
             {
-                byte filterType = rawData[rawIdx++];
-                Array.Copy(rawData, rawIdx, curRow, 0, stride);
-                rawIdx += stride;
-
-                if (filterType == 0)
-                {
-                    Array.Copy(curRow, 0, recon, reconIdx, stride);
-                    reconIdx += stride;
-                    (curRow, prevRow) = (prevRow, curRow);
-                    continue;
-                }
-
-                if (filterType == 2)
-                {
-                    ApplyUpFilterDecodeSimd(curRow, prevRow, stride);
-                }
-                else
-                {
-                    for (int i = 0; i < stride; i++)
-                    {
-                        byte x = curRow[i];
-                        byte a = (i >= bpp) ? curRow[i - bpp] : (byte)0;
-                        byte b = prevRow[i];
-                        byte c = (i >= bpp) ? prevRow[i - bpp] : (byte)0;
-
-                        switch (filterType)
-                        {
-                            case 1:
-                                x += a;
-                                break;
-                            case 3:
-                                x += (byte)((a + b) / 2);
-                                break;
-                            case 4:
-                                x += PaethPredictor(a, b, c);
-                                break;
-                        }
-                        curRow[i] = x;
-                    }
-                }
-
-                Array.Copy(curRow, 0, recon, reconIdx, stride);
+                curSpan.CopyTo(recon.AsSpan(reconIdx, stride));
                 reconIdx += stride;
-                (curRow, prevRow) = (prevRow, curRow);
+                (cur, prev) = (prev, cur);
+                continue;
             }
-        }
-        finally
-        {
-            ArrayPool<byte>.Shared.Return(prevRow);
-            ArrayPool<byte>.Shared.Return(curRow);
+
+            if (filterType == 2)
+            {
+                SimdHelper.AddBytesInPlace(curSpan, prevSpan);
+            }
+            else
+            {
+                for (int i = 0; i < stride; i++)
+                {
+                    byte x = curSpan[i];
+                    byte a = (i >= bpp) ? curSpan[i - bpp] : (byte)0;
+                    byte b = prevSpan[i];
+                    byte c = (i >= bpp) ? prevSpan[i - bpp] : (byte)0;
+
+                    switch (filterType)
+                    {
+                        case 1:
+                            x += a;
+                            break;
+                        case 3:
+                            x += (byte)((a + b) / 2);
+                            break;
+                        case 4:
+                            x += PaethPredictor(a, b, c);
+                            break;
+                    }
+                    curSpan[i] = x;
+                }
+            }
+
+            curSpan.CopyTo(recon.AsSpan(reconIdx, stride));
+            reconIdx += stride;
+            (cur, prev) = (prev, cur);
         }
 
         return recon;

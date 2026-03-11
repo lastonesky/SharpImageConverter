@@ -2,6 +2,7 @@ using System;
 using System.Buffers;
 using System.IO;
 using System.Numerics;
+using SharpImageConverter.Core;
 using SharpImageConverter.Metadata;
 
 namespace SharpImageConverter.Formats.Png;
@@ -220,31 +221,25 @@ public static class PngWriter
     private static void WriteUpFilteredScanlines(Stream s, byte[] src, int width, int height, int bytesPerPixel)
     {
         int stride = width * bytesPerPixel;
-        byte[] prevRow = ArrayPool<byte>.Shared.Rent(stride);
-        byte[] filtered = ArrayPool<byte>.Shared.Rent(stride);
-        try
+        using var prevRow = SimdHelper.AllocateAlignedBytes(stride, alignment: SimdHelper.DefaultAlignment, clear: true, padToMultiple: Vector<byte>.Count);
+        using var filtered = SimdHelper.AllocateAlignedBytes(stride, alignment: SimdHelper.DefaultAlignment, clear: false, padToMultiple: Vector<byte>.Count);
+
+        Span<byte> prevSpan = prevRow.Span.Slice(0, stride);
+        Span<byte> filteredSpan = filtered.Span.Slice(0, stride);
+        int srcIdx = 0;
+        for (int y = 0; y < height; y++)
         {
-            Array.Clear(prevRow, 0, stride);
-            int srcIdx = 0;
-            for (int y = 0; y < height; y++)
-            {
-                s.WriteByte(2);
-                ApplyUpFilterSimd(src.AsSpan(srcIdx, stride), prevRow, filtered);
-                s.Write(filtered, 0, stride);
-                Array.Copy(src, srcIdx, prevRow, 0, stride);
-                srcIdx += stride;
-            }
-        }
-        finally
-        {
-            ArrayPool<byte>.Shared.Return(prevRow);
-            ArrayPool<byte>.Shared.Return(filtered);
+            s.WriteByte(2);
+            ApplyUpFilterSimd(src.AsSpan(srcIdx, stride), prevSpan, filteredSpan);
+            s.Write(filteredSpan);
+            src.AsSpan(srcIdx, stride).CopyTo(prevSpan);
+            srcIdx += stride;
         }
     }
-    private static void ApplyUpFilterSimd(ReadOnlySpan<byte> current, byte[] prevRow, byte[] destination)
+    private static void ApplyUpFilterSimd(ReadOnlySpan<byte> current, ReadOnlySpan<byte> prevRow, Span<byte> destination)
     {
         int length = current.Length;
-        Span<byte> prevSpan = prevRow;
+        ReadOnlySpan<byte> prevSpan = prevRow;
         Span<byte> destSpan = destination;
         int i = 0;
         if (Vector.IsHardwareAccelerated && length >= Vector<byte>.Count)
