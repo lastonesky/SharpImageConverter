@@ -31,9 +31,6 @@ public static class JpegEncoder
     private static readonly int[] CrG = BuildScale(-107);
     private static readonly int[] CrB = BuildScale(-21);
 
-    private static long _ticksFillMcu420;
-    private static long _ticksFillBlock444;
-
     private static int[] BuildScale(int k)
     {
         var t = new int[256];
@@ -183,6 +180,12 @@ public static class JpegEncoder
             B4 = null;
             B5 = null;
         }
+    }
+
+    private sealed class EncodeMetrics
+    {
+        public long TicksFillMcu420;
+        public long TicksFillBlock444;
     }
 
     private static readonly byte[] Order420 = [0, 0, 0, 0, 1, 2];
@@ -361,9 +364,7 @@ public static class JpegEncoder
     private static void WriteInternal(Stream stream, int width, int height, byte[] rgb24, int quality, bool subsample420, ImageMetadata? metadata, bool keepMetadata)
     {
         long totalStartTicks = Stopwatch.GetTimestamp();
-
-        _ticksFillMcu420 = 0;
-        _ticksFillBlock444 = 0;
+        EncodeMetrics? metrics = DebugPrintConfig ? new EncodeMetrics() : null;
 
         if (DebugPrintConfig)
         {
@@ -396,7 +397,7 @@ public static class JpegEncoder
         WriteSos(stream);
 
         var bw = new JpegBitWriter(stream);
-        EncodeRgbPipeline(bw, width, height, rgb24, subsample420, qYRecip, qCRecip, dcY, acY, dcC, acC);
+        EncodeRgbPipeline(bw, width, height, rgb24, subsample420, qYRecip, qCRecip, dcY, acY, dcC, acC, metrics);
         bw.FlushFinal();
         WriteMarker(stream, 0xD9);
 
@@ -406,10 +407,12 @@ public static class JpegEncoder
         {
             long totalTicks = totalEndTicks - totalStartTicks;
             double totalMs = totalTicks * 1000.0 / Stopwatch.Frequency;
-            double mcu420Ms = _ticksFillMcu420 * 1000.0 / Stopwatch.Frequency;
-            double block444Ms = _ticksFillBlock444 * 1000.0 / Stopwatch.Frequency;
-            double mcu420Pct = totalTicks != 0 ? (double)_ticksFillMcu420 * 100.0 / totalTicks : 0.0;
-            double block444Pct = totalTicks != 0 ? (double)_ticksFillBlock444 * 100.0 / totalTicks : 0.0;
+            long ticksFillMcu420 = metrics?.TicksFillMcu420 ?? 0;
+            long ticksFillBlock444 = metrics?.TicksFillBlock444 ?? 0;
+            double mcu420Ms = ticksFillMcu420 * 1000.0 / Stopwatch.Frequency;
+            double block444Ms = ticksFillBlock444 * 1000.0 / Stopwatch.Frequency;
+            double mcu420Pct = totalTicks != 0 ? (double)ticksFillMcu420 * 100.0 / totalTicks : 0.0;
+            double block444Pct = totalTicks != 0 ? (double)ticksFillBlock444 * 100.0 / totalTicks : 0.0;
 
             Console.WriteLine($"[jpeg-timing] total={totalMs:F3}ms FillMcu420={mcu420Ms:F3}ms ({mcu420Pct:F1}%) FillBlock444={block444Ms:F3}ms ({block444Pct:F1}%)");
         }
@@ -468,7 +471,8 @@ public static class JpegEncoder
         HuffCode[] dcY,
         HuffCode[] acY,
         HuffCode[] dcC,
-        HuffCode[] acC)
+        HuffCode[] acC,
+        EncodeMetrics? metrics)
     {
         int capacity = Math.Clamp(Environment.ProcessorCount, 2, 16);
         var sampleQueue = new PipeQueue<SampledMcu>(capacity);
@@ -480,7 +484,7 @@ public static class JpegEncoder
         using var cts = new CancellationTokenSource();
         CancellationToken token = cts.Token;
 
-        var t1 = Task.Run(() => RunStage(() => ProduceRgbSamples(sampleQueue, pool, rgb24, width, height, subsample420, dctWorkers, token), cts), token);
+        var t1 = Task.Run(() => RunStage(() => ProduceRgbSamples(sampleQueue, pool, rgb24, width, height, subsample420, dctWorkers, token, metrics), cts), token);
         Task[] dctTasks = new Task[dctWorkers];
         for (int i = 0; i < dctWorkers; i++)
         {
@@ -549,7 +553,8 @@ public static class JpegEncoder
         int height,
         bool subsample420,
         int completionCount,
-        CancellationToken token)
+        CancellationToken token,
+        EncodeMetrics? metrics)
     {
         int sequence = 0;
         if (subsample420)
@@ -586,7 +591,8 @@ public static class JpegEncoder
                             mcu.B2!.AsSpan(0, 64),
                             mcu.B3!.AsSpan(0, 64),
                             mcu.B4!.AsSpan(0, 64),
-                            mcu.B5!.AsSpan(0, 64));
+                            mcu.B5!.AsSpan(0, 64),
+                            metrics);
                         output.Enqueue(mcu, token);
                     }
                     catch
@@ -625,7 +631,8 @@ public static class JpegEncoder
                             by * 8,
                             mcu.B0!.AsSpan(0, 64),
                             mcu.B1!.AsSpan(0, 64),
-                            mcu.B2!.AsSpan(0, 64));
+                            mcu.B2!.AsSpan(0, 64),
+                            metrics);
                         output.Enqueue(mcu, token);
                     }
                     catch
@@ -935,7 +942,8 @@ public static class JpegEncoder
         Span<int> y01,
         Span<int> y11,
         Span<int> cb,
-        Span<int> cr)
+        Span<int> cr,
+        EncodeMetrics? metrics)
     {
         long startTicks = Stopwatch.GetTimestamp();
 
@@ -1007,10 +1015,13 @@ public static class JpegEncoder
         }
 
         long endTicks = Stopwatch.GetTimestamp();
-        _ticksFillMcu420 += endTicks - startTicks;
+        if (metrics is not null)
+        {
+            Interlocked.Add(ref metrics.TicksFillMcu420, endTicks - startTicks);
+        }
     }
 
-    private static unsafe void FillBlockRgbToYCbCr444(byte[] rgb, int width, int height, int baseX, int baseY, Span<int> y, Span<int> cb, Span<int> cr)
+    private static unsafe void FillBlockRgbToYCbCr444(byte[] rgb, int width, int height, int baseX, int baseY, Span<int> y, Span<int> cb, Span<int> cr, EncodeMetrics? metrics)
     {
         long startTicks = Stopwatch.GetTimestamp();
 
@@ -1047,7 +1058,10 @@ public static class JpegEncoder
         }
 
         long endTicks = Stopwatch.GetTimestamp();
-        _ticksFillBlock444 += endTicks - startTicks;
+        if (metrics is not null)
+        {
+            Interlocked.Add(ref metrics.TicksFillBlock444, endTicks - startTicks);
+        }
     }
 
     private static void FillBlockGray8ToY(byte[] gray, int width, int height, int baseX, int baseY, Span<int> y)
