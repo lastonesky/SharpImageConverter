@@ -17,7 +17,7 @@ namespace SharpImageConverter.Formats.Gif
         private readonly byte[] _suffix = new byte[4096];
         private readonly byte[] _pixelStack = new byte[4096 + 1];
 
-        public void Decode(byte[] pixels, int width, int height, int dataSize)
+        public void Decode(Span<byte> pixels, int width, int height, int dataSize)
         {
             int clearCode = 1 << dataSize;
             int endCode = clearCode + 1;
@@ -54,7 +54,7 @@ namespace SharpImageConverter.Formats.Gif
                             int read = 0;
                             while (read < len)
                             {
-                                int n = _stream.Read(_blockBuffer, read, len - read);
+                                int n = _stream.Read(_blockBuffer.AsSpan(read, len - read));
                                 if (n == 0) throw new EndOfStreamException("Unexpected end of stream in GIF data block");
                                 read += n;
                             }
@@ -120,7 +120,7 @@ namespace SharpImageConverter.Formats.Gif
                         if ((available & codeMask) == 0 && available < 4096)
                         {
                             codeSize++;
-                            codeMask += available;
+                            codeMask = (1 << codeSize) - 1;
                         }
                     }
                     oldCode = inCode;
@@ -136,7 +136,12 @@ namespace SharpImageConverter.Formats.Gif
             {
                  int len = _stream.ReadByte();
                  if (len <= 0) break;
-                 _stream.Seek(len, SeekOrigin.Current);
+                 if (_stream.CanSeek)
+                    _stream.Seek(len, SeekOrigin.Current);
+                 else
+                 {
+                    for (int i = 0; i < len; i++) _stream.ReadByte();
+                 }
             }
         }
     }

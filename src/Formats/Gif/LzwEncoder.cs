@@ -6,10 +6,6 @@ namespace SharpImageConverter.Formats.Gif;
 /// <summary>
 /// LZW 编码器，用于 GIF 图像数据压缩。
 /// </summary>
-/// <remarks>
-/// 初始化 LZW 编码器
-/// </remarks>
-/// <param name="stream">输出流</param>
 public class LzwEncoder(Stream stream)
 {
     private readonly Stream _stream = stream;
@@ -20,30 +16,22 @@ public class LzwEncoder(Stream stream)
     private int _curMaxCode;
     private int _initCodeSize;
     
-    // Hash table for dictionary
+    // Hash table for dictionary: 4096 entries max, use 8191 (prime) for efficiency
+    private const int HSIZE = 8191; 
     private readonly int[] _htab = new int[HSIZE];
     private readonly int[] _codetab = new int[HSIZE];
-    private const int HSIZE = 5003; // Prime number
 
-    private int _curAccum;
+    private long _curAccum;
     private int _curBits;
     
-    // Block buffering
     private const int MAX_BLOCK_SIZE = 255;
     private readonly byte[] _packet = new byte[256];
     private int _packetSize = 0;
 
-    /// <summary>
-    /// 对像素索引数据进行 LZW 编码
-    /// </summary>
-    /// <param name="pixels">像素索引数组</param>
-    /// <param name="width">图像宽度</param>
-    /// <param name="height">图像高度</param>
-    /// <param name="colorDepth">颜色深度（位数）</param>
     public void Encode(byte[] pixels, int width, int height, int colorDepth)
     {
         _initCodeSize = Math.Max(2, colorDepth);
-        _stream.WriteByte((byte)_initCodeSize); // Write initial code size
+        _stream.WriteByte((byte)_initCodeSize);
 
         _codeSize = _initCodeSize + 1;
         _clearCode = 1 << _initCodeSize;
@@ -55,7 +43,6 @@ public class LzwEncoder(Stream stream)
         _curBits = 0;
         _packetSize = 0;
 
-        // Initialize hash table
         for (int i = 0; i < HSIZE; i++) _htab[i] = -1;
 
         Output(_clearCode);
@@ -65,31 +52,33 @@ public class LzwEncoder(Stream stream)
         for (int i = 1; i < pixels.Length; i++)
         {
             int c = pixels[i];
-            int fcode = (c << 12) + ent;
-            int h = (c << 4) ^ ent; // XOR hashing
+            int fcode = (c << 12) | ent;
+            int h = (c << 4) ^ ent; // Basic XOR hash
 
             if (_htab[h] == fcode)
             {
                 ent = _codetab[h];
                 continue;
             }
-            else if (_htab[h] >= 0) // Collision
+            
+            if (_htab[h] >= 0) // Collision
             {
                 int disp = HSIZE - h;
                 if (h == 0) disp = 1;
                 
                 bool found = false;
-                do
+                while (true)
                 {
-                    if ((h -= disp) < 0) h += HSIZE;
+                    h -= disp;
+                    if (h < 0) h += HSIZE;
                     if (_htab[h] == fcode)
                     {
                         ent = _codetab[h];
                         found = true;
                         break;
                     }
-                } while (_htab[h] >= 0);
-
+                    if (_htab[h] < 0) break;
+                }
                 if (found) continue;
             }
 
@@ -103,40 +92,36 @@ public class LzwEncoder(Stream stream)
             }
             else
             {
-                // Clear table
-                for (int j = 0; j < HSIZE; j++) _htab[j] = -1;
-                Output(_clearCode);
-                _codeSize = _initCodeSize + 1;
-                _nextCode = _clearCode + 2;
-                _curMaxCode = (1 << _codeSize) - 1;
+                ClearTable();
             }
         }
 
         Output(ent);
         Output(_endCode);
-        
-        // Flush remaining bits
-        while (_curBits > 0)
-        {
-            AddToPacket((byte)(_curAccum & 0xFF));
-            _curAccum >>= 8;
-            _curBits -= 8;
-        }
-        
-        FlushPacket();
+        FlushBits();
         _stream.WriteByte(0); // Block terminator
+    }
+
+    private void ClearTable()
+    {
+        for (int i = 0; i < HSIZE; i++) _htab[i] = -1;
+        Output(_clearCode);
+        _codeSize = _initCodeSize + 1;
+        _nextCode = _clearCode + 2;
+        _curMaxCode = (1 << _codeSize) - 1;
     }
 
     private void Output(int code)
     {
-        _curAccum |= code << _curBits;
+        _curAccum |= (long)code << _curBits;
         _curBits += _codeSize;
 
         while (_curBits >= 8)
         {
-            AddToPacket((byte)(_curAccum & 0xFF));
+            _packet[++_packetSize] = (byte)(_curAccum & 0xFF);
             _curAccum >>= 8;
             _curBits -= 8;
+            if (_packetSize >= MAX_BLOCK_SIZE) FlushPacket();
         }
 
         if (_nextCode > _curMaxCode && _codeSize < 12)
@@ -146,21 +131,24 @@ public class LzwEncoder(Stream stream)
         }
     }
 
-    private void AddToPacket(byte b)
+    private void FlushBits()
     {
-        _packet[_packetSize++] = b;
-        if (_packetSize >= MAX_BLOCK_SIZE)
+        while (_curBits > 0)
         {
-            FlushPacket();
+            _packet[++_packetSize] = (byte)(_curAccum & 0xFF);
+            _curAccum >>= 8;
+            _curBits -= 8;
+            if (_packetSize >= MAX_BLOCK_SIZE) FlushPacket();
         }
+        FlushPacket();
     }
 
     private void FlushPacket()
     {
         if (_packetSize > 0)
         {
-            _stream.WriteByte((byte)_packetSize);
-            _stream.Write(_packet, 0, _packetSize);
+            _packet[0] = (byte)_packetSize;
+            _stream.Write(_packet, 0, _packetSize + 1);
             _packetSize = 0;
         }
     }
