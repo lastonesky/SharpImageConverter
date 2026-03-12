@@ -1,5 +1,6 @@
 using System;
 using System.Buffers;
+using System.Buffers.Binary;
 using System.IO;
 
 namespace SharpImageConverter.Formats.Bmp;
@@ -9,6 +10,10 @@ namespace SharpImageConverter.Formats.Bmp;
 /// </summary>
 public static class BmpWriter
 {
+    private const int FileHeaderSize = 14;
+    private const int InfoHeaderSize = 40;
+    private const int DefaultPelsPerMeter = 2835; // ~72 DPI
+
     public static void Write8(string path, int width, int height, byte[] gray)
     {
         using var fs = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None, 1 << 20, FileOptions.SequentialScan);
@@ -20,43 +25,50 @@ public static class BmpWriter
         int rowStride = ((width + 3) / 4) * 4;
         int imageSize = rowStride * height;
         int paletteSize = 256 * 4;
-        int fileSize = 14 + 40 + paletteSize + imageSize;
+        int fileSize = FileHeaderSize + InfoHeaderSize + paletteSize + imageSize;
 
-        byte[] header = new byte[14 + 40];
+        // Header
+        Span<byte> header = stackalloc byte[FileHeaderSize + InfoHeaderSize];
+        
+        // File Header
         header[0] = (byte)'B';
         header[1] = (byte)'M';
-        WriteLe32ToBuffer(header, 2, fileSize);
-        WriteLe16ToBuffer(header, 6, 0);
-        WriteLe16ToBuffer(header, 8, 0);
-        WriteLe32ToBuffer(header, 10, 14 + 40 + paletteSize);
-        WriteLe32ToBuffer(header, 14, 40);
-        WriteLe32ToBuffer(header, 18, width);
-        WriteLe32ToBuffer(header, 22, height);
-        WriteLe16ToBuffer(header, 26, 1);
-        WriteLe16ToBuffer(header, 28, 8);
-        WriteLe32ToBuffer(header, 30, 0);
-        WriteLe32ToBuffer(header, 34, imageSize);
-        WriteLe32ToBuffer(header, 38, 2835);
-        WriteLe32ToBuffer(header, 42, 2835);
-        WriteLe32ToBuffer(header, 46, 256);
-        WriteLe32ToBuffer(header, 50, 0);
-        stream.Write(header, 0, header.Length);
+        BinaryPrimitives.WriteInt32LittleEndian(header.Slice(2), fileSize);
+        BinaryPrimitives.WriteInt16LittleEndian(header.Slice(6), 0); // Reserved 1
+        BinaryPrimitives.WriteInt16LittleEndian(header.Slice(8), 0); // Reserved 2
+        BinaryPrimitives.WriteInt32LittleEndian(header.Slice(10), FileHeaderSize + InfoHeaderSize + paletteSize); // Offset to data
 
-        byte[] palette = new byte[paletteSize];
-        int pi = 0;
+        // Info Header
+        BinaryPrimitives.WriteInt32LittleEndian(header.Slice(14), InfoHeaderSize);
+        BinaryPrimitives.WriteInt32LittleEndian(header.Slice(18), width);
+        BinaryPrimitives.WriteInt32LittleEndian(header.Slice(22), height);
+        BinaryPrimitives.WriteInt16LittleEndian(header.Slice(26), 1); // Planes
+        BinaryPrimitives.WriteInt16LittleEndian(header.Slice(28), 8); // BPP
+        BinaryPrimitives.WriteInt32LittleEndian(header.Slice(30), 0); // Compression (BI_RGB)
+        BinaryPrimitives.WriteInt32LittleEndian(header.Slice(34), imageSize);
+        BinaryPrimitives.WriteInt32LittleEndian(header.Slice(38), DefaultPelsPerMeter);
+        BinaryPrimitives.WriteInt32LittleEndian(header.Slice(42), DefaultPelsPerMeter);
+        BinaryPrimitives.WriteInt32LittleEndian(header.Slice(46), 256); // Colors used
+        BinaryPrimitives.WriteInt32LittleEndian(header.Slice(50), 0); // Colors important
+
+        stream.Write(header);
+
+        // Palette (Grayscale)
+        Span<byte> palette = stackalloc byte[paletteSize];
         for (int i = 0; i < 256; i++)
         {
-            palette[pi + 0] = (byte)i;
-            palette[pi + 1] = (byte)i;
-            palette[pi + 2] = (byte)i;
-            palette[pi + 3] = 0;
-            pi += 4;
+            int offset = i * 4;
+            palette[offset + 0] = (byte)i; // B
+            palette[offset + 1] = (byte)i; // G
+            palette[offset + 2] = (byte)i; // R
+            palette[offset + 3] = 0;       // A
         }
-        stream.Write(palette, 0, palette.Length);
+        stream.Write(palette);
 
         byte[] row = ArrayPool<byte>.Shared.Rent(rowStride);
         try
         {
+            // Bottom-up
             for (int y = height - 1; y >= 0; y--)
             {
                 int srcBase = y * width;
@@ -73,6 +85,7 @@ public static class BmpWriter
             ArrayPool<byte>.Shared.Return(row);
         }
     }
+
     /// <summary>
     /// 以 24 位 BMP 格式写出 RGB24 像素数据
     /// </summary>
@@ -97,33 +110,39 @@ public static class BmpWriter
     {
         int rowStride = ((width * 3 + 3) / 4) * 4;
         int imageSize = rowStride * height;
-        int fileSize = 14 + 40 + imageSize;
+        int fileSize = FileHeaderSize + InfoHeaderSize + imageSize;
 
-        byte[] header = new byte[14 + 40];
+        Span<byte> header = stackalloc byte[FileHeaderSize + InfoHeaderSize];
+        
+        // File Header
         header[0] = (byte)'B';
         header[1] = (byte)'M';
-        WriteLe32ToBuffer(header, 2, fileSize);
-        WriteLe16ToBuffer(header, 6, 0);
-        WriteLe16ToBuffer(header, 8, 0);
-        WriteLe32ToBuffer(header, 10, 14 + 40);
-        WriteLe32ToBuffer(header, 14, 40);
-        WriteLe32ToBuffer(header, 18, width);
-        WriteLe32ToBuffer(header, 22, height);
-        WriteLe16ToBuffer(header, 26, 1);
-        WriteLe16ToBuffer(header, 28, 24);
-        WriteLe32ToBuffer(header, 30, 0);
-        WriteLe32ToBuffer(header, 34, imageSize);
-        WriteLe32ToBuffer(header, 38, 2835);
-        WriteLe32ToBuffer(header, 42, 2835);
-        WriteLe32ToBuffer(header, 46, 0);
-        WriteLe32ToBuffer(header, 50, 0);
-        stream.Write(header, 0, header.Length);
+        BinaryPrimitives.WriteInt32LittleEndian(header.Slice(2), fileSize);
+        BinaryPrimitives.WriteInt16LittleEndian(header.Slice(6), 0);
+        BinaryPrimitives.WriteInt16LittleEndian(header.Slice(8), 0);
+        BinaryPrimitives.WriteInt32LittleEndian(header.Slice(10), FileHeaderSize + InfoHeaderSize); // Offset to data
+
+        // Info Header
+        BinaryPrimitives.WriteInt32LittleEndian(header.Slice(14), InfoHeaderSize);
+        BinaryPrimitives.WriteInt32LittleEndian(header.Slice(18), width);
+        BinaryPrimitives.WriteInt32LittleEndian(header.Slice(22), height);
+        BinaryPrimitives.WriteInt16LittleEndian(header.Slice(26), 1);
+        BinaryPrimitives.WriteInt16LittleEndian(header.Slice(28), 24);
+        BinaryPrimitives.WriteInt32LittleEndian(header.Slice(30), 0); // Compression
+        BinaryPrimitives.WriteInt32LittleEndian(header.Slice(34), imageSize);
+        BinaryPrimitives.WriteInt32LittleEndian(header.Slice(38), DefaultPelsPerMeter);
+        BinaryPrimitives.WriteInt32LittleEndian(header.Slice(42), DefaultPelsPerMeter);
+        BinaryPrimitives.WriteInt32LittleEndian(header.Slice(46), 0);
+        BinaryPrimitives.WriteInt32LittleEndian(header.Slice(50), 0);
+        
+        stream.Write(header);
 
         int srcRowSize = width * 3;
+        int padding = rowStride - srcRowSize;
+        
         byte[] row = ArrayPool<byte>.Shared.Rent(rowStride);
         try
         {
-            int padding = rowStride - srcRowSize;
             unsafe
             {
                 fixed (byte* pRgb = rgb)
@@ -134,6 +153,7 @@ public static class BmpWriter
                         byte* src = pRgb + (y * srcRowSize);
                         byte* dst = pRow;
                         byte* srcEnd = src + srcRowSize;
+                        
                         while (src < srcEnd)
                         {
                             byte r = src[0];
@@ -145,9 +165,10 @@ public static class BmpWriter
                             src += 3;
                             dst += 3;
                         }
+                        
                         if (padding > 0)
                         {
-                            new Span<byte>(dst, padding).Clear();
+                             for(int p=0; p<padding; p++) dst[p] = 0;
                         }
                         stream.Write(row, 0, rowStride);
                     }
@@ -158,18 +179,5 @@ public static class BmpWriter
         {
             ArrayPool<byte>.Shared.Return(row);
         }
-    }
-
-    private static void WriteLe16ToBuffer(byte[] buf, int offset, int v)
-    {
-        buf[offset + 0] = (byte)(v & 0xFF);
-        buf[offset + 1] = (byte)((v >> 8) & 0xFF);
-    }
-    private static void WriteLe32ToBuffer(byte[] buf, int offset, int v)
-    {
-        buf[offset + 0] = (byte)(v & 0xFF);
-        buf[offset + 1] = (byte)((v >> 8) & 0xFF);
-        buf[offset + 2] = (byte)((v >> 16) & 0xFF);
-        buf[offset + 3] = (byte)((v >> 24) & 0xFF);
     }
 }
