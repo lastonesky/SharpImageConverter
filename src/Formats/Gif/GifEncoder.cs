@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using SharpImageConverter.Core;
 
 namespace SharpImageConverter.Formats.Gif;
 
@@ -9,308 +10,242 @@ namespace SharpImageConverter.Formats.Gif;
 /// </summary>
 public class GifEncoder
 {
+    private readonly byte[] _headerBuf = new byte[1024];
+
     /// <summary>
-    /// 编码图像帧到流
+    /// 是否开启 Floyd-Steinberg 抖动，默认开启。
     /// </summary>
-    /// <param name="image">图像帧</param>
-    /// <param name="stream">输出流</param>
+    public bool EnableDithering { get; set; } = true;
+
     public void Encode(ImageFrame image, Stream stream)
     {
-        // 1. Quantize
+        var (palette, indices) = Quantizer.Quantize(image.Pixels, image.Width, image.Height, EnableDithering);
         
-        var (palette, indices) = Quantizer.Quantize(image.Pixels, image.Width, image.Height);
-
-        // 2. Write Header
-        WriteAscii(stream, "GIF89a");
-        
-        // 3. Write LSD
-        WriteShort(stream, image.Width);
-        WriteShort(stream, image.Height);
-        
-        // Calculate palette size power of 2
         int paletteCount = palette.Length / 3;
-        int depth = 0;
-        while ((1 << (depth + 1)) < paletteCount) depth++;
-        if (depth > 7) depth = 7;
-        
-        // Packed field: 
-        // 1 (Global Table Flag)
-        // 111 (Color Res: 8 bits - usually fixed to max)
-        // 0 (Sort Flag)
-        // size (Size of Global Table: 2^(size+1))
-        int packed = 0x80 | (0x07 << 4) | depth;
-        stream.WriteByte((byte)packed);
-        
-        stream.WriteByte(0); // Background Color Index
-        stream.WriteByte(0); // Pixel Aspect Ratio
-        
-        // 4. Write Global Color Table
+        int depth = GetColorDepth(paletteCount);
         int actualTableSize = 1 << (depth + 1);
-        stream.Write(palette, 0, palette.Length);
-        
-        // Pad with zeros if palette is smaller than power of 2
-        int paddingBytes = (actualTableSize * 3) - palette.Length;
-        for (int i = 0; i < paddingBytes; i++)
+
+        // Header & LSD
+        int ptr = 0;
+        WriteAscii(_headerBuf, ref ptr, "GIF89a");
+        WriteShort(_headerBuf, ref ptr, image.Width);
+        WriteShort(_headerBuf, ref ptr, image.Height);
+        _headerBuf[ptr++] = (byte)(0x80 | (0x07 << 4) | depth); // GCT Flag, 8-bit res, size
+        _headerBuf[ptr++] = 0; // BG index
+        _headerBuf[ptr++] = 0; // Aspect
+        stream.Write(_headerBuf, 0, ptr);
+
+        // Global Color Table
+        stream.Write(palette);
+        if (actualTableSize * 3 > palette.Length)
         {
-            stream.WriteByte(0);
+            byte[] padding = new byte[actualTableSize * 3 - palette.Length];
+            stream.Write(padding);
         }
 
-        // 5. Write Image Descriptor
-        stream.WriteByte(0x2C); // Separator ','
-        WriteShort(stream, 0); // Left Position
-        WriteShort(stream, 0); // Top Position
-        WriteShort(stream, image.Width);
-        WriteShort(stream, image.Height);
-        stream.WriteByte(0); // Packed: Local Table Flag(0), Interlace(0), Sort(0), Reserved(0), Size(0)
-        
-        // 6. Write Image Data
-        // LZW Minimum Code Size should be at least 2.
-        int lzwMinCodeSize = Math.Max(2, depth + 1);
-        var lzw = new LzwEncoder(stream);
-        lzw.Encode(indices, image.Width, image.Height, lzwMinCodeSize);
-        
-        // 7. Write Trailer
-        stream.WriteByte(0x3B); // ';'
+        // Image Descriptor
+        ptr = 0;
+        _headerBuf[ptr++] = 0x2C;
+        WriteShort(_headerBuf, ref ptr, 0);
+        WriteShort(_headerBuf, ref ptr, 0);
+        WriteShort(_headerBuf, ref ptr, image.Width);
+        WriteShort(_headerBuf, ref ptr, image.Height);
+        _headerBuf[ptr++] = 0; // No local table
+        stream.Write(_headerBuf, 0, ptr);
+
+        // LZW
+        new LzwEncoder(stream).Encode(indices, image.Width, image.Height, Math.Max(2, depth + 1));
+        stream.WriteByte(0x3B); // Trailer
     }
-    
-    /// <summary>
-    /// 编码 RGBA 图像数据到流（支持透明度处理）
-    /// </summary>
-    /// <param name="width">宽度</param>
-    /// <param name="height">高度</param>
-    /// <param name="rgba">RGBA32 像素数据</param>
-    /// <param name="stream">输出流</param>
+
     public void EncodeRgba(int width, int height, byte[] rgba, Stream stream)
     {
         bool hasTransparent = false;
-        for (int i = 3; i < rgba.Length; i += 4)
-        {
-            if (rgba[i] == 0) { hasTransparent = true; break; }
-        }
+        for (int i = 3; i < rgba.Length; i += 4) { if (rgba[i] < 128) { hasTransparent = true; break; } }
+        
         if (!hasTransparent)
         {
-            var rgb = new byte[width * height * 3];
+            byte[] rgb = new byte[width * height * 3];
             for (int i = 0, j = 0; i < rgba.Length; i += 4, j += 3)
             {
-                rgb[j + 0] = rgba[i + 0];
-                rgb[j + 1] = rgba[i + 1];
-                rgb[j + 2] = rgba[i + 2];
+                rgb[j] = rgba[i]; rgb[j + 1] = rgba[i + 1]; rgb[j + 2] = rgba[i + 2];
             }
             Encode(new ImageFrame(width, height, rgb), stream);
             return;
         }
+
         QuantizeRgbaWithTransparency(width, height, rgba, out var palette, out var indices, out int depth);
-        WriteAscii(stream, "GIF89a");
-        WriteShort(stream, width);
-        WriteShort(stream, height);
-        int packed = 0x80 | (0x07 << 4) | depth;
-        stream.WriteByte((byte)packed);
-        stream.WriteByte(0);
-        stream.WriteByte(0);
-        stream.Write(palette, 0, palette.Length);
-        stream.WriteByte(0x21);
-        stream.WriteByte(0xF9);
-        stream.WriteByte(4);
-        stream.WriteByte(0x01);
-        stream.WriteByte(0);
-        stream.WriteByte(0);
-        stream.WriteByte(0);
-        stream.WriteByte(0);
-        stream.WriteByte(0x2C);
-        WriteShort(stream, 0);
-        WriteShort(stream, 0);
-        WriteShort(stream, width);
-        WriteShort(stream, height);
-        stream.WriteByte(0);
-        int lzwMinCodeSize = Math.Max(2, depth + 1);
-        var lzw = new LzwEncoder(stream);
-        lzw.Encode(indices, width, height, lzwMinCodeSize);
+        
+        int ptr = 0;
+        WriteAscii(_headerBuf, ref ptr, "GIF89a");
+        WriteShort(_headerBuf, ref ptr, width);
+        WriteShort(_headerBuf, ref ptr, height);
+        _headerBuf[ptr++] = (byte)(0x80 | (0x07 << 4) | depth);
+        _headerBuf[ptr++] = 0; _headerBuf[ptr++] = 0;
+        stream.Write(_headerBuf, 0, ptr);
+        
+        stream.Write(palette);
+
+        // GCE for transparency
+        ptr = 0;
+        _headerBuf[ptr++] = 0x21; _headerBuf[ptr++] = 0xF9; _headerBuf[ptr++] = 4;
+        _headerBuf[ptr++] = 0x01; // Transparent flag
+        _headerBuf[ptr++] = 0; _headerBuf[ptr++] = 0; // Delay
+        _headerBuf[ptr++] = 0; // Transparent index
+        _headerBuf[ptr++] = 0; // Terminator
+        
+        // Image Descriptor
+        _headerBuf[ptr++] = 0x2C;
+        WriteShort(_headerBuf, ref ptr, 0); WriteShort(_headerBuf, ref ptr, 0);
+        WriteShort(_headerBuf, ref ptr, width); WriteShort(_headerBuf, ref ptr, height);
+        _headerBuf[ptr++] = 0;
+        stream.Write(_headerBuf, 0, ptr);
+
+        new LzwEncoder(stream).Encode(indices, width, height, Math.Max(2, depth + 1));
         stream.WriteByte(0x3B);
     }
 
     public void EncodeAnimation(IReadOnlyList<ImageFrame> frames, IReadOnlyList<int> frameDurationsMs, int loopCount, Stream stream)
     {
-        ArgumentNullException.ThrowIfNull(stream);
-        ArgumentNullException.ThrowIfNull(frames);
-        ArgumentNullException.ThrowIfNull(frameDurationsMs);
-        if (frames.Count == 0) throw new ArgumentOutOfRangeException(nameof(frames));
-        if (frames.Count != frameDurationsMs.Count) throw new ArgumentException("帧与时长数量不一致");
-        int width = frames[0].Width;
-        int height = frames[0].Height;
-        for (int i = 0; i < frames.Count; i++)
-        {
-            if (frames[i].Width != width || frames[i].Height != height) throw new ArgumentException("所有帧必须具有相同的宽高");
-        }
-        WriteAscii(stream, "GIF89a");
-        WriteShort(stream, width);
-        WriteShort(stream, height);
-        int packed = 0x70;
-        stream.WriteByte((byte)packed);
-        stream.WriteByte(0);
-        stream.WriteByte(0);
+        if (frames.Count == 0) return;
+        int w = frames[0].Width, h = frames[0].Height;
+
+        int ptr = 0;
+        WriteAscii(_headerBuf, ref ptr, "GIF89a");
+        WriteShort(_headerBuf, ref ptr, w); WriteShort(_headerBuf, ref ptr, h);
+        _headerBuf[ptr++] = 0x70; // No GCT, 8-bit res
+        _headerBuf[ptr++] = 0; _headerBuf[ptr++] = 0;
+        stream.Write(_headerBuf, 0, ptr);
+
         WriteNetscapeExtension(stream, loopCount);
+
         for (int i = 0; i < frames.Count; i++)
         {
-            var frame = frames[i];
-            var (palette, indices) = Quantizer.Quantize(frame.Pixels, frame.Width, frame.Height);
-            int palCount = palette.Length / 3;
-            int depth = 0;
-            while ((1 << (depth + 1)) < palCount) depth++;
-            if (depth > 7) depth = 7;
-            int delayCs = ToGifDelayCs(frameDurationsMs[i]);
-            WriteGraphicControlExtension(stream, delayCs, false, 0, 0);
-            WriteImageDescriptor(stream, width, height, depth, true);
-            WriteColorTable(stream, palette, depth);
-            int lzwMinCodeSize = Math.Max(2, depth + 1);
-            var lzw = new LzwEncoder(stream);
-            lzw.Encode(indices, width, height, lzwMinCodeSize);
+            var (pal, inds) = Quantizer.Quantize(frames[i].Pixels, w, h, EnableDithering);
+            int depth = GetColorDepth(pal.Length / 3);
+            
+            ptr = 0;
+            // GCE
+            _headerBuf[ptr++] = 0x21; _headerBuf[ptr++] = 0xF9; _headerBuf[ptr++] = 4;
+            _headerBuf[ptr++] = 0; // Disposal=0
+            int delay = (frameDurationsMs[i] + 5) / 10;
+            WriteShort(_headerBuf, ref ptr, Math.Clamp(delay, 0, 65535));
+            _headerBuf[ptr++] = 0; _headerBuf[ptr++] = 0;
+            
+            // Image Descriptor
+            _headerBuf[ptr++] = 0x2C;
+            WriteShort(_headerBuf, ref ptr, 0); WriteShort(_headerBuf, ref ptr, 0);
+            WriteShort(_headerBuf, ref ptr, w); WriteShort(_headerBuf, ref ptr, h);
+            _headerBuf[ptr++] = (byte)(0x80 | depth);
+            stream.Write(_headerBuf, 0, ptr);
+
+            // Local Color Table
+            stream.Write(pal);
+            int pad = (1 << (depth + 1)) * 3 - pal.Length;
+            if (pad > 0) stream.Write(new byte[pad]);
+
+            new LzwEncoder(stream).Encode(inds, w, h, Math.Max(2, depth + 1));
         }
         stream.WriteByte(0x3B);
     }
 
     public void EncodeAnimationRgba(int width, int height, IReadOnlyList<byte[]> rgbaFrames, IReadOnlyList<int> frameDurationsMs, int loopCount, Stream stream)
     {
-        ArgumentNullException.ThrowIfNull(stream);
-        ArgumentNullException.ThrowIfNull(rgbaFrames);
-        ArgumentNullException.ThrowIfNull(frameDurationsMs);
-        if (rgbaFrames.Count == 0) throw new ArgumentOutOfRangeException(nameof(rgbaFrames));
-        if (rgbaFrames.Count != frameDurationsMs.Count) throw new ArgumentException("帧与时长数量不一致");
-        int expected = checked(width * height * 4);
-        for (int i = 0; i < rgbaFrames.Count; i++)
-        {
-            if (rgbaFrames[i].Length != expected) throw new ArgumentException("RGBA 帧尺寸不一致");
-        }
-        WriteAscii(stream, "GIF89a");
-        WriteShort(stream, width);
-        WriteShort(stream, height);
-        int packed = 0x70;
-        stream.WriteByte((byte)packed);
-        stream.WriteByte(0);
-        stream.WriteByte(0);
+        if (rgbaFrames.Count == 0) return;
+
+        int ptr = 0;
+        WriteAscii(_headerBuf, ref ptr, "GIF89a");
+        WriteShort(_headerBuf, ref ptr, width); WriteShort(_headerBuf, ref ptr, height);
+        _headerBuf[ptr++] = 0x70;
+        _headerBuf[ptr++] = 0; _headerBuf[ptr++] = 0;
+        stream.Write(_headerBuf, 0, ptr);
+
         WriteNetscapeExtension(stream, loopCount);
+
         for (int i = 0; i < rgbaFrames.Count; i++)
         {
-            var rgba = rgbaFrames[i];
-            QuantizeRgbaWithTransparency(width, height, rgba, out var palette, out var indices, out int depth);
-            int delayCs = ToGifDelayCs(frameDurationsMs[i]);
-            WriteGraphicControlExtension(stream, delayCs, true, 0, 2);
-            WriteImageDescriptor(stream, width, height, depth, true);
-            WriteColorTable(stream, palette, depth);
-            int lzwMinCodeSize = Math.Max(2, depth + 1);
-            var lzw = new LzwEncoder(stream);
-            lzw.Encode(indices, width, height, lzwMinCodeSize);
+            QuantizeRgbaWithTransparency(width, height, rgbaFrames[i], out var pal, out var inds, out int depth);
+            
+            ptr = 0;
+            // GCE
+            _headerBuf[ptr++] = 0x21; _headerBuf[ptr++] = 0xF9; _headerBuf[ptr++] = 4;
+            _headerBuf[ptr++] = 0x09; // Disposal=2 (restore to BG), HasTrans=1
+            int delay = (frameDurationsMs[i] + 5) / 10;
+            WriteShort(_headerBuf, ref ptr, Math.Clamp(delay, 0, 65535));
+            _headerBuf[ptr++] = 0; // TransIndex=0
+            _headerBuf[ptr++] = 0;
+            
+            // Image Descriptor
+            _headerBuf[ptr++] = 0x2C;
+            WriteShort(_headerBuf, ref ptr, 0); WriteShort(_headerBuf, ref ptr, 0);
+            WriteShort(_headerBuf, ref ptr, width); WriteShort(_headerBuf, ref ptr, height);
+            _headerBuf[ptr++] = (byte)(0x80 | depth);
+            stream.Write(_headerBuf, 0, ptr);
+
+            stream.Write(pal);
+            new LzwEncoder(stream).Encode(inds, width, height, Math.Max(2, depth + 1));
         }
         stream.WriteByte(0x3B);
     }
-    
-    private void WriteAscii(Stream stream, string s)
-    {
-        foreach (char c in s) stream.WriteByte((byte)c);
-    }
-    
-    private void WriteShort(Stream stream, int v)
-    {
-        stream.WriteByte((byte)(v & 0xFF));
-        stream.WriteByte((byte)((v >> 8) & 0xFF));
-    }
 
-    private static int ToGifDelayCs(int durationMs)
+    private static int GetColorDepth(int count)
     {
-        if (durationMs <= 0) return 0;
-        int cs = (durationMs + 5) / 10;
-        if (cs <= 0) cs = 1;
-        return cs > 65535 ? 65535 : cs;
+        int depth = 0;
+        while ((1 << (depth + 1)) < count) depth++;
+        return Math.Min(depth, 7);
     }
 
     private void WriteNetscapeExtension(Stream stream, int loopCount)
     {
-        if (loopCount < 0) loopCount = 0;
-        if (loopCount > 65535) loopCount = 65535;
-        stream.WriteByte(0x21);
-        stream.WriteByte(0xFF);
-        stream.WriteByte(11);
-        WriteAscii(stream, "NETSCAPE2.0");
-        stream.WriteByte(3);
-        stream.WriteByte(1);
-        stream.WriteByte((byte)(loopCount & 0xFF));
-        stream.WriteByte((byte)((loopCount >> 8) & 0xFF));
-        stream.WriteByte(0);
+        int ptr = 0;
+        _headerBuf[ptr++] = 0x21; _headerBuf[ptr++] = 0xFF; _headerBuf[ptr++] = 11;
+        WriteAscii(_headerBuf, ref ptr, "NETSCAPE2.0");
+        _headerBuf[ptr++] = 3; _headerBuf[ptr++] = 1;
+        WriteShort(_headerBuf, ref ptr, Math.Clamp(loopCount, 0, 65535));
+        _headerBuf[ptr++] = 0;
+        stream.Write(_headerBuf, 0, ptr);
     }
 
-    private void WriteGraphicControlExtension(Stream stream, int delayCs, bool hasTransparent, int transparentIndex, int disposal)
+    private void WriteAscii(byte[] buf, ref int ptr, string s)
     {
-        stream.WriteByte(0x21);
-        stream.WriteByte(0xF9);
-        stream.WriteByte(4);
-        int packed = ((disposal & 0x07) << 2) | (hasTransparent ? 1 : 0);
-        stream.WriteByte((byte)packed);
-        stream.WriteByte((byte)(delayCs & 0xFF));
-        stream.WriteByte((byte)((delayCs >> 8) & 0xFF));
-        stream.WriteByte((byte)transparentIndex);
-        stream.WriteByte(0);
+        for (int i = 0; i < s.Length; i++) buf[ptr++] = (byte)s[i];
     }
 
-    private void WriteImageDescriptor(Stream stream, int width, int height, int depth, bool useLocalTable)
+    private void WriteShort(byte[] buf, ref int ptr, int v)
     {
-        stream.WriteByte(0x2C);
-        WriteShort(stream, 0);
-        WriteShort(stream, 0);
-        WriteShort(stream, width);
-        WriteShort(stream, height);
-        int packed = useLocalTable ? (0x80 | depth) : 0;
-        stream.WriteByte((byte)packed);
+        buf[ptr++] = (byte)(v & 0xFF);
+        buf[ptr++] = (byte)((v >> 8) & 0xFF);
     }
 
-    private void WriteColorTable(Stream stream, byte[] palette, int depth)
+    private void QuantizeRgbaWithTransparency(int width, int height, byte[] rgba, out byte[] palette, out byte[] indices, out int depth)
     {
-        int actualTableSize = 1 << (depth + 1);
-        int paletteBytes = palette.Length;
-        stream.Write(palette, 0, paletteBytes);
-        int paddingBytes = (actualTableSize * 3) - paletteBytes;
-        for (int i = 0; i < paddingBytes; i++)
+        int pixelCount = width * height;
+        byte[] opaque = new byte[pixelCount * 3];
+        byte[] mask = new byte[pixelCount];
+        int opPtr = 0;
+        for (int i = 0; i < pixelCount; i++)
         {
-            stream.WriteByte(0);
+            int s = i * 4;
+            if (rgba[s + 3] < 128) mask[i] = 0;
+            else
+            {
+                mask[i] = 1;
+                opaque[opPtr] = rgba[s]; opaque[opPtr + 1] = rgba[s + 1]; opaque[opPtr + 2] = rgba[s + 2];
+                opPtr += 3;
+            }
         }
-    }
 
-    private static void QuantizeRgbaWithTransparency(int width, int height, byte[] rgba, out byte[] palette, out byte[] indices, out int depth)
-    {
-        var opaque = new byte[width * height * 3];
-        var opaqueMask = new byte[width * height];
-        int pi = 0;
-        for (int idx = 0; idx < width * height; idx++)
-        {
-            int s = idx * 4;
-            byte a = rgba[s + 3];
-            opaqueMask[idx] = a == 0 ? (byte)0 : (byte)1;
-            opaque[pi + 0] = rgba[s + 0];
-            opaque[pi + 1] = rgba[s + 1];
-            opaque[pi + 2] = rgba[s + 2];
-            pi += 3;
-        }
-        var quantizer = new Quantizer();
-        var (pal, indsOpaque) = Quantizer.Quantize(opaque, width, height);
+        var (pal, indsOpaque) = Quantizer.Quantize(opaque, width, height, EnableDithering);
         int palCount = pal.Length / 3;
-        depth = 0;
-        while ((1 << (depth + 1)) < (palCount + 1)) depth++;
-        if (depth > 7) depth = 7;
+        depth = GetColorDepth(palCount + 1);
         int actualSize = 1 << (depth + 1);
         palette = new byte[actualSize * 3];
-        palette[0] = 0;
-        palette[1] = 0;
-        palette[2] = 0;
-        for (int i = 0; i < palCount; i++)
+        Array.Copy(pal, 0, palette, 3, pal.Length);
+
+        indices = new byte[pixelCount];
+        for (int i = 0; i < pixelCount; i++)
         {
-            int dst = (i + 1) * 3;
-            int src = i * 3;
-            palette[dst + 0] = pal[src + 0];
-            palette[dst + 1] = pal[src + 1];
-            palette[dst + 2] = pal[src + 2];
-        }
-        indices = new byte[width * height];
-        for (int i = 0; i < indices.Length; i++)
-        {
-            indices[i] = opaqueMask[i] == 0 ? (byte)0 : (byte)(indsOpaque[i] + 1);
+            indices[i] = mask[i] == 0 ? (byte)0 : (byte)(indsOpaque[i] + 1);
         }
     }
 }

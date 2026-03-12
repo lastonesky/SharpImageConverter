@@ -52,7 +52,7 @@ class Program
         Console.WriteLine("支持输入: .jpg/.jpeg/.png/.bmp/.webp/.gif");
         Console.WriteLine("支持输出: .jpg/.jpeg/.png/.bmp/.webp/.gif");
         Console.WriteLine("操作: resize:WxH | resizebilinear:WxH | resizefit:WxH | grayscale");
-        Console.WriteLine("参数: --quality N | --subsample 420/444 | --keep-metadata | --idct int/float | --stream | --jpeg-debug | --gif-frames | --gray");
+        Console.WriteLine("参数: --quality N | --subsample 420/444 | --keep-metadata | --idct int/float | --stream | --jpeg-debug | --gif-frames | --gray | --dithering on/off");
         Console.WriteLine("文件夹选项: --recursive | --to bmp/png/jpg/webp | --parallel N | --skip-existing");
     }
 
@@ -70,6 +70,17 @@ class Program
             if (string.Equals(a, "--jpeg-debug", StringComparison.OrdinalIgnoreCase))
             {
                 JpegEncoder.DebugPrintConfig = true;
+                continue;
+            }
+            if (string.Equals(a, "--dithering", StringComparison.OrdinalIgnoreCase))
+            {
+                if (i + 1 < args.Length)
+                {
+                    string v = args[i + 1].Trim().ToLowerInvariant();
+                    if (v is "on" or "true" or "1") options.Dithering = true;
+                    else if (v is "off" or "false" or "0") options.Dithering = false;
+                    i++;
+                }
                 continue;
             }
             if (string.Equals(a, "--gray", StringComparison.OrdinalIgnoreCase))
@@ -210,6 +221,7 @@ class Program
             Subsample420 = src.Subsample420,
             KeepMetadata = src.KeepMetadata,
             GifFrames = src.GifFrames,
+            Dithering = src.Dithering,
             UseFloatIdct = src.UseFloatIdct,
             UseStreamingDecoder = src.UseStreamingDecoder,
             Gray = src.Gray
@@ -289,6 +301,11 @@ class Program
         string outputPath = options.OutputPath ?? throw new InvalidOperationException("输出路径为空");
         string outExt = Path.GetExtension(outputPath).ToLowerInvariant();
 
+        if (outExt == ".gif")
+        {
+            GifEncoderAdapter.EnableDithering = options.Dithering;
+        }
+
         // GIF -> WebP：保留动画信息
         if (inExt == ".gif" && outExt == ".webp")
         {
@@ -346,6 +363,11 @@ class Program
         options.OutputPath = EnsureOutputPath(options.InputPath, options.OutputPath, ".bmp");
         string outputPath = options.OutputPath ?? throw new InvalidOperationException("输出路径为空");
         string outExt = Path.GetExtension(outputPath).ToLowerInvariant();
+
+        if (outExt == ".gif")
+        {
+            GifEncoderAdapter.EnableDithering = options.Dithering;
+        }
 
         // 带操作的 GIF -> WebP 动画
         if (inExt == ".gif" && outExt == ".webp")
@@ -747,6 +769,7 @@ class Program
         public bool? Subsample420 { get; set; }
         public bool KeepMetadata { get; set; }
         public bool GifFrames { get; set; }
+        public bool Dithering { get; set; } = true;
         public bool UseFloatIdct { get; set; }
         public bool UseStreamingDecoder { get; set; }
         public bool Gray { get; set; }

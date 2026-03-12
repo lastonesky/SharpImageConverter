@@ -11,13 +11,18 @@ namespace SharpImageConverter.Formats.Gif
     public sealed class GifEncoderAdapter : IImageEncoder
     {
         /// <summary>
+        /// 是否开启抖动。
+        /// </summary>
+        public static bool EnableDithering { get; set; } = true;
+
+        /// <summary>
         /// 将 RGB24 图像编码为 GIF 文件
         /// </summary>
         /// <param name="path">输出路径</param>
         /// <param name="image">输入图像</param>
         public void EncodeRgb24(string path, Image<Rgb24> image)
         {
-            var encoder = new GifEncoder();
+            var encoder = new GifEncoder { EnableDithering = EnableDithering };
             using var fs = File.Create(path);
             var frame = new ImageFrame(image.Width, image.Height, image.Buffer);
             encoder.Encode(frame, fs);
@@ -30,7 +35,7 @@ namespace SharpImageConverter.Formats.Gif
         /// <param name="image">输入图像</param>
         public void EncodeRgb24(Stream stream, Image<Rgb24> image)
         {
-            var encoder = new GifEncoder();
+            var encoder = new GifEncoder { EnableDithering = EnableDithering };
             var frame = new ImageFrame(image.Width, image.Height, image.Buffer);
             encoder.Encode(frame, stream);
         }
@@ -48,7 +53,7 @@ namespace SharpImageConverter.Formats.Gif
         /// <param name="image">输入图像</param>
         public void EncodeRgba32(string path, Image<Rgba32> image)
         {
-            var encoder = new GifEncoder();
+            var encoder = new GifEncoder { EnableDithering = GifEncoderAdapter.EnableDithering };
             using var fs = File.Create(path);
             encoder.EncodeRgba(image.Width, image.Height, image.Buffer, fs);
         }
@@ -60,7 +65,7 @@ namespace SharpImageConverter.Formats.Gif
         /// <param name="image">输入图像</param>
         public void EncodeRgba32(Stream stream, Image<Rgba32> image)
         {
-            var encoder = new GifEncoder();
+            var encoder = new GifEncoder { EnableDithering = GifEncoderAdapter.EnableDithering };
             encoder.EncodeRgba(image.Width, image.Height, image.Buffer, stream);
         }
     }

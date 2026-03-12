@@ -5,317 +5,312 @@ using System.Threading.Tasks;
 
 namespace SharpImageConverter.Formats.Gif;
 
+/// <summary>
+/// 高质量颜色量化器，实现 Wu's Color Quantizer 算法并支持极限优化后的 Floyd-Steinberg 抖动。
+/// </summary>
 public class Quantizer
 {
-    private const int LUT_BITS = 5;              // 每通道 5bit
-    private const int LUT_SIZE = 1 << LUT_BITS;  // 32
-    private const int LUT_MASK = LUT_SIZE - 1;   // 31
+    private const int BITS = 5;
+    private const int SIZE = 33; // 2^5 + 1
     private const int MaxColors = 256;
 
-    public Quantizer()
+    private readonly long[] _vwt = new long[SIZE * SIZE * SIZE];
+    private readonly long[] _vmr = new long[SIZE * SIZE * SIZE];
+    private readonly long[] _vmg = new long[SIZE * SIZE * SIZE];
+    private readonly long[] _vmb = new long[SIZE * SIZE * SIZE];
+    private readonly double[] _m2 = new double[SIZE * SIZE * SIZE];
+
+    private struct Box
     {
+        public int r0, r1;
+        public int g0, g1;
+        public int b0, b1;
+        public int vol;
     }
 
     /// <summary>
-    /// 对图像像素进行量化，生成调色板与索引数据
+    /// 对图像进行高质量量化，生成 256 色调色板并支持抖动处理。
     /// </summary>
-    /// <param name="pixels">RGB 像素数据</param>
+    /// <param name="pixels">原始 RGB 像素数据</param>
     /// <param name="width">宽度</param>
     /// <param name="height">高度</param>
-    /// <returns>调色板与索引数组</returns>
-    public static (byte[] Palette, byte[] Indices) Quantize(byte[] pixels, int width, int height)
+    /// <param name="enableDithering">是否启用 Floyd-Steinberg 抖动</param>
+    /// <returns>调色板与像素索引</returns>
+    public static (byte[] Palette, byte[] Indices) Quantize(byte[] pixels, int width, int height, bool enableDithering = true)
     {
-        var (palette, indices) = QuantizeInternal(pixels, width, height, out _, out _, out _, false);
+        var q = new Quantizer();
+        return q.QuantizeInternal(pixels, width, height, enableDithering);
+    }
+
+    private (byte[] Palette, byte[] Indices) QuantizeInternal(byte[] pixels, int width, int height, bool enableDithering)
+    {
+        Stopwatch sw = Stopwatch.StartNew();
+        
+        BuildHistogramParallel(pixels);
+        long tHistogram = sw.ElapsedMilliseconds;
+        
+        CalculateMoments();
+        long tMoments = sw.ElapsedMilliseconds - tHistogram;
+
+        Box[] cube = new Box[MaxColors];
+        cube[0].r0 = cube[0].g0 = cube[0].b0 = 0;
+        cube[0].r1 = cube[0].g1 = cube[0].b1 = SIZE - 1;
+        
+        double[] vv = new double[MaxColors];
+        int next = 0;
+        int actualK = 1;
+        for (int i = 1; i < MaxColors; i++)
+        {
+            if (Split(ref cube[next], ref cube[i]))
+            {
+                vv[next] = cube[next].vol > 1 ? Variance(ref cube[next]) : 0;
+                vv[i] = cube[i].vol > 1 ? Variance(ref cube[i]) : 0;
+            }
+            else
+            {
+                vv[next] = 0;
+                i--;
+            }
+            next = 0;
+            double temp = vv[0];
+            for (int j = 1; j <= i; j++)
+            {
+                if (vv[j] > temp)
+                {
+                    temp = vv[j];
+                    next = j;
+                }
+            }
+            if (temp <= 0) { actualK = i + 1; break; }
+            actualK = i + 1;
+        }
+        long tSplitting = sw.ElapsedMilliseconds - tHistogram - tMoments;
+
+        byte[] palette = new byte[actualK * 3];
+        for (int i = 0; i < actualK; i++)
+        {
+            long weight = Vol(ref cube[i], _vwt);
+            if (weight > 0)
+            {
+                palette[i * 3 + 0] = (byte)(Vol(ref cube[i], _vmr) / weight);
+                palette[i * 3 + 1] = (byte)(Vol(ref cube[i], _vmg) / weight);
+                palette[i * 3 + 2] = (byte)(Vol(ref cube[i], _vmb) / weight);
+            }
+        }
+        long tPalette = sw.ElapsedMilliseconds - tHistogram - tMoments - tSplitting;
+
+        byte[] mappingLut = BuildMappingLut(palette);
+        long tLut = sw.ElapsedMilliseconds - tHistogram - tMoments - tSplitting - tPalette;
+
+        byte[] indices;
+        if (enableDithering)
+        {
+            indices = ApplyDitheringWithLut(pixels, width, height, palette, mappingLut);
+        }
+        else
+        {
+            indices = ApplyMappingOnly(pixels, width, height, mappingLut);
+        }
+        long tMapping = sw.ElapsedMilliseconds - tHistogram - tMoments - tSplitting - tPalette - tLut;
+
+        Console.WriteLine($"[Quantizer] Perf: Dithering={enableDithering}, Hist={tHistogram}ms, Moments={tMoments}ms, Split={tSplitting}ms, Palette={tPalette}ms, LUT={tLut}ms, Map={tMapping}ms, Total={sw.ElapsedMilliseconds}ms");
+        
         return (palette, indices);
     }
 
-    private static (byte[] Palette, byte[] Indices) QuantizeInternal(byte[] pixels, int width, int height, out long ticksTraverse, out long ticksBuildPalette, out long ticksMap, bool timing)
+    private void BuildHistogramParallel(byte[] pixels)
     {
-        long t0 = 0;
-        long t1 = 0;
-        long t2 = 0;
-        long t3 = 0;
-        if (timing) t0 = Stopwatch.GetTimestamp();
+        Array.Clear(_vwt, 0, _vwt.Length);
+        Array.Clear(_vmr, 0, _vmr.Length);
+        Array.Clear(_vmg, 0, _vmg.Length);
+        Array.Clear(_vmb, 0, _vmb.Length);
+        Array.Clear(_m2, 0, _m2.Length);
 
-        int binLength = LUT_SIZE * LUT_SIZE * LUT_SIZE;
-        int[] binCount = new int[binLength];
-        for (int i = 0; i < pixels.Length; i += 3)
+        int threadCount = Environment.ProcessorCount;
+        int len = pixels.Length / 3;
+        int blockSize = len / threadCount;
+
+        Parallel.For(0, threadCount, t =>
         {
-            int r = pixels[i] >> (8 - LUT_BITS);
-            int g = pixels[i + 1] >> (8 - LUT_BITS);
-            int b = pixels[i + 2] >> (8 - LUT_BITS);
-            int idx = (r << (LUT_BITS * 2)) | (g << LUT_BITS) | b;
-            binCount[idx]++;
-        }
+            long[] tVwt = new long[SIZE * SIZE * SIZE];
+            long[] tVmr = new long[SIZE * SIZE * SIZE];
+            long[] tVmg = new long[SIZE * SIZE * SIZE];
+            long[] tVmb = new long[SIZE * SIZE * SIZE];
+            double[] tM2 = new double[SIZE * SIZE * SIZE];
 
-        int nonZero = 0;
-        for (int i = 0; i < binLength; i++)
-        {
-            if (binCount[i] != 0) nonZero++;
-        }
+            int start = t * blockSize;
+            int end = (t == threadCount - 1) ? len : (t + 1) * blockSize;
 
-        if (nonZero == 0)
-        {
-            ticksTraverse = 0;
-            ticksBuildPalette = 0;
-            ticksMap = 0;
-            return (Array.Empty<byte>(), new byte[width * height]);
-        }
-
-        int[] binR = new int[nonZero];
-        int[] binG = new int[nonZero];
-        int[] binB = new int[nonZero];
-        int[] binW = new int[nonZero];
-        int bi = 0;
-        for (int i = 0; i < binLength; i++)
-        {
-            int w = binCount[i];
-            if (w == 0) continue;
-            int r5 = (i >> (LUT_BITS * 2)) & LUT_MASK;
-            int g5 = (i >> LUT_BITS) & LUT_MASK;
-            int b5 = i & LUT_MASK;
-            int rr = (r5 << (8 - LUT_BITS)) + (1 << (7 - LUT_BITS));
-            int gg = (g5 << (8 - LUT_BITS)) + (1 << (7 - LUT_BITS));
-            int bb = (b5 << (8 - LUT_BITS)) + (1 << (7 - LUT_BITS));
-            binR[bi] = rr;
-            binG[bi] = gg;
-            binB[bi] = bb;
-            binW[bi] = w;
-            bi++;
-        }
-
-        int k = Math.Min(MaxColors, nonZero);
-        int[] centerR = new int[k];
-        int[] centerG = new int[k];
-        int[] centerB = new int[k];
-
-        long totalW = 0;
-        for (int i = 0; i < nonZero; i++) totalW += binW[i];
-        long step = totalW / k;
-        if (step <= 0) step = 1;
-        long target = step;
-        long acc = 0;
-        int ci = 0;
-        for (int i = 0; i < nonZero && ci < k; i++)
-        {
-            acc += binW[i];
-            if (acc >= target)
+            for (int i = start; i < end; i++)
             {
-                centerR[ci] = binR[i];
-                centerG[ci] = binG[i];
-                centerB[ci] = binB[i];
-                ci++;
-                target += step;
+                int baseIdx = i * 3;
+                int r = (pixels[baseIdx] >> 3) + 1;
+                int g = (pixels[baseIdx + 1] >> 3) + 1;
+                int b = (pixels[baseIdx + 2] >> 3) + 1;
+                int idx = (r * SIZE * SIZE) + (g * SIZE) + b;
+                tVwt[idx]++;
+                tVmr[idx] += pixels[baseIdx];
+                tVmg[idx] += pixels[baseIdx + 1];
+                tVmb[idx] += pixels[baseIdx + 2];
+                tM2[idx] += (double)pixels[baseIdx] * pixels[baseIdx] + (double)pixels[baseIdx + 1] * pixels[baseIdx + 1] + (double)pixels[baseIdx + 2] * pixels[baseIdx + 2];
             }
-        }
-        for (; ci < k; ci++)
-        {
-            centerR[ci] = binR[nonZero - 1];
-            centerG[ci] = binG[nonZero - 1];
-            centerB[ci] = binB[nonZero - 1];
-        }
 
-        int maxIter = 10;
-        long[] sumR = new long[k];
-        long[] sumG = new long[k];
-        long[] sumB = new long[k];
-        long[] sumW = new long[k];
-
-        for (int iter = 0; iter < maxIter; iter++)
-        {
-            Array.Clear(sumR, 0, k);
-            Array.Clear(sumG, 0, k);
-            Array.Clear(sumB, 0, k);
-            Array.Clear(sumW, 0, k);
-
-            for (int i = 0; i < nonZero; i++)
+            lock (_vwt)
             {
-                int rr = binR[i];
-                int gg = binG[i];
-                int bb = binB[i];
-                int best = 0;
-                int bestDist = int.MaxValue;
-                for (int c = 0; c < k; c++)
+                for (int i = 0; i < _vwt.Length; i++)
                 {
-                    int dr = centerR[c] - rr;
-                    int dg = centerG[c] - gg;
-                    int db = centerB[c] - bb;
-                    int dist = dr * dr + dg * dg + db * db;
-                    if (dist < bestDist)
-                    {
-                        bestDist = dist;
-                        best = c;
-                        if (dist == 0) break;
-                    }
+                    _vwt[i] += tVwt[i];
+                    _vmr[i] += tVmr[i];
+                    _vmg[i] += tVmg[i];
+                    _vmb[i] += tVmb[i];
+                    _m2[i] += tM2[i];
                 }
-
-                int w = binW[i];
-                sumR[best] += (long)rr * w;
-                sumG[best] += (long)gg * w;
-                sumB[best] += (long)bb * w;
-                sumW[best] += w;
-            }
-
-            bool changed = false;
-            for (int c = 0; c < k; c++)
-            {
-                if (sumW[c] == 0) continue;
-                int nr = (int)(sumR[c] / sumW[c]);
-                int ng = (int)(sumG[c] / sumW[c]);
-                int nb = (int)(sumB[c] / sumW[c]);
-                if (nr != centerR[c] || ng != centerG[c] || nb != centerB[c])
-                {
-                    centerR[c] = nr;
-                    centerG[c] = ng;
-                    centerB[c] = nb;
-                    changed = true;
-                }
-            }
-
-            if (!changed) break;
-        }
-
-        if (timing) t1 = Stopwatch.GetTimestamp();
-        int[] order = new int[k];
-        for (int i = 0; i < k; i++) order[i] = i;
-        Array.Sort(order, (a, b) => sumW[b].CompareTo(sumW[a]));
-
-        byte[] palette = new byte[k * 3];
-        for (int i = 0; i < k; i++)
-        {
-            int c = order[i];
-            int r = centerR[c];
-            int g = centerG[c];
-            int b = centerB[c];
-            if (r < 0) r = 0;
-            else if (r > 255) r = 255;
-            if (g < 0) g = 0;
-            else if (g > 255) g = 255;
-            if (b < 0) b = 0;
-            else if (b > 255) b = 255;
-            int p = i * 3;
-            palette[p + 0] = (byte)r;
-            palette[p + 1] = (byte)g;
-            palette[p + 2] = (byte)b;
-        }
-
-        if (timing) t2 = Stopwatch.GetTimestamp();
-
-        byte[] indices = new byte[width * height];
-        byte[] lut = BuildColorLut(palette, k);
-        Parallel.For(0, height, y =>
-        {
-            int rowPixel = y * width;
-            int src = rowPixel * 3;
-            int dst = rowPixel;
-            for (int x = 0; x < width; x++)
-            {
-                int s = src + x * 3;
-                int r = pixels[s] >> (8 - LUT_BITS);
-                int g = pixels[s + 1] >> (8 - LUT_BITS);
-                int b = pixels[s + 2] >> (8 - LUT_BITS);
-                int lutIndex = (r << (LUT_BITS * 2)) | (g << LUT_BITS) | b;
-                indices[dst + x] = lut[lutIndex];
             }
         });
-
-        if (timing) t3 = Stopwatch.GetTimestamp();
-
-        ticksTraverse = timing ? t1 - t0 : 0;
-        ticksBuildPalette = timing ? t2 - t1 : 0;
-        ticksMap = timing ? t3 - t2 : 0;
-
-        return (palette, indices);
     }
-    private static byte[] BuildColorLut(byte[] palette, int paletteCount)
+
+    private void CalculateMoments()
     {
-        int lutLength = LUT_SIZE * LUT_SIZE * LUT_SIZE;
-        byte[] lut = new byte[lutLength];
-        int[] palR = new int[paletteCount];
-        int[] palG = new int[paletteCount];
-        int[] palB = new int[paletteCount];
-        for (int i = 0; i < paletteCount; i++)
+        for (int r = 1; r < SIZE; r++)
         {
-            int p = i * 3;
-            palR[i] = palette[p + 0];
-            palG[i] = palette[p + 1];
-            palB[i] = palette[p + 2];
-        }
-
-        int vecSize = Vector<int>.Count;
-        int limit = paletteCount - (paletteCount % vecSize);
-        int vecBlocks = limit / vecSize;
-        Vector<int>[] palRVectors = new Vector<int>[vecBlocks];
-        Vector<int>[] palGVectors = new Vector<int>[vecBlocks];
-        Vector<int>[] palBVectors = new Vector<int>[vecBlocks];
-        for (int i = 0; i < limit; i += vecSize)
-        {
-            int block = i / vecSize;
-            palRVectors[block] = new Vector<int>(palR, i);
-            palGVectors[block] = new Vector<int>(palG, i);
-            palBVectors[block] = new Vector<int>(palB, i);
-        }
-        Parallel.For(0, LUT_SIZE, r =>
-        {
-            int rr = (r << (8 - LUT_BITS)) + (1 << (7 - LUT_BITS));
-            Vector<int> vrr = new(rr);
-            for (int g = 0; g < LUT_SIZE; g++)
+            long[] areaWt = new long[SIZE], areaMr = new long[SIZE], areaMg = new long[SIZE], areaMb = new long[SIZE];
+            double[] areaM2 = new double[SIZE];
+            for (int g = 1; g < SIZE; g++)
             {
-                int gg = (g << (8 - LUT_BITS)) + (1 << (7 - LUT_BITS));
-                Vector<int> vgg = new(gg);
-                for (int b = 0; b < LUT_SIZE; b++)
+                long lineWt = 0, lineMr = 0, lineMg = 0, lineMb = 0;
+                double lineM2 = 0;
+                for (int b = 1; b < SIZE; b++)
                 {
-                    int bb = (b << (8 - LUT_BITS)) + (1 << (7 - LUT_BITS));
-                    Vector<int> vbb = new(bb);
+                    int idx = (r * SIZE * SIZE) + (g * SIZE) + b;
+                    lineWt += _vwt[idx]; lineMr += _vmr[idx]; lineMg += _vmg[idx]; lineMb += _vmb[idx]; lineM2 += _m2[idx];
+                    areaWt[b] += lineWt; areaMr[b] += lineMr; areaMg[b] += lineMg; areaMb[b] += lineMb; areaM2[b] += lineM2;
+                    int prevR = ((r - 1) * SIZE * SIZE) + (g * SIZE) + b;
+                    _vwt[idx] = _vwt[prevR] + areaWt[b]; _vmr[idx] = _vmr[prevR] + areaMr[b]; _vmg[idx] = _vmg[prevR] + areaMg[b]; _vmb[idx] = _vmb[prevR] + areaMb[b]; _m2[idx] = _m2[prevR] + areaM2[b];
+                }
+            }
+        }
+    }
 
-                    int minDist = int.MaxValue;
-                    int bestIndex = 0;
+    private static long Vol(ref Box cube, long[] m)
+    {
+        return m[(cube.r1 * SIZE * SIZE) + (cube.g1 * SIZE) + cube.b1] - m[(cube.r0 * SIZE * SIZE) + (cube.g1 * SIZE) + cube.b1] - m[(cube.r1 * SIZE * SIZE) + (cube.g0 * SIZE) + cube.b1] + m[(cube.r0 * SIZE * SIZE) + (cube.g0 * SIZE) + cube.b1] - m[(cube.r1 * SIZE * SIZE) + (cube.g1 * SIZE) + cube.b0] + m[(cube.r0 * SIZE * SIZE) + (cube.g1 * SIZE) + cube.b0] + m[(cube.r1 * SIZE * SIZE) + (cube.g0 * SIZE) + cube.b0] - m[(cube.r0 * SIZE * SIZE) + (cube.g0 * SIZE) + cube.b0];
+    }
 
-                    int i = 0;
-                    for (int block = 0; block < vecBlocks; block++)
+    private static long Top(ref Box cube, int dir, int pos, long[] m)
+    {
+        switch (dir)
+        {
+            case 0: return m[(pos * SIZE * SIZE) + (cube.g1 * SIZE) + cube.b1] - m[(pos * SIZE * SIZE) + (cube.g0 * SIZE) + cube.b1] - m[(pos * SIZE * SIZE) + (cube.g1 * SIZE) + cube.b0] + m[(pos * SIZE * SIZE) + (cube.g0 * SIZE) + cube.b0];
+            case 1: return m[(cube.r1 * SIZE * SIZE) + (pos * SIZE) + cube.b1] - m[(cube.r0 * SIZE * SIZE) + (pos * SIZE) + cube.b1] - m[(cube.r1 * SIZE * SIZE) + (pos * SIZE) + cube.b0] + m[(cube.r0 * SIZE * SIZE) + (pos * SIZE) + cube.b0];
+            case 2: return m[(cube.r1 * SIZE * SIZE) + (cube.g1 * SIZE) + pos] - m[(cube.r0 * SIZE * SIZE) + (cube.g1 * SIZE) + pos] - m[(cube.r1 * SIZE * SIZE) + (cube.g0 * SIZE) + pos] + m[(cube.r0 * SIZE * SIZE) + (cube.g0 * SIZE) + pos];
+            default: return 0;
+        }
+    }
+
+    private double Variance(ref Box cube)
+    {
+        double dr = Vol(ref cube, _vmr), dg = Vol(ref cube, _vmg), db = Vol(ref cube, _vmb), wt = Vol(ref cube, _vwt);
+        if (wt <= 0) return 0;
+        return Vol2(ref cube, _m2) - (dr * dr + dg * dg + db * db) / wt;
+    }
+
+    private static double Vol2(ref Box cube, double[] m)
+    {
+        return m[(cube.r1 * SIZE * SIZE) + (cube.g1 * SIZE) + cube.b1] - m[(cube.r0 * SIZE * SIZE) + (cube.g1 * SIZE) + cube.b1] - m[(cube.r1 * SIZE * SIZE) + (cube.g0 * SIZE) + cube.b1] + m[(cube.r0 * SIZE * SIZE) + (cube.g0 * SIZE) + cube.b1] - m[(cube.r1 * SIZE * SIZE) + (cube.g1 * SIZE) + cube.b0] + m[(cube.r0 * SIZE * SIZE) + (cube.g1 * SIZE) + cube.b0] + m[(cube.r1 * SIZE * SIZE) + (cube.g0 * SIZE) + cube.b0] - m[(cube.r0 * SIZE * SIZE) + (cube.g0 * SIZE) + cube.b0];
+    }
+
+    private bool Split(ref Box b1, ref Box b2)
+    {
+        double maxVariance = 0; int bestDir = -1, bestPos = -1;
+        for (int dir = 0; dir < 3; dir++)
+        {
+            int start = dir == 0 ? b1.r0 + 1 : (dir == 1 ? b1.g0 + 1 : b1.b0 + 1);
+            int end = dir == 0 ? b1.r1 : (dir == 1 ? b1.g1 : b1.b1);
+            long totalWt = Vol(ref b1, _vwt), totalMr = Vol(ref b1, _vmr), totalMg = Vol(ref b1, _vmg), totalMb = Vol(ref b1, _vmb);
+            long currentWt = 0, currentMr = 0, currentMg = 0, currentMb = 0;
+            for (int pos = start; pos < end; pos++)
+            {
+                currentWt += Top(ref b1, dir, pos, _vwt); currentMr += Top(ref b1, dir, pos, _vmr); currentMg += Top(ref b1, dir, pos, _vmg); currentMb += Top(ref b1, dir, pos, _vmb);
+                if (currentWt == 0 || currentWt == totalWt) continue;
+                double var = (double)(currentMr * currentMr + currentMg * currentMg + currentMb * currentMb) / currentWt + (double)((totalMr - currentMr) * (totalMr - currentMr) + (totalMg - currentMg) * (totalMg - currentMg) + (totalMb - currentMb) * (totalMb - currentMb)) / (totalWt - currentWt);
+                if (var > maxVariance) { maxVariance = var; bestDir = dir; bestPos = pos; }
+            }
+        }
+        if (bestDir == -1) return false;
+        b2 = b1;
+        if (bestDir == 0) b1.r1 = b2.r0 = bestPos; else if (bestDir == 1) b1.g1 = b2.g0 = bestPos; else b1.b1 = b2.b0 = bestPos;
+        b1.vol = (b1.r1 - b1.r0) * (b1.g1 - b1.g0) * (b1.b1 - b1.b0);
+        b2.vol = (b2.r1 - b2.r0) * (b2.g1 - b2.g0) * (b2.b1 - b2.b0);
+        return true;
+    }
+
+    private byte[] BuildMappingLut(byte[] palette)
+    {
+        int paletteCount = palette.Length / 3;
+        byte[] lut = new byte[SIZE * SIZE * SIZE];
+        Parallel.For(0, SIZE, r =>
+        {
+            float fr = (r == 0) ? 0 : (r - 0.5f) * 8;
+            for (int g = 0; g < SIZE; g++)
+            {
+                float fg = (g == 0) ? 0 : (g - 0.5f) * 8;
+                for (int b = 0; b < SIZE; b++)
+                {
+                    float fb = (b == 0) ? 0 : (b - 0.5f) * 8;
+                    int bestIndex = 0; float minSqDist = float.MaxValue;
+                    for (int i = 0; i < paletteCount; i++)
                     {
-                        var vr = palRVectors[block];
-                        var vg = palGVectors[block];
-                        var vb = palBVectors[block];
-                        var dr = vr - vrr;
-                        var dg = vg - vgg;
-                        var db = vb - vbb;
-                        var dist = Vector.Add(Vector.Add(Vector.Multiply(dr, dr), Vector.Multiply(dg, dg)), Vector.Multiply(db, db));
-                        for (int lane = 0; lane < vecSize; lane++)
-                        {
-                            int d = dist[lane];
-                            if (d < minDist)
-                            {
-                                minDist = d;
-                                bestIndex = (block * vecSize) + lane;
-                                if (d == 0) break;
-                            }
-                        }
-                        if (minDist == 0) break;
+                        float dr = fr - palette[i * 3], dg = fg - palette[i * 3 + 1], db = fb - palette[i * 3 + 2];
+                        float dist = dr * dr + dg * dg + db * db;
+                        if (dist < minSqDist) { minSqDist = dist; bestIndex = i; if (dist == 0) break; }
                     }
-
-                    i = limit;
-                    for (; i < paletteCount; i++)
-                    {
-                        int dr = palR[i] - rr;
-                        int dg = palG[i] - gg;
-                        int db = palB[i] - bb;
-                        int dist = dr * dr + dg * dg + db * db;
-                        if (dist < minDist)
-                        {
-                            minDist = dist;
-                            bestIndex = i;
-                            if (dist == 0) break;
-                        }
-                    }
-
-                    int index = (r << (LUT_BITS * 2)) | (g << LUT_BITS) | b;
-                    lut[index] = (byte)bestIndex;
+                    lut[(r * SIZE * SIZE) + (g * SIZE) + b] = (byte)bestIndex;
                 }
             }
         });
-
         return lut;
     }
 
+    private byte[] ApplyDitheringWithLut(byte[] pixels, int width, int height, byte[] palette, byte[] lut)
+    {
+        byte[] indices = new byte[width * height];
+        float[] currentRowError = new float[(width + 2) * 3], nextRowError = new float[(width + 2) * 3];
+        for (int y = 0; y < height; y++)
+        {
+            int rowOffset = y * width * 3;
+            for (int x = 0; x < width; x++)
+            {
+                int pxOff = rowOffset + x * 3;
+                float r = Math.Clamp(pixels[pxOff] + currentRowError[(x + 1) * 3], 0, 255);
+                float g = Math.Clamp(pixels[pxOff + 1] + currentRowError[(x + 1) * 3 + 1], 0, 255);
+                float b = Math.Clamp(pixels[pxOff + 2] + currentRowError[(x + 1) * 3 + 2], 0, 255);
+                int bestIndex = lut[(((int)r >> 3) + 1) * SIZE * SIZE + (((int)g >> 3) + 1) * SIZE + (((int)b >> 3) + 1)];
+                indices[y * width + x] = (byte)bestIndex;
+                int palOff = bestIndex * 3;
+                float er = (r - palette[palOff]) / 16f, eg = (g - palette[palOff + 1]) / 16f, eb = (b - palette[palOff + 2]) / 16f;
+                currentRowError[(x + 2) * 3] += er * 7; currentRowError[(x + 2) * 3 + 1] += eg * 7; currentRowError[(x + 2) * 3 + 2] += eb * 7;
+                nextRowError[x * 3] += er * 3; nextRowError[x * 3 + 1] += eg * 3; nextRowError[x * 3 + 2] += eb * 3;
+                nextRowError[(x + 1) * 3] += er * 5; nextRowError[(x + 1) * 3 + 1] += eg * 5; nextRowError[(x + 1) * 3 + 2] += eb * 5;
+                nextRowError[(x + 2) * 3] += er; nextRowError[(x + 2) * 3 + 1] += eg; nextRowError[(x + 2) * 3 + 2] += eb;
+            }
+            Array.Copy(nextRowError, currentRowError, nextRowError.Length); Array.Clear(nextRowError, 0, nextRowError.Length);
+        }
+        return indices;
+    }
+
+    private byte[] ApplyMappingOnly(byte[] pixels, int width, int height, byte[] lut)
+    {
+        byte[] indices = new byte[width * height];
+        Parallel.For(0, height, y =>
+        {
+            int rowPixels = y * width, rowSrc = rowPixels * 3;
+            for (int x = 0; x < width; x++)
+            {
+                int s = rowSrc + x * 3;
+                int r = (pixels[s] >> 3) + 1, g = (pixels[s + 1] >> 3) + 1, b = (pixels[s + 2] >> 3) + 1;
+                indices[rowPixels + x] = lut[(r * SIZE * SIZE) + (g * SIZE) + b];
+            }
+        });
+        return indices;
+    }
 }
