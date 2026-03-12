@@ -32,6 +32,9 @@ public static class StaticJpegDecoder
         private readonly QuantizationTable[] quantTables = new QuantizationTable[4];
         private readonly HuffmanDecodingTable[] dcTables = new HuffmanDecodingTable[4];
         private readonly HuffmanDecodingTable[] acTables = new HuffmanDecodingTable[4];
+        private readonly bool[] quantTableDefined = new bool[4];
+        private readonly bool[] dcTableDefined = new bool[4];
+        private readonly bool[] acTableDefined = new bool[4];
 
         private FrameHeader frame;
         private bool hasFrame;
@@ -39,6 +42,7 @@ public static class StaticJpegDecoder
         private ushort restartInterval;
         private ComponentState[] components = Array.Empty<ComponentState>();
         private int queuedMarker = -1;
+        private bool hasJfif;
         private bool hasAdobe;
         private byte adobeTransform;
         private IccProfileCollector? iccCollector;
@@ -144,6 +148,7 @@ public static class StaticJpegDecoder
                 segment[3] == (byte)'F' &&
                 segment[4] == 0)
             {
+                hasJfif = true;
                 return;
             }
         }
@@ -208,7 +213,7 @@ public static class StaticJpegDecoder
 
             int fullWidth = frame.McuX * maxH * 8;
             int fullHeight = frame.McuY * maxV * 8;
-            JpegColorSpace colorSpace = DetermineColorSpace(components.Length, hasAdobe, adobeTransform);
+            JpegColorSpace colorSpace = DetermineColorSpace(components, hasJfif, hasAdobe, adobeTransform);
             JpegPixelFormat pixelFormat = PixelFormatFromColorSpace(colorSpace);
             int[] componentOrder = BuildComponentOrder(components, colorSpace);
             int channelCount = componentOrder.Length;
@@ -217,29 +222,39 @@ public static class StaticJpegDecoder
             int[] planeStrides = new int[components.Length];
             int[] planeWidths = new int[components.Length];
             int[] planeHeights = new int[components.Length];
+            byte[] output;
 
-            for (int i = 0; i < components.Length; i++)
+            try
             {
-                ComponentState c = components[i];
-                int w = frame.McuX * c.H * 8;
-                int h = frame.McuY * c.V * 8;
+                for (int i = 0; i < components.Length; i++)
+                {
+                    ComponentState c = components[i];
+                    int w = frame.McuX * c.H * 8;
+                    int h = frame.McuY * c.V * 8;
 
-                planeWidths[i] = w;
-                planeHeights[i] = h;
-                planeStrides[i] = w;
+                    planeWidths[i] = w;
+                    planeHeights[i] = h;
+                    planeStrides[i] = w;
 
-                byte[] plane = ArrayPool<byte>.Shared.Rent(w * h);
-                planes[i] = plane;
+                    byte[] plane = ArrayPool<byte>.Shared.Rent(w * h);
+                    planes[i] = plane;
 
-                c.DecodeSpatial(plane.AsSpan(0, w * h), w, h, w, quantTables[c.QuantTableId].Table, useFloatingPointIdct);
+                    c.DecodeSpatial(plane.AsSpan(0, w * h), w, h, w, quantTables[c.QuantTableId].Table, useFloatingPointIdct);
+                }
+
+                output = new byte[checked(width * height * channelCount)];
+                InterleaveComponents(planes, planeStrides, planeWidths, planeHeights, fullWidth, fullHeight, width, height, componentOrder, output);
             }
-
-            byte[] output = new byte[checked(width * height * channelCount)];
-            InterleaveComponents(planes, planeStrides, planeWidths, planeHeights, fullWidth, fullHeight, width, height, componentOrder, output);
-
-            for (int i = 0; i < planes.Length; i++)
+            finally
             {
-                ArrayPool<byte>.Shared.Return(planes[i]);
+                for (int i = 0; i < planes.Length; i++)
+                {
+                    byte[]? plane = planes[i];
+                    if (plane is not null)
+                    {
+                        ArrayPool<byte>.Shared.Return(plane);
+                    }
+                }
             }
 
             byte[]? iccProfile = iccCollector?.GetProfile();
@@ -255,17 +270,23 @@ public static class StaticJpegDecoder
             }
 
             ReadOnlySpan<byte> segment = ReadSegment(out int segmentStart, out int segmentLength);
+            if (segmentLength < 1)
+            {
+                ThrowHelper.ThrowInvalidData("Invalid SOS length.");
+            }
+
             int count = segment[0];
             if (count <= 0 || count > 4)
             {
                 ThrowHelper.ThrowInvalidData("Invalid SOS component count.");
             }
 
-            if (segmentLength < 1 + (2 * count) + 3)
+            if (count > components.Length || segmentLength < 1 + (2 * count) + 3)
             {
                 ThrowHelper.ThrowInvalidData("Invalid SOS length.");
             }
 
+            Span<byte> seenScanComponentIds = stackalloc byte[256];
             var scanComponents = new ScanComponent[count];
             int p = 1;
             for (int i = 0; i < count; i++)
@@ -274,6 +295,22 @@ public static class StaticJpegDecoder
                 byte tdta = segment[p++];
                 byte td = (byte)(tdta >> 4);
                 byte ta = (byte)(tdta & 0x0F);
+                if (td >= 4 || ta >= 4)
+                {
+                    ThrowHelper.ThrowInvalidData("Invalid Huffman table selector.");
+                }
+
+                if (FindComponentIndex(components, cs) < 0)
+                {
+                    ThrowHelper.ThrowInvalidData("Unknown component id in SOS.");
+                }
+
+                if (seenScanComponentIds[cs] != 0)
+                {
+                    ThrowHelper.ThrowInvalidData("Duplicated component id in SOS.");
+                }
+
+                seenScanComponentIds[cs] = 1;
                 scanComponents[i] = new ScanComponent(cs, td, ta);
             }
 
@@ -285,6 +322,11 @@ public static class StaticJpegDecoder
 
             if (!isProgressive)
             {
+                if (count != components.Length)
+                {
+                    ThrowHelper.ThrowInvalidData("Baseline scan must include all components.");
+                }
+
                 if (ss != 0 || se != 63 || ah != 0 || al != 0)
                 {
                     ThrowHelper.ThrowInvalidData("Invalid baseline SOS parameters.");
@@ -333,6 +375,21 @@ public static class StaticJpegDecoder
                 if (!comp.HasCoefficients)
                 {
                     comp.EnsureCoefficientBuffer(isProgressive);
+                }
+
+                if (!quantTableDefined[comp.QuantTableId])
+                {
+                    ThrowHelper.ThrowInvalidData("Missing quantization table for component.");
+                }
+
+                if (!dcTableDefined[sc.DcTableId])
+                {
+                    ThrowHelper.ThrowInvalidData("Missing DC Huffman table.");
+                }
+
+                if (scan.Ss != 0 && !acTableDefined[sc.AcTableId])
+                {
+                    ThrowHelper.ThrowInvalidData("Missing AC Huffman table.");
                 }
 
                 comp.AssignTables(sc.DcTableId, sc.AcTableId);
@@ -716,6 +773,7 @@ public static class StaticJpegDecoder
             int p = 6;
             int maxH = 0;
             int maxV = 0;
+            Span<byte> seenComponentIds = stackalloc byte[256];
             for (int i = 0; i < count; i++)
             {
                 byte id = segment[p++];
@@ -732,6 +790,13 @@ public static class StaticJpegDecoder
                 {
                     ThrowHelper.ThrowInvalidData("Invalid quant table id.");
                 }
+
+                if (seenComponentIds[id] != 0)
+                {
+                    ThrowHelper.ThrowInvalidData("Duplicated component id in SOF.");
+                }
+
+                seenComponentIds[id] = 1;
 
                 if (h > maxH) maxH = h;
                 if (v > maxV) maxV = v;
@@ -776,6 +841,8 @@ public static class StaticJpegDecoder
                     {
                         quantTables[tq].Table[zigzag[i]] = segment[p++];
                     }
+
+                    quantTableDefined[tq] = true;
                 }
                 else if (pq == 1)
                 {
@@ -786,6 +853,7 @@ public static class StaticJpegDecoder
                     }
 
                     p += 128;
+                    quantTableDefined[tq] = true;
                 }
                 else
                 {
@@ -820,10 +888,12 @@ public static class StaticJpegDecoder
                 if (tc == 0)
                 {
                     dcTables[th].Build(bits, values);
+                    dcTableDefined[th] = true;
                 }
                 else
                 {
                     acTables[th].Build(bits, values);
+                    acTableDefined[th] = true;
                 }
             }
         }
@@ -918,8 +988,9 @@ public static class StaticJpegDecoder
         private static ushort ReadU16(ReadOnlySpan<byte> s) => (ushort)((s[0] << 8) | s[1]);
     }
 
-    private static JpegColorSpace DetermineColorSpace(int componentCount, bool hasAdobe, byte adobeTransform)
+    private static JpegColorSpace DetermineColorSpace(ComponentState[] components, bool hasJfif, bool hasAdobe, byte adobeTransform)
     {
+        int componentCount = components.Length;
         if (componentCount == 1)
         {
             return JpegColorSpace.Gray;
@@ -940,6 +1011,16 @@ public static class StaticJpegDecoder
                 }
             }
 
+            if (HasComponentIds(components, [(byte)'R', (byte)'G', (byte)'B']))
+            {
+                return JpegColorSpace.Rgb;
+            }
+
+            if (hasJfif || HasComponentIds(components, [1, 2, 3]))
+            {
+                return JpegColorSpace.YCbCr;
+            }
+
             return JpegColorSpace.YCbCr;
         }
 
@@ -956,6 +1037,11 @@ public static class StaticJpegDecoder
                 {
                     return JpegColorSpace.Ycck;
                 }
+            }
+
+            if (HasComponentIds(components, [(byte)'C', (byte)'M', (byte)'Y', (byte)'K']))
+            {
+                return JpegColorSpace.Cmyk;
             }
 
             return JpegColorSpace.Unknown4;
@@ -984,9 +1070,9 @@ public static class StaticJpegDecoder
         return colorSpace switch
         {
             JpegColorSpace.Gray => BuildComponentOrder(components, [1]),
-            JpegColorSpace.Rgb => BuildComponentOrder(components, [1, 2, 3]),
+            JpegColorSpace.Rgb => BuildComponentOrderWithFallback(components, [1, 2, 3], [(byte)'R', (byte)'G', (byte)'B']),
             JpegColorSpace.YCbCr => BuildComponentOrder(components, [1, 2, 3]),
-            JpegColorSpace.Cmyk => BuildComponentOrder(components, [1, 2, 3, 4]),
+            JpegColorSpace.Cmyk => BuildComponentOrderWithFallback(components, [1, 2, 3, 4], [(byte)'C', (byte)'M', (byte)'Y', (byte)'K']),
             JpegColorSpace.Ycck => BuildComponentOrder(components, [1, 2, 3, 4]),
             JpegColorSpace.Unknown4 => BuildSequentialOrder(components.Length),
             _ => BuildSequentialOrder(components.Length)
@@ -1021,6 +1107,36 @@ public static class StaticJpegDecoder
         return order;
     }
 
+    private static int[] BuildComponentOrderWithFallback(ComponentState[] components, ReadOnlySpan<byte> expectedIds, ReadOnlySpan<byte> fallbackIds)
+    {
+        int[] order = BuildComponentOrder(components, expectedIds);
+        if (order.Length == expectedIds.Length && !IsSequential(order))
+        {
+            return order;
+        }
+
+        int[] fallback = BuildComponentOrder(components, fallbackIds);
+        if (fallback.Length == fallbackIds.Length && !IsSequential(fallback))
+        {
+            return fallback;
+        }
+
+        return order;
+    }
+
+    private static bool IsSequential(ReadOnlySpan<int> order)
+    {
+        for (int i = 0; i < order.Length; i++)
+        {
+            if (order[i] != i)
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
     private static int FindComponentIndex(ComponentState[] components, byte id)
     {
         for (int i = 0; i < components.Length; i++)
@@ -1032,6 +1148,24 @@ public static class StaticJpegDecoder
         }
 
         return -1;
+    }
+
+    private static bool HasComponentIds(ComponentState[] components, ReadOnlySpan<byte> expectedIds)
+    {
+        if (components.Length != expectedIds.Length)
+        {
+            return false;
+        }
+
+        for (int i = 0; i < expectedIds.Length; i++)
+        {
+            if (FindComponentIndex(components, expectedIds[i]) < 0)
+            {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     private static void InterleaveComponents(
@@ -1048,6 +1182,40 @@ public static class StaticJpegDecoder
     {
         int channels = componentOrder.Length;
         int outStride = width * channels;
+
+        bool directSample = true;
+        for (int c = 0; c < channels; c++)
+        {
+            int planeIndex = componentOrder[c];
+            if (planeWidths[planeIndex] != fullWidth || planeHeights[planeIndex] != fullHeight)
+            {
+                directSample = false;
+                break;
+            }
+        }
+
+        if (directSample)
+        {
+            for (int y = 0; y < height; y++)
+            {
+                int rowOut = y * outStride;
+                for (int c = 0; c < channels; c++)
+                {
+                    int planeIndex = componentOrder[c];
+                    int srcRow = y * planeStrides[planeIndex];
+                    byte[] plane = planes[planeIndex];
+                    int outIndex = rowOut + c;
+                    for (int x = 0; x < width; x++)
+                    {
+                        output[outIndex] = plane[srcRow + x];
+                        outIndex += channels;
+                    }
+                }
+            }
+
+            return;
+        }
+
         int mapLength = width * channels;
         int[] x0Map = ArrayPool<int>.Shared.Rent(mapLength);
         int[] x1Map = ArrayPool<int>.Shared.Rent(mapLength);
@@ -1143,6 +1311,9 @@ public static class StaticJpegDecoder
         private readonly QuantizationTable[] quantTables = new QuantizationTable[4];
         private readonly HuffmanDecodingTable[] dcTables = new HuffmanDecodingTable[4];
         private readonly HuffmanDecodingTable[] acTables = new HuffmanDecodingTable[4];
+        private readonly bool[] quantTableDefined = new bool[4];
+        private readonly bool[] dcTableDefined = new bool[4];
+        private readonly bool[] acTableDefined = new bool[4];
 
         private FrameHeader frame;
         private bool hasFrame;
@@ -1152,6 +1323,7 @@ public static class StaticJpegDecoder
         private int queuedMarker = -1;
         private byte[]? exifRaw;
         private int exifOrientation = 1;
+        private bool hasJfif;
         private bool hasAdobe;
         private byte adobeTransform;
         private IccProfileCollector? iccCollector;
@@ -1259,6 +1431,7 @@ public static class StaticJpegDecoder
                     span[3] == (byte)'F' &&
                     span[4] == 0)
                 {
+                    hasJfif = true;
                     return;
                 }
             }
@@ -1359,7 +1532,7 @@ public static class StaticJpegDecoder
 
             int fullWidth = frame.McuX * maxH * 8;
             int fullHeight = frame.McuY * maxV * 8;
-            JpegColorSpace colorSpace = DetermineColorSpace(components.Length, hasAdobe, adobeTransform);
+            JpegColorSpace colorSpace = DetermineColorSpace(components, hasJfif, hasAdobe, adobeTransform);
             JpegPixelFormat pixelFormat = PixelFormatFromColorSpace(colorSpace);
             int[] componentOrder = BuildComponentOrder(components, colorSpace);
             int channelCount = componentOrder.Length;
@@ -1368,29 +1541,39 @@ public static class StaticJpegDecoder
             int[] planeStrides = new int[components.Length];
             int[] planeWidths = new int[components.Length];
             int[] planeHeights = new int[components.Length];
+            byte[] output;
 
-            for (int i = 0; i < components.Length; i++)
+            try
             {
-                ComponentState c = components[i];
-                int w = frame.McuX * c.H * 8;
-                int h = frame.McuY * c.V * 8;
+                for (int i = 0; i < components.Length; i++)
+                {
+                    ComponentState c = components[i];
+                    int w = frame.McuX * c.H * 8;
+                    int h = frame.McuY * c.V * 8;
 
-                planeWidths[i] = w;
-                planeHeights[i] = h;
-                planeStrides[i] = w;
+                    planeWidths[i] = w;
+                    planeHeights[i] = h;
+                    planeStrides[i] = w;
 
-                byte[] plane = ArrayPool<byte>.Shared.Rent(w * h);
-                planes[i] = plane;
+                    byte[] plane = ArrayPool<byte>.Shared.Rent(w * h);
+                    planes[i] = plane;
 
-                c.DecodeSpatial(plane.AsSpan(0, w * h), w, h, w, quantTables[c.QuantTableId].Table, useFloatingPointIdct);
+                    c.DecodeSpatial(plane.AsSpan(0, w * h), w, h, w, quantTables[c.QuantTableId].Table, useFloatingPointIdct);
+                }
+
+                output = new byte[checked(width * height * channelCount)];
+                InterleaveComponents(planes, planeStrides, planeWidths, planeHeights, fullWidth, fullHeight, width, height, componentOrder, output);
             }
-
-            byte[] output = new byte[checked(width * height * channelCount)];
-            InterleaveComponents(planes, planeStrides, planeWidths, planeHeights, fullWidth, fullHeight, width, height, componentOrder, output);
-
-            for (int i = 0; i < planes.Length; i++)
+            finally
             {
-                ArrayPool<byte>.Shared.Return(planes[i]);
+                for (int i = 0; i < planes.Length; i++)
+                {
+                    byte[]? plane = planes[i];
+                    if (plane is not null)
+                    {
+                        ArrayPool<byte>.Shared.Return(plane);
+                    }
+                }
             }
 
             byte[]? iccProfile = iccCollector?.GetProfile();
@@ -1409,17 +1592,23 @@ public static class StaticJpegDecoder
             try
             {
                 ReadOnlySpan<byte> span = segment.Span;
+                if (segment.Length < 1)
+                {
+                    ThrowHelper.ThrowInvalidData("Invalid SOS length.");
+                }
+
                 int count = span[0];
                 if (count <= 0 || count > 4)
                 {
                     ThrowHelper.ThrowInvalidData("Invalid SOS component count.");
                 }
 
-                if (segment.Length < 1 + (2 * count) + 3)
+                if (count > components.Length || segment.Length < 1 + (2 * count) + 3)
                 {
                     ThrowHelper.ThrowInvalidData("Invalid SOS length.");
                 }
 
+                Span<byte> seenScanComponentIds = stackalloc byte[256];
                 var scanComponents = new ScanComponent[count];
                 int p = 1;
                 for (int i = 0; i < count; i++)
@@ -1428,6 +1617,22 @@ public static class StaticJpegDecoder
                     byte tdta = span[p++];
                     byte td = (byte)(tdta >> 4);
                     byte ta = (byte)(tdta & 0x0F);
+                    if (td >= 4 || ta >= 4)
+                    {
+                        ThrowHelper.ThrowInvalidData("Invalid Huffman table selector.");
+                    }
+
+                    if (FindComponentIndex(components, cs) < 0)
+                    {
+                        ThrowHelper.ThrowInvalidData("Unknown component id in SOS.");
+                    }
+
+                    if (seenScanComponentIds[cs] != 0)
+                    {
+                        ThrowHelper.ThrowInvalidData("Duplicated component id in SOS.");
+                    }
+
+                    seenScanComponentIds[cs] = 1;
                     scanComponents[i] = new ScanComponent(cs, td, ta);
                 }
 
@@ -1439,6 +1644,11 @@ public static class StaticJpegDecoder
 
                 if (!isProgressive)
                 {
+                    if (count != components.Length)
+                    {
+                        ThrowHelper.ThrowInvalidData("Baseline scan must include all components.");
+                    }
+
                     if (ss != 0 || se != 63 || ah != 0 || al != 0)
                     {
                         ThrowHelper.ThrowInvalidData("Invalid baseline SOS parameters.");
@@ -1482,6 +1692,21 @@ public static class StaticJpegDecoder
                 if (!comp.HasCoefficients)
                 {
                     comp.EnsureCoefficientBuffer(isProgressive);
+                }
+
+                if (!quantTableDefined[comp.QuantTableId])
+                {
+                    ThrowHelper.ThrowInvalidData("Missing quantization table for component.");
+                }
+
+                if (!dcTableDefined[sc.DcTableId])
+                {
+                    ThrowHelper.ThrowInvalidData("Missing DC Huffman table.");
+                }
+
+                if (scan.Ss != 0 && !acTableDefined[sc.AcTableId])
+                {
+                    ThrowHelper.ThrowInvalidData("Missing AC Huffman table.");
                 }
 
                 comp.AssignTables(sc.DcTableId, sc.AcTableId);
@@ -1862,6 +2087,7 @@ public static class StaticJpegDecoder
                 int p = 6;
                 int maxH = 0;
                 int maxV = 0;
+                Span<byte> seenComponentIds = stackalloc byte[256];
                 for (int i = 0; i < count; i++)
                 {
                     byte id = span[p++];
@@ -1878,6 +2104,13 @@ public static class StaticJpegDecoder
                     {
                         ThrowHelper.ThrowInvalidData("Invalid quant table id.");
                     }
+
+                    if (seenComponentIds[id] != 0)
+                    {
+                        ThrowHelper.ThrowInvalidData("Duplicated component id in SOF.");
+                    }
+
+                    seenComponentIds[id] = 1;
 
                     if (h > maxH) maxH = h;
                     if (v > maxV) maxV = v;
@@ -1930,6 +2163,8 @@ public static class StaticJpegDecoder
                         {
                             quantTables[tq].Table[zigzag[i]] = span[p++];
                         }
+
+                        quantTableDefined[tq] = true;
                     }
                     else if (pq == 1)
                     {
@@ -1940,6 +2175,7 @@ public static class StaticJpegDecoder
                         }
 
                         p += 128;
+                        quantTableDefined[tq] = true;
                     }
                     else
                     {
@@ -1982,10 +2218,12 @@ public static class StaticJpegDecoder
                     if (tc == 0)
                     {
                         dcTables[th].Build(bits, values);
+                        dcTableDefined[th] = true;
                     }
                     else
                     {
                         acTables[th].Build(bits, values);
+                        acTableDefined[th] = true;
                     }
                 }
             }
@@ -2321,36 +2559,40 @@ public static class StaticJpegDecoder
                 ThrowHelper.ThrowInvalidData("Missing coefficients.");
             }
 
+            short[] buffer = coefficientBuffer!;
             int blocksX = BlocksX;
             int blocksY = BlocksY;
-
-            for (int by = 0; by < blocksY; by++)
+            try
             {
-                int py = by * 8;
-                if (py >= planeHeight) break;
-
-                for (int bx = 0; bx < blocksX; bx++)
+                for (int by = 0; by < blocksY; by++)
                 {
-                    int px = bx * 8;
-                    if (px >= planeWidth) break;
+                    int py = by * 8;
+                    if (py >= planeHeight) break;
 
-                    Span<byte> dest = plane[((py * stride) + px)..];
-                    ReadOnlySpan<short> block = coefficientBuffer.AsSpan(((by * blocksX) + bx) * 64, 64);
-                    if (useFloatingPointIdct)
+                    for (int bx = 0; bx < blocksX; bx++)
                     {
-                        FloatingPointIDCT.Transform(block, quant, dest, stride);
-                    }
-                    else
-                    {
-                        FastIDCT.Transform(block, quant, dest, stride);
+                        int px = bx * 8;
+                        if (px >= planeWidth) break;
+
+                        Span<byte> dest = plane[((py * stride) + px)..];
+                        ReadOnlySpan<short> block = buffer.AsSpan(((by * blocksX) + bx) * 64, 64);
+                        if (useFloatingPointIdct)
+                        {
+                            FloatingPointIDCT.Transform(block, quant, dest, stride);
+                        }
+                        else
+                        {
+                            FastIDCT.Transform(block, quant, dest, stride);
+                        }
                     }
                 }
             }
-
-            short[] buffer = coefficientBuffer!;
-            ArrayPool<short>.Shared.Return(buffer);
-            coefficientBuffer = null;
-            coefficientLength = 0;
+            finally
+            {
+                ArrayPool<short>.Shared.Return(buffer);
+                coefficientBuffer = null;
+                coefficientLength = 0;
+            }
         }
     }
 }

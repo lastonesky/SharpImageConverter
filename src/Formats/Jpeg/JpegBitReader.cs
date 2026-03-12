@@ -266,15 +266,22 @@ internal sealed class JpegStreamInput(Stream stream, int bufferSize = 16 * 1024)
         return buffer[bufferPos++];
     }
 
-    public byte ReadByteBlocking(CancellationToken cancellationToken)
+    public bool TryReadByteBlocking(CancellationToken cancellationToken, out byte value)
     {
-        ValueTask<byte> vt = ReadByteAsync(cancellationToken);
-        if (vt.IsCompletedSuccessfully)
+        cancellationToken.ThrowIfCancellationRequested();
+        if (bufferPos >= bufferLen)
         {
-            return vt.Result;
+            bufferLen = stream.Read(buffer, 0, buffer.Length);
+            bufferPos = 0;
+            if (bufferLen == 0)
+            {
+                value = 0;
+                return false;
+            }
         }
 
-        return vt.AsTask().GetAwaiter().GetResult();
+        value = buffer[bufferPos++];
+        return true;
     }
 
     public ValueTask DisposeAsync()
@@ -334,17 +341,14 @@ internal struct JpegStreamBitReader(JpegStreamInput input, CancellationToken can
 
     private bool TryReadByte(out byte value)
     {
-        try
+        if (input.TryReadByteBlocking(cancellationToken, out value))
         {
-            value = input.ReadByteBlocking(cancellationToken);
             bytesConsumed++;
             return true;
         }
-        catch (InvalidDataException)
-        {
-            value = 0;
-            return false;
-        }
+
+        value = 0;
+        return false;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]

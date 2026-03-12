@@ -33,7 +33,7 @@ public sealed class JpegImage
 {
     private readonly byte[] pixelData;
     private byte[]? rgba32Cache;
-    public static JpegCmykConversionMode CmykConversionMode { get; set; } = JpegCmykConversionMode.Fast;
+    public JpegCmykConversionMode CmykConversionMode { get; init; } = JpegCmykConversionMode.Fast;
 
     public JpegImage(int width, int height, byte[] rgba32)
         : this(width, height, JpegPixelFormat.Rgba32, 8, new JpegColorInfo(JpegColorSpace.Rgb, false, 0, null), rgba32)
