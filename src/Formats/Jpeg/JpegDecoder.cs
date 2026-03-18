@@ -20,9 +20,8 @@ public static class JpegDecoder
     public static JpegImage Decode(Stream stream, bool useFloatingPointIdct = false)
     {
         ArgumentNullException.ThrowIfNull(stream);
-        using var ms = new MemoryStream();
-        stream.CopyTo(ms);
-        return Decode(ms.ToArray(), useFloatingPointIdct);
+        byte[] data = ReadAllBytesFromStreamPooled(stream);
+        return Decode(data, useFloatingPointIdct);
     }
 
     public static async Task<StreamingDecodeResult> DecodeFromStreamAsync(Stream stream, CancellationToken cancellationToken = default, bool useFloatingPointIdct = false)
@@ -34,6 +33,44 @@ public static class JpegDecoder
     }
 
     public readonly record struct StreamingDecodeResult(JpegImage Image, byte[]? ExifRaw, int ExifOrientation);
+
+    private static byte[] ReadAllBytesFromStreamPooled(Stream stream)
+    {
+        byte[] rented = ArrayPool<byte>.Shared.Rent(16 * 1024);
+        int length = 0;
+        try
+        {
+            while (true)
+            {
+                if (length == rented.Length)
+                {
+                    int newSize = checked(rented.Length << 1);
+                    byte[] enlarged = ArrayPool<byte>.Shared.Rent(newSize);
+                    Buffer.BlockCopy(rented, 0, enlarged, 0, length);
+                    ArrayPool<byte>.Shared.Return(rented);
+                    rented = enlarged;
+                }
+
+                int read = stream.Read(rented, length, rented.Length - length);
+                if (read == 0)
+                {
+                    break;
+                }
+                length += read;
+            }
+
+            byte[] data = new byte[length];
+            if (length != 0)
+            {
+                Buffer.BlockCopy(rented, 0, data, 0, length);
+            }
+            return data;
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(rented);
+        }
+    }
 
     private ref struct Parser
     {
@@ -77,74 +114,81 @@ public static class JpegDecoder
 
         public JpegImage Decode()
         {
-            ReadMarkerExpected(JpegMarker.SOI);
-
-            while (offset < data.Length)
+            try
             {
-                JpegMarker marker = ReadMarker();
-                if (marker == JpegMarker.EOI)
+                ReadMarkerExpected(JpegMarker.SOI);
+
+                while (offset < data.Length)
                 {
-                    break;
+                    JpegMarker marker = ReadMarker();
+                    if (marker == JpegMarker.EOI)
+                    {
+                        break;
+                    }
+
+                    switch (marker)
+                    {
+                        case JpegMarker.APP0:
+                            ParseApp0();
+                            break;
+                        case JpegMarker.APP1:
+                            ParseApp1();
+                            break;
+                        case JpegMarker.APP2:
+                            ParseApp2();
+                            break;
+                        case JpegMarker.APP14:
+                            ParseApp14();
+                            break;
+                        case JpegMarker.COM:
+                            SkipSegment();
+                            break;
+                        case JpegMarker.DQT:
+                            ParseDqt();
+                            break;
+                        case JpegMarker.DHT:
+                            ParseDht();
+                            break;
+                        case JpegMarker.DRI:
+                            ParseDri();
+                            break;
+                        case JpegMarker.SOF0:
+                        case JpegMarker.SOF2:
+                            ParseSof(marker);
+                            break;
+                        case JpegMarker.SOS:
+                            ParseSosAndDecodeScan();
+                            break;
+                        default:
+                            if (marker is >= JpegMarker.RST0 and <= JpegMarker.RST7)
+                            {
+                                ThrowHelper.ThrowInvalidData("Unexpected restart marker outside entropy-coded data.");
+                            }
+
+                            SkipSegment();
+                            break;
+                    }
                 }
 
-                switch (marker)
+                if (!hasFrame)
                 {
-                    case JpegMarker.APP0:
-                        ParseApp0();
-                        break;
-                    case JpegMarker.APP1:
-                        ParseApp1();
-                        break;
-                    case JpegMarker.APP2:
-                        ParseApp2();
-                        break;
-                    case JpegMarker.APP14:
-                        ParseApp14();
-                        break;
-                    case JpegMarker.COM:
-                        SkipSegment();
-                        break;
-                    case JpegMarker.DQT:
-                        ParseDqt();
-                        break;
-                    case JpegMarker.DHT:
-                        ParseDht();
-                        break;
-                    case JpegMarker.DRI:
-                        ParseDri();
-                        break;
-                    case JpegMarker.SOF0:
-                    case JpegMarker.SOF2:
-                        ParseSof(marker);
-                        break;
-                    case JpegMarker.SOS:
-                        ParseSosAndDecodeScan();
-                        break;
-                    default:
-                        if (marker is >= JpegMarker.RST0 and <= JpegMarker.RST7)
-                        {
-                            ThrowHelper.ThrowInvalidData("Unexpected restart marker outside entropy-coded data.");
-                        }
-
-                        SkipSegment();
-                        break;
+                    ThrowHelper.ThrowInvalidData("Missing SOF marker.");
                 }
-            }
 
-            if (!hasFrame)
-            {
-                ThrowHelper.ThrowInvalidData("Missing SOF marker.");
-            }
-
-            for (int i = 0; i < components.Length; i++)
-            {
-                if (!components[i].HasCoefficients)
+                for (int i = 0; i < components.Length; i++)
                 {
-                    ThrowHelper.ThrowInvalidData("Missing scan data.");
+                    if (!components[i].HasCoefficients)
+                    {
+                        ThrowHelper.ThrowInvalidData("Missing scan data.");
+                    }
                 }
-            }
 
-            return ReconstructImage();
+                return ReconstructImage();
+            }
+            finally
+            {
+                iccCollector?.Dispose();
+            }
         }
 
         private void ParseApp0()
@@ -1048,75 +1092,82 @@ public static class JpegDecoder
 
         public async Task<StreamingDecodeResult> DecodeAsync(CancellationToken cancellationToken)
         {
-            await ReadMarkerExpectedAsync(JpegMarker.SOI, cancellationToken).ConfigureAwait(false);
-
-            while (true)
+            try
             {
-                JpegMarker marker = await ReadMarkerAsync(cancellationToken).ConfigureAwait(false);
-                if (marker == JpegMarker.EOI)
+                await ReadMarkerExpectedAsync(JpegMarker.SOI, cancellationToken).ConfigureAwait(false);
+
+                while (true)
                 {
-                    break;
+                    JpegMarker marker = await ReadMarkerAsync(cancellationToken).ConfigureAwait(false);
+                    if (marker == JpegMarker.EOI)
+                    {
+                        break;
+                    }
+
+                    switch (marker)
+                    {
+                        case JpegMarker.APP0:
+                            await ParseApp0Async(cancellationToken).ConfigureAwait(false);
+                            break;
+                        case JpegMarker.APP1:
+                            await ParseApp1Async(cancellationToken).ConfigureAwait(false);
+                            break;
+                        case JpegMarker.APP2:
+                            await ParseApp2Async(cancellationToken).ConfigureAwait(false);
+                            break;
+                        case JpegMarker.APP14:
+                            await ParseApp14Async(cancellationToken).ConfigureAwait(false);
+                            break;
+                        case JpegMarker.COM:
+                            await SkipSegmentAsync(cancellationToken).ConfigureAwait(false);
+                            break;
+                        case JpegMarker.DQT:
+                            await ParseDqtAsync(cancellationToken).ConfigureAwait(false);
+                            break;
+                        case JpegMarker.DHT:
+                            await ParseDhtAsync(cancellationToken).ConfigureAwait(false);
+                            break;
+                        case JpegMarker.DRI:
+                            await ParseDriAsync(cancellationToken).ConfigureAwait(false);
+                            break;
+                        case JpegMarker.SOF0:
+                        case JpegMarker.SOF2:
+                            await ParseSofAsync(marker, cancellationToken).ConfigureAwait(false);
+                            break;
+                        case JpegMarker.SOS:
+                            await ParseSosAndDecodeScanAsync(cancellationToken).ConfigureAwait(false);
+                            break;
+                        default:
+                            if (marker is >= JpegMarker.RST0 and <= JpegMarker.RST7)
+                            {
+                                ThrowHelper.ThrowInvalidData("Unexpected restart marker outside entropy-coded data.");
+                            }
+
+                            await SkipSegmentAsync(cancellationToken).ConfigureAwait(false);
+                            break;
+                    }
                 }
 
-                switch (marker)
+                if (!hasFrame)
                 {
-                    case JpegMarker.APP0:
-                        await ParseApp0Async(cancellationToken).ConfigureAwait(false);
-                        break;
-                    case JpegMarker.APP1:
-                        await ParseApp1Async(cancellationToken).ConfigureAwait(false);
-                        break;
-                    case JpegMarker.APP2:
-                        await ParseApp2Async(cancellationToken).ConfigureAwait(false);
-                        break;
-                    case JpegMarker.APP14:
-                        await ParseApp14Async(cancellationToken).ConfigureAwait(false);
-                        break;
-                    case JpegMarker.COM:
-                        await SkipSegmentAsync(cancellationToken).ConfigureAwait(false);
-                        break;
-                    case JpegMarker.DQT:
-                        await ParseDqtAsync(cancellationToken).ConfigureAwait(false);
-                        break;
-                    case JpegMarker.DHT:
-                        await ParseDhtAsync(cancellationToken).ConfigureAwait(false);
-                        break;
-                    case JpegMarker.DRI:
-                        await ParseDriAsync(cancellationToken).ConfigureAwait(false);
-                        break;
-                    case JpegMarker.SOF0:
-                    case JpegMarker.SOF2:
-                        await ParseSofAsync(marker, cancellationToken).ConfigureAwait(false);
-                        break;
-                    case JpegMarker.SOS:
-                        await ParseSosAndDecodeScanAsync(cancellationToken).ConfigureAwait(false);
-                        break;
-                    default:
-                        if (marker is >= JpegMarker.RST0 and <= JpegMarker.RST7)
-                        {
-                            ThrowHelper.ThrowInvalidData("Unexpected restart marker outside entropy-coded data.");
-                        }
-
-                        await SkipSegmentAsync(cancellationToken).ConfigureAwait(false);
-                        break;
+                    ThrowHelper.ThrowInvalidData("Missing SOF marker.");
                 }
-            }
 
-            if (!hasFrame)
-            {
-                ThrowHelper.ThrowInvalidData("Missing SOF marker.");
-            }
-
-            for (int i = 0; i < components.Length; i++)
-            {
-                if (!components[i].HasCoefficients)
+                for (int i = 0; i < components.Length; i++)
                 {
-                    ThrowHelper.ThrowInvalidData("Missing scan data.");
+                    if (!components[i].HasCoefficients)
+                    {
+                        ThrowHelper.ThrowInvalidData("Missing scan data.");
+                    }
                 }
-            }
 
-            var img = ReconstructImage();
-            return new StreamingDecodeResult(img, exifRaw, exifOrientation);
+                var img = ReconstructImage();
+                return new StreamingDecodeResult(img, exifRaw, exifOrientation);
+            }
+            finally
+            {
+                iccCollector?.Dispose();
+            }
         }
 
         private async Task ParseApp0Async(CancellationToken cancellationToken)
@@ -2574,14 +2625,18 @@ public static class JpegDecoder
         }
     }
 
-    private sealed class IccProfileCollector
+    private sealed class IccProfileCollector : IDisposable
     {
-        private readonly List<byte[]> chunks = new();
+        private readonly List<(byte[] Buffer, int Length)> chunks = new();
         public void Add(ReadOnlySpan<byte> segment)
         {
             if (segment.Length < 14) return;
             if (!segment.StartsWith("ICC_PROFILE"u8)) return;
-            chunks.Add(segment.Slice(14).ToArray());
+            int len = segment.Length - 14;
+            if (len <= 0) return;
+            byte[] chunk = ArrayPool<byte>.Shared.Rent(len);
+            segment.Slice(14).CopyTo(chunk);
+            chunks.Add((chunk, len));
         }
         public byte[]? GetProfile()
         {
@@ -2592,10 +2647,20 @@ public static class JpegDecoder
             int offset = 0;
             foreach (var chunk in chunks)
             {
-                chunk.CopyTo(profile.AsSpan(offset));
+                chunk.Buffer.AsSpan(0, chunk.Length).CopyTo(profile.AsSpan(offset));
                 offset += chunk.Length;
             }
+            Dispose();
             return profile;
+        }
+
+        public void Dispose()
+        {
+            for (int i = 0; i < chunks.Count; i++)
+            {
+                ArrayPool<byte>.Shared.Return(chunks[i].Buffer);
+            }
+            chunks.Clear();
         }
     }
 

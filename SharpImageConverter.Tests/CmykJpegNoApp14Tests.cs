@@ -13,8 +13,8 @@ public sealed class CmykJpegNoApp14Tests
         string path = Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "examples", "video-001.cmyk.jpeg");
         byte[] data = File.ReadAllBytes(path);
 
-        var img = StaticJpegDecoder.Decode(data);
-        _ = img.Rgba32;
+        var img = JpegDecoder.Decode(data);
+        _ = img.ToRgb24();
     }
 }
 
