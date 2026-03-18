@@ -27,7 +27,7 @@ jobs:
         run: dotnet restore .\SharpImageConvert.slnx
 
       - name: Test
-        run: dotnet test .\SharpImageConvert.slnx -c Release --no-build
+        run: dotnet test .\SharpImageConvert.slnx -c Release --no-restore
 
       - name: Pack
         run: dotnet pack .\src\SharpImageConverter.csproj -c Release -o .\artifacts\nuget
