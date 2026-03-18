@@ -691,19 +691,19 @@ class Program
                 long fileLength = new FileInfo(path).Length;
                 Console.WriteLine($"[stream] 开始解码: {Path.GetFileName(path)} ({fileLength} bytes)");
                 using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 20, FileOptions.SequentialScan);
-                var decoder = new JpegDecoder { UseFloatingPointIdct = useFloatIdct };
                 var sw = Stopwatch.StartNew();
-                var img = decoder.Decode(fs);
+                var jpeg = JpegDecoder.Decode(fs, useFloatIdct);
                 sw.Stop();
                 Console.WriteLine($"[stream] 解码完成: {sw.ElapsedMilliseconds} ms");
-                if (decoder.ExifOrientation != 1)
+                if (jpeg.Metadata.Orientation != 1)
                 {
-                    var frame = new ImageFrame(img.Width, img.Height, img.Buffer, img.Metadata);
-                    frame = frame.ApplyExifOrientation(decoder.ExifOrientation);
-                    img.Update(frame.Width, frame.Height, frame.Pixels);
-                    img.Metadata.Orientation = 1;
+                    var frame = new ImageFrame(jpeg.Width, jpeg.Height, jpeg.ToRgb24(), jpeg.Metadata);
+                    frame = frame.ApplyExifOrientation(jpeg.Metadata.Orientation);
+                    jpeg.Metadata.Orientation = 1;
+                    return new Image<Rgb24>(frame.Width, frame.Height, frame.Pixels, frame.Metadata);
                 }
-                return img;
+
+                return new Image<Rgb24>(jpeg.Width, jpeg.Height, jpeg.ToRgb24(), jpeg.Metadata);
             }
             catch (Exception ex)
             {
@@ -712,16 +712,15 @@ class Program
         }
         if (!useFloatIdct || !isJpeg) return Image.Load(path);
         using var fs2 = File.OpenRead(path);
-        var decoder2 = new JpegDecoder { UseFloatingPointIdct = true };
-        var img2 = decoder2.Decode(fs2);
-        if (decoder2.ExifOrientation != 1)
+        var jpeg2 = JpegDecoder.Decode(fs2, true);
+        if (jpeg2.Metadata.Orientation != 1)
         {
-            var frame = new ImageFrame(img2.Width, img2.Height, img2.Buffer, img2.Metadata);
-            frame = frame.ApplyExifOrientation(decoder2.ExifOrientation);
-            img2.Update(frame.Width, frame.Height, frame.Pixels);
-            img2.Metadata.Orientation = 1;
+            var frame = new ImageFrame(jpeg2.Width, jpeg2.Height, jpeg2.ToRgb24(), jpeg2.Metadata);
+            frame = frame.ApplyExifOrientation(jpeg2.Metadata.Orientation);
+            jpeg2.Metadata.Orientation = 1;
+            return new Image<Rgb24>(frame.Width, frame.Height, frame.Pixels, frame.Metadata);
         }
-        return img2;
+        return new Image<Rgb24>(jpeg2.Width, jpeg2.Height, jpeg2.ToRgb24(), jpeg2.Metadata);
     }
 
     static Image<Rgba32> LoadRgba32(string path, bool useFloatIdct, bool useStreamingDecoder)

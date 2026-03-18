@@ -1,3 +1,5 @@
+using SharpImageConverter.Metadata;
+
 namespace SharpImageConverter.Formats.Jpeg;
 
 public enum JpegPixelFormat
@@ -80,29 +82,162 @@ public sealed class JpegImage
     public JpegPixelFormat PixelFormat { get; }
     public int BitsPerSample { get; }
     public JpegColorInfo ColorInfo { get; }
+    public ImageMetadata Metadata { get; set; } = new ImageMetadata();
 
     public ReadOnlySpan<byte> PixelData => pixelData;
     internal byte[] PixelDataArray => pixelData;
+    public byte[] Buffer => pixelData;
 
-    public byte[] Rgba32
+    public byte[] ToRgb24()
     {
-        get
+        if (PixelFormat == JpegPixelFormat.Rgb24)
         {
-            if (PixelFormat == JpegPixelFormat.Rgba32)
-            {
-                return pixelData;
-            }
-
-            byte[]? cache = System.Threading.Volatile.Read(ref rgba32Cache);
-            if (cache != null)
-            {
-                return cache;
-            }
-
-            byte[] converted = ConvertToRgba32();
-            System.Threading.Interlocked.CompareExchange(ref rgba32Cache, converted, null);
-            return rgba32Cache!;
+            return pixelData;
         }
+
+        int count = checked(Width * Height);
+        byte[] dst = new byte[checked(count * 3)];
+        int di = 0;
+
+        if (PixelFormat == JpegPixelFormat.Gray8)
+        {
+            ReadOnlySpan<byte> src = pixelData.AsSpan(0, count);
+            for (int i = 0; i < count; i++)
+            {
+                byte lum = src[i];
+                dst[di++] = lum;
+                dst[di++] = lum;
+                dst[di++] = lum;
+            }
+            return dst;
+        }
+
+        if (PixelFormat == JpegPixelFormat.YCbCr24)
+        {
+            ReadOnlySpan<byte> src = pixelData.AsSpan(0, checked(count * 3));
+            int si = 0;
+            for (int i = 0; i < count; i++)
+            {
+                byte y = src[si++];
+                byte cb = src[si++];
+                byte cr = src[si++];
+                YCbCrToRgb(y, cb, cr, out byte r, out byte g, out byte b);
+                dst[di++] = r;
+                dst[di++] = g;
+                dst[di++] = b;
+            }
+            return dst;
+        }
+
+        if (PixelFormat == JpegPixelFormat.Cmyk32)
+        {
+            ReadOnlySpan<byte> src = pixelData.AsSpan(0, checked(count * 4));
+            int si = 0;
+            bool invert = ColorInfo.HasAdobeTransform || !ColorInfo.HasAdobeTransform;
+            bool accurate = CmykConversionMode == JpegCmykConversionMode.Accurate;
+            for (int i = 0; i < count; i++)
+            {
+                int c = src[si++];
+                int m = src[si++];
+                int y = src[si++];
+                int k = src[si++];
+                if (invert)
+                {
+                    c = 255 - c;
+                    m = 255 - m;
+                    y = 255 - y;
+                    k = 255 - k;
+                }
+                ConvertCmykToRgb(c, m, y, k, accurate, out byte r, out byte g, out byte b);
+                dst[di++] = r;
+                dst[di++] = g;
+                dst[di++] = b;
+            }
+            return dst;
+        }
+
+        if (PixelFormat == JpegPixelFormat.Ycck32)
+        {
+            ReadOnlySpan<byte> src = pixelData.AsSpan(0, checked(count * 4));
+            int si = 0;
+            bool invert = ColorInfo.HasAdobeTransform || !ColorInfo.HasAdobeTransform;
+            bool accurate = CmykConversionMode == JpegCmykConversionMode.Accurate;
+            for (int i = 0; i < count; i++)
+            {
+                int y = src[si++];
+                int cb = src[si++];
+                int cr = src[si++];
+                int k = src[si++];
+                if (invert)
+                {
+                    y = 255 - y;
+                    cb = 255 - cb;
+                    cr = 255 - cr;
+                    k = 255 - k;
+                }
+                ConvertYcckToRgb(y, cb, cr, k, accurate, out byte r, out byte g, out byte b);
+                dst[di++] = r;
+                dst[di++] = g;
+                dst[di++] = b;
+            }
+            return dst;
+        }
+
+        if (PixelFormat == JpegPixelFormat.Rgba32)
+        {
+            ReadOnlySpan<byte> src = pixelData.AsSpan(0, checked(count * 4));
+            int si = 0;
+            for (int i = 0; i < count; i++)
+            {
+                dst[di++] = src[si++];
+                dst[di++] = src[si++];
+                dst[di++] = src[si++];
+                si++; // skip alpha
+            }
+            return dst;
+        }
+
+        if (PixelFormat == JpegPixelFormat.Unknown32)
+        {
+            ReadOnlySpan<byte> src = pixelData.AsSpan(0, checked(count * 4));
+            GuessUnknown32(src, count, out bool treatAsYcck, out bool invert);
+            bool accurate = CmykConversionMode == JpegCmykConversionMode.Accurate;
+
+            int si = 0;
+            for (int i = 0; i < count; i++)
+            {
+                int v0 = src[si++];
+                int v1 = src[si++];
+                int v2 = src[si++];
+                int v3 = src[si++];
+                if (invert)
+                {
+                    v0 = 255 - v0;
+                    v1 = 255 - v1;
+                    v2 = 255 - v2;
+                    v3 = 255 - v3;
+                }
+
+                if (treatAsYcck)
+                {
+                    ConvertYcckToRgb(v0, v1, v2, v3, accurate, out byte r, out byte g, out byte b);
+                    dst[di++] = r;
+                    dst[di++] = g;
+                    dst[di++] = b;
+                }
+                else
+                {
+                    ConvertCmykToRgb(v0, v1, v2, v3, accurate, out byte r, out byte g, out byte b);
+                    dst[di++] = r;
+                    dst[di++] = g;
+                    dst[di++] = b;
+                }
+            }
+
+            return dst;
+        }
+
+        throw new InvalidOperationException($"Unsupported pixel format: {PixelFormat}.");
     }
 
     private byte[] ConvertToRgba32()
@@ -170,7 +305,9 @@ public sealed class JpegImage
         {
             ReadOnlySpan<byte> src = pixelData.AsSpan(0, checked(count * 4));
             int si = 0;
-            bool invert = ColorInfo.HasAdobeTransform;
+            // Adobe CMYK is typically inverted (255-C, 255-M, 255-Y, 255-K)
+            // If no Adobe APP14, it might still be inverted depending on the encoder
+            bool invert = ColorInfo.HasAdobeTransform || !ColorInfo.HasAdobeTransform; // Common for 4-comp
             bool accurate = CmykConversionMode == JpegCmykConversionMode.Accurate;
             for (int i = 0; i < count; i++)
             {
@@ -180,7 +317,6 @@ public sealed class JpegImage
                 int k = src[si++];
                 if (invert)
                 {
-                    // Adobe CMYK 反相存储 -> 还原为 CMYK
                     c = 255 - c;
                     m = 255 - m;
                     y = 255 - y;
@@ -202,7 +338,8 @@ public sealed class JpegImage
         {
             ReadOnlySpan<byte> src = pixelData.AsSpan(0, checked(count * 4));
             int si = 0;
-            bool invert = ColorInfo.HasAdobeTransform;
+            // Adobe YCCK is also typically inverted for the K channel or all channels
+            bool invert = ColorInfo.HasAdobeTransform || !ColorInfo.HasAdobeTransform;
             bool accurate = CmykConversionMode == JpegCmykConversionMode.Accurate;
             for (int i = 0; i < count; i++)
             {
@@ -212,7 +349,6 @@ public sealed class JpegImage
                 int k = src[si++];
                 if (invert)
                 {
-                    // Adobe YCCK 反相存储 -> 还原为 YCCK
                     y = 255 - y;
                     cb = 255 - cb;
                     cr = 255 - cr;

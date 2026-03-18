@@ -11,8 +11,8 @@ public sealed class JpegDecoderAdapter : IImageDecoder
 
     public Image<Rgb24> DecodeRgb24(Stream stream)
     {
-        var dec = new JpegDecoder();
-        return dec.Decode(stream);
+        var img = JpegDecoder.Decode(stream);
+        return new Image<Rgb24>(img.Width, img.Height, img.ToRgb24(), img.Metadata);
     }
 }
 
