@@ -266,6 +266,38 @@ internal sealed class JpegStreamInput(Stream stream, int bufferSize = 16 * 1024)
         return buffer[bufferPos++];
     }
 
+    public async ValueTask<ushort> ReadU16Async(CancellationToken cancellationToken)
+    {
+        byte b1 = await ReadByteAsync(cancellationToken).ConfigureAwait(false);
+        byte b2 = await ReadByteAsync(cancellationToken).ConfigureAwait(false);
+        return (ushort)((b1 << 8) | b2);
+    }
+
+    public async ValueTask SkipAsync(int count, CancellationToken cancellationToken)
+    {
+        while (count > 0)
+        {
+            if (bufferPos < bufferLen)
+            {
+                int available = bufferLen - bufferPos;
+                int toSkip = Math.Min(available, count);
+                bufferPos += toSkip;
+                count -= toSkip;
+            }
+            else
+            {
+                // If count is large, we could seek the stream, but JPEG streams are often not seekable.
+                // Just read and discard.
+                bufferLen = await stream.ReadAsync(buffer, cancellationToken).ConfigureAwait(false);
+                bufferPos = 0;
+                if (bufferLen == 0)
+                {
+                    ThrowHelper.ThrowInvalidData("Unexpected end of file.");
+                }
+            }
+        }
+    }
+
     public bool TryReadByteBlocking(CancellationToken cancellationToken, out byte value)
     {
         cancellationToken.ThrowIfCancellationRequested();

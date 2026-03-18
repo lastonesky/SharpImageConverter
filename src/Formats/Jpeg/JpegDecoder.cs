@@ -2,16 +2,27 @@ using SharpImageConverter.Core;
 using SharpImageConverter.Metadata;
 using System.Buffers;
 using System.Runtime.CompilerServices;
+using System.Runtime.Intrinsics;
+using System.Runtime.Intrinsics.X86;
 using System.Threading;
 using System.Threading.Tasks;
+
 namespace SharpImageConverter.Formats.Jpeg;
 
-public static class StaticJpegDecoder
+public static class JpegDecoder
 {
     public static JpegImage Decode(ReadOnlySpan<byte> data, bool useFloatingPointIdct = false)
     {
         var parser = new Parser(data, useFloatingPointIdct);
         return parser.Decode();
+    }
+
+    public static JpegImage Decode(Stream stream, bool useFloatingPointIdct = false)
+    {
+        ArgumentNullException.ThrowIfNull(stream);
+        using var ms = new MemoryStream();
+        stream.CopyTo(ms);
+        return Decode(ms.ToArray(), useFloatingPointIdct);
     }
 
     public static async Task<StreamingDecodeResult> DecodeFromStreamAsync(Stream stream, CancellationToken cancellationToken = default, bool useFloatingPointIdct = false)
@@ -46,6 +57,8 @@ public static class StaticJpegDecoder
         private bool hasAdobe;
         private byte adobeTransform;
         private IccProfileCollector? iccCollector;
+        private byte[]? exifRaw;
+        private int exifOrientation = 1;
         private readonly bool useFloatingPointIdct;
 
         public Parser(ReadOnlySpan<byte> data, bool useFloatingPointIdct)
@@ -149,7 +162,6 @@ public static class StaticJpegDecoder
                 segment[4] == 0)
             {
                 hasJfif = true;
-                return;
             }
         }
 
@@ -168,7 +180,8 @@ public static class StaticJpegDecoder
                 segment[4] == 0 &&
                 segment[5] == 0)
             {
-                return;
+                exifRaw = segment.ToArray();
+                exifOrientation = ParseExifOrientation(segment);
             }
         }
 
@@ -203,7 +216,7 @@ public static class StaticJpegDecoder
             iccCollector.Add(segment);
         }
 
-        private readonly JpegImage ReconstructImage()
+        private JpegImage ReconstructImage()
         {
             int width = frame.Width;
             int height = frame.Height;
@@ -226,6 +239,22 @@ public static class StaticJpegDecoder
 
             try
             {
+                if (colorSpace == JpegColorSpace.YCbCr && !useFloatingPointIdct && Sse2.IsSupported)
+                {
+                    output = new byte[checked(width * height * channelCount)];
+                    if (TryDecodeInterleavedYCbCrSimd(components, output, width, height, fullWidth, fullHeight, componentOrder, quantTables, useFloatingPointIdct, frame))
+                    {
+                        byte[]? iccProfileSimd = iccCollector?.GetProfile();
+                        var colorInfoSimd = new JpegColorInfo(colorSpace, hasAdobe, adobeTransform, iccProfileSimd);
+                        // SIMD path produces RGB24
+                        var jpegImg = new JpegImage(width, height, JpegPixelFormat.Rgb24, bitsPerSample, colorInfoSimd, output);
+                        jpegImg.Metadata.ExifRaw = exifRaw;
+                        jpegImg.Metadata.Orientation = exifOrientation;
+                        jpegImg.Metadata.IccProfile = iccProfileSimd;
+                        return jpegImg;
+                    }
+                }
+
                 for (int i = 0; i < components.Length; i++)
                 {
                     ComponentState c = components[i];
@@ -259,7 +288,11 @@ public static class StaticJpegDecoder
 
             byte[]? iccProfile = iccCollector?.GetProfile();
             var colorInfo = new JpegColorInfo(colorSpace, hasAdobe, adobeTransform, iccProfile);
-            return new JpegImage(width, height, pixelFormat, bitsPerSample, colorInfo, output);
+            var result = new JpegImage(width, height, pixelFormat, bitsPerSample, colorInfo, output);
+            result.Metadata.ExifRaw = exifRaw;
+            result.Metadata.Orientation = exifOrientation;
+            result.Metadata.IccProfile = iccProfile;
+            return result;
         }
 
         private void ParseSosAndDecodeScan()
@@ -358,11 +391,6 @@ public static class StaticJpegDecoder
             offset = entropyStart + reader.BytesConsumed;
         }
 
-        /// <summary>
-        /// 解码一次扫描（Scan），处理熵编码数据、重启标记以及渐进 JPEG 的 EOB 运行。
-        /// </summary>
-        /// <param name="scan">扫描头，包含参与的分量及 SS/SE/Ah/Al 参数</param>
-        /// <param name="reader">位流读取器，封装了 JPEG 字节填充与标记处理</param>
         private void DecodeScan(in ScanHeader scan, ref JpegBitReader reader)
         {
             bool interleaved = scan.Components.Length > 1;
@@ -551,7 +579,7 @@ public static class StaticJpegDecoder
             }
         }
 
-        private readonly void DecodeProgressiveBlock(ref JpegBitReader reader, ComponentState comp, Span<short> block, int ss, int se, int ah, int al, ref int eobRun)
+        private void DecodeProgressiveBlock(ref JpegBitReader reader, ComponentState comp, Span<short> block, int ss, int se, int ah, int al, ref int eobRun)
         {
             ReadOnlySpan<byte> zigzag = JpegConstants.ZigZag;
 
@@ -736,11 +764,6 @@ public static class StaticJpegDecoder
             return null!;
         }
 
-        /// <summary>
-        /// 解析 SOF 帧头（SOF0 基线 / SOF2 渐进），并初始化帧尺寸、
-        /// 采样因子、MCU 网格以及各分量的块几何信息。
-        /// </summary>
-        /// <param name="marker">SOF 标记类型（决定是否为渐进 JPEG）</param>
         private void ParseSof(JpegMarker marker)
         {
             ReadOnlySpan<byte> segment = ReadSegment(out _, out int segmentLength);
@@ -914,34 +937,6 @@ public static class StaticJpegDecoder
             _ = ReadSegment(out _, out _);
         }
 
-        private ReadOnlySpan<byte> ReadSegment(out int segmentStart, out int segmentLength)
-        {
-            if (offset + 2 > data.Length)
-            {
-                ThrowHelper.ThrowInvalidData("Unexpected end of file.");
-            }
-
-            ushort length = ReadU16(data.Slice(offset, 2));
-            offset += 2;
-
-            if (length < 2)
-            {
-                ThrowHelper.ThrowInvalidData("Invalid segment length.");
-            }
-
-            segmentStart = offset;
-            segmentLength = length - 2;
-
-            if (offset + segmentLength > data.Length)
-            {
-                ThrowHelper.ThrowInvalidData("Truncated segment.");
-            }
-
-            ReadOnlySpan<byte> seg = data.Slice(offset, segmentLength);
-            offset += segmentLength;
-            return seg;
-        }
-
         private void ReadMarkerExpected(JpegMarker expected)
         {
             JpegMarker m = ReadMarker();
@@ -984,325 +979,35 @@ public static class StaticJpegDecoder
             return (JpegMarker)marker;
         }
 
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private ReadOnlySpan<byte> ReadSegment(out int segmentStart, out int segmentLength)
+        {
+            if (offset + 2 > data.Length)
+            {
+                ThrowHelper.ThrowInvalidData("Unexpected end of file.");
+            }
+
+            ushort length = ReadU16(data.Slice(offset, 2));
+            offset += 2;
+
+            if (length < 2)
+            {
+                ThrowHelper.ThrowInvalidData("Invalid segment length.");
+            }
+
+            segmentStart = offset;
+            segmentLength = length - 2;
+
+            if (offset + segmentLength > data.Length)
+            {
+                ThrowHelper.ThrowInvalidData("Truncated segment.");
+            }
+
+            ReadOnlySpan<byte> seg = data.Slice(offset, segmentLength);
+            offset += segmentLength;
+            return seg;
+        }
+
         private static ushort ReadU16(ReadOnlySpan<byte> s) => (ushort)((s[0] << 8) | s[1]);
-    }
-
-    private static JpegColorSpace DetermineColorSpace(ComponentState[] components, bool hasJfif, bool hasAdobe, byte adobeTransform)
-    {
-        int componentCount = components.Length;
-        if (componentCount == 1)
-        {
-            return JpegColorSpace.Gray;
-        }
-
-        if (componentCount == 3)
-        {
-            if (hasAdobe)
-            {
-                if (adobeTransform == 0)
-                {
-                    return JpegColorSpace.Rgb;
-                }
-
-                if (adobeTransform == 1)
-                {
-                    return JpegColorSpace.YCbCr;
-                }
-            }
-
-            if (HasComponentIds(components, [(byte)'R', (byte)'G', (byte)'B']))
-            {
-                return JpegColorSpace.Rgb;
-            }
-
-            if (hasJfif || HasComponentIds(components, [1, 2, 3]))
-            {
-                return JpegColorSpace.YCbCr;
-            }
-
-            return JpegColorSpace.YCbCr;
-        }
-
-        if (componentCount == 4)
-        {
-            if (hasAdobe)
-            {
-                if (adobeTransform == 0)
-                {
-                    return JpegColorSpace.Cmyk;
-                }
-
-                if (adobeTransform == 2)
-                {
-                    return JpegColorSpace.Ycck;
-                }
-            }
-
-            if (HasComponentIds(components, [(byte)'C', (byte)'M', (byte)'Y', (byte)'K']))
-            {
-                return JpegColorSpace.Cmyk;
-            }
-
-            return JpegColorSpace.Unknown4;
-        }
-
-        ThrowHelper.ThrowNotSupported("Unsupported number of components.");
-        return JpegColorSpace.Unknown4;
-    }
-
-    private static JpegPixelFormat PixelFormatFromColorSpace(JpegColorSpace colorSpace)
-    {
-        return colorSpace switch
-        {
-            JpegColorSpace.Gray => JpegPixelFormat.Gray8,
-            JpegColorSpace.Rgb => JpegPixelFormat.Rgb24,
-            JpegColorSpace.YCbCr => JpegPixelFormat.YCbCr24,
-            JpegColorSpace.Cmyk => JpegPixelFormat.Cmyk32,
-            JpegColorSpace.Ycck => JpegPixelFormat.Ycck32,
-            JpegColorSpace.Unknown4 => JpegPixelFormat.Unknown32,
-            _ => throw new ArgumentOutOfRangeException(nameof(colorSpace))
-        };
-    }
-
-    private static int[] BuildComponentOrder(ComponentState[] components, JpegColorSpace colorSpace)
-    {
-        return colorSpace switch
-        {
-            JpegColorSpace.Gray => BuildComponentOrder(components, [1]),
-            JpegColorSpace.Rgb => BuildComponentOrderWithFallback(components, [1, 2, 3], [(byte)'R', (byte)'G', (byte)'B']),
-            JpegColorSpace.YCbCr => BuildComponentOrder(components, [1, 2, 3]),
-            JpegColorSpace.Cmyk => BuildComponentOrderWithFallback(components, [1, 2, 3, 4], [(byte)'C', (byte)'M', (byte)'Y', (byte)'K']),
-            JpegColorSpace.Ycck => BuildComponentOrder(components, [1, 2, 3, 4]),
-            JpegColorSpace.Unknown4 => BuildSequentialOrder(components.Length),
-            _ => BuildSequentialOrder(components.Length)
-        };
-    }
-
-    private static int[] BuildComponentOrder(ComponentState[] components, ReadOnlySpan<byte> expectedIds)
-    {
-        int[] order = new int[expectedIds.Length];
-        for (int i = 0; i < expectedIds.Length; i++)
-        {
-            int index = FindComponentIndex(components, expectedIds[i]);
-            if (index < 0)
-            {
-                return BuildSequentialOrder(components.Length);
-            }
-
-            order[i] = index;
-        }
-
-        return order;
-    }
-
-    private static int[] BuildSequentialOrder(int count)
-    {
-        int[] order = new int[count];
-        for (int i = 0; i < count; i++)
-        {
-            order[i] = i;
-        }
-
-        return order;
-    }
-
-    private static int[] BuildComponentOrderWithFallback(ComponentState[] components, ReadOnlySpan<byte> expectedIds, ReadOnlySpan<byte> fallbackIds)
-    {
-        int[] order = BuildComponentOrder(components, expectedIds);
-        if (order.Length == expectedIds.Length && !IsSequential(order))
-        {
-            return order;
-        }
-
-        int[] fallback = BuildComponentOrder(components, fallbackIds);
-        if (fallback.Length == fallbackIds.Length && !IsSequential(fallback))
-        {
-            return fallback;
-        }
-
-        return order;
-    }
-
-    private static bool IsSequential(ReadOnlySpan<int> order)
-    {
-        for (int i = 0; i < order.Length; i++)
-        {
-            if (order[i] != i)
-            {
-                return false;
-            }
-        }
-
-        return true;
-    }
-
-    private static int FindComponentIndex(ComponentState[] components, byte id)
-    {
-        for (int i = 0; i < components.Length; i++)
-        {
-            if (components[i].Id == id)
-            {
-                return i;
-            }
-        }
-
-        return -1;
-    }
-
-    private static bool HasComponentIds(ComponentState[] components, ReadOnlySpan<byte> expectedIds)
-    {
-        if (components.Length != expectedIds.Length)
-        {
-            return false;
-        }
-
-        for (int i = 0; i < expectedIds.Length; i++)
-        {
-            if (FindComponentIndex(components, expectedIds[i]) < 0)
-            {
-                return false;
-            }
-        }
-
-        return true;
-    }
-
-    private static void InterleaveComponents(
-        byte[][] planes,
-        int[] planeStrides,
-        int[] planeWidths,
-        int[] planeHeights,
-        int fullWidth,
-        int fullHeight,
-        int width,
-        int height,
-        int[] componentOrder,
-        byte[] output)
-    {
-        int channels = componentOrder.Length;
-        int outStride = width * channels;
-
-        bool directSample = true;
-        for (int c = 0; c < channels; c++)
-        {
-            int planeIndex = componentOrder[c];
-            if (planeWidths[planeIndex] != fullWidth || planeHeights[planeIndex] != fullHeight)
-            {
-                directSample = false;
-                break;
-            }
-        }
-
-        if (directSample)
-        {
-            for (int y = 0; y < height; y++)
-            {
-                int rowOut = y * outStride;
-                for (int c = 0; c < channels; c++)
-                {
-                    int planeIndex = componentOrder[c];
-                    int srcRow = y * planeStrides[planeIndex];
-                    byte[] plane = planes[planeIndex];
-                    int outIndex = rowOut + c;
-                    for (int x = 0; x < width; x++)
-                    {
-                        output[outIndex] = plane[srcRow + x];
-                        outIndex += channels;
-                    }
-                }
-            }
-
-            return;
-        }
-
-        int mapLength = width * channels;
-        int[] x0Map = ArrayPool<int>.Shared.Rent(mapLength);
-        int[] x1Map = ArrayPool<int>.Shared.Rent(mapLength);
-        byte[] xWeightMap = ArrayPool<byte>.Shared.Rent(mapLength);
-        try
-        {
-            for (int c = 0; c < channels; c++)
-            {
-                int planeIndex = componentOrder[c];
-                int planeW = planeWidths[planeIndex];
-                int baseIndex = c * width;
-                for (int x = 0; x < width; x++)
-                {
-                    ComputeLinearSample(x, width, planeW, fullWidth, out int sx0, out int sx1, out byte xWeight);
-                    x0Map[baseIndex + x] = sx0;
-                    x1Map[baseIndex + x] = sx1;
-                    xWeightMap[baseIndex + x] = xWeight;
-                }
-            }
-
-            for (int y = 0; y < height; y++)
-            {
-                int rowOut = y * outStride;
-                for (int c = 0; c < channels; c++)
-                {
-                    int planeIndex = componentOrder[c];
-                    int planeH = planeHeights[planeIndex];
-                    ComputeLinearSample(y, height, planeH, fullHeight, out int sy0, out int sy1, out byte yWeight);
-                    int srcRow0 = sy0 * planeStrides[planeIndex];
-                    int srcRow1 = sy1 * planeStrides[planeIndex];
-                    byte[] plane = planes[planeIndex];
-                    int mapBase = c * width;
-                    int outIndex = rowOut + c;
-                    for (int x = 0; x < width; x++)
-                    {
-                        int mapIndex = mapBase + x;
-                        int sx0 = x0Map[mapIndex];
-                        int sx1 = x1Map[mapIndex];
-                        int wx = xWeightMap[mapIndex];
-                        int top = ((plane[srcRow0 + sx0] * (256 - wx)) + (plane[srcRow0 + sx1] * wx) + 128) >> 8;
-                        int bottom = ((plane[srcRow1 + sx0] * (256 - wx)) + (plane[srcRow1 + sx1] * wx) + 128) >> 8;
-                        int value = ((top * (256 - yWeight)) + (bottom * yWeight) + 128) >> 8;
-                        output[outIndex] = (byte)value;
-                        outIndex += channels;
-                    }
-                }
-            }
-        }
-        finally
-        {
-            ArrayPool<int>.Shared.Return(x0Map);
-            ArrayPool<int>.Shared.Return(x1Map);
-            ArrayPool<byte>.Shared.Return(xWeightMap);
-        }
-    }
-
-    private static void ComputeLinearSample(int dstIndex, int dstLength, int srcLength, int fullLength, out int index0, out int index1, out byte weight1)
-    {
-        if (srcLength <= 1 || fullLength <= 0 || dstLength <= 1)
-        {
-            index0 = 0;
-            index1 = 0;
-            weight1 = 0;
-            return;
-        }
-
-        float srcPos = (((dstIndex + 0.5f) * srcLength) / fullLength) - 0.5f;
-        int i0 = (int)MathF.Floor(srcPos);
-        float frac = srcPos - i0;
-
-        if (i0 < 0)
-        {
-            i0 = 0;
-            frac = 0f;
-        }
-        else if (i0 >= srcLength - 1)
-        {
-            i0 = srcLength - 1;
-            frac = 0f;
-        }
-
-        index0 = i0;
-        index1 = i0 < srcLength - 1 ? i0 + 1 : i0;
-        int w = (int)(frac * 256f + 0.5f);
-        if (w < 0) w = 0;
-        if (w > 255) w = 255;
-        weight1 = (byte)w;
     }
 
     private sealed class StreamingParser
@@ -1319,7 +1024,7 @@ public static class StaticJpegDecoder
         private bool hasFrame;
         private bool isProgressive;
         private ushort restartInterval;
-        private ComponentState[] components = [];
+        private ComponentState[] components = Array.Empty<ComponentState>();
         private int queuedMarker = -1;
         private byte[]? exifRaw;
         private int exifOrientation = 1;
@@ -1462,7 +1167,7 @@ public static class StaticJpegDecoder
                     exifRaw ??= span.ToArray();
                     if (exifOrientation == 1)
                     {
-                        int orientation = ParseExifOrientation(span.Slice(6));
+                        int orientation = ParseExifOrientation(span);
                         if (orientation >= 1 && orientation <= 8)
                         {
                             exifOrientation = orientation;
@@ -1545,6 +1250,22 @@ public static class StaticJpegDecoder
 
             try
             {
+                if (colorSpace == JpegColorSpace.YCbCr && !useFloatingPointIdct && Sse2.IsSupported)
+                {
+                    output = new byte[checked(width * height * channelCount)];
+                    if (TryDecodeInterleavedYCbCrSimd(components, output, width, height, fullWidth, fullHeight, componentOrder, quantTables, useFloatingPointIdct, frame))
+                    {
+                        byte[]? iccProfileSimd = iccCollector?.GetProfile();
+                        var colorInfoSimd = new JpegColorInfo(colorSpace, hasAdobe, adobeTransform, iccProfileSimd);
+                        // SIMD path produces RGB24
+                        var jpegImg = new JpegImage(width, height, JpegPixelFormat.Rgb24, bitsPerSample, colorInfoSimd, output);
+                        jpegImg.Metadata.ExifRaw = exifRaw;
+                        jpegImg.Metadata.Orientation = exifOrientation;
+                        jpegImg.Metadata.IccProfile = iccProfileSimd;
+                        return jpegImg;
+                    }
+                }
+
                 for (int i = 0; i < components.Length; i++)
                 {
                     ComponentState c = components[i];
@@ -1578,7 +1299,11 @@ public static class StaticJpegDecoder
 
             byte[]? iccProfile = iccCollector?.GetProfile();
             var colorInfo = new JpegColorInfo(colorSpace, hasAdobe, adobeTransform, iccProfile);
-            return new JpegImage(width, height, pixelFormat, bitsPerSample, colorInfo, output);
+            var result = new JpegImage(width, height, pixelFormat, bitsPerSample, colorInfo, output);
+            result.Metadata.ExifRaw = exifRaw;
+            result.Metadata.Orientation = exifOrientation;
+            result.Metadata.IccProfile = iccProfile;
+            return result;
         }
 
         private async Task ParseSosAndDecodeScanAsync(CancellationToken cancellationToken)
@@ -2053,226 +1778,32 @@ public static class StaticJpegDecoder
             return null!;
         }
 
-        private async Task ParseSofAsync(JpegMarker marker, CancellationToken cancellationToken)
+        private async Task<JpegMarker> ReadMarkerAsync(CancellationToken cancellationToken)
         {
-            SegmentBuffer segment = await ReadSegmentAsync(cancellationToken).ConfigureAwait(false);
-            try
+            if (queuedMarker >= 0)
             {
-                if (segment.Length < 6)
-                {
-                    ThrowHelper.ThrowInvalidData("Invalid SOF length.");
-                }
-
-                ReadOnlySpan<byte> span = segment.Span;
-                byte precision = span[0];
-                if (precision != 8)
-                {
-                    ThrowHelper.ThrowNotSupported("Only 8-bit JPEG is supported.");
-                }
-
-                ushort height = ReadU16(span.Slice(1));
-                ushort width = ReadU16(span.Slice(3));
-                byte count = span[5];
-                if (count <= 0 || count > 4)
-                {
-                    ThrowHelper.ThrowInvalidData("Invalid component count.");
-                }
-
-                if (segment.Length < 6 + (3 * count))
-                {
-                    ThrowHelper.ThrowInvalidData("Invalid SOF length.");
-                }
-
-                var comps = new ComponentState[count];
-                int p = 6;
-                int maxH = 0;
-                int maxV = 0;
-                Span<byte> seenComponentIds = stackalloc byte[256];
-                for (int i = 0; i < count; i++)
-                {
-                    byte id = span[p++];
-                    byte hv = span[p++];
-                    byte tq = span[p++];
-                    int h = hv >> 4;
-                    int v = hv & 0x0F;
-                    if (h <= 0 || v <= 0 || h > 4 || v > 4)
-                    {
-                        ThrowHelper.ThrowInvalidData("Invalid sampling factor.");
-                    }
-
-                    if (tq >= 4)
-                    {
-                        ThrowHelper.ThrowInvalidData("Invalid quant table id.");
-                    }
-
-                    if (seenComponentIds[id] != 0)
-                    {
-                        ThrowHelper.ThrowInvalidData("Duplicated component id in SOF.");
-                    }
-
-                    seenComponentIds[id] = 1;
-
-                    if (h > maxH) maxH = h;
-                    if (v > maxV) maxV = v;
-
-                    comps[i] = new ComponentState(id, (byte)h, (byte)v, tq);
-                }
-
-                int mcuX = (width + (8 * maxH) - 1) / (8 * maxH);
-                int mcuY = (height + (8 * maxV) - 1) / (8 * maxV);
-
-                for (int i = 0; i < comps.Length; i++)
-                {
-                    comps[i].SetGeometry(mcuX, mcuY);
-                }
-
-                frame = new FrameHeader(width, height, precision, maxH, maxV, mcuX, mcuY);
-                hasFrame = true;
-                isProgressive = marker == JpegMarker.SOF2;
-                components = comps;
+                byte m = (byte)queuedMarker;
+                queuedMarker = -1;
+                return (JpegMarker)m;
             }
-            finally
-            {
-                segment.Dispose();
-            }
-        }
 
-        private async Task ParseDqtAsync(CancellationToken cancellationToken)
-        {
-            SegmentBuffer segment = await ReadSegmentAsync(cancellationToken).ConfigureAwait(false);
-            try
+            while (true)
             {
-                ReadOnlySpan<byte> span = segment.Span;
-                int p = 0;
-                ReadOnlySpan<byte> zigzag = JpegConstants.ZigZag;
-
-                while (p < segment.Length)
+                byte b = await input.ReadByteAsync(cancellationToken).ConfigureAwait(false);
+                if (b == 0xFF)
                 {
-                    byte pqTq = span[p++];
-                    int pq = pqTq >> 4;
-                    int tq = pqTq & 0x0F;
-                    if (tq >= 4)
-                    {
-                        ThrowHelper.ThrowInvalidData("Invalid DQT table id.");
-                    }
-
-                    if (pq == 0)
-                    {
-                        if (p + 64 > segment.Length) ThrowHelper.ThrowInvalidData("Invalid DQT length.");
-                        for (int i = 0; i < 64; i++)
-                        {
-                            quantTables[tq].Table[zigzag[i]] = span[p++];
-                        }
-
-                        quantTableDefined[tq] = true;
-                    }
-                    else if (pq == 1)
-                    {
-                        if (p + 128 > segment.Length) ThrowHelper.ThrowInvalidData("Invalid DQT length.");
-                        for (int i = 0; i < 64; i++)
-                        {
-                            quantTables[tq].Table[zigzag[i]] = ReadU16(span[(p + (i * 2))..]);
-                        }
-
-                        p += 128;
-                        quantTableDefined[tq] = true;
-                    }
-                    else
-                    {
-                        ThrowHelper.ThrowInvalidData("Invalid DQT precision.");
-                    }
+                    break;
                 }
             }
-            finally
-            {
-                segment.Dispose();
-            }
-        }
 
-        private async Task ParseDhtAsync(CancellationToken cancellationToken)
-        {
-            SegmentBuffer segment = await ReadSegmentAsync(cancellationToken).ConfigureAwait(false);
-            try
+            while (true)
             {
-                ReadOnlySpan<byte> span = segment.Span;
-                int p = 0;
-
-                while (p < segment.Length)
+                byte b = await input.ReadByteAsync(cancellationToken).ConfigureAwait(false);
+                if (b != 0xFF)
                 {
-                    byte tcTh = span[p++];
-                    int tc = tcTh >> 4;
-                    int th = tcTh & 0x0F;
-                    if (th >= 4) ThrowHelper.ThrowInvalidData("Invalid DHT table id.");
-                    if (tc is not (0 or 1)) ThrowHelper.ThrowInvalidData("Invalid DHT class.");
-
-                    if (p + 16 > segment.Length) ThrowHelper.ThrowInvalidData("Invalid DHT length.");
-                    ReadOnlySpan<byte> bits = span.Slice(p, 16);
-                    p += 16;
-
-                    int total = 0;
-                    for (int i = 0; i < 16; i++) total += bits[i];
-                    if (p + total > segment.Length) ThrowHelper.ThrowInvalidData("Invalid DHT length.");
-                    ReadOnlySpan<byte> values = span.Slice(p, total);
-                    p += total;
-
-                    if (tc == 0)
-                    {
-                        dcTables[th].Build(bits, values);
-                        dcTableDefined[th] = true;
-                    }
-                    else
-                    {
-                        acTables[th].Build(bits, values);
-                        acTableDefined[th] = true;
-                    }
+                    return (JpegMarker)b;
                 }
             }
-            finally
-            {
-                segment.Dispose();
-            }
-        }
-
-        private async Task ParseDriAsync(CancellationToken cancellationToken)
-        {
-            SegmentBuffer segment = await ReadSegmentAsync(cancellationToken).ConfigureAwait(false);
-            try
-            {
-                if (segment.Length != 2)
-                {
-                    ThrowHelper.ThrowInvalidData("Invalid DRI length.");
-                }
-
-                restartInterval = ReadU16(segment.Span);
-            }
-            finally
-            {
-                segment.Dispose();
-            }
-        }
-
-        private async Task SkipSegmentAsync(CancellationToken cancellationToken)
-        {
-            SegmentBuffer segment = await ReadSegmentAsync(cancellationToken).ConfigureAwait(false);
-            segment.Dispose();
-        }
-
-        private async Task<SegmentBuffer> ReadSegmentAsync(CancellationToken cancellationToken)
-        {
-            ushort length = await ReadU16Async(cancellationToken).ConfigureAwait(false);
-            if (length < 2)
-            {
-                ThrowHelper.ThrowInvalidData("Invalid segment length.");
-            }
-
-            int segmentLength = length - 2;
-            byte[] buffer = ArrayPool<byte>.Shared.Rent(segmentLength);
-            if (segmentLength > 0)
-            {
-                await input.ReadExactAsync(buffer.AsMemory(0, segmentLength), cancellationToken).ConfigureAwait(false);
-            }
-
-            return new SegmentBuffer(buffer, segmentLength);
         }
 
         private async Task ReadMarkerExpectedAsync(JpegMarker expected, CancellationToken cancellationToken)
@@ -2284,230 +1815,700 @@ public static class StaticJpegDecoder
             }
         }
 
-        private async Task<JpegMarker> ReadMarkerAsync(CancellationToken cancellationToken)
+        private async Task<SegmentBuffer> ReadSegmentAsync(CancellationToken cancellationToken)
         {
-            if (queuedMarker >= 0)
+            ushort length = await input.ReadU16Async(cancellationToken).ConfigureAwait(false);
+            if (length < 2)
             {
-                byte m = (byte)queuedMarker;
-                queuedMarker = -1;
-                return (JpegMarker)m;
+                ThrowHelper.ThrowInvalidData("Invalid segment length.");
             }
 
-            byte b;
-            do
-            {
-                b = await input.ReadByteAsync(cancellationToken).ConfigureAwait(false);
-            } while (b != 0xFF);
-
-            do
-            {
-                b = await input.ReadByteAsync(cancellationToken).ConfigureAwait(false);
-            } while (b == 0xFF);
-
-            return (JpegMarker)b;
+            int contentLen = length - 2;
+            byte[] buffer = ArrayPool<byte>.Shared.Rent(contentLen);
+            await input.ReadExactAsync(buffer.AsMemory(0, contentLen), cancellationToken).ConfigureAwait(false);
+            return new SegmentBuffer(buffer, contentLen);
         }
 
-        private async Task<ushort> ReadU16Async(CancellationToken cancellationToken)
+        private async Task SkipAsync(int count, CancellationToken cancellationToken)
         {
-            byte hi = await input.ReadByteAsync(cancellationToken).ConfigureAwait(false);
-            byte lo = await input.ReadByteAsync(cancellationToken).ConfigureAwait(false);
-            return (ushort)((hi << 8) | lo);
+            await input.SkipAsync(count, cancellationToken).ConfigureAwait(false);
         }
 
-        private static ushort ReadU16(ReadOnlySpan<byte> s) => (ushort)((s[0] << 8) | s[1]);
-
-        private static int ParseExifOrientation(ReadOnlySpan<byte> tiff)
+        private async Task ParseDqtAsync(CancellationToken cancellationToken)
         {
-            if (tiff.Length < 8) return 1;
-            bool little = tiff[0] == 0x49 && tiff[1] == 0x49;
-            bool big = tiff[0] == 0x4D && tiff[1] == 0x4D;
-            if (!little && !big) return 1;
+            using SegmentBuffer segment = await ReadSegmentAsync(cancellationToken).ConfigureAwait(false);
+            int p = 0;
+            ReadOnlySpan<byte> zigzag = JpegConstants.ZigZag;
 
-            if (ReadU16(tiff, little, 2) != 42) return 1;
-            uint ifd0 = ReadU32(tiff, little, 4);
-            if (ifd0 + 2 > tiff.Length) return 1;
+            while (p < segment.Length)
+            {
+                byte pqTq = segment.Span[p++];
+                int pq = pqTq >> 4;
+                int tq = pqTq & 0x0F;
+                if (tq >= 4)
+                {
+                    ThrowHelper.ThrowInvalidData("Invalid DQT table id.");
+                }
 
-            int offset = (int)ifd0;
-            ushort count = ReadU16(tiff, little, offset);
-            offset += 2;
+                if (pq == 0)
+                {
+                    if (p + 64 > segment.Length) ThrowHelper.ThrowInvalidData("Invalid DQT length.");
+                    for (int i = 0; i < 64; i++)
+                    {
+                        quantTables[tq].Table[zigzag[i]] = segment.Span[p++];
+                    }
+
+                    quantTableDefined[tq] = true;
+                }
+                else if (pq == 1)
+                {
+                    if (p + 128 > segment.Length) ThrowHelper.ThrowInvalidData("Invalid DQT length.");
+                    for (int i = 0; i < 64; i++)
+                    {
+                        quantTables[tq].Table[zigzag[i]] = (ushort)((segment.Span[p + (i * 2)] << 8) | segment.Span[p + (i * 2) + 1]);
+                    }
+
+                    p += 128;
+                    quantTableDefined[tq] = true;
+                }
+                else
+                {
+                    ThrowHelper.ThrowInvalidData("Invalid DQT precision.");
+                }
+            }
+        }
+
+        private async Task ParseDhtAsync(CancellationToken cancellationToken)
+        {
+            using SegmentBuffer segment = await ReadSegmentAsync(cancellationToken).ConfigureAwait(false);
+            int p = 0;
+
+            while (p < segment.Length)
+            {
+                byte tcTh = segment.Span[p++];
+                int tc = tcTh >> 4;
+                int th = tcTh & 0x0F;
+                if (th >= 4) ThrowHelper.ThrowInvalidData("Invalid DHT table id.");
+                if (tc is not (0 or 1)) ThrowHelper.ThrowInvalidData("Invalid DHT class.");
+
+                if (p + 16 > segment.Length) ThrowHelper.ThrowInvalidData("Invalid DHT length.");
+                ReadOnlySpan<byte> bits = segment.Span.Slice(p, 16);
+                p += 16;
+
+                int total = 0;
+                for (int i = 0; i < 16; i++) total += bits[i];
+                if (p + total > segment.Length) ThrowHelper.ThrowInvalidData("Invalid DHT length.");
+                ReadOnlySpan<byte> values = segment.Span.Slice(p, total);
+                p += total;
+
+                if (tc == 0)
+                {
+                    dcTables[th].Build(bits, values);
+                    dcTableDefined[th] = true;
+                }
+                else
+                {
+                    acTables[th].Build(bits, values);
+                    acTableDefined[th] = true;
+                }
+            }
+        }
+
+        private async Task ParseDriAsync(CancellationToken cancellationToken)
+        {
+            using SegmentBuffer segment = await ReadSegmentAsync(cancellationToken).ConfigureAwait(false);
+            if (segment.Length != 2)
+            {
+                ThrowHelper.ThrowInvalidData("Invalid DRI length.");
+            }
+
+            restartInterval = (ushort)((segment.Span[0] << 8) | segment.Span[1]);
+        }
+
+        private async Task ParseSofAsync(JpegMarker marker, CancellationToken cancellationToken)
+        {
+            using SegmentBuffer segment = await ReadSegmentAsync(cancellationToken).ConfigureAwait(false);
+            ReadOnlySpan<byte> span = segment.Span;
+
+            if (segment.Length < 6)
+            {
+                ThrowHelper.ThrowInvalidData("Invalid SOF length.");
+            }
+
+            byte precision = span[0];
+            if (precision != 8)
+            {
+                ThrowHelper.ThrowNotSupported("Only 8-bit JPEG is supported.");
+            }
+
+            ushort height = (ushort)((span[1] << 8) | span[2]);
+            ushort width = (ushort)((span[3] << 8) | span[4]);
+            byte count = span[5];
+            if (count <= 0 || count > 4)
+            {
+                ThrowHelper.ThrowInvalidData("Invalid component count.");
+            }
+
+            if (segment.Length < 6 + (3 * count))
+            {
+                ThrowHelper.ThrowInvalidData("Invalid SOF length.");
+            }
+
+            var comps = new ComponentState[count];
+            int p = 6;
+            int maxH = 0;
+            int maxV = 0;
+            Span<byte> seenComponentIds = stackalloc byte[256];
             for (int i = 0; i < count; i++)
             {
-                int entry = offset + (i * 12);
-                if (entry + 12 > tiff.Length) break;
-                ushort tag = ReadU16(tiff, little, entry);
-                if (tag != 0x0112) continue;
-                ushort type = ReadU16(tiff, little, entry + 2);
-                uint num = ReadU32(tiff, little, entry + 4);
-                if (num != 1) return 1;
-                if (type == 3)
+                byte id = span[p++];
+                byte hv = span[p++];
+                byte tq = span[p++];
+                int h = hv >> 4;
+                int v = hv & 0x0F;
+                if (h <= 0 || v <= 0 || h > 4 || v > 4)
                 {
-                    ushort val = ReadU16(tiff, little, entry + 8);
-                    return val;
+                    ThrowHelper.ThrowInvalidData("Invalid sampling factor.");
                 }
-                if (type == 4)
+
+                if (tq >= 4)
                 {
-                    uint val = ReadU32(tiff, little, entry + 8);
-                    return (int)val;
+                    ThrowHelper.ThrowInvalidData("Invalid quant table id.");
                 }
-                return 1;
+
+                if (seenComponentIds[id] != 0)
+                {
+                    ThrowHelper.ThrowInvalidData("Duplicated component id in SOF.");
+                }
+
+                seenComponentIds[id] = 1;
+
+                if (h > maxH) maxH = h;
+                if (v > maxV) maxV = v;
+
+                comps[i] = new ComponentState(id, (byte)h, (byte)v, tq);
             }
 
-            return 1;
-        }
+            int mcuX = (width + (8 * maxH) - 1) / (8 * maxH);
+            int mcuY = (height + (8 * maxV) - 1) / (8 * maxV);
 
-        private static ushort ReadU16(ReadOnlySpan<byte> tiff, bool little, int offset)
-        {
-            if (offset + 2 > tiff.Length) return 0;
-            return little
-                ? (ushort)(tiff[offset] | (tiff[offset + 1] << 8))
-                : (ushort)((tiff[offset] << 8) | tiff[offset + 1]);
-        }
-
-        private static uint ReadU32(ReadOnlySpan<byte> tiff, bool little, int offset)
-        {
-            if (offset + 4 > tiff.Length) return 0;
-            return little
-                ? (uint)(tiff[offset] | (tiff[offset + 1] << 8) | (tiff[offset + 2] << 16) | (tiff[offset + 3] << 24))
-                : (uint)((tiff[offset] << 24) | (tiff[offset + 1] << 16) | (tiff[offset + 2] << 8) | tiff[offset + 3]);
-        }
-
-        private readonly struct SegmentBuffer(byte[] buffer, int length) : IDisposable
-        {
-            private readonly byte[] buffer = buffer;
-            public readonly int Length = length;
-
-            public ReadOnlySpan<byte> Span => buffer.AsSpan(0, Length);
-
-            public void Dispose()
+            for (int i = 0; i < comps.Length; i++)
             {
-                ArrayPool<byte>.Shared.Return(buffer);
+                comps[i].SetGeometry(mcuX, mcuY);
             }
+
+            frame = new FrameHeader(width, height, precision, maxH, maxV, mcuX, mcuY);
+            hasFrame = true;
+            isProgressive = marker == JpegMarker.SOF2;
+            components = comps;
+        }
+
+        private async Task SkipSegmentAsync(CancellationToken cancellationToken)
+        {
+            ushort length = await input.ReadU16Async(cancellationToken).ConfigureAwait(false);
+            if (length < 2)
+            {
+                ThrowHelper.ThrowInvalidData("Invalid segment length.");
+            }
+
+            await input.SkipAsync(length - 2, cancellationToken).ConfigureAwait(false);
         }
     }
 
-    private readonly record struct FrameHeader(int Width, int Height, byte Precision, int MaxH, int MaxV, int McuX, int McuY);
+    private static bool TryDecodeInterleavedYCbCrSimd(ComponentState[] components, byte[] output, int width, int height, int fullWidth, int fullHeight, int[] componentOrder, QuantizationTable[] quantTables, bool useFloatingPointIdct, FrameHeader frame)
+    {
+        if (!Sse2.IsSupported || useFloatingPointIdct) return false;
+        if (componentOrder.Length != 3) return false;
+        int yIdx = componentOrder[0];
+        int cbIdx = componentOrder[1];
+        int crIdx = componentOrder[2];
+
+        ComponentState yComp = components[yIdx];
+        ComponentState cbComp = components[cbIdx];
+        ComponentState crComp = components[crIdx];
+
+        bool is444 = yComp.H == 1 && yComp.V == 1 && cbComp.H == 1 && cbComp.V == 1 && crComp.H == 1 && crComp.V == 1;
+        bool is420 = yComp.H == 2 && yComp.V == 2 && cbComp.H == 1 && cbComp.V == 1 && crComp.H == 1 && crComp.V == 1;
+
+        if (!is444 && !is420) return false;
+
+        int mcuX = frame.McuX;
+        int mcuY = frame.McuY;
+        ushort[] yQuant = quantTables[yComp.QuantTableId].Table;
+        ushort[] cbQuant = quantTables[cbComp.QuantTableId].Table;
+        ushort[] crQuant = quantTables[crComp.QuantTableId].Table;
+
+        for (int my = 0; my < mcuY; my++)
+        {
+            for (int mx = 0; mx < mcuX; mx++)
+            {
+                if (is444)
+                {
+                    DecodeMcu444Simd(mx, my, yComp, cbComp, crComp, yQuant, cbQuant, crQuant, output, width, height);
+                }
+                else if (is420)
+                {
+                    DecodeMcu420Simd(mx, my, yComp, cbComp, crComp, yQuant, cbQuant, crQuant, output, width, height);
+                }
+            }
+        }
+
+        return true;
+    }
+
+    private static void DecodeMcu444Simd(int mx, int my, ComponentState yComp, ComponentState cbComp, ComponentState crComp,
+        ushort[] yQuant, ushort[] cbQuant, ushort[] crQuant, byte[] output, int width, int height)
+    {
+        int px = mx * 8;
+        int py = my * 8;
+        if (px >= width || py >= height) return;
+
+        ReadOnlySpan<short> yBlock = yComp.GetBlockSpan(my * yComp.BlocksX + mx);
+        ReadOnlySpan<short> cbBlock = cbComp.GetBlockSpan(my * cbComp.BlocksX + mx);
+        ReadOnlySpan<short> crBlock = crComp.GetBlockSpan(my * crComp.BlocksX + mx);
+
+        int stride = width * 3;
+        if (px + 8 <= width && py + 8 <= height)
+        {
+            SimdJpegPipeline.TransformAndConvertYCbCr8x8(yBlock, yQuant, cbBlock, cbQuant, crBlock, crQuant, output.AsSpan(py * stride + px * 3), stride);
+        }
+    }
+
+    private static void DecodeMcu420Simd(int mx, int my, ComponentState yComp, ComponentState cbComp, ComponentState crComp,
+        ushort[] yQuant, ushort[] cbQuant, ushort[] crQuant, byte[] output, int width, int height)
+    {
+        int px = mx * 16;
+        int py = my * 16;
+        if (px >= width || py >= height) return;
+
+        int blocksX = yComp.BlocksX;
+        ReadOnlySpan<short> y0 = yComp.GetBlockSpan((my * 2 + 0) * blocksX + (mx * 2 + 0));
+        ReadOnlySpan<short> y1 = yComp.GetBlockSpan((my * 2 + 0) * blocksX + (mx * 2 + 1));
+        ReadOnlySpan<short> y2 = yComp.GetBlockSpan((my * 2 + 1) * blocksX + (mx * 2 + 0));
+        ReadOnlySpan<short> y3 = yComp.GetBlockSpan((my * 2 + 1) * blocksX + (mx * 2 + 1));
+        ReadOnlySpan<short> cb = cbComp.GetBlockSpan(my * cbComp.BlocksX + mx);
+        ReadOnlySpan<short> cr = crComp.GetBlockSpan(my * crComp.BlocksX + mx);
+
+        int stride = width * 3;
+        if (px + 16 <= width && py + 16 <= height)
+        {
+            SimdJpegPipeline.TransformAndConvertYCbCr420(y0, y1, y2, y3, yQuant, cb, cbQuant, cr, crQuant, output.AsSpan(py * stride + px * 3), stride);
+        }
+    }
+
+    private static JpegColorSpace DetermineColorSpace(ComponentState[] components, bool hasJfif, bool hasAdobe, byte adobeTransform)
+    {
+        int componentCount = components.Length;
+        if (componentCount == 1)
+        {
+            return JpegColorSpace.Gray;
+        }
+
+        if (componentCount == 3)
+        {
+            if (hasAdobe)
+            {
+                if (adobeTransform == 0)
+                {
+                    return JpegColorSpace.Rgb;
+                }
+
+                if (adobeTransform == 1)
+                {
+                    return JpegColorSpace.YCbCr;
+                }
+            }
+
+            if (HasComponentIds(components, [(byte)'R', (byte)'G', (byte)'B']))
+            {
+                return JpegColorSpace.Rgb;
+            }
+
+            if (hasJfif || HasComponentIds(components, [1, 2, 3]))
+            {
+                return JpegColorSpace.YCbCr;
+            }
+
+            return JpegColorSpace.YCbCr;
+        }
+
+        if (componentCount == 4)
+        {
+            if (hasAdobe)
+            {
+                if (adobeTransform == 0)
+                {
+                    return JpegColorSpace.Cmyk;
+                }
+
+                if (adobeTransform == 2)
+                {
+                    return JpegColorSpace.Ycck;
+                }
+            }
+
+            if (HasComponentIds(components, [(byte)'C', (byte)'M', (byte)'Y', (byte)'K']))
+            {
+                return JpegColorSpace.Cmyk;
+            }
+
+            if (HasComponentIds(components, [1, 2, 3, 4]))
+            {
+                // Default 4-component is often YCbCrK (YCCK) in many JPEG libraries if no Adobe APP14
+                return JpegColorSpace.Ycck;
+            }
+
+            return JpegColorSpace.Unknown4;
+        }
+
+        return JpegColorSpace.Unknown4;
+    }
+
+    private static JpegPixelFormat PixelFormatFromColorSpace(JpegColorSpace colorSpace)
+    {
+        return colorSpace switch
+        {
+            JpegColorSpace.Gray => JpegPixelFormat.Gray8,
+            JpegColorSpace.Rgb => JpegPixelFormat.Rgb24,
+            JpegColorSpace.YCbCr => JpegPixelFormat.YCbCr24,
+            JpegColorSpace.Cmyk => JpegPixelFormat.Cmyk32,
+            JpegColorSpace.Ycck => JpegPixelFormat.Ycck32,
+            JpegColorSpace.Unknown4 => JpegPixelFormat.Unknown32,
+            _ => throw new ArgumentOutOfRangeException(nameof(colorSpace))
+        };
+    }
+
+    private static int[] BuildComponentOrder(ComponentState[] components, JpegColorSpace colorSpace)
+    {
+        return colorSpace switch
+        {
+            JpegColorSpace.Gray => BuildComponentOrder(components, [1]),
+            JpegColorSpace.Rgb => BuildComponentOrderWithFallback(components, [1, 2, 3], [(byte)'R', (byte)'G', (byte)'B']),
+            JpegColorSpace.YCbCr => BuildComponentOrder(components, [1, 2, 3]),
+            JpegColorSpace.Cmyk => BuildComponentOrderWithFallback(components, [1, 2, 3, 4], [(byte)'C', (byte)'M', (byte)'Y', (byte)'K']),
+            JpegColorSpace.Ycck => BuildComponentOrder(components, [1, 2, 3, 4]),
+            JpegColorSpace.Unknown4 => BuildSequentialOrder(components.Length),
+            _ => BuildSequentialOrder(components.Length)
+        };
+    }
+
+    private static int[] BuildComponentOrder(ComponentState[] components, ReadOnlySpan<byte> expectedIds)
+    {
+        int[] order = new int[expectedIds.Length];
+        for (int i = 0; i < expectedIds.Length; i++)
+        {
+            int index = FindComponentIndex(components, expectedIds[i]);
+            if (index < 0)
+            {
+                return BuildSequentialOrder(components.Length);
+            }
+
+            order[i] = index;
+        }
+
+        return order;
+    }
+
+    private static int[] BuildSequentialOrder(int count)
+    {
+        int[] order = new int[count];
+        for (int i = 0; i < count; i++)
+        {
+            order[i] = i;
+        }
+
+        return order;
+    }
+
+    private static int[] BuildComponentOrderWithFallback(ComponentState[] components, ReadOnlySpan<byte> expectedIds, ReadOnlySpan<byte> fallbackIds)
+    {
+        int[] order = BuildComponentOrder(components, expectedIds);
+        if (order.Length == expectedIds.Length)
+        {
+            return order;
+        }
+
+        int[] fallback = BuildComponentOrder(components, fallbackIds);
+        if (fallback.Length == fallbackIds.Length)
+        {
+            return fallback;
+        }
+
+        return order;
+    }
+
+    private static bool IsSequential(ReadOnlySpan<int> order)
+    {
+        for (int i = 0; i < order.Length; i++)
+        {
+            if (order[i] != i)
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private static int FindComponentIndex(ComponentState[] components, byte id)
+    {
+        for (int i = 0; i < components.Length; i++)
+        {
+            if (components[i].Id == id)
+            {
+                return i;
+            }
+        }
+
+        return -1;
+    }
+
+    private static bool HasComponentIds(ComponentState[] components, ReadOnlySpan<byte> expectedIds)
+    {
+        if (components.Length != expectedIds.Length)
+        {
+            return false;
+        }
+
+        for (int i = 0; i < expectedIds.Length; i++)
+        {
+            if (FindComponentIndex(components, expectedIds[i]) < 0)
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private static void InterleaveComponents(
+        byte[][] planes,
+        int[] planeStrides,
+        int[] planeWidths,
+        int[] planeHeights,
+        int fullWidth,
+        int fullHeight,
+        int width,
+        int height,
+        int[] componentOrder,
+        byte[] output)
+    {
+        int channels = componentOrder.Length;
+        int outStride = width * channels;
+
+        bool directSample = true;
+        for (int c = 0; c < channels; c++)
+        {
+            int planeIndex = componentOrder[c];
+            if (planeWidths[planeIndex] != fullWidth || planeHeights[planeIndex] != fullHeight)
+            {
+                directSample = false;
+                break;
+            }
+        }
+
+        if (directSample)
+        {
+            for (int y = 0; y < height; y++)
+            {
+                int rowOut = y * outStride;
+                for (int c = 0; c < channels; c++)
+                {
+                    int planeIndex = componentOrder[c];
+                    int srcRow = y * planeStrides[planeIndex];
+                    byte[] plane = planes[planeIndex];
+                    int outIndex = rowOut + c;
+                    for (int x = 0; x < width; x++)
+                    {
+                        output[outIndex] = plane[srcRow + x];
+                        outIndex += channels;
+                    }
+                }
+            }
+
+            return;
+        }
+
+        int mapLength = width * channels;
+        int[] x0Map = ArrayPool<int>.Shared.Rent(mapLength);
+        int[] x1Map = ArrayPool<int>.Shared.Rent(mapLength);
+        byte[] xWeightMap = ArrayPool<byte>.Shared.Rent(mapLength);
+        try
+        {
+            for (int c = 0; c < channels; c++)
+            {
+                int planeIndex = componentOrder[c];
+                int planeW = planeWidths[planeIndex];
+                int baseIndex = c * width;
+                for (int x = 0; x < width; x++)
+                {
+                    ComputeLinearSample(x, width, planeW, fullWidth, out int sx0, out int sx1, out byte xWeight);
+                    x0Map[baseIndex + x] = sx0;
+                    x1Map[baseIndex + x] = sx1;
+                    xWeightMap[baseIndex + x] = xWeight;
+                }
+            }
+
+            for (int y = 0; y < height; y++)
+            {
+                int rowOut = y * outStride;
+                for (int c = 0; c < channels; c++)
+                {
+                    int planeIndex = componentOrder[c];
+                    int planeH = planeHeights[planeIndex];
+                    ComputeLinearSample(y, height, planeH, fullHeight, out int sy0, out int sy1, out byte yWeight);
+                    int srcRow0 = sy0 * planeStrides[planeIndex];
+                    int srcRow1 = sy1 * planeStrides[planeIndex];
+                    byte[] plane = planes[planeIndex];
+                    int mapBase = c * width;
+                    int outIndex = rowOut + c;
+                    for (int x = 0; x < width; x++)
+                    {
+                        int mapIndex = mapBase + x;
+                        int sx0 = x0Map[mapIndex];
+                        int sx1 = x1Map[mapIndex];
+                        int wx = xWeightMap[mapIndex];
+                        int top = ((plane[srcRow0 + sx0] * (256 - wx)) + (plane[srcRow0 + sx1] * wx) + 128) >> 8;
+                        int bottom = ((plane[srcRow1 + sx0] * (256 - wx)) + (plane[srcRow1 + sx1] * wx) + 128) >> 8;
+                        int value = ((top * (256 - yWeight)) + (bottom * yWeight) + 128) >> 8;
+                        output[outIndex] = (byte)value;
+                        outIndex += channels;
+                    }
+                }
+            }
+        }
+        finally
+        {
+            ArrayPool<int>.Shared.Return(x0Map);
+            ArrayPool<int>.Shared.Return(x1Map);
+            ArrayPool<byte>.Shared.Return(xWeightMap);
+        }
+    }
+
+    private static void ComputeLinearSample(int dstIndex, int dstLength, int srcLength, int fullLength, out int index0, out int index1, out byte weight1)
+    {
+        if (srcLength <= 1 || fullLength <= 0 || dstLength <= 1)
+        {
+            index0 = 0;
+            index1 = 0;
+            weight1 = 0;
+            return;
+        }
+
+        float srcPos = (((dstIndex + 0.5f) * srcLength) / fullLength) - 0.5f;
+        int i0 = (int)MathF.Floor(srcPos);
+        float frac = srcPos - i0;
+
+        if (i0 < 0)
+        {
+            i0 = 0;
+            frac = 0f;
+        }
+        else if (i0 >= srcLength - 1)
+        {
+            i0 = srcLength - 1;
+            frac = 0f;
+        }
+
+        index0 = i0;
+        index1 = i0 < srcLength - 1 ? i0 + 1 : i0;
+        int w = (int)(frac * 256f + 0.5f);
+        if (w < 0) w = 0;
+        if (w > 255) w = 255;
+        weight1 = (byte)w;
+    }
+
+    private static void ComputeLinearSample(int index, int length, int fullLength, out int i0, out int i1, out byte w)
+    {
+        float srcPos = ((index + 0.5f) * fullLength) / length - 0.5f;
+        i0 = (int)MathF.Floor(srcPos);
+        float frac = srcPos - i0;
+        if (i0 < 0) { i0 = 0; frac = 0; }
+        if (i0 >= fullLength - 1) { i0 = fullLength - 1; frac = 0; }
+        i1 = (i0 < fullLength - 1) ? i0 + 1 : i0;
+        w = (byte)(frac * 256 + 0.5f);
+    }
+
+    private static int ParseExifOrientation(ReadOnlySpan<byte> data)
+    {
+        if (data.Length < 14) return 1;
+        if (data[0] != (byte)'E' || data[1] != (byte)'x' || data[2] != (byte)'i' || data[3] != (byte)'f' || data[4] != 0 || data[5] != 0)
+            return 1;
+
+        int tiffBase = 6;
+        bool littleEndian;
+        if (data[tiffBase + 0] == (byte)'I' && data[tiffBase + 1] == (byte)'I') littleEndian = true;
+        else if (data[tiffBase + 0] == (byte)'M' && data[tiffBase + 1] == (byte)'M') littleEndian = false;
+        else return 1;
+
+        if (ReadU16(data, tiffBase + 2, littleEndian) != 42) return 1;
+        uint ifdOffset = ReadU32(data, tiffBase + 4, littleEndian);
+        if (ifdOffset == 0) return 1;
+
+        int p = tiffBase + (int)ifdOffset;
+        ushort entryCount = ReadU16(data, p, littleEndian);
+        p += 2;
+
+        for (int i = 0; i < entryCount; i++)
+        {
+            ushort tag = ReadU16(data, p, littleEndian);
+            if (tag == 0x0112) // Orientation
+            {
+                ushort type = ReadU16(data, p + 2, littleEndian);
+                uint count = ReadU32(data, p + 4, littleEndian);
+                if (type == 3 && count == 1) // SHORT
+                {
+                    return ReadU16(data, p + 8, littleEndian);
+                }
+            }
+
+            p += 12;
+        }
+
+        return 1;
+
+        static ushort ReadU16(ReadOnlySpan<byte> s, int offset, bool le)
+        {
+            if (offset < 0 || offset + 2 > s.Length) return 0;
+            return le ? (ushort)(s[offset] | (s[offset + 1] << 8)) : (ushort)((s[offset] << 8) | s[offset + 1]);
+        }
+
+        static uint ReadU32(ReadOnlySpan<byte> s, int offset, bool le)
+        {
+            if (offset < 0 || offset + 4 > s.Length) return 0;
+            return le
+                ? (uint)(s[offset] | (s[offset + 1] << 8) | (s[offset + 2] << 16) | (s[offset + 3] << 24))
+                : (uint)((s[offset] << 24) | (s[offset + 1] << 16) | (s[offset + 2] << 8) | s[offset + 3]);
+        }
+    }
 
     private sealed class QuantizationTable
     {
         public ushort[] Table { get; } = new ushort[64];
     }
 
-    private readonly record struct ScanHeader(ScanComponent[] Components, byte Ss, byte Se, byte Ah, byte Al);
+    private readonly record struct FrameHeader(int Width, int Height, int Precision, int MaxH, int MaxV, int McuX, int McuY);
 
-    private sealed class IccProfileCollector
+    private sealed class ComponentState
     {
-        private int totalChunkCount;
-        private byte[][]? chunks;
-        private int collectedCount;
-
-        public void Add(ReadOnlySpan<byte> segment)
-        {
-            if (segment.Length < 14)
-            {
-                return;
-            }
-
-            if (segment[0] != (byte)'I' ||
-                segment[1] != (byte)'C' ||
-                segment[2] != (byte)'C' ||
-                segment[3] != (byte)'_' ||
-                segment[4] != (byte)'P' ||
-                segment[5] != (byte)'R' ||
-                segment[6] != (byte)'O' ||
-                segment[7] != (byte)'F' ||
-                segment[8] != (byte)'I' ||
-                segment[9] != (byte)'L' ||
-                segment[10] != (byte)'E' ||
-                segment[11] != 0)
-            {
-                return;
-            }
-
-            int sequenceNo = segment[12];
-            int count = segment[13];
-            if (sequenceNo <= 0 || count <= 0 || sequenceNo > count)
-            {
-                return;
-            }
-
-            if (totalChunkCount == 0)
-            {
-                totalChunkCount = count;
-                chunks = new byte[count][];
-            }
-            else if (totalChunkCount != count || chunks is null)
-            {
-                return;
-            }
-
-            int idx = sequenceNo - 1;
-            if (chunks[idx] != null)
-            {
-                return;
-            }
-
-            byte[] payload = segment[14..].ToArray();
-            chunks[idx] = payload;
-            collectedCount++;
-        }
-
-        public byte[]? GetProfile()
-        {
-            if (totalChunkCount == 0 || chunks is null || collectedCount != totalChunkCount)
-            {
-                return null;
-            }
-
-            int totalLength = 0;
-            for (int i = 0; i < chunks.Length; i++)
-            {
-                byte[]? chunk = chunks[i];
-                if (chunk is null)
-                {
-                    return null;
-                }
-
-                totalLength += chunk.Length;
-            }
-
-            byte[] profile = new byte[totalLength];
-            int offset = 0;
-            for (int i = 0; i < chunks.Length; i++)
-            {
-                byte[] chunk = chunks[i]!;
-                Buffer.BlockCopy(chunk, 0, profile, offset, chunk.Length);
-                offset += chunk.Length;
-            }
-
-            return profile;
-        }
-    }
-
-    private readonly record struct ScanComponent(byte ComponentId, byte DcTableId, byte AcTableId);
-
-    private sealed class ComponentState(byte id, byte h, byte v, byte quantTableId)
-    {
-        private short[]? coefficientBuffer;
-        private int coefficientLength;
-
-        public byte Id { get; } = id;
-        public byte H { get; } = h;
-        public byte V { get; } = v;
-        public byte QuantTableId { get; } = quantTableId;
-
-        public byte DcTableId { get; private set; }
-        public byte AcTableId { get; private set; }
-        public int DcPredictor { get; set; }
-
+        public byte Id { get; }
+        public byte H { get; }
+        public byte V { get; }
+        public byte QuantTableId { get; }
         public int BlocksX { get; private set; }
         public int BlocksY { get; private set; }
-
+        public short[]? Coefficients { get; private set; }
         public bool HasCoefficients { get; set; }
+        public int DcPredictor { get; set; }
+        public byte DcTableId { get; private set; }
+        public byte AcTableId { get; private set; }
 
-        public void AssignTables(byte dcId, byte acId)
+        public ComponentState(byte id, byte h, byte v, byte quantTableId)
         {
-            DcTableId = dcId;
-            AcTableId = acId;
+            Id = id;
+            H = h;
+            V = v;
+            QuantTableId = quantTableId;
         }
 
         public void SetGeometry(int mcuX, int mcuY)
@@ -2516,354 +2517,97 @@ public static class StaticJpegDecoder
             BlocksY = mcuY * V;
         }
 
+        public void EnsureCoefficientBuffer(bool isProgressive)
+        {
+            if (Coefficients == null)
+            {
+                Coefficients = new short[BlocksX * BlocksY * 64];
+            }
+        }
+
+        public void AssignTables(byte dc, byte ac)
+        {
+            DcTableId = dc;
+            AcTableId = ac;
+        }
+
         public void ResetPredictors()
         {
             DcPredictor = 0;
         }
 
-        public void EnsureCoefficientBuffer(bool clear)
-        {
-            int blocks = BlocksX * BlocksY;
-            coefficientLength = blocks * 64;
-            coefficientBuffer = ArrayPool<short>.Shared.Rent(coefficientLength);
-            if (clear)
-            {
-                Array.Clear(coefficientBuffer, 0, coefficientLength);
-            }
-        }
-
         public Span<short> GetBlockSpan(int blockIndex)
         {
-            if (coefficientBuffer is null)
-            {
-                ThrowHelper.ThrowInvalidData("Coefficient buffer not allocated.");
-            }
-
-            int start = blockIndex * 64;
-            return coefficientBuffer.AsSpan(start, 64);
+            return Coefficients.AsSpan(blockIndex * 64, 64);
         }
 
-        /// <summary>
-        /// 将当前分量的频域系数通过 IDCT 与反量化还原为空间域像素块，
-        /// 并写入目标平面缓冲区，随后归还系数缓冲。
-        /// </summary>
-        /// <param name="plane">输出平面缓冲区</param>
-        /// <param name="planeWidth">平面宽度（像素）</param>
-        /// <param name="planeHeight">平面高度（像素）</param>
-        /// <param name="stride">平面行跨度（字节）</param>
-        /// <param name="quant">对应的量化表</param>
-        public void DecodeSpatial(Span<byte> plane, int planeWidth, int planeHeight, int stride, ushort[] quant, bool useFloatingPointIdct)
+        public void DecodeSpatial(Span<byte> output, int width, int height, int stride, ushort[] quantTable, bool useFloatingPointIdct)
         {
-            if (coefficientBuffer is null)
-            {
-                ThrowHelper.ThrowInvalidData("Missing coefficients.");
-            }
+            if (Coefficients == null) return;
 
-            short[] buffer = coefficientBuffer!;
-            int blocksX = BlocksX;
-            int blocksY = BlocksY;
-            try
+            for (int by = 0; by < BlocksY; by++)
             {
-                for (int by = 0; by < blocksY; by++)
+                int basePy = by * 8;
+                if (basePy >= height) break;
+
+                for (int bx = 0; bx < BlocksX; bx++)
                 {
-                    int py = by * 8;
-                    if (py >= planeHeight) break;
+                    int basePx = bx * 8;
+                    if (basePx >= width) break;
 
-                    for (int bx = 0; bx < blocksX; bx++)
+                    int blockIdx = by * BlocksX + bx;
+                    Span<short> block = GetBlockSpan(blockIdx);
+
+                    int rowOffset = basePy * stride;
+                    Span<byte> dest = output.Slice(rowOffset + basePx);
+
+                    if (useFloatingPointIdct)
                     {
-                        int px = bx * 8;
-                        if (px >= planeWidth) break;
-
-                        Span<byte> dest = plane[((py * stride) + px)..];
-                        ReadOnlySpan<short> block = buffer.AsSpan(((by * blocksX) + bx) * 64, 64);
-                        if (useFloatingPointIdct)
-                        {
-                            FloatingPointIDCT.Transform(block, quant, dest, stride);
-                        }
-                        else
-                        {
-                            FastIDCT.Transform(block, quant, dest, stride);
-                        }
+                        FloatingPointIDCT.Transform(block, quantTable, dest, stride);
+                    }
+                    else
+                    {
+                        FastIDCT.Transform(block, quantTable, dest, stride);
                     }
                 }
             }
-            finally
-            {
-                ArrayPool<short>.Shared.Return(buffer);
-                coefficientBuffer = null;
-                coefficientLength = 0;
-            }
         }
     }
-}
 
-public sealed class JpegDecoder
-{
-    public int Width { get; private set; }
-    public int Height { get; private set; }
-    public int ExifOrientation { get; private set; } = 1;
-    public bool UseFloatingPointIdct { get; set; }
-    public Image<Rgb24> Decode(Stream stream)
+    private sealed class IccProfileCollector
     {
-        ArgumentNullException.ThrowIfNull(stream);
-
-        return DecodeAsync(stream, CancellationToken.None).GetAwaiter().GetResult();
-    }
-
-    public async Task<Image<Rgb24>> DecodeAsync(Stream stream, CancellationToken cancellationToken = default)
-    {
-        ArgumentNullException.ThrowIfNull(stream);
-        var result = await StaticJpegDecoder.DecodeFromStreamAsync(stream, cancellationToken, UseFloatingPointIdct).ConfigureAwait(false);
-        return BuildImageFromJpeg(result.Image, result.ExifOrientation, result.ExifRaw);
-    }
-
-    public Image<Rgb24> Decode(ReadOnlySpan<byte> data)
-    {
-        int orientation = TryReadExifOrientation(data, out var exifRaw);
-        var img = StaticJpegDecoder.Decode(data, UseFloatingPointIdct);
-        return BuildImageFromJpeg(img, orientation, exifRaw);
-    }
-
-    private Image<Rgb24> BuildImageFromJpeg(JpegImage img, int orientation, byte[]? exifRaw)
-    {
-        var metadata = new ImageMetadata();
-        ExifOrientation = orientation;
-        if (exifRaw != null) metadata.ExifRaw = exifRaw;
-        metadata.Orientation = ExifOrientation;
-
-        Width = img.Width;
-        Height = img.Height;
-
-        byte[] rgb;
-        if (img.PixelFormat == JpegPixelFormat.Rgb24)
+        private readonly List<byte[]> chunks = new();
+        public void Add(ReadOnlySpan<byte> segment)
         {
-            if (ExifOrientation != 1)
-            {
-                var t = ApplyExifOrientation(img.PixelDataArray, Width, Height, ExifOrientation);
-                rgb = t.pixels;
-                Width = t.width;
-                Height = t.height;
-                ExifOrientation = 1;
-                metadata.Orientation = 1;
-            }
-            else
-            {
-                rgb = img.PixelDataArray;
-            }
+            if (segment.Length < 14) return;
+            if (!segment.StartsWith("ICC_PROFILE"u8)) return;
+            chunks.Add(segment.Slice(14).ToArray());
         }
-        else
+        public byte[]? GetProfile()
         {
-            rgb = img.PixelFormat switch
+            if (chunks.Count == 0) return null;
+            int totalLen = 0;
+            foreach (var chunk in chunks) totalLen += chunk.Length;
+            byte[] profile = new byte[totalLen];
+            int offset = 0;
+            foreach (var chunk in chunks)
             {
-                JpegPixelFormat.Gray8 => ExpandGray(img.PixelData, Width, Height),
-                JpegPixelFormat.Rgba32 => DropAlpha(img.PixelData, Width, Height),
-                JpegPixelFormat.YCbCr24 => DropAlpha(img.Rgba32, Width, Height),
-                JpegPixelFormat.Cmyk32 => DropAlpha(img.Rgba32, Width, Height),
-                JpegPixelFormat.Ycck32 => DropAlpha(img.Rgba32, Width, Height),
-                JpegPixelFormat.Unknown32 => DropAlpha(img.Rgba32, Width, Height),
-                _ => throw new InvalidOperationException("Unsupported pixel format.")
-            };
-            if (ExifOrientation != 1)
-            {
-                var t = ApplyExifOrientation(rgb, Width, Height, ExifOrientation);
-                rgb = t.pixels;
-                Width = t.width;
-                Height = t.height;
-                ExifOrientation = 1;
-                metadata.Orientation = 1;
+                chunk.CopyTo(profile.AsSpan(offset));
+                offset += chunk.Length;
             }
+            return profile;
         }
-        return new Image<Rgb24>(Width, Height, rgb, metadata);
-    }
-    private static (byte[] pixels, int width, int height) ApplyExifOrientation(byte[] src, int width, int height, int orientation)
-    {
-        int newW;
-        int newH;
-        switch (orientation)
-        {
-            case 1:
-                return (src, width, height);
-            case 2:
-            case 3:
-            case 4:
-                newW = width; newH = height; break;
-            case 5:
-            case 6:
-            case 7:
-            case 8:
-                newW = height; newH = width; break;
-            default:
-                return (src, width, height);
-        }
-
-        byte[] dst = new byte[newW * newH * 3];
-        for (int y = 0; y < height; y++)
-        {
-            for (int x = 0; x < width; x++)
-            {
-                int dx, dy;
-                switch (orientation)
-                {
-                    case 2:
-                        dx = (width - 1 - x); dy = y; break;
-                    case 3:
-                        dx = (width - 1 - x); dy = (height - 1 - y); break;
-                    case 4:
-                        dx = x; dy = (height - 1 - y); break;
-                    case 5:
-                        dx = y; dy = x; break;
-                    case 6:
-                        dx = (height - 1 - y); dy = x; break;
-                    case 7:
-                        dx = (height - 1 - y); dy = (width - 1 - x); break;
-                    case 8:
-                        dx = y; dy = (width - 1 - x); break;
-                    default:
-                        dx = x; dy = y; break;
-                }
-                int srcIdx = (y * width + x) * 3;
-                int dstIdx = (dy * newW + dx) * 3;
-                dst[dstIdx + 0] = src[srcIdx + 0];
-                dst[dstIdx + 1] = src[srcIdx + 1];
-                dst[dstIdx + 2] = src[srcIdx + 2];
-            }
-        }
-        return (dst, newW, newH);
-    }
-    private static byte[] ExpandGray(ReadOnlySpan<byte> src, int width, int height)
-    {
-        int count = checked(width * height);
-        var dst = new byte[checked(count * 3)];
-        for (int i = 0; i < count; i++)
-        {
-            byte v = src[i];
-            int o = i * 3;
-            dst[o + 0] = v;
-            dst[o + 1] = v;
-            dst[o + 2] = v;
-        }
-        return dst;
     }
 
-    private static byte[] DropAlpha(ReadOnlySpan<byte> src, int width, int height)
+    private readonly record struct ScanHeader(ScanComponent[] Components, byte Ss, byte Se, byte Ah, byte Al);
+    private readonly record struct ScanComponent(byte ComponentId, byte DcTableId, byte AcTableId);
+
+    private sealed class SegmentBuffer : IDisposable
     {
-        int count = checked(width * height);
-        var dst = new byte[checked(count * 3)];
-        int si = 0;
-        for (int i = 0; i < count; i++)
-        {
-            int o = i * 3;
-            dst[o + 0] = src[si + 0];
-            dst[o + 1] = src[si + 1];
-            dst[o + 2] = src[si + 2];
-            si += 4;
-        }
-        return dst;
-    }
-
-    private static int TryReadExifOrientation(ReadOnlySpan<byte> data, out byte[]? exifRaw)
-    {
-        exifRaw = null;
-        int i = 0;
-        while (i + 3 < data.Length)
-        {
-            if (data[i] != 0xFF)
-            {
-                i++;
-                continue;
-            }
-
-            int marker = data[i + 1];
-            i += 2;
-
-            if (marker == 0xD8 || marker == 0x01)
-            {
-                continue;
-            }
-
-            if (marker == 0xD9 || marker == 0xDA)
-            {
-                break;
-            }
-
-            if (i + 2 > data.Length) break;
-            int length = (data[i] << 8) | data[i + 1];
-            if (length < 2 || i + length > data.Length) break;
-
-            if (marker == 0xE1 && length >= 8)
-            {
-                var segment = data.Slice(i + 2, length - 2);
-                if (segment.Length >= 6 &&
-                    segment[0] == (byte)'E' &&
-                    segment[1] == (byte)'x' &&
-                    segment[2] == (byte)'i' &&
-                    segment[3] == (byte)'f' &&
-                    segment[4] == 0 &&
-                    segment[5] == 0)
-                {
-                    exifRaw = segment.ToArray();
-                    int orientation = ParseExifOrientation(segment.Slice(6));
-                    if (orientation >= 1 && orientation <= 8) return orientation;
-                }
-            }
-
-            i += length;
-        }
-        return 1;
-    }
-
-    private static int ParseExifOrientation(ReadOnlySpan<byte> tiff)
-    {
-        if (tiff.Length < 8) return 1;
-        bool little = tiff[0] == 0x49 && tiff[1] == 0x49;
-        bool big = tiff[0] == 0x4D && tiff[1] == 0x4D;
-        if (!little && !big) return 1;
-
-        if (ReadU16(tiff, little, 2) != 42) return 1;
-        uint ifd0 = ReadU32(tiff, little, 4);
-        if (ifd0 + 2 > tiff.Length) return 1;
-
-        int offset = (int)ifd0;
-        ushort count = ReadU16(tiff, little, offset);
-        offset += 2;
-        for (int i = 0; i < count; i++)
-        {
-            int entry = offset + (i * 12);
-            if (entry + 12 > tiff.Length) break;
-            ushort tag = ReadU16(tiff, little, entry);
-            if (tag != 0x0112) continue;
-            ushort type = ReadU16(tiff, little, entry + 2);
-            uint num = ReadU32(tiff, little, entry + 4);
-            if (num != 1) return 1;
-            if (type == 3)
-            {
-                ushort val = ReadU16(tiff, little, entry + 8);
-                return val;
-            }
-            if (type == 4)
-            {
-                uint val = ReadU32(tiff, little, entry + 8);
-                return (int)val;
-            }
-            return 1;
-        }
-
-        return 1;
-    }
-
-    private static ushort ReadU16(ReadOnlySpan<byte> tiff, bool little, int offset)
-    {
-        if (offset + 2 > tiff.Length) return 0;
-        return little
-            ? (ushort)(tiff[offset] | (tiff[offset + 1] << 8))
-            : (ushort)((tiff[offset] << 8) | tiff[offset + 1]);
-    }
-
-    private static uint ReadU32(ReadOnlySpan<byte> tiff, bool little, int offset)
-    {
-        if (offset + 4 > tiff.Length) return 0;
-        return little
-            ? (uint)(tiff[offset] | (tiff[offset + 1] << 8) | (tiff[offset + 2] << 16) | (tiff[offset + 3] << 24))
-            : (uint)((tiff[offset] << 24) | (tiff[offset + 1] << 16) | (tiff[offset + 2] << 8) | tiff[offset + 3]);
+        private readonly byte[] buffer;
+        public int Length { get; }
+        public ReadOnlySpan<byte> Span => buffer.AsSpan(0, Length);
+        public SegmentBuffer(byte[] buffer, int length) { this.buffer = buffer; Length = length; }
+        public void Dispose() => ArrayPool<byte>.Shared.Return(buffer);
     }
 }

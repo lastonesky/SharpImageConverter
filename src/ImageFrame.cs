@@ -250,18 +250,17 @@ public sealed class ImageFrame
     /// <returns>图像帧</returns>
     public static ImageFrame LoadJpeg(Stream stream)
     {
-        var decoder = new JpegDecoder();
-        var img = decoder.Decode(stream);
-        byte[] rgb = img.Buffer;
+        var img = JpegDecoder.Decode(stream);
+        byte[] rgb = img.ToRgb24();
 
-        if (decoder.ExifOrientation != 1)
+        if (img.Metadata.Orientation != 1)
         {
-            var t = ApplyExifOrientation(rgb, decoder.Width, decoder.Height, decoder.ExifOrientation);
+            var t = ApplyExifOrientation(rgb, img.Width, img.Height, img.Metadata.Orientation);
             img.Metadata.Orientation = 1;
             return new ImageFrame(t.width, t.height, t.pixels, img.Metadata);
         }
 
-        return new ImageFrame(decoder.Width, decoder.Height, rgb, img.Metadata);
+        return new ImageFrame(img.Width, img.Height, rgb, img.Metadata);
     }
 
     /// <summary>
