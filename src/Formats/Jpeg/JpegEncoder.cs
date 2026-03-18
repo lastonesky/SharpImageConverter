@@ -49,10 +49,19 @@ public static class JpegEncoder
     private sealed class JpegBitWriter(Stream stream)
     {
         private readonly Stream _stream = stream;
-        private uint _bitBuffer;
+        private ulong _bitBuffer;
         private int _bitCount;
         private readonly byte[] _out = new byte[64 * 1024];
         private int _outPos;
+
+        private void EnsureOutCapacity(int count)
+        {
+            if (_outPos + count > _out.Length)
+            {
+                _stream.Write(_out, 0, _outPos);
+                _outPos = 0;
+            }
+        }
 
         private void WriteByteBuffered(byte b)
         {
@@ -64,19 +73,61 @@ public static class JpegEncoder
             _out[_outPos++] = b;
         }
 
+        private void WriteByteStuffed(byte b)
+        {
+            WriteByteBuffered(b);
+            if (b == 0xFF)
+            {
+                WriteByteBuffered(0x00);
+            }
+        }
+
+        private static bool Contains0xFF(uint value)
+        {
+            uint t = ~value;
+            return ((t - 0x01010101u) & ~t & 0x80808080u) != 0;
+        }
+
+        private void WriteUInt32Stuffed(uint value)
+        {
+            if (!Contains0xFF(value))
+            {
+                EnsureOutCapacity(4);
+                _out[_outPos++] = (byte)(value >> 24);
+                _out[_outPos++] = (byte)(value >> 16);
+                _out[_outPos++] = (byte)(value >> 8);
+                _out[_outPos++] = (byte)value;
+                return;
+            }
+
+            WriteByteStuffed((byte)(value >> 24));
+            WriteByteStuffed((byte)(value >> 16));
+            WriteByteStuffed((byte)(value >> 8));
+            WriteByteStuffed((byte)value);
+        }
+
         public void WriteBits(uint bits, int count)
         {
-            _bitBuffer = (_bitBuffer << count) | (bits & ((1u << count) - 1u));
+            ulong bitMask = count == 32 ? 0xFFFFFFFFUL : ((1UL << count) - 1UL);
+            _bitBuffer = (_bitBuffer << count) | (bits & bitMask);
             _bitCount += count;
+
+            while (_bitCount >= 32)
+            {
+                int shift = _bitCount - 32;
+                uint chunk = (uint)(_bitBuffer >> shift);
+                WriteUInt32Stuffed(chunk);
+                _bitCount -= 32;
+                _bitBuffer &= _bitCount == 0 ? 0UL : ((1UL << _bitCount) - 1UL);
+            }
 
             while (_bitCount >= 8)
             {
                 int shift = _bitCount - 8;
                 byte b = (byte)((_bitBuffer >> shift) & 0xFF);
-                WriteByteBuffered(b);
-                if (b == 0xFF) WriteByteBuffered(0x00);
+                WriteByteStuffed(b);
                 _bitCount -= 8;
-                _bitBuffer &= (uint)((1 << _bitCount) - 1);
+                _bitBuffer &= _bitCount == 0 ? 0UL : ((1UL << _bitCount) - 1UL);
             }
         }
 
@@ -1141,6 +1192,33 @@ public static class JpegEncoder
     {
         FDCT8x8IntInPlace(block);
 
+        if (Vector.IsHardwareAccelerated
+            && (System.Runtime.Intrinsics.X86.Sse2.IsSupported || System.Runtime.Intrinsics.Arm.AdvSimd.IsSupported)
+            && Vector<int>.Count >= 4)
+        {
+            int width = Vector<int>.Count;
+            var zero = Vector<int>.Zero;
+            var bias = new Vector<int>(1 << 19);
+            int i = 0;
+            for (; i <= 64 - width; i += width)
+            {
+                var coeff = new Vector<int>(block.Slice(i, width));
+                var recip = new Vector<int>(quantRecip, i);
+                var negativeMask = Vector.LessThan(coeff, zero);
+                var absCoeff = Vector.ConditionalSelect(negativeMask, -coeff, coeff);
+                var scaled = (absCoeff * recip + bias) >> 20;
+                var restored = Vector.ConditionalSelect(negativeMask, -scaled, scaled);
+                restored.CopyTo(block.Slice(i, width));
+            }
+
+            for (; i < 64; i++)
+            {
+                int v = block[i];
+                block[i] = QuantizeNearest(v, quantRecip[i]);
+            }
+            return;
+        }
+
         for (int i = 0; i < 64; i++)
         {
             int v = block[i];
@@ -1283,13 +1361,38 @@ public static class JpegEncoder
             }
         }
 
-        for (int i = 0; i < 64; i++)
+        if (Vector.IsHardwareAccelerated
+            && (System.Runtime.Intrinsics.X86.Sse2.IsSupported || System.Runtime.Intrinsics.Arm.AdvSimd.IsSupported)
+            && Vector<int>.Count >= 4)
         {
-            int cbVal = (cbAcc[i] + 2) >> 2;
-            int crVal = (crAcc[i] + 2) >> 2;
-
-            cb[i] = cbVal - 128;
-            cr[i] = crVal - 128;
+            int widthVec = Vector<int>.Count;
+            var rounding = new Vector<int>(2);
+            var offset = new Vector<int>(128);
+            int i = 0;
+            for (; i <= 64 - widthVec; i += widthVec)
+            {
+                var cbVec = new Vector<int>(cbAcc.Slice(i, widthVec));
+                var crVec = new Vector<int>(crAcc.Slice(i, widthVec));
+                (((cbVec + rounding) >> 2) - offset).CopyTo(cb.Slice(i, widthVec));
+                (((crVec + rounding) >> 2) - offset).CopyTo(cr.Slice(i, widthVec));
+            }
+            for (; i < 64; i++)
+            {
+                int cbVal = (cbAcc[i] + 2) >> 2;
+                int crVal = (crAcc[i] + 2) >> 2;
+                cb[i] = cbVal - 128;
+                cr[i] = crVal - 128;
+            }
+        }
+        else
+        {
+            for (int i = 0; i < 64; i++)
+            {
+                int cbVal = (cbAcc[i] + 2) >> 2;
+                int crVal = (crAcc[i] + 2) >> 2;
+                cb[i] = cbVal - 128;
+                cr[i] = crVal - 128;
+            }
         }
 
         long endTicks = Stopwatch.GetTimestamp();
