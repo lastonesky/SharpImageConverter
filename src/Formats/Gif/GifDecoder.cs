@@ -241,14 +241,18 @@ namespace SharpImageConverter.Formats.Gif
                                 if (dx < w)
                                 {
                                     byte idx = indices[idxPtr + x];
+                                    int dOff = rowOff + dx * comp;
                                     if (idx != trans && idx < palColors)
                                     {
-                                        int dOff = rowOff + dx * comp;
                                         int pOff = idx * 3;
                                         canvas[dOff] = pal[pOff];
                                         canvas[dOff+1] = pal[pOff+1];
                                         canvas[dOff+2] = pal[pOff+2];
                                         if (rgba) canvas[dOff+3] = 255;
+                                    }
+                                    else if (rgba && idx == trans)
+                                    {
+                                        canvas[dOff+3] = 0;
                                     }
                                 }
                             }
@@ -271,14 +275,18 @@ namespace SharpImageConverter.Formats.Gif
                         if (dx < w)
                         {
                             byte idx = indices[iOff + x];
+                            int dOff = rowOff + dx * comp;
                             if (idx != trans && idx < palColors)
                             {
-                                int dOff = rowOff + dx * comp;
                                 int pOff = idx * 3;
                                 canvas[dOff] = pal[pOff];
                                 canvas[dOff+1] = pal[pOff+1];
                                 canvas[dOff+2] = pal[pOff+2];
                                 if (rgba) canvas[dOff+3] = 255;
+                            }
+                            else if (rgba && idx == trans)
+                            {
+                                canvas[dOff+3] = 0;
                             }
                         }
                     }

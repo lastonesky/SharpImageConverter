@@ -3,6 +3,7 @@ using System;
 using System.IO;
 using SharpImageConverter;
 using SharpImageConverter.Formats.Png;
+using SharpImageConverter.Formats.Webp;
 using Tests.Helpers;
 
 namespace Jpeg2Bmp.Tests
@@ -69,8 +70,11 @@ namespace Jpeg2Bmp.Tests
         [Fact]
         public void ImageFrame_Load_Webp_NonSeekableStream_Matches_ByteArray()
         {
-            string path = ExamplePath("video-001.cmyk.webp");
-            byte[] data = File.ReadAllBytes(path);
+            var img = TestImageFactory.CreateChecker(32, 32, (10, 20, 30), (200, 210, 220), 4);
+            using var ms = new MemoryStream();
+            var enc = new WebpEncoderAdapter();
+            enc.EncodeRgb24(ms, img);
+            byte[] data = ms.ToArray();
             var frameFromBytes = ImageFrame.Load(data);
             using var nonSeek = new NonSeekableReadOnlyStream(data);
             var frameFromStream = ImageFrame.Load(nonSeek);
