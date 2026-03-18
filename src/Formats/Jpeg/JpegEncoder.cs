@@ -16,6 +16,8 @@ namespace SharpImageConverter;
 /// </summary>
 public static class JpegEncoder
 {
+    private const int McuBatchSize = 16;
+
     /// <summary>
     /// 是否在编码时打印配置（质量、采样）
     /// </summary>
@@ -182,10 +184,58 @@ public static class JpegEncoder
         }
     }
 
+    private sealed class McuBatch
+    {
+        public readonly SampledMcu?[] Items;
+        public int Count;
+
+        public McuBatch(SampledMcu?[] items)
+        {
+            Items = items;
+        }
+    }
+
     private sealed class EncodeMetrics
     {
         public long TicksFillMcu420;
         public long TicksFillBlock444;
+    }
+
+    private static McuBatch RentMcuBatch(int batchSize)
+    {
+        return new McuBatch(ArrayPool<SampledMcu?>.Shared.Rent(batchSize));
+    }
+
+    private static void ReturnMcuBatch(McuBatch batch)
+    {
+        Array.Clear(batch.Items, 0, batch.Items.Length);
+        batch.Count = 0;
+        ArrayPool<SampledMcu?>.Shared.Return(batch.Items);
+    }
+
+    private static void EnqueueSampledMcu(
+        PipeQueue<McuBatch> output,
+        ref McuBatch? currentBatch,
+        SampledMcu mcu,
+        int batchSize,
+        CancellationToken token)
+    {
+        currentBatch ??= RentMcuBatch(batchSize);
+        currentBatch.Items[currentBatch.Count++] = mcu;
+        if (currentBatch.Count == batchSize)
+        {
+            output.Enqueue(currentBatch, token);
+            currentBatch = null;
+        }
+    }
+
+    private static void FlushSampledBatch(PipeQueue<McuBatch> output, ref McuBatch? currentBatch, CancellationToken token)
+    {
+        if (currentBatch != null && currentBatch.Count > 0)
+        {
+            output.Enqueue(currentBatch, token);
+            currentBatch = null;
+        }
     }
 
     private static readonly byte[] Order420 = [0, 0, 0, 0, 1, 2];
@@ -475,26 +525,24 @@ public static class JpegEncoder
         EncodeMetrics? metrics)
     {
         int capacity = Math.Clamp(Environment.ProcessorCount, 2, 16);
-        var sampleQueue = new PipeQueue<SampledMcu>(capacity);
-        var dctQueue = new PipeQueue<SampledMcu>(capacity);
-        var orderedQueue = new PipeQueue<SampledMcu>(capacity);
+        var sampleQueue = new PipeQueue<McuBatch>(capacity);
+        var dctQueue = new PipeQueue<McuBatch>(capacity);
         var pool = ArrayPool<int>.Shared;
         int dctWorkers = Math.Clamp(Environment.ProcessorCount - 1, 1, 8);
 
         using var cts = new CancellationTokenSource();
         CancellationToken token = cts.Token;
 
-        var t1 = Task.Run(() => RunStage(() => ProduceRgbSamples(sampleQueue, pool, rgb24, width, height, subsample420, dctWorkers, token, metrics), cts), token);
+        var t1 = Task.Run(() => RunStage(() => ProduceRgbSamples(sampleQueue, pool, rgb24, width, height, subsample420, dctWorkers, McuBatchSize, token, metrics), cts), token);
         Task[] dctTasks = new Task[dctWorkers];
         for (int i = 0; i < dctWorkers; i++)
         {
-            dctTasks[i] = Task.Run(() => RunStage(() => ProcessDct(sampleQueue, dctQueue, qYRecip, qCRecip, token), cts), token);
+            dctTasks[i] = Task.Run(() => RunStage(() => ProcessDct(sampleQueue, dctQueue, qYRecip, qCRecip, pool, token), cts), token);
         }
-        var t3 = Task.Run(() => RunStage(() => ReorderBySequence(dctQueue, orderedQueue, dctWorkers, token), cts), token);
-        var t4 = Task.Run(() => RunStage(() => ProcessHuffman(orderedQueue, pool, bw, dcY, acY, dcC, acC, token), cts), token);
+        var t4 = Task.Run(() => RunStage(() => ProcessHuffmanOrdered(dctQueue, dctWorkers, pool, bw, dcY, acY, dcC, acC, token), cts), token);
 
         Task.WaitAll(dctTasks);
-        Task.WaitAll(t1, t3, t4);
+        Task.WaitAll(t1, t4);
     }
 
     private static void EncodeGrayPipeline(
@@ -507,26 +555,24 @@ public static class JpegEncoder
         HuffCode[] acY)
     {
         int capacity = Math.Clamp(Environment.ProcessorCount, 2, 16);
-        var sampleQueue = new PipeQueue<SampledMcu>(capacity);
-        var dctQueue = new PipeQueue<SampledMcu>(capacity);
-        var orderedQueue = new PipeQueue<SampledMcu>(capacity);
+        var sampleQueue = new PipeQueue<McuBatch>(capacity);
+        var dctQueue = new PipeQueue<McuBatch>(capacity);
         var pool = ArrayPool<int>.Shared;
         int dctWorkers = Math.Clamp(Environment.ProcessorCount - 1, 1, 8);
 
         using var cts = new CancellationTokenSource();
         CancellationToken token = cts.Token;
 
-        var t1 = Task.Run(() => RunStage(() => ProduceGraySamples(sampleQueue, pool, gray8, width, height, dctWorkers, token), cts), token);
+        var t1 = Task.Run(() => RunStage(() => ProduceGraySamples(sampleQueue, pool, gray8, width, height, dctWorkers, McuBatchSize, token), cts), token);
         Task[] dctTasks = new Task[dctWorkers];
         for (int i = 0; i < dctWorkers; i++)
         {
-            dctTasks[i] = Task.Run(() => RunStage(() => ProcessDctGray(sampleQueue, dctQueue, qYRecip, token), cts), token);
+            dctTasks[i] = Task.Run(() => RunStage(() => ProcessDctGray(sampleQueue, dctQueue, qYRecip, pool, token), cts), token);
         }
-        var t3 = Task.Run(() => RunStage(() => ReorderBySequence(dctQueue, orderedQueue, dctWorkers, token), cts), token);
-        var t4 = Task.Run(() => RunStage(() => ProcessHuffmanGray(orderedQueue, pool, bw, dcY, acY, token), cts), token);
+        var t4 = Task.Run(() => RunStage(() => ProcessHuffmanGrayOrdered(dctQueue, dctWorkers, pool, bw, dcY, acY, token), cts), token);
 
         Task.WaitAll(dctTasks);
-        Task.WaitAll(t1, t3, t4);
+        Task.WaitAll(t1, t4);
     }
 
     private static void RunStage(Action action, CancellationTokenSource cts)
@@ -546,94 +592,160 @@ public static class JpegEncoder
     }
 
     private static void ProduceRgbSamples(
-        PipeQueue<SampledMcu> output,
+        PipeQueue<McuBatch> output,
         ArrayPool<int> pool,
         byte[] rgb24,
         int width,
         int height,
         bool subsample420,
         int completionCount,
+        int batchSize,
         CancellationToken token,
         EncodeMetrics? metrics)
     {
         int sequence = 0;
-        if (subsample420)
+        McuBatch? batch = null;
+        try
         {
-            int mcusX = (width + 15) / 16;
-            int mcusY = (height + 15) / 16;
-
-            for (int my = 0; my < mcusY; my++)
+            if (subsample420)
             {
-                for (int mx = 0; mx < mcusX; mx++)
+                int mcusX = (width + 15) / 16;
+                int mcusY = (height + 15) / 16;
+
+                for (int my = 0; my < mcusY; my++)
                 {
-                    var mcu = new SampledMcu
+                    for (int mx = 0; mx < mcusX; mx++)
                     {
-                        BlockCount = 6,
-                        Sequence = sequence++,
-                        Order = Order420,
-                        B0 = pool.Rent(64),
-                        B1 = pool.Rent(64),
-                        B2 = pool.Rent(64),
-                        B3 = pool.Rent(64),
-                        B4 = pool.Rent(64),
-                        B5 = pool.Rent(64)
-                    };
-                    try
-                    {
-                        FillMcu420RgbToYCbCr(
-                            rgb24,
-                            width,
-                            height,
-                            mx * 16,
-                            my * 16,
-                            mcu.B0!.AsSpan(0, 64),
-                            mcu.B1!.AsSpan(0, 64),
-                            mcu.B2!.AsSpan(0, 64),
-                            mcu.B3!.AsSpan(0, 64),
-                            mcu.B4!.AsSpan(0, 64),
-                            mcu.B5!.AsSpan(0, 64),
-                            metrics);
-                        output.Enqueue(mcu, token);
-                    }
-                    catch
-                    {
-                        mcu.Release(pool);
-                        throw;
+                        var mcu = new SampledMcu
+                        {
+                            BlockCount = 6,
+                            Sequence = sequence++,
+                            Order = Order420,
+                            B0 = pool.Rent(64),
+                            B1 = pool.Rent(64),
+                            B2 = pool.Rent(64),
+                            B3 = pool.Rent(64),
+                            B4 = pool.Rent(64),
+                            B5 = pool.Rent(64)
+                        };
+                        try
+                        {
+                            FillMcu420RgbToYCbCr(
+                                rgb24,
+                                width,
+                                height,
+                                mx * 16,
+                                my * 16,
+                                mcu.B0!.AsSpan(0, 64),
+                                mcu.B1!.AsSpan(0, 64),
+                                mcu.B2!.AsSpan(0, 64),
+                                mcu.B3!.AsSpan(0, 64),
+                                mcu.B4!.AsSpan(0, 64),
+                                mcu.B5!.AsSpan(0, 64),
+                                metrics);
+                            EnqueueSampledMcu(output, ref batch, mcu, batchSize, token);
+                        }
+                        catch
+                        {
+                            mcu.Release(pool);
+                            throw;
+                        }
                     }
                 }
             }
-        }
-        else
-        {
-            int blocksX = (width + 7) / 8;
-            int blocksY = (height + 7) / 8;
+            else
+            {
+                int blocksX = (width + 7) / 8;
+                int blocksY = (height + 7) / 8;
 
+                for (int by = 0; by < blocksY; by++)
+                {
+                    for (int bx = 0; bx < blocksX; bx++)
+                    {
+                        var mcu = new SampledMcu
+                        {
+                            BlockCount = 3,
+                            Sequence = sequence++,
+                            Order = Order444,
+                            B0 = pool.Rent(64),
+                            B1 = pool.Rent(64),
+                            B2 = pool.Rent(64)
+                        };
+                        try
+                        {
+                            FillBlockRgbToYCbCr444(
+                                rgb24,
+                                width,
+                                height,
+                                bx * 8,
+                                by * 8,
+                                mcu.B0!.AsSpan(0, 64),
+                                mcu.B1!.AsSpan(0, 64),
+                                mcu.B2!.AsSpan(0, 64),
+                                metrics);
+                            EnqueueSampledMcu(output, ref batch, mcu, batchSize, token);
+                        }
+                        catch
+                        {
+                            mcu.Release(pool);
+                            throw;
+                        }
+                    }
+                }
+            }
+
+            FlushSampledBatch(output, ref batch, token);
+            for (int i = 0; i < completionCount; i++)
+            {
+                output.Enqueue(null, token);
+            }
+        }
+        catch
+        {
+            if (batch != null)
+            {
+                for (int i = 0; i < batch.Count; i++)
+                {
+                    batch.Items[i]?.Release(pool);
+                }
+                ReturnMcuBatch(batch);
+                batch = null;
+            }
+            throw;
+        }
+    }
+
+    private static void ProduceGraySamples(
+        PipeQueue<McuBatch> output,
+        ArrayPool<int> pool,
+        byte[] gray8,
+        int width,
+        int height,
+        int completionCount,
+        int batchSize,
+        CancellationToken token)
+    {
+        int blocksX = (width + 7) / 8;
+        int blocksY = (height + 7) / 8;
+        int sequence = 0;
+        McuBatch? batch = null;
+        try
+        {
             for (int by = 0; by < blocksY; by++)
             {
                 for (int bx = 0; bx < blocksX; bx++)
                 {
                     var mcu = new SampledMcu
                     {
-                        BlockCount = 3,
+                        BlockCount = 1,
                         Sequence = sequence++,
-                        Order = Order444,
-                        B0 = pool.Rent(64),
-                        B1 = pool.Rent(64),
-                        B2 = pool.Rent(64)
+                        Order = OrderGray,
+                        B0 = pool.Rent(64)
                     };
                     try
                     {
-                        FillBlockRgbToYCbCr444(
-                            rgb24,
-                            width,
-                            height,
-                            bx * 8,
-                            by * 8,
-                            mcu.B0!.AsSpan(0, 64),
-                            mcu.B1!.AsSpan(0, 64),
-                            mcu.B2!.AsSpan(0, 64),
-                            metrics);
-                        output.Enqueue(mcu, token);
+                        FillBlockGray8ToY(gray8, width, height, bx * 8, by * 8, mcu.B0!.AsSpan(0, 64));
+                        EnqueueSampledMcu(output, ref batch, mcu, batchSize, token);
                     }
                     catch
                     {
@@ -642,156 +754,192 @@ public static class JpegEncoder
                     }
                 }
             }
-        }
 
-        for (int i = 0; i < completionCount; i++)
-        {
-            output.Enqueue(null, token);
-        }
-    }
-
-    private static void ProduceGraySamples(
-        PipeQueue<SampledMcu> output,
-        ArrayPool<int> pool,
-        byte[] gray8,
-        int width,
-        int height,
-        int completionCount,
-        CancellationToken token)
-    {
-        int blocksX = (width + 7) / 8;
-        int blocksY = (height + 7) / 8;
-        int sequence = 0;
-
-        for (int by = 0; by < blocksY; by++)
-        {
-            for (int bx = 0; bx < blocksX; bx++)
+            FlushSampledBatch(output, ref batch, token);
+            for (int i = 0; i < completionCount; i++)
             {
-                var mcu = new SampledMcu
-                {
-                    BlockCount = 1,
-                    Sequence = sequence++,
-                    Order = OrderGray,
-                    B0 = pool.Rent(64)
-                };
-                try
-                {
-                    FillBlockGray8ToY(gray8, width, height, bx * 8, by * 8, mcu.B0!.AsSpan(0, 64));
-                    output.Enqueue(mcu, token);
-                }
-                catch
-                {
-                    mcu.Release(pool);
-                    throw;
-                }
+                output.Enqueue(null, token);
             }
         }
-
-        for (int i = 0; i < completionCount; i++)
+        catch
         {
-            output.Enqueue(null, token);
+            if (batch != null)
+            {
+                for (int i = 0; i < batch.Count; i++)
+                {
+                    batch.Items[i]?.Release(pool);
+                }
+                ReturnMcuBatch(batch);
+                batch = null;
+            }
+            throw;
         }
     }
 
     private static void ProcessDct(
-        PipeQueue<SampledMcu> input,
-        PipeQueue<SampledMcu> output,
+        PipeQueue<McuBatch> input,
+        PipeQueue<McuBatch> output,
         int[] qYRecip,
         int[] qCRecip,
+        ArrayPool<int> pool,
         CancellationToken token)
     {
         for (; ; )
         {
-            var mcu = input.Dequeue(token);
-            if (mcu == null)
+            var batch = input.Dequeue(token);
+            if (batch == null)
             {
                 output.Enqueue(null, token);
                 break;
             }
 
-            for (int i = 0; i < mcu.BlockCount; i++)
+            for (int m = 0; m < batch.Count; m++)
             {
-                int[] q = mcu.Order[i] == 0 ? qYRecip : qCRecip;
-                DctQuantizeInPlace(mcu.GetBlockSpan(i), q);
+                var mcu = batch.Items[m];
+                if (mcu == null)
+                {
+                    continue;
+                }
+                try
+                {
+                    for (int i = 0; i < mcu.BlockCount; i++)
+                    {
+                        int[] q = mcu.Order[i] == 0 ? qYRecip : qCRecip;
+                        DctQuantizeInPlace(mcu.GetBlockSpan(i), q);
+                    }
+                }
+                catch
+                {
+                    for (int j = m; j < batch.Count; j++)
+                    {
+                        batch.Items[j]?.Release(pool);
+                    }
+                    ReturnMcuBatch(batch);
+                    throw;
+                }
             }
 
-            output.Enqueue(mcu, token);
+            output.Enqueue(batch, token);
         }
     }
 
     private static void ProcessDctGray(
-        PipeQueue<SampledMcu> input,
-        PipeQueue<SampledMcu> output,
+        PipeQueue<McuBatch> input,
+        PipeQueue<McuBatch> output,
         int[] qYRecip,
+        ArrayPool<int> pool,
         CancellationToken token)
     {
         for (; ; )
         {
-            var mcu = input.Dequeue(token);
-            if (mcu == null)
+            var batch = input.Dequeue(token);
+            if (batch == null)
             {
                 output.Enqueue(null, token);
                 break;
             }
 
-            DctQuantizeInPlace(mcu.GetBlockSpan(0), qYRecip);
-            output.Enqueue(mcu, token);
+            for (int m = 0; m < batch.Count; m++)
+            {
+                var mcu = batch.Items[m];
+                if (mcu == null)
+                {
+                    continue;
+                }
+                try
+                {
+                    DctQuantizeInPlace(mcu.GetBlockSpan(0), qYRecip);
+                }
+                catch
+                {
+                    for (int j = m; j < batch.Count; j++)
+                    {
+                        batch.Items[j]?.Release(pool);
+                    }
+                    ReturnMcuBatch(batch);
+                    throw;
+                }
+            }
+
+            output.Enqueue(batch, token);
         }
     }
 
-    private static void ReorderBySequence(
-        PipeQueue<SampledMcu> input,
-        PipeQueue<SampledMcu> output,
-        int completionCount,
-        CancellationToken token)
+    private static void EnsurePendingCapacity(
+        ref SampledMcu?[] pendingItems,
+        ref int[] pendingSequences,
+        ref int pendingMask,
+        int requiredSequence)
     {
-        int expected = 0;
-        int completed = 0;
-        var buffer = new Dictionary<int, SampledMcu>();
-
-        while (completed < completionCount)
+        while (true)
         {
-            var mcu = input.Dequeue(token);
-            if (mcu == null)
+            int index = requiredSequence & pendingMask;
+            if (pendingItems[index] == null || pendingSequences[index] == requiredSequence)
             {
-                completed++;
-                continue;
+                return;
             }
 
-            if (mcu.Sequence == expected)
+            int newSize = pendingItems.Length << 1;
+            var newItems = new SampledMcu?[newSize];
+            var newSequences = new int[newSize];
+            Array.Fill(newSequences, -1);
+            int newMask = newSize - 1;
+
+            for (int i = 0; i < pendingItems.Length; i++)
             {
-                output.Enqueue(mcu, token);
-                expected++;
-                while (buffer.TryGetValue(expected, out var next))
+                var item = pendingItems[i];
+                if (item == null)
                 {
-                    buffer.Remove(expected);
-                    output.Enqueue(next, token);
-                    expected++;
+                    continue;
                 }
+                int sequence = pendingSequences[i];
+                int newIndex = sequence & newMask;
+                while (newItems[newIndex] != null)
+                {
+                    newIndex = (newIndex + 1) & newMask;
+                }
+                newItems[newIndex] = item;
+                newSequences[newIndex] = sequence;
+            }
+
+            pendingItems = newItems;
+            pendingSequences = newSequences;
+            pendingMask = newMask;
+        }
+    }
+
+    private static void WriteMcuHuffman(
+        SampledMcu mcu,
+        JpegBitWriter bw,
+        HuffCode[] dcY,
+        HuffCode[] acY,
+        HuffCode[] dcC,
+        HuffCode[] acC,
+        ref int prevYdc,
+        ref int prevCbdc,
+        ref int prevCrdc)
+    {
+        for (int i = 0; i < mcu.BlockCount; i++)
+        {
+            byte comp = mcu.Order[i];
+            if (comp == 0)
+            {
+                HuffmanWriteBlock(bw, mcu.GetBlockSpan(i), dcY, acY, ref prevYdc);
+            }
+            else if (comp == 1)
+            {
+                HuffmanWriteBlock(bw, mcu.GetBlockSpan(i), dcC, acC, ref prevCbdc);
             }
             else
             {
-                buffer[mcu.Sequence] = mcu;
+                HuffmanWriteBlock(bw, mcu.GetBlockSpan(i), dcC, acC, ref prevCrdc);
             }
         }
-
-        while (buffer.TryGetValue(expected, out var next))
-        {
-            buffer.Remove(expected);
-            output.Enqueue(next, token);
-            expected++;
-        }
-
-        foreach (var remaining in buffer.Values)
-        {
-            output.Enqueue(remaining, token);
-        }
-
-        output.Enqueue(null, token);
     }
 
-    private static void ProcessHuffman(
-        PipeQueue<SampledMcu> input,
+    private static void ProcessHuffmanOrdered(
+        PipeQueue<McuBatch> input,
+        int completionCount,
         ArrayPool<int> pool,
         JpegBitWriter bw,
         HuffCode[] dcY,
@@ -803,39 +951,97 @@ public static class JpegEncoder
         int prevYdc = 0;
         int prevCbdc = 0;
         int prevCrdc = 0;
+        int expected = 0;
+        int completed = 0;
+        var pendingItems = new SampledMcu?[256];
+        var pendingSequences = new int[256];
+        Array.Fill(pendingSequences, -1);
+        int pendingMask = pendingItems.Length - 1;
 
-        for (; ; )
+        while (completed < completionCount)
         {
-            var mcu = input.Dequeue(token);
-            if (mcu == null) break;
+            var batch = input.Dequeue(token);
+            if (batch == null)
+            {
+                completed++;
+                continue;
+            }
+
             try
             {
-                for (int i = 0; i < mcu.BlockCount; i++)
+                for (int i = 0; i < batch.Count; i++)
                 {
-                    byte comp = mcu.Order[i];
-                    if (comp == 0)
+                    var mcu = batch.Items[i]!;
+                    batch.Items[i] = null;
+                    if (mcu.Sequence == expected)
                     {
-                        HuffmanWriteBlock(bw, mcu.GetBlockSpan(i), dcY, acY, ref prevYdc);
-                    }
-                    else if (comp == 1)
-                    {
-                        HuffmanWriteBlock(bw, mcu.GetBlockSpan(i), dcC, acC, ref prevCbdc);
+                        WriteMcuHuffman(mcu, bw, dcY, acY, dcC, acC, ref prevYdc, ref prevCbdc, ref prevCrdc);
+                        mcu.Release(pool);
+                        expected++;
+
+                        while (true)
+                        {
+                            int expectedIndex = expected & pendingMask;
+                            var pending = pendingItems[expectedIndex];
+                            if (pending == null || pendingSequences[expectedIndex] != expected)
+                            {
+                                break;
+                            }
+
+                            pendingItems[expectedIndex] = null;
+                            pendingSequences[expectedIndex] = -1;
+                            WriteMcuHuffman(pending, bw, dcY, acY, dcC, acC, ref prevYdc, ref prevCbdc, ref prevCrdc);
+                            pending.Release(pool);
+                            expected++;
+                        }
                     }
                     else
                     {
-                        HuffmanWriteBlock(bw, mcu.GetBlockSpan(i), dcC, acC, ref prevCrdc);
+                        EnsurePendingCapacity(ref pendingItems, ref pendingSequences, ref pendingMask, mcu.Sequence);
+                        int index = mcu.Sequence & pendingMask;
+                        while (pendingItems[index] != null && pendingSequences[index] != mcu.Sequence)
+                        {
+                            index = (index + 1) & pendingMask;
+                        }
+                        pendingItems[index] = mcu;
+                        pendingSequences[index] = mcu.Sequence;
                     }
                 }
             }
             finally
             {
-                mcu.Release(pool);
+                for (int i = 0; i < batch.Count; i++)
+                {
+                    batch.Items[i]?.Release(pool);
+                }
+                ReturnMcuBatch(batch);
             }
+        }
+
+        while (true)
+        {
+            int index = expected & pendingMask;
+            var pending = pendingItems[index];
+            if (pending == null || pendingSequences[index] != expected)
+            {
+                break;
+            }
+            pendingItems[index] = null;
+            pendingSequences[index] = -1;
+            WriteMcuHuffman(pending, bw, dcY, acY, dcC, acC, ref prevYdc, ref prevCbdc, ref prevCrdc);
+            pending.Release(pool);
+            expected++;
+        }
+
+        for (int i = 0; i < pendingItems.Length; i++)
+        {
+            pendingItems[i]?.Release(pool);
         }
     }
 
-    private static void ProcessHuffmanGray(
-        PipeQueue<SampledMcu> input,
+    private static void ProcessHuffmanGrayOrdered(
+        PipeQueue<McuBatch> input,
+        int completionCount,
         ArrayPool<int> pool,
         JpegBitWriter bw,
         HuffCode[] dcY,
@@ -843,19 +1049,91 @@ public static class JpegEncoder
         CancellationToken token)
     {
         int prevYdc = 0;
+        int expected = 0;
+        int completed = 0;
+        var pendingItems = new SampledMcu?[256];
+        var pendingSequences = new int[256];
+        Array.Fill(pendingSequences, -1);
+        int pendingMask = pendingItems.Length - 1;
 
-        for (; ; )
+        while (completed < completionCount)
         {
-            var mcu = input.Dequeue(token);
-            if (mcu == null) break;
+            var batch = input.Dequeue(token);
+            if (batch == null)
+            {
+                completed++;
+                continue;
+            }
+
             try
             {
-                HuffmanWriteBlock(bw, mcu.GetBlockSpan(0), dcY, acY, ref prevYdc);
+                for (int i = 0; i < batch.Count; i++)
+                {
+                    var mcu = batch.Items[i]!;
+                    batch.Items[i] = null;
+                    if (mcu.Sequence == expected)
+                    {
+                        HuffmanWriteBlock(bw, mcu.GetBlockSpan(0), dcY, acY, ref prevYdc);
+                        mcu.Release(pool);
+                        expected++;
+
+                        while (true)
+                        {
+                            int expectedIndex = expected & pendingMask;
+                            var pending = pendingItems[expectedIndex];
+                            if (pending == null || pendingSequences[expectedIndex] != expected)
+                            {
+                                break;
+                            }
+
+                            pendingItems[expectedIndex] = null;
+                            pendingSequences[expectedIndex] = -1;
+                            HuffmanWriteBlock(bw, pending.GetBlockSpan(0), dcY, acY, ref prevYdc);
+                            pending.Release(pool);
+                            expected++;
+                        }
+                    }
+                    else
+                    {
+                        EnsurePendingCapacity(ref pendingItems, ref pendingSequences, ref pendingMask, mcu.Sequence);
+                        int index = mcu.Sequence & pendingMask;
+                        while (pendingItems[index] != null && pendingSequences[index] != mcu.Sequence)
+                        {
+                            index = (index + 1) & pendingMask;
+                        }
+                        pendingItems[index] = mcu;
+                        pendingSequences[index] = mcu.Sequence;
+                    }
+                }
             }
             finally
             {
-                mcu.Release(pool);
+                for (int i = 0; i < batch.Count; i++)
+                {
+                    batch.Items[i]?.Release(pool);
+                }
+                ReturnMcuBatch(batch);
             }
+        }
+
+        while (true)
+        {
+            int index = expected & pendingMask;
+            var pending = pendingItems[index];
+            if (pending == null || pendingSequences[index] != expected)
+            {
+                break;
+            }
+            pendingItems[index] = null;
+            pendingSequences[index] = -1;
+            HuffmanWriteBlock(bw, pending.GetBlockSpan(0), dcY, acY, ref prevYdc);
+            pending.Release(pool);
+            expected++;
+        }
+
+        for (int i = 0; i < pendingItems.Length; i++)
+        {
+            pendingItems[i]?.Release(pool);
         }
     }
 
