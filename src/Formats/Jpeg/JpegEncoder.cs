@@ -17,6 +17,10 @@ namespace SharpImageConverter;
 public static class JpegEncoder
 {
     private const int McuBatchSize = 16;
+    private static readonly byte[] IccProfileSignature =
+    [
+        (byte)'I',(byte)'C',(byte)'C',(byte)'_',(byte)'P',(byte)'R',(byte)'O',(byte)'F',(byte)'I',(byte)'L',(byte)'E',0x00
+    ];
 
     /// <summary>
     /// 是否在编码时打印配置（质量、采样）
@@ -32,7 +36,6 @@ public static class JpegEncoder
     private static readonly int[] CrR = BuildScale(128);
     private static readonly int[] CrG = BuildScale(-107);
     private static readonly int[] CrB = BuildScale(-21);
-
     private static int[] BuildScale(int k)
     {
         var t = new int[256];
@@ -46,12 +49,12 @@ public static class JpegEncoder
         public byte Length;
     }
 
-    private sealed class JpegBitWriter(Stream stream)
+    private sealed class JpegBitWriter(Stream stream) : IDisposable
     {
         private readonly Stream _stream = stream;
         private ulong _bitBuffer;
         private int _bitCount;
-        private readonly byte[] _out = new byte[64 * 1024];
+        private readonly byte[] _out = ArrayPool<byte>.Shared.Rent(64 * 1024);
         private int _outPos;
 
         private void EnsureOutCapacity(int count)
@@ -148,6 +151,11 @@ public static class JpegEncoder
                 _stream.Write(_out, 0, _outPos);
                 _outPos = 0;
             }
+        }
+
+        public void Dispose()
+        {
+            ArrayPool<byte>.Shared.Return(_out);
         }
     }
 
@@ -354,6 +362,10 @@ public static class JpegEncoder
         0xE2,0xE3,0xE4,0xE5,0xE6,0xE7,0xE8,0xE9,0xEA,0xF2,0xF3,0xF4,0xF5,0xF6,0xF7,0xF8,
         0xF9,0xFA
     ];
+    private static readonly HuffCode[] DcYHuffTable = BuildHuffTable(DcLumaCounts, DcLumaSymbols);
+    private static readonly HuffCode[] AcYHuffTable = BuildHuffTable(AcLumaCounts, AcLumaSymbols);
+    private static readonly HuffCode[] DcCHuffTable = BuildHuffTable(DcChromaCounts, DcChromaSymbols);
+    private static readonly HuffCode[] AcCHuffTable = BuildHuffTable(AcChromaCounts, AcChromaSymbols);
 
     /// <summary>
     /// 将 RGB24 编码为 JPEG 文件（默认使用 4:2:0 采样）
@@ -477,11 +489,6 @@ public static class JpegEncoder
         int[] qYRecip = BuildQuantRecipIntDct(qY);
         int[] qCRecip = BuildQuantRecipIntDct(qC);
 
-        HuffCode[] dcY = BuildHuffTable(DcLumaCounts, DcLumaSymbols);
-        HuffCode[] acY = BuildHuffTable(AcLumaCounts, AcLumaSymbols);
-        HuffCode[] dcC = BuildHuffTable(DcChromaCounts, DcChromaSymbols);
-        HuffCode[] acC = BuildHuffTable(AcChromaCounts, AcChromaSymbols);
-
         WriteMarker(stream, 0xD8);
         WriteApp0Jfif(stream);
         if (keepMetadata && metadata != null)
@@ -497,8 +504,8 @@ public static class JpegEncoder
         WriteDht(stream, 1, 1, AcChromaCounts, AcChromaSymbols);
         WriteSos(stream);
 
-        var bw = new JpegBitWriter(stream);
-        EncodeRgbPipeline(bw, width, height, rgb24, subsample420, qYRecip, qCRecip, dcY, acY, dcC, acC, metrics);
+        using var bw = new JpegBitWriter(stream);
+        EncodeRgbPipeline(bw, width, height, rgb24, subsample420, qYRecip, qCRecip, DcYHuffTable, AcYHuffTable, DcCHuffTable, AcCHuffTable, metrics);
         bw.FlushFinal();
         WriteMarker(stream, 0xD9);
 
@@ -531,9 +538,6 @@ public static class JpegEncoder
         byte[] qY = BuildQuantTable(StdLumaQuant, quality);
         int[] qYRecip = BuildQuantRecipIntDct(qY);
 
-        HuffCode[] dcY = BuildHuffTable(DcLumaCounts, DcLumaSymbols);
-        HuffCode[] acY = BuildHuffTable(AcLumaCounts, AcLumaSymbols);
-
         WriteMarker(stream, 0xD8);
         WriteApp0Jfif(stream);
         if (keepMetadata && metadata != null)
@@ -546,8 +550,8 @@ public static class JpegEncoder
         WriteDht(stream, 1, 0, AcLumaCounts, AcLumaSymbols);
         WriteSosGray(stream);
 
-        var bw = new JpegBitWriter(stream);
-        EncodeGrayPipeline(bw, width, height, gray8, qYRecip, dcY, acY);
+        using var bw = new JpegBitWriter(stream);
+        EncodeGrayPipeline(bw, width, height, gray8, qYRecip, DcYHuffTable, AcYHuffTable);
         bw.FlushFinal();
         WriteMarker(stream, 0xD9);
 
@@ -916,9 +920,25 @@ public static class JpegEncoder
         }
     }
 
+    private static void RentPendingState(
+        int minimumCapacity,
+        out SampledMcu?[] pendingItems,
+        out int[] pendingSequences,
+        out int pendingCapacity,
+        out int pendingMask)
+    {
+        pendingCapacity = (int)BitOperations.RoundUpToPowerOf2((uint)Math.Max(2, minimumCapacity));
+        pendingItems = ArrayPool<SampledMcu?>.Shared.Rent(pendingCapacity);
+        pendingSequences = ArrayPool<int>.Shared.Rent(pendingCapacity);
+        Array.Clear(pendingItems, 0, pendingCapacity);
+        Array.Fill(pendingSequences, -1, 0, pendingCapacity);
+        pendingMask = pendingCapacity - 1;
+    }
+
     private static void EnsurePendingCapacity(
         ref SampledMcu?[] pendingItems,
         ref int[] pendingSequences,
+        ref int pendingCapacity,
         ref int pendingMask,
         int requiredSequence)
     {
@@ -930,13 +950,14 @@ public static class JpegEncoder
                 return;
             }
 
-            int newSize = pendingItems.Length << 1;
-            var newItems = new SampledMcu?[newSize];
-            var newSequences = new int[newSize];
-            Array.Fill(newSequences, -1);
-            int newMask = newSize - 1;
+            int newCapacity = pendingCapacity << 1;
+            var newItems = ArrayPool<SampledMcu?>.Shared.Rent(newCapacity);
+            var newSequences = ArrayPool<int>.Shared.Rent(newCapacity);
+            Array.Clear(newItems, 0, newCapacity);
+            Array.Fill(newSequences, -1, 0, newCapacity);
+            int newMask = newCapacity - 1;
 
-            for (int i = 0; i < pendingItems.Length; i++)
+            for (int i = 0; i < pendingCapacity; i++)
             {
                 var item = pendingItems[i];
                 if (item == null)
@@ -953,10 +974,29 @@ public static class JpegEncoder
                 newSequences[newIndex] = sequence;
             }
 
+            Array.Clear(pendingItems, 0, pendingCapacity);
+            ArrayPool<SampledMcu?>.Shared.Return(pendingItems, clearArray: false);
+            ArrayPool<int>.Shared.Return(pendingSequences, clearArray: false);
             pendingItems = newItems;
             pendingSequences = newSequences;
+            pendingCapacity = newCapacity;
             pendingMask = newMask;
         }
+    }
+
+    private static void ReturnPendingState(
+        SampledMcu?[] pendingItems,
+        int[] pendingSequences,
+        int pendingCapacity,
+        ArrayPool<int> pool)
+    {
+        for (int i = 0; i < pendingCapacity; i++)
+        {
+            pendingItems[i]?.Release(pool);
+        }
+        Array.Clear(pendingItems, 0, pendingCapacity);
+        ArrayPool<SampledMcu?>.Shared.Return(pendingItems, clearArray: false);
+        ArrayPool<int>.Shared.Return(pendingSequences, clearArray: false);
     }
 
     private static void WriteMcuHuffman(
@@ -1004,89 +1044,88 @@ public static class JpegEncoder
         int prevCrdc = 0;
         int expected = 0;
         int completed = 0;
-        var pendingItems = new SampledMcu?[256];
-        var pendingSequences = new int[256];
-        Array.Fill(pendingSequences, -1);
-        int pendingMask = pendingItems.Length - 1;
+        RentPendingState(256, out var pendingItems, out var pendingSequences, out int pendingCapacity, out int pendingMask);
 
-        while (completed < completionCount)
+        try
         {
-            var batch = input.Dequeue(token);
-            if (batch == null)
+            while (completed < completionCount)
             {
-                completed++;
-                continue;
-            }
-
-            try
-            {
-                for (int i = 0; i < batch.Count; i++)
+                var batch = input.Dequeue(token);
+                if (batch == null)
                 {
-                    var mcu = batch.Items[i]!;
-                    batch.Items[i] = null;
-                    if (mcu.Sequence == expected)
+                    completed++;
+                    continue;
+                }
+
+                try
+                {
+                    for (int i = 0; i < batch.Count; i++)
                     {
-                        WriteMcuHuffman(mcu, bw, dcY, acY, dcC, acC, ref prevYdc, ref prevCbdc, ref prevCrdc);
-                        mcu.Release(pool);
-                        expected++;
-
-                        while (true)
+                        var mcu = batch.Items[i]!;
+                        batch.Items[i] = null;
+                        if (mcu.Sequence == expected)
                         {
-                            int expectedIndex = expected & pendingMask;
-                            var pending = pendingItems[expectedIndex];
-                            if (pending == null || pendingSequences[expectedIndex] != expected)
-                            {
-                                break;
-                            }
-
-                            pendingItems[expectedIndex] = null;
-                            pendingSequences[expectedIndex] = -1;
-                            WriteMcuHuffman(pending, bw, dcY, acY, dcC, acC, ref prevYdc, ref prevCbdc, ref prevCrdc);
-                            pending.Release(pool);
+                            WriteMcuHuffman(mcu, bw, dcY, acY, dcC, acC, ref prevYdc, ref prevCbdc, ref prevCrdc);
+                            mcu.Release(pool);
                             expected++;
+
+                            while (true)
+                            {
+                                int expectedIndex = expected & pendingMask;
+                                var pending = pendingItems[expectedIndex];
+                                if (pending == null || pendingSequences[expectedIndex] != expected)
+                                {
+                                    break;
+                                }
+
+                                pendingItems[expectedIndex] = null;
+                                pendingSequences[expectedIndex] = -1;
+                                WriteMcuHuffman(pending, bw, dcY, acY, dcC, acC, ref prevYdc, ref prevCbdc, ref prevCrdc);
+                                pending.Release(pool);
+                                expected++;
+                            }
                         }
-                    }
-                    else
-                    {
-                        EnsurePendingCapacity(ref pendingItems, ref pendingSequences, ref pendingMask, mcu.Sequence);
-                        int index = mcu.Sequence & pendingMask;
-                        while (pendingItems[index] != null && pendingSequences[index] != mcu.Sequence)
+                        else
                         {
-                            index = (index + 1) & pendingMask;
+                            EnsurePendingCapacity(ref pendingItems, ref pendingSequences, ref pendingCapacity, ref pendingMask, mcu.Sequence);
+                            int index = mcu.Sequence & pendingMask;
+                            while (pendingItems[index] != null && pendingSequences[index] != mcu.Sequence)
+                            {
+                                index = (index + 1) & pendingMask;
+                            }
+                            pendingItems[index] = mcu;
+                            pendingSequences[index] = mcu.Sequence;
                         }
-                        pendingItems[index] = mcu;
-                        pendingSequences[index] = mcu.Sequence;
                     }
                 }
-            }
-            finally
-            {
-                for (int i = 0; i < batch.Count; i++)
+                finally
                 {
-                    batch.Items[i]?.Release(pool);
+                    for (int i = 0; i < batch.Count; i++)
+                    {
+                        batch.Items[i]?.Release(pool);
+                    }
+                    ReturnMcuBatch(batch);
                 }
-                ReturnMcuBatch(batch);
             }
-        }
 
-        while (true)
-        {
-            int index = expected & pendingMask;
-            var pending = pendingItems[index];
-            if (pending == null || pendingSequences[index] != expected)
+            while (true)
             {
-                break;
+                int index = expected & pendingMask;
+                var pending = pendingItems[index];
+                if (pending == null || pendingSequences[index] != expected)
+                {
+                    break;
+                }
+                pendingItems[index] = null;
+                pendingSequences[index] = -1;
+                WriteMcuHuffman(pending, bw, dcY, acY, dcC, acC, ref prevYdc, ref prevCbdc, ref prevCrdc);
+                pending.Release(pool);
+                expected++;
             }
-            pendingItems[index] = null;
-            pendingSequences[index] = -1;
-            WriteMcuHuffman(pending, bw, dcY, acY, dcC, acC, ref prevYdc, ref prevCbdc, ref prevCrdc);
-            pending.Release(pool);
-            expected++;
         }
-
-        for (int i = 0; i < pendingItems.Length; i++)
+        finally
         {
-            pendingItems[i]?.Release(pool);
+            ReturnPendingState(pendingItems, pendingSequences, pendingCapacity, pool);
         }
     }
 
@@ -1102,89 +1141,88 @@ public static class JpegEncoder
         int prevYdc = 0;
         int expected = 0;
         int completed = 0;
-        var pendingItems = new SampledMcu?[256];
-        var pendingSequences = new int[256];
-        Array.Fill(pendingSequences, -1);
-        int pendingMask = pendingItems.Length - 1;
+        RentPendingState(256, out var pendingItems, out var pendingSequences, out int pendingCapacity, out int pendingMask);
 
-        while (completed < completionCount)
+        try
         {
-            var batch = input.Dequeue(token);
-            if (batch == null)
+            while (completed < completionCount)
             {
-                completed++;
-                continue;
-            }
-
-            try
-            {
-                for (int i = 0; i < batch.Count; i++)
+                var batch = input.Dequeue(token);
+                if (batch == null)
                 {
-                    var mcu = batch.Items[i]!;
-                    batch.Items[i] = null;
-                    if (mcu.Sequence == expected)
+                    completed++;
+                    continue;
+                }
+
+                try
+                {
+                    for (int i = 0; i < batch.Count; i++)
                     {
-                        HuffmanWriteBlock(bw, mcu.GetBlockSpan(0), dcY, acY, ref prevYdc);
-                        mcu.Release(pool);
-                        expected++;
-
-                        while (true)
+                        var mcu = batch.Items[i]!;
+                        batch.Items[i] = null;
+                        if (mcu.Sequence == expected)
                         {
-                            int expectedIndex = expected & pendingMask;
-                            var pending = pendingItems[expectedIndex];
-                            if (pending == null || pendingSequences[expectedIndex] != expected)
-                            {
-                                break;
-                            }
-
-                            pendingItems[expectedIndex] = null;
-                            pendingSequences[expectedIndex] = -1;
-                            HuffmanWriteBlock(bw, pending.GetBlockSpan(0), dcY, acY, ref prevYdc);
-                            pending.Release(pool);
+                            HuffmanWriteBlock(bw, mcu.GetBlockSpan(0), dcY, acY, ref prevYdc);
+                            mcu.Release(pool);
                             expected++;
+
+                            while (true)
+                            {
+                                int expectedIndex = expected & pendingMask;
+                                var pending = pendingItems[expectedIndex];
+                                if (pending == null || pendingSequences[expectedIndex] != expected)
+                                {
+                                    break;
+                                }
+
+                                pendingItems[expectedIndex] = null;
+                                pendingSequences[expectedIndex] = -1;
+                                HuffmanWriteBlock(bw, pending.GetBlockSpan(0), dcY, acY, ref prevYdc);
+                                pending.Release(pool);
+                                expected++;
+                            }
                         }
-                    }
-                    else
-                    {
-                        EnsurePendingCapacity(ref pendingItems, ref pendingSequences, ref pendingMask, mcu.Sequence);
-                        int index = mcu.Sequence & pendingMask;
-                        while (pendingItems[index] != null && pendingSequences[index] != mcu.Sequence)
+                        else
                         {
-                            index = (index + 1) & pendingMask;
+                            EnsurePendingCapacity(ref pendingItems, ref pendingSequences, ref pendingCapacity, ref pendingMask, mcu.Sequence);
+                            int index = mcu.Sequence & pendingMask;
+                            while (pendingItems[index] != null && pendingSequences[index] != mcu.Sequence)
+                            {
+                                index = (index + 1) & pendingMask;
+                            }
+                            pendingItems[index] = mcu;
+                            pendingSequences[index] = mcu.Sequence;
                         }
-                        pendingItems[index] = mcu;
-                        pendingSequences[index] = mcu.Sequence;
                     }
                 }
-            }
-            finally
-            {
-                for (int i = 0; i < batch.Count; i++)
+                finally
                 {
-                    batch.Items[i]?.Release(pool);
+                    for (int i = 0; i < batch.Count; i++)
+                    {
+                        batch.Items[i]?.Release(pool);
+                    }
+                    ReturnMcuBatch(batch);
                 }
-                ReturnMcuBatch(batch);
             }
-        }
 
-        while (true)
-        {
-            int index = expected & pendingMask;
-            var pending = pendingItems[index];
-            if (pending == null || pendingSequences[index] != expected)
+            while (true)
             {
-                break;
+                int index = expected & pendingMask;
+                var pending = pendingItems[index];
+                if (pending == null || pendingSequences[index] != expected)
+                {
+                    break;
+                }
+                pendingItems[index] = null;
+                pendingSequences[index] = -1;
+                HuffmanWriteBlock(bw, pending.GetBlockSpan(0), dcY, acY, ref prevYdc);
+                pending.Release(pool);
+                expected++;
             }
-            pendingItems[index] = null;
-            pendingSequences[index] = -1;
-            HuffmanWriteBlock(bw, pending.GetBlockSpan(0), dcY, acY, ref prevYdc);
-            pending.Release(pool);
-            expected++;
         }
-
-        for (int i = 0; i < pendingItems.Length; i++)
+        finally
         {
-            pendingItems[i]?.Release(pool);
+            ReturnPendingState(pendingItems, pendingSequences, pendingCapacity, pool);
         }
     }
 
@@ -1693,38 +1731,39 @@ public static class JpegEncoder
         }
     }
 
-    private static void WriteAppSegment(Stream s, byte markerLow, byte[] payload)
+    private static void WriteAppSegment(Stream s, byte markerLow, ReadOnlySpan<byte> payload)
     {
         int len = payload.Length + 2;
         if (len > 0xFFFF) throw new ArgumentOutOfRangeException(nameof(payload), "APP 段长度过大");
         WriteMarker(s, markerLow);
         WriteBe16(s, len);
-        s.Write(payload, 0, payload.Length);
+        s.Write(payload);
+    }
+
+    private static void WriteAppSegment(Stream s, byte markerLow, byte[] payload)
+    {
+        WriteAppSegment(s, markerLow, payload.AsSpan());
     }
 
     private static void WriteIccProfile(Stream s, byte[] profile)
     {
-        byte[] sig =
-        [
-            (byte)'I',(byte)'C',(byte)'C',(byte)'_',(byte)'P',(byte)'R',(byte)'O',(byte)'F',(byte)'I',(byte)'L',(byte)'E',0x00
-        ];
-
         const int overhead = 14;
         int maxPayload = 0xFFFD - overhead;
         int count = (profile.Length + maxPayload - 1) / maxPayload;
         if (count <= 0) count = 1;
         if (count > 255) throw new ArgumentOutOfRangeException(nameof(profile), "ICC Profile 过大");
 
+        using IMemoryOwner<byte> owner = MemoryPool<byte>.Shared.Rent(0xFFFD);
+        Span<byte> buffer = owner.Memory.Span;
         int offset = 0;
         for (int i = 0; i < count; i++)
         {
             int take = Math.Min(maxPayload, profile.Length - offset);
-            byte[] payload = new byte[overhead + take];
-            Buffer.BlockCopy(sig, 0, payload, 0, sig.Length);
-            payload[12] = (byte)(i + 1);
-            payload[13] = (byte)count;
-            Buffer.BlockCopy(profile, offset, payload, overhead, take);
-            WriteAppSegment(s, 0xE2, payload);
+            IccProfileSignature.CopyTo(buffer);
+            buffer[12] = (byte)(i + 1);
+            buffer[13] = (byte)count;
+            profile.AsSpan(offset, take).CopyTo(buffer.Slice(overhead, take));
+            WriteAppSegment(s, 0xE2, buffer.Slice(0, overhead + take));
             offset += take;
         }
     }

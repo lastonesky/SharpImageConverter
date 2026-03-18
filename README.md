@@ -175,21 +175,28 @@ dotnet run -- <输入文件或文件夹路径> [输出文件或文件夹路径] 
 特殊情况：
 - GIF → WebP：当输入为动图 GIF、输出扩展名为 `.webp` 时，会编码为动图 WebP（尽量保留帧间隔与循环次数）
 
-### 操作 (Operations)
-- `resize:WxH` : 强制缩放到指定宽 (W) 高 (H)
-- `resizebilinear:WxH` : 使用双线性插值缩放到指定尺寸
-- `resizefit:WxH` : 等比缩放到适应指定矩形框 (W x H)
-- `grayscale` : 转为灰度图
-
-### 参数 (Options)
-- `--quality N` : 设置 JPEG 编码质量 (0-100)，默认 75
-- `--subsample 420|444` : 设置 JPEG 色度采样，默认 420
-- `--keep-metadata` : 在重新编码 JPEG 时尽量保留 EXIF/ICC 等基础元数据
-- `--jpeg-debug` : 启用 JPEG 解码调试输出
-- `--gif-frames` : 将动图 GIF 的每一帧导出为独立图片，方便调试与检查
-- `--gray` : 强制输出为灰度（对 JPEG/PNG/BMP/WebP 生效）
-- `--stream` : 针对 JPEG 使用流式解码以降低内存占用，其他格式会回退为常规解码
-- `--idct int|float` : 选择 JPEG IDCT 实现（整数/浮点），仅对 JPEG 解码有效
+- 基本用法：`dotnet run -- <输入文件或文件夹> [输出路径] [操作] [选项]`
+- 图像操作参数：
+  - `resize:WxH`：缩放到指定尺寸（默认缩放实现）。
+  - `resizebilinear:WxH`：双线性缩放。
+  - `resizefit:WxH`：等比缩放并适配目标框。
+  - `grayscale`：处理管线中转灰度。
+- 编解码与质量参数：
+  - `--quality N` / `-q N` / `--quality=N`：JPEG/WebP 质量（默认 75）。
+  - `--subsample 420|444` / `--subsample=420|444`：JPEG 子采样（默认 420）。
+  - `--keep-metadata`：JPEG 重编码保留元数据（EXIF/ICC）。
+  - `--idct int|float` / `--idct=int|float`：JPEG IDCT 实现选择。
+  - `--stream`：JPEG 优先走流式解码路径（非 JPEG 自动回退常规解码）。
+  - `--jpeg-debug`：打印 JPEG 编码配置与耗时信息。
+- GIF/灰度相关：
+  - `--gif-frames`：GIF 拆帧导出。
+  - `--gray`：输出阶段按灰度保存（BMP/PNG/WebP/JPEG 路径生效）。
+  - `--dithering on|off`：GIF 编码抖动开关（默认 on）。
+- 目录批处理参数：
+  - `--recursive`：递归处理子目录。
+  - `--to ext` / `--to=ext`（同义：`--out-ext`）：指定输出后缀（bmp/png/jpg/jpeg/webp）。
+  - `--parallel N`：并行度（目录模式；WebP 输出强制串行）。
+  - `--skip-existing`：目标文件存在时跳过。
 
 ### 文件夹批量转换
 - 递归：`--recursive`（遍历子目录）

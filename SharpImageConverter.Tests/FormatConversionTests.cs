@@ -212,7 +212,7 @@ namespace Jpeg2Bmp.Tests
             Image.Save(img, path);
 
             byte[] data = File.ReadAllBytes(path);
-            var jpeg = StaticJpegDecoder.Decode(data);
+            var jpeg = JpegDecoder.Decode(data);
 
             Assert.Equal(JpegPixelFormat.Gray8, jpeg.PixelFormat);
             Assert.Equal(w, jpeg.Width);
@@ -257,12 +257,10 @@ namespace Jpeg2Bmp.Tests
             JpegEncoder.Write(ms, img.Width, img.Height, img.Buffer, 85);
             byte[] data = ms.ToArray();
 
-            var decA = new JpegDecoder();
-            var imgA = decA.Decode(data);
+            var imgA = JpegDecoder.Decode(data);
 
             using var chunked = new ChunkedReadOnlyStream(data, 11);
-            var decB = new JpegDecoder();
-            var imgB = decB.Decode(chunked);
+            var imgB = JpegDecoder.Decode(chunked);
 
             Assert.Equal(imgA.Width, imgB.Width);
             Assert.Equal(imgA.Height, imgB.Height);
@@ -344,8 +342,7 @@ namespace Jpeg2Bmp.Tests
                 byte[] mutated = MutateBytes(data, rng, 3);
                 try
                 {
-                    var dec = new JpegDecoder();
-                    _ = dec.Decode(mutated);
+                    _ = JpegDecoder.Decode(mutated);
                 }
                 catch
                 {
@@ -380,8 +377,7 @@ namespace Jpeg2Bmp.Tests
                 using var ms = new MemoryStream();
                 JpegEncoder.Write(ms, img.Width, img.Height, img.Buffer, 85);
                 byte[] data = ms.ToArray();
-                var dec = new JpegDecoder();
-                _ = dec.Decode(data);
+                _ = JpegDecoder.Decode(data);
             }
             sw.Stop();
             Assert.True(sw.ElapsedMilliseconds < 5000);
@@ -399,11 +395,9 @@ namespace Jpeg2Bmp.Tests
             foreach (string path in files)
             {
                 byte[] data = File.ReadAllBytes(path);
-                var dec1 = new JpegDecoder();
-                var img1 = dec1.Decode(data);
+                var img1 = JpegDecoder.Decode(data);
                 using var ms = new MemoryStream(data);
-                var dec2 = new JpegDecoder();
-                var img2 = dec2.Decode(ms);
+                var img2 = JpegDecoder.Decode(ms);
                 Assert.Equal(img1.Width, img2.Width);
                 Assert.Equal(img1.Height, img2.Height);
                 Assert.Equal(Hash(img1.Buffer), Hash(img2.Buffer));

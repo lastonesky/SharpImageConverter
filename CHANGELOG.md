@@ -1,3 +1,21 @@
+## 0.2.1（相对 v0.2.0）
+- 版本号：`src/SharpImageConverter.csproj` 从 `0.2.0` 升级为 `0.2.1`。
+- 变更范围：共 6 个文件，约 `+397 / -334`（`git diff v0.2.0..HEAD --stat`）。
+- 主要方向：JPEG 编解码路径继续收紧内存分配策略（ArrayPool/MemoryPool），并修复测试侧对静态解码 API 的调用方式。
+
+### 代码改动摘要
+- `src/Formats/Jpeg/JpegEncoder.cs`
+  - 位流写缓冲改为池化租借/归还，减少每次编码时的临时分配。
+  - 有序 Huffman 阶段的 pending 容器改为池化扩容与回收，降低 GC 压力。
+  - ICC APP2 分片写入改为基于 `MemoryPool<byte>` 的复用缓冲写出。
+  - Huffman 表改为静态复用，并修正静态初始化顺序问题。
+- `src/Formats/Jpeg/JpegDecoder.cs`
+  - `Decode(Stream)` 路径改为池化读取，去掉 `MemoryStream + ToArray` 方式。
+  - ICC 收集器改为池化 chunk 管理，并在同步/异步解析完成后统一释放。
+- `SharpImageConverter.Tests/*.cs`
+  - 测试代码切换到静态 `JpegDecoder` API（`Decode` / `DecodeFromStreamAsync`）。
+  - 兼容 `JpegImage` 当前接口，移除不可用成员调用。
+
 ## 0.2.0
 - 相比 0.1.6，本版本对 JPEG/PNG/GIF/BMP/WebP 全链路进行了较大规模重构与优化，总体聚焦性能、稳定性与流式处理能力。
 - JPEG：引入 SIMD 优化的 IDCT 与颜色转换、MCU 批处理与流水线并行编码；新增 APP2 ICC 配置文件支持与可选 CMYK 转换模式；修复多个解码验证问题与资源泄漏问题。
