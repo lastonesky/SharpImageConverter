@@ -221,18 +221,25 @@ public static class PngWriter
     private static void WriteUpFilteredScanlines(Stream s, byte[] src, int width, int height, int bytesPerPixel)
     {
         int stride = width * bytesPerPixel;
-        using var prevRow = SimdHelper.AllocateAlignedBytes(stride, alignment: SimdHelper.DefaultAlignment, clear: true, padToMultiple: Vector<byte>.Count);
-        using var filtered = SimdHelper.AllocateAlignedBytes(stride, alignment: SimdHelper.DefaultAlignment, clear: false, padToMultiple: Vector<byte>.Count);
+        using var filtered = SimdHelper.AllocateAlignedBytes(stride + 1, alignment: SimdHelper.DefaultAlignment, clear: false, padToMultiple: Vector<byte>.Count);
 
-        Span<byte> prevSpan = prevRow.Span.Slice(0, stride);
-        Span<byte> filteredSpan = filtered.Span.Slice(0, stride);
+        Span<byte> writeSpan = filtered.Span.Slice(0, stride + 1);
+        Span<byte> filteredSpan = writeSpan.Slice(1, stride);
         int srcIdx = 0;
         for (int y = 0; y < height; y++)
         {
-            s.WriteByte(2);
-            ApplyUpFilterSimd(src.AsSpan(srcIdx, stride), prevSpan, filteredSpan);
-            s.Write(filteredSpan);
-            src.AsSpan(srcIdx, stride).CopyTo(prevSpan);
+            writeSpan[0] = 2;
+            ReadOnlySpan<byte> current = src.AsSpan(srcIdx, stride);
+            if (y == 0)
+            {
+                current.CopyTo(filteredSpan);
+            }
+            else
+            {
+                ReadOnlySpan<byte> prev = src.AsSpan(srcIdx - stride, stride);
+                ApplyUpFilterSimd(current, prev, filteredSpan);
+            }
+            s.Write(writeSpan);
             srcIdx += stride;
         }
     }
@@ -245,16 +252,11 @@ public static class PngWriter
         if (Vector.IsHardwareAccelerated && length >= Vector<byte>.Count)
         {
             int simdCount = Vector<byte>.Count;
-            var mask = new Vector<ushort>(0xFF);
             for (; i <= length - simdCount; i += simdCount)
             {
                 var curVec = new Vector<byte>(current.Slice(i));
                 var prevVec = new Vector<byte>(prevSpan.Slice(i));
-                Vector.Widen(curVec, out Vector<ushort> curLow, out Vector<ushort> curHigh);
-                Vector.Widen(prevVec, out Vector<ushort> prevLow, out Vector<ushort> prevHigh);
-                var resLow = (curLow - prevLow) & mask;
-                var resHigh = (curHigh - prevHigh) & mask;
-                var result = Vector.Narrow(resLow, resHigh);
+                var result = Vector.Subtract(curVec, prevVec);
                 result.CopyTo(destSpan.Slice(i));
             }
         }
