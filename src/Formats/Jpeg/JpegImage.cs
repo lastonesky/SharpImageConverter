@@ -34,7 +34,6 @@ public readonly record struct JpegColorInfo(JpegColorSpace ColorSpace, bool HasA
 public sealed class JpegImage
 {
     private readonly byte[] pixelData;
-    private byte[]? rgba32Cache;
     public JpegCmykConversionMode CmykConversionMode { get; init; } = JpegCmykConversionMode.Fast;
 
     public JpegImage(int width, int height, byte[] rgba32)
