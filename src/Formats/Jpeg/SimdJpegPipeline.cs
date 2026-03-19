@@ -9,6 +9,8 @@ internal static class SimdJpegPipeline
 {
     private const int ConstBits = 13;
     private const int Pass1Bits = 2;
+    private const int Pass1Shift = ConstBits - Pass1Bits;
+    private const int Pass2Shift = ConstBits + Pass1Bits + 3;
 
     // LLM algorithm constants (scaled by 1 << ConstBits)
     private static readonly int Fix_0_298631336 = 2446;
@@ -59,8 +61,8 @@ internal static class SimdJpegPipeline
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static void Idct8ElementsSse2(ref Vector128<short> v0, ref Vector128<short> v1, ref Vector128<short> v2, ref Vector128<short> v3,
-                                          ref Vector128<short> v4, ref Vector128<short> v5, ref Vector128<short> v6, ref Vector128<short> v7, int shift)
+    private static void Idct8ElementsSse2Pass1(ref Vector128<short> v0, ref Vector128<short> v1, ref Vector128<short> v2, ref Vector128<short> v3,
+                                               ref Vector128<short> v4, ref Vector128<short> v5, ref Vector128<short> v6, ref Vector128<short> v7)
     {
         Vector128<int> i0l = Vector128.WidenLower(v0);
         Vector128<int> i0h = Vector128.WidenUpper(v0);
@@ -79,8 +81,8 @@ internal static class SimdJpegPipeline
         Vector128<int> i7l = Vector128.WidenLower(v7);
         Vector128<int> i7h = Vector128.WidenUpper(v7);
 
-        Idct8Core32(ref i0l, ref i1l, ref i2l, ref i3l, ref i4l, ref i5l, ref i6l, ref i7l, shift);
-        Idct8Core32(ref i0h, ref i1h, ref i2h, ref i3h, ref i4h, ref i5h, ref i6h, ref i7h, shift);
+        Idct8Core32Pass1(ref i0l, ref i1l, ref i2l, ref i3l, ref i4l, ref i5l, ref i6l, ref i7l);
+        Idct8Core32Pass1(ref i0h, ref i1h, ref i2h, ref i3h, ref i4h, ref i5h, ref i6h, ref i7h);
 
         v0 = Sse2.PackSignedSaturate(i0l, i0h);
         v1 = Sse2.PackSignedSaturate(i1l, i1h);
@@ -93,8 +95,42 @@ internal static class SimdJpegPipeline
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static void Idct8Core32(ref Vector128<int> v0, ref Vector128<int> v1, ref Vector128<int> v2, ref Vector128<int> v3,
-                                    ref Vector128<int> v4, ref Vector128<int> v5, ref Vector128<int> v6, ref Vector128<int> v7, int shift)
+    private static void Idct8ElementsSse2Pass2(ref Vector128<short> v0, ref Vector128<short> v1, ref Vector128<short> v2, ref Vector128<short> v3,
+                                               ref Vector128<short> v4, ref Vector128<short> v5, ref Vector128<short> v6, ref Vector128<short> v7)
+    {
+        Vector128<int> i0l = Vector128.WidenLower(v0);
+        Vector128<int> i0h = Vector128.WidenUpper(v0);
+        Vector128<int> i1l = Vector128.WidenLower(v1);
+        Vector128<int> i1h = Vector128.WidenUpper(v1);
+        Vector128<int> i2l = Vector128.WidenLower(v2);
+        Vector128<int> i2h = Vector128.WidenUpper(v2);
+        Vector128<int> i3l = Vector128.WidenLower(v3);
+        Vector128<int> i3h = Vector128.WidenUpper(v3);
+        Vector128<int> i4l = Vector128.WidenLower(v4);
+        Vector128<int> i4h = Vector128.WidenUpper(v4);
+        Vector128<int> i5l = Vector128.WidenLower(v5);
+        Vector128<int> i5h = Vector128.WidenUpper(v5);
+        Vector128<int> i6l = Vector128.WidenLower(v6);
+        Vector128<int> i6h = Vector128.WidenUpper(v6);
+        Vector128<int> i7l = Vector128.WidenLower(v7);
+        Vector128<int> i7h = Vector128.WidenUpper(v7);
+
+        Idct8Core32Pass2(ref i0l, ref i1l, ref i2l, ref i3l, ref i4l, ref i5l, ref i6l, ref i7l);
+        Idct8Core32Pass2(ref i0h, ref i1h, ref i2h, ref i3h, ref i4h, ref i5h, ref i6h, ref i7h);
+
+        v0 = Sse2.PackSignedSaturate(i0l, i0h);
+        v1 = Sse2.PackSignedSaturate(i1l, i1h);
+        v2 = Sse2.PackSignedSaturate(i2l, i2h);
+        v3 = Sse2.PackSignedSaturate(i3l, i3h);
+        v4 = Sse2.PackSignedSaturate(i4l, i4h);
+        v5 = Sse2.PackSignedSaturate(i5l, i5h);
+        v6 = Sse2.PackSignedSaturate(i6l, i6h);
+        v7 = Sse2.PackSignedSaturate(i7l, i7h);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void Idct8Core32Pass1(ref Vector128<int> v0, ref Vector128<int> v1, ref Vector128<int> v2, ref Vector128<int> v3,
+                                         ref Vector128<int> v4, ref Vector128<int> v5, ref Vector128<int> v6, ref Vector128<int> v7)
     {
         Vector128<int> tmp0 = Sse2.Add(v0, v4);
         tmp0 = Sse2.ShiftLeftLogical(tmp0, ConstBits);
@@ -135,14 +171,67 @@ internal static class SimdJpegPipeline
         tmp2o = Sse2.Add(tmp2o, Sse2.Add(z2o, z3o));
         tmp3o = Sse2.Add(tmp3o, Sse2.Add(z1o, z4o));
 
-        v0 = Descale32(Sse2.Add(tmp10, tmp3o), shift);
-        v7 = Descale32(Sse2.Subtract(tmp10, tmp3o), shift);
-        v1 = Descale32(Sse2.Add(tmp11, tmp2o), shift);
-        v6 = Descale32(Sse2.Subtract(tmp11, tmp2o), shift);
-        v2 = Descale32(Sse2.Add(tmp12, tmp1o), shift);
-        v5 = Descale32(Sse2.Subtract(tmp12, tmp1o), shift);
-        v3 = Descale32(Sse2.Add(tmp13, tmp0o), shift);
-        v4 = Descale32(Sse2.Subtract(tmp13, tmp0o), shift);
+        v0 = Descale32Pass1(Sse2.Add(tmp10, tmp3o));
+        v7 = Descale32Pass1(Sse2.Subtract(tmp10, tmp3o));
+        v1 = Descale32Pass1(Sse2.Add(tmp11, tmp2o));
+        v6 = Descale32Pass1(Sse2.Subtract(tmp11, tmp2o));
+        v2 = Descale32Pass1(Sse2.Add(tmp12, tmp1o));
+        v5 = Descale32Pass1(Sse2.Subtract(tmp12, tmp1o));
+        v3 = Descale32Pass1(Sse2.Add(tmp13, tmp0o));
+        v4 = Descale32Pass1(Sse2.Subtract(tmp13, tmp0o));
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void Idct8Core32Pass2(ref Vector128<int> v0, ref Vector128<int> v1, ref Vector128<int> v2, ref Vector128<int> v3,
+                                         ref Vector128<int> v4, ref Vector128<int> v5, ref Vector128<int> v6, ref Vector128<int> v7)
+    {
+        Vector128<int> tmp0 = Sse2.Add(v0, v4);
+        tmp0 = Sse2.ShiftLeftLogical(tmp0, ConstBits);
+        Vector128<int> tmp1 = Sse2.Subtract(v0, v4);
+        tmp1 = Sse2.ShiftLeftLogical(tmp1, ConstBits);
+
+        Vector128<int> z1 = Multiply32(Sse2.Add(v2, v6), Fix_0_541196100);
+        Vector128<int> tmp2 = Sse2.Add(z1, Multiply32(v6, -Fix_1_847759065));
+        Vector128<int> tmp3 = Sse2.Add(z1, Multiply32(v2, Fix_0_765366865));
+
+        Vector128<int> tmp10 = Sse2.Add(tmp0, tmp3);
+        Vector128<int> tmp13 = Sse2.Subtract(tmp0, tmp3);
+        Vector128<int> tmp11 = Sse2.Add(tmp1, tmp2);
+        Vector128<int> tmp12 = Sse2.Subtract(tmp1, tmp2);
+
+        Vector128<int> tmp0o = v7;
+        Vector128<int> tmp1o = v5;
+        Vector128<int> tmp2o = v3;
+        Vector128<int> tmp3o = v1;
+
+        Vector128<int> z1o = Sse2.Add(tmp0o, tmp3o);
+        Vector128<int> z2o = Sse2.Add(tmp1o, tmp2o);
+        Vector128<int> z3o = Sse2.Add(tmp0o, tmp2o);
+        Vector128<int> z4o = Sse2.Add(tmp1o, tmp3o);
+        Vector128<int> z5o = Multiply32(Sse2.Add(z3o, z4o), Fix_1_175875602);
+
+        tmp0o = Multiply32(tmp0o, Fix_0_298631336);
+        tmp1o = Multiply32(tmp1o, Fix_2_053119869);
+        tmp2o = Multiply32(tmp2o, Fix_3_072711026);
+        tmp3o = Multiply32(tmp3o, Fix_1_501321110);
+        z1o = Multiply32(z1o, -Fix_0_899976223);
+        z2o = Multiply32(z2o, -Fix_2_562915447);
+        z3o = Sse2.Add(Multiply32(z3o, -Fix_1_961570560), z5o);
+        z4o = Sse2.Add(Multiply32(z4o, -Fix_0_390180644), z5o);
+
+        tmp0o = Sse2.Add(tmp0o, Sse2.Add(z1o, z3o));
+        tmp1o = Sse2.Add(tmp1o, Sse2.Add(z2o, z4o));
+        tmp2o = Sse2.Add(tmp2o, Sse2.Add(z2o, z3o));
+        tmp3o = Sse2.Add(tmp3o, Sse2.Add(z1o, z4o));
+
+        v0 = Descale32Pass2(Sse2.Add(tmp10, tmp3o));
+        v7 = Descale32Pass2(Sse2.Subtract(tmp10, tmp3o));
+        v1 = Descale32Pass2(Sse2.Add(tmp11, tmp2o));
+        v6 = Descale32Pass2(Sse2.Subtract(tmp11, tmp2o));
+        v2 = Descale32Pass2(Sse2.Add(tmp12, tmp1o));
+        v5 = Descale32Pass2(Sse2.Subtract(tmp12, tmp1o));
+        v3 = Descale32Pass2(Sse2.Add(tmp13, tmp0o));
+        v4 = Descale32Pass2(Sse2.Subtract(tmp13, tmp0o));
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -159,10 +248,17 @@ internal static class SimdJpegPipeline
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static Vector128<int> Descale32(Vector128<int> v, int shift)
+    private static Vector128<int> Descale32Pass1(Vector128<int> v)
     {
-        Vector128<int> half = Vector128.Create(1 << (shift - 1));
-        return Sse2.ShiftRightArithmetic(Sse2.Add(v, half), (byte)shift);
+        Vector128<int> half = Vector128.Create(1 << (Pass1Shift - 1));
+        return Sse2.ShiftRightArithmetic(Sse2.Add(v, half), (byte)Pass1Shift);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static Vector128<int> Descale32Pass2(Vector128<int> v)
+    {
+        Vector128<int> half = Vector128.Create(1 << (Pass2Shift - 1));
+        return Sse2.ShiftRightArithmetic(Sse2.Add(v, half), (byte)Pass2Shift);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -298,11 +394,11 @@ internal static class SimdJpegPipeline
             Vector128<short> v7 = Sse2.MultiplyLow(Sse2.LoadVector128(cPtr + 56), Sse2.LoadVector128(sqPtr + 56));
 
             // Pass 1: IDCT on columns
-            Idct8ElementsSse2(ref v0, ref v1, ref v2, ref v3, ref v4, ref v5, ref v6, ref v7, ConstBits - Pass1Bits);
+            Idct8ElementsSse2Pass1(ref v0, ref v1, ref v2, ref v3, ref v4, ref v5, ref v6, ref v7);
             // Transpose to make rows vertical
             Transpose8x8Sse2(ref v0, ref v1, ref v2, ref v3, ref v4, ref v5, ref v6, ref v7);
             // Pass 2: IDCT on original rows
-            Idct8ElementsSse2(ref v0, ref v1, ref v2, ref v3, ref v4, ref v5, ref v6, ref v7, ConstBits + Pass1Bits + 3);
+            Idct8ElementsSse2Pass2(ref v0, ref v1, ref v2, ref v3, ref v4, ref v5, ref v6, ref v7);
             // Transpose back to row-major
             Transpose8x8Sse2(ref v0, ref v1, ref v2, ref v3, ref v4, ref v5, ref v6, ref v7);
 
