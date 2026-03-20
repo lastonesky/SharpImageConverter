@@ -24,9 +24,25 @@ namespace SharpImageConverter.Formats.Bmp
         /// <returns>匹配返回 true</returns>
         public bool IsMatch(Stream s)
         {
+            long origin = 0;
+            bool restorePosition = s.CanSeek;
+            if (restorePosition)
+            {
+                origin = s.Position;
+            }
             Span<byte> b = stackalloc byte[2];
-            if (s.Read(b) != b.Length) return false;
-            return b[0] == (byte)'B' && b[1] == (byte)'M';
+            try
+            {
+                if (s.Read(b) != b.Length) return false;
+                return b[0] == (byte)'B' && b[1] == (byte)'M';
+            }
+            finally
+            {
+                if (restorePosition)
+                {
+                    s.Position = origin;
+                }
+            }
         }
     }
 }
