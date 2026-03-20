@@ -2236,6 +2236,18 @@ public static class JpegDecoder
         if (px + 8 <= width && py + 8 <= height)
         {
             SimdJpegPipeline.TransformAndConvertYCbCr8x8(yBlock, yQuant, cbBlock, cbQuant, crBlock, crQuant, output.AsSpan(py * stride + px * 3), stride);
+            return;
+        }
+
+        Span<byte> temp = stackalloc byte[8 * 8 * 3];
+        SimdJpegPipeline.TransformAndConvertYCbCr8x8(yBlock, yQuant, cbBlock, cbQuant, crBlock, crQuant, temp, 8 * 3);
+        int copyW = Math.Min(8, width - px);
+        int copyH = Math.Min(8, height - py);
+        for (int y = 0; y < copyH; y++)
+        {
+            int src = y * 8 * 3;
+            int dst = (py + y) * stride + px * 3;
+            temp.Slice(src, copyW * 3).CopyTo(output.AsSpan(dst));
         }
     }
 
@@ -2258,6 +2270,18 @@ public static class JpegDecoder
         if (px + 16 <= width && py + 16 <= height)
         {
             SimdJpegPipeline.TransformAndConvertYCbCr420(y0, y1, y2, y3, yQuant, cb, cbQuant, cr, crQuant, output.AsSpan(py * stride + px * 3), stride);
+            return;
+        }
+
+        Span<byte> temp = stackalloc byte[16 * 16 * 3];
+        SimdJpegPipeline.TransformAndConvertYCbCr420(y0, y1, y2, y3, yQuant, cb, cbQuant, cr, crQuant, temp, 16 * 3);
+        int copyW = Math.Min(16, width - px);
+        int copyH = Math.Min(16, height - py);
+        for (int y = 0; y < copyH; y++)
+        {
+            int src = y * 16 * 3;
+            int dst = (py + y) * stride + px * 3;
+            temp.Slice(src, copyW * 3).CopyTo(output.AsSpan(dst));
         }
     }
 
