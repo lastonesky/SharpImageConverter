@@ -35,6 +35,16 @@ namespace SharpImageConverter.Tests
         }
 
         [Fact]
+        public void Bmp_IsMatch_Restores_Stream_Position()
+        {
+            var fmt = new BmpFormat();
+            using var ms = new MemoryStream(new byte[] { (byte)'B', (byte)'M', 0x12, 0x34 });
+            ms.Position = 1;
+            Assert.False(fmt.IsMatch(ms));
+            Assert.Equal(1, ms.Position);
+        }
+
+        [Fact]
         public void Webp_IsMatch_By_Header()
         {
             var fmt = new WebpFormat();

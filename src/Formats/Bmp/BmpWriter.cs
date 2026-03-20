@@ -22,10 +22,18 @@ public static class BmpWriter
 
     public static void Write8(Stream stream, int width, int height, byte[] gray)
     {
-        int rowStride = ((width + 3) / 4) * 4;
-        int imageSize = rowStride * height;
+        ArgumentNullException.ThrowIfNull(stream);
+        ArgumentNullException.ThrowIfNull(gray);
+        if (width <= 0) throw new ArgumentOutOfRangeException(nameof(width), "Width must be positive.");
+        if (height <= 0) throw new ArgumentOutOfRangeException(nameof(height), "Height must be positive.");
+
+        int expectedGrayLength = checked(width * height);
+        if (gray.Length != expectedGrayLength) throw new ArgumentException("Gray buffer length does not match dimensions.", nameof(gray));
+
+        int rowStride = checked(((width + 3) / 4) * 4);
+        int imageSize = checked(rowStride * height);
         int paletteSize = 256 * 4;
-        int fileSize = FileHeaderSize + InfoHeaderSize + paletteSize + imageSize;
+        int fileSize = checked(FileHeaderSize + InfoHeaderSize + paletteSize + imageSize);
 
         // Header
         Span<byte> header = stackalloc byte[FileHeaderSize + InfoHeaderSize];
@@ -72,10 +80,10 @@ public static class BmpWriter
             for (int y = height - 1; y >= 0; y--)
             {
                 int srcBase = y * width;
-                Array.Copy(gray, srcBase, row, 0, width);
+                Buffer.BlockCopy(gray, srcBase, row, 0, width);
                 if (rowStride > width)
                 {
-                    Array.Clear(row, width, rowStride - width);
+                    row.AsSpan(width, rowStride - width).Clear();
                 }
                 stream.Write(row, 0, rowStride);
             }
@@ -108,9 +116,18 @@ public static class BmpWriter
     /// <param name="rgb">RGB24 像素数据</param>
     public static void Write24(Stream stream, int width, int height, byte[] rgb)
     {
-        int rowStride = ((width * 3 + 3) / 4) * 4;
-        int imageSize = rowStride * height;
-        int fileSize = FileHeaderSize + InfoHeaderSize + imageSize;
+        ArgumentNullException.ThrowIfNull(stream);
+        ArgumentNullException.ThrowIfNull(rgb);
+        if (width <= 0) throw new ArgumentOutOfRangeException(nameof(width), "Width must be positive.");
+        if (height <= 0) throw new ArgumentOutOfRangeException(nameof(height), "Height must be positive.");
+
+        int srcRowSize = checked(width * 3);
+        int expectedRgbLength = checked(srcRowSize * height);
+        if (rgb.Length != expectedRgbLength) throw new ArgumentException("RGB buffer length does not match dimensions.", nameof(rgb));
+
+        int rowStride = checked(((srcRowSize + 3) / 4) * 4);
+        int imageSize = checked(rowStride * height);
+        int fileSize = checked(FileHeaderSize + InfoHeaderSize + imageSize);
 
         Span<byte> header = stackalloc byte[FileHeaderSize + InfoHeaderSize];
         
@@ -137,7 +154,6 @@ public static class BmpWriter
         
         stream.Write(header);
 
-        int srcRowSize = width * 3;
         int padding = rowStride - srcRowSize;
         
         byte[] row = ArrayPool<byte>.Shared.Rent(rowStride);
@@ -168,7 +184,7 @@ public static class BmpWriter
                         
                         if (padding > 0)
                         {
-                             for(int p=0; p<padding; p++) dst[p] = 0;
+                            row.AsSpan(srcRowSize, padding).Clear();
                         }
                         stream.Write(row, 0, rowStride);
                     }
