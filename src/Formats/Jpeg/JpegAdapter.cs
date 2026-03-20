@@ -1,4 +1,5 @@
 using SharpImageConverter.Core;
+using SharpImageConverter;
 
 namespace SharpImageConverter.Formats.Jpeg;
 public sealed class JpegDecoderAdapter : IImageDecoder
@@ -11,8 +12,8 @@ public sealed class JpegDecoderAdapter : IImageDecoder
 
     public Image<Rgb24> DecodeRgb24(Stream stream)
     {
-        var img = JpegDecoder.Decode(stream);
-        return new Image<Rgb24>(img.Width, img.Height, img.ToRgb24(), img.Metadata);
+        var frame = ImageFrame.LoadJpeg(stream);
+        return new Image<Rgb24>(frame.Width, frame.Height, frame.Pixels, frame.Metadata);
     }
 }
 
