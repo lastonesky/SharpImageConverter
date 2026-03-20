@@ -155,7 +155,7 @@ namespace SharpImageConverter.Processing
             double scaleX = (double)sw / width;
             double scaleY = (double)sh / height;
 
-            for (int dy = 0; dy < height; dy++)
+            void ProcessRow(int dy)
             {
                 double sy0 = dy * scaleY;
                 double sy1 = (dy + 1) * scaleY;
@@ -219,6 +219,19 @@ namespace SharpImageConverter.Processing
                         dst[d + 1] = 0;
                         dst[d + 2] = 0;
                     }
+                }
+            }
+
+            bool useParallel = width * height >= 200000 && height >= 32 && Environment.ProcessorCount > 1;
+            if (useParallel)
+            {
+                Parallel.For(0, height, ProcessRow);
+            }
+            else
+            {
+                for (int dy = 0; dy < height; dy++)
+                {
+                    ProcessRow(dy);
                 }
             }
 
@@ -477,16 +490,39 @@ namespace SharpImageConverter.Processing
         public ImageProcessingContext Grayscale()
         {
             var buf = _image.Buffer;
+            int width = _image.Width;
+            int height = _image.Height;
             int n = buf.Length / 3;
-            for (int i = 0; i < n; i++)
+            bool useParallel = n >= 200000 && height >= 32 && Environment.ProcessorCount > 1;
+            if (useParallel)
             {
-                int o = i * 3;
-                int r = buf[o + 0], g = buf[o + 1], b = buf[o + 2];
-                int y = (77 * r + 150 * g + 29 * b) >> 8;
-                byte yy = (byte)y;
-                buf[o + 0] = yy;
-                buf[o + 1] = yy;
-                buf[o + 2] = yy;
+                Parallel.For(0, height, y =>
+                {
+                    int row = y * width * 3;
+                    int end = row + width * 3;
+                    for (int o = row; o < end; o += 3)
+                    {
+                        int r = buf[o + 0], g = buf[o + 1], b = buf[o + 2];
+                        int yy = (77 * r + 150 * g + 29 * b) >> 8;
+                        byte yb = (byte)yy;
+                        buf[o + 0] = yb;
+                        buf[o + 1] = yb;
+                        buf[o + 2] = yb;
+                    }
+                });
+            }
+            else
+            {
+                for (int i = 0; i < n; i++)
+                {
+                    int o = i * 3;
+                    int r = buf[o + 0], g = buf[o + 1], b = buf[o + 2];
+                    int y = (77 * r + 150 * g + 29 * b) >> 8;
+                    byte yy = (byte)y;
+                    buf[o + 0] = yy;
+                    buf[o + 1] = yy;
+                    buf[o + 2] = yy;
+                }
             }
             return this;
         }

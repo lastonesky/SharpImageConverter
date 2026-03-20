@@ -1,13 +1,13 @@
 性能问题定位
 
-- JPEG 解码对流直接全量读入并二次拷贝，峰值内存≈输入大小×2，且阻塞式读取不利于大图/网络流场景 JpegDecoder.cs:L20-L72
-- JPEG 重建阶段按组件租借平面缓冲，再分量交错到输出，出现多份大缓冲并行存在与全量遍历开销 JpegDecoder.cs:L263-L339
-- JPEG 像素格式转 RGB24 全量逐像素循环，缺少 SIMD/并行，高清大图会成为 CPU 热点 JpegImage.cs:L90-L197
-- PNG 解码先把 IDAT 全量收集到内存流，再一次性解压到大缓冲，且色彩转换会再分配并二次遍历，内存与带宽消耗偏高 PngDecoder.cs:L80-L186 , PngDecoder.cs:L650-L823
-- GIF 多帧解码每帧都会 clone 整张画布，叠加 backBuffer 复制，帧数多时内存与拷贝成本急剧上升 GifDecoder.cs:L184-L205
-- 图像处理的缩放与灰度转换为纯 CPU 密集循环，尤其是 Area 缩放的双重嵌套与双精度计算在大图缩小时极易成为热点 Processing.cs:L38-L433 , Processing.cs:L473-L489
-- EXIF 方向处理直接新分配并全量拷贝像素，若在 LoadJpeg 后立即执行会造成额外一次整图遍历与内存分配 ImageFrame.cs:L492-L553
-- Clone 会无条件复制整张缓冲，在流水线中多次调用会放大内存带宽占用 Processing.cs:L500-L513
+- 【已完成】JPEG 解码对流直接全量读入并二次拷贝，峰值内存≈输入大小×2，且阻塞式读取不利于大图/网络流场景 JpegDecoder.cs:L20-L72
+- 【已完成】JPEG 重建阶段按组件租借平面缓冲，再分量交错到输出，出现多份大缓冲并行存在与全量遍历开销 JpegDecoder.cs:L263-L339
+- 【已完成】JPEG 像素格式转 RGB24 全量逐像素循环，缺少 SIMD/并行，高清大图会成为 CPU 热点 JpegImage.cs:L90-L197
+- 【已完成】PNG 解码先把 IDAT 全量收集到内存流，再一次性解压到大缓冲，且色彩转换会再分配并二次遍历，内存与带宽消耗偏高 PngDecoder.cs:L80-L186 , PngDecoder.cs:L650-L823
+- 【问题确认不存在】GIF 多帧解码每帧都会 clone 整张画布，叠加 backBuffer 复制，帧数多时内存与拷贝成本急剧上升 GifDecoder.cs:L184-L205
+- 【已完成】图像处理的缩放与灰度转换为纯 CPU 密集循环，尤其是 Area 缩放的双重嵌套与双精度计算在大图缩小时极易成为热点 Processing.cs:L38-L433 , Processing.cs:L473-L489
+- 【已完成】EXIF 方向处理直接新分配并全量拷贝像素，若在 LoadJpeg 后立即执行会造成额外一次整图遍历与内存分配 ImageFrame.cs:L492-L553
+- 【问题确认不存在】Clone 会无条件复制整张缓冲，在流水线中多次调用会放大内存带宽占用 Processing.cs:L500-L513
 优化建议
 
 - JPEG 解码：优先使用流式解析路径（已有异步流式 API），或在能获知长度时一次性分配精确大小缓冲，避免“租借扩容 + 二次拷贝”模式；对超大图可考虑分块解码以降低峰值内存 JpegDecoder.cs:L20-L72
