@@ -250,17 +250,38 @@ public sealed class ImageFrame
     /// <returns>图像帧</returns>
     public static ImageFrame LoadJpeg(Stream stream)
     {
-        var img = JpegDecoder.Decode(stream);
-        byte[] rgb = img.ToRgb24();
+        return LoadJpeg(stream, useStreamingDecoder: false, useFloatingPointIdct: false);
+    }
 
-        if (img.Metadata.Orientation != 1)
+    public static ImageFrame LoadJpeg(Stream stream, bool useStreamingDecoder, bool useFloatingPointIdct = false)
+    {
+        if (!useStreamingDecoder)
         {
-            var t = ApplyExifOrientationInPlace(rgb, img.Width, img.Height, img.Metadata.Orientation);
-            img.Metadata.Orientation = 1;
-            return new ImageFrame(t.width, t.height, t.pixels, img.Metadata);
+            var img = JpegDecoder.Decode(stream, useFloatingPointIdct);
+            byte[] rgb = img.ToRgb24();
+            int orientation = img.Metadata.Orientation;
+            if (orientation != 1)
+            {
+                var t = ApplyExifOrientationInPlace(rgb, img.Width, img.Height, orientation);
+                img.Metadata.Orientation = 1;
+                return new ImageFrame(t.width, t.height, t.pixels, img.Metadata);
+            }
+
+            return new ImageFrame(img.Width, img.Height, rgb, img.Metadata);
         }
 
-        return new ImageFrame(img.Width, img.Height, rgb, img.Metadata);
+        var streaming = JpegDecoder.DecodeFromStreamAsync(stream, cancellationToken: default, useFloatingPointIdct: useFloatingPointIdct).GetAwaiter().GetResult();
+        var jpeg = streaming.Image;
+        byte[] rgbStream = jpeg.ToRgb24();
+        int streamOrientation = streaming.ExifOrientation;
+        if (streamOrientation != 1)
+        {
+            var t = ApplyExifOrientationInPlace(rgbStream, jpeg.Width, jpeg.Height, streamOrientation);
+            jpeg.Metadata.Orientation = 1;
+            return new ImageFrame(t.width, t.height, t.pixels, jpeg.Metadata);
+        }
+
+        return new ImageFrame(jpeg.Width, jpeg.Height, rgbStream, jpeg.Metadata);
     }
 
     /// <summary>

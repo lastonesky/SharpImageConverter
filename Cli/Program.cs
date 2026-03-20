@@ -692,20 +692,10 @@ class Program
                 Console.WriteLine($"[stream] 开始解码: {Path.GetFileName(path)} ({fileLength} bytes)");
                 using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 20, FileOptions.SequentialScan);
                 var sw = Stopwatch.StartNew();
-                var streaming = JpegDecoder.DecodeFromStreamAsync(fs, cancellationToken: default, useFloatingPointIdct: useFloatIdct).GetAwaiter().GetResult();
-                var jpeg = streaming.Image;
+                var frame = ImageFrame.LoadJpeg(fs, useStreamingDecoder: true, useFloatingPointIdct: useFloatIdct);
                 sw.Stop();
                 Console.WriteLine($"[stream] 解码完成: {sw.ElapsedMilliseconds} ms");
-                int orientation = streaming.ExifOrientation;
-                if (orientation != 1)
-                {
-                    var frame = new ImageFrame(jpeg.Width, jpeg.Height, jpeg.ToRgb24(), jpeg.Metadata);
-                    frame = frame.ApplyExifOrientation(orientation);
-                    jpeg.Metadata.Orientation = 1;
-                    return new Image<Rgb24>(frame.Width, frame.Height, frame.Pixels, frame.Metadata);
-                }
-
-                return new Image<Rgb24>(jpeg.Width, jpeg.Height, jpeg.ToRgb24(), jpeg.Metadata);
+                return new Image<Rgb24>(frame.Width, frame.Height, frame.Pixels, frame.Metadata);
             }
             catch (Exception ex)
             {
@@ -714,15 +704,8 @@ class Program
         }
         if (!useFloatIdct || !isJpeg) return Image.Load(path);
         using var fs2 = File.OpenRead(path);
-        var jpeg2 = JpegDecoder.Decode(fs2, true);
-        if (jpeg2.Metadata.Orientation != 1)
-        {
-            var frame = new ImageFrame(jpeg2.Width, jpeg2.Height, jpeg2.ToRgb24(), jpeg2.Metadata);
-            frame = frame.ApplyExifOrientation(jpeg2.Metadata.Orientation);
-            jpeg2.Metadata.Orientation = 1;
-            return new Image<Rgb24>(frame.Width, frame.Height, frame.Pixels, frame.Metadata);
-        }
-        return new Image<Rgb24>(jpeg2.Width, jpeg2.Height, jpeg2.ToRgb24(), jpeg2.Metadata);
+        var frame2 = ImageFrame.LoadJpeg(fs2, useStreamingDecoder: false, useFloatingPointIdct: true);
+        return new Image<Rgb24>(frame2.Width, frame2.Height, frame2.Pixels, frame2.Metadata);
     }
 
     static Image<Rgba32> LoadRgba32(string path, bool useFloatIdct, bool useStreamingDecoder)
@@ -733,11 +716,6 @@ class Program
         {
             var rgb = LoadRgb24(path, useFloatIdct, true);
             return ToRgba32(rgb);
-        }
-        if (!useFloatIdct && isJpeg)
-        {
-            var frame = ImageFrame.LoadJpeg(path);
-            return ToRgba32(new Image<Rgb24>(frame.Width, frame.Height, frame.Pixels, frame.Metadata));
         }
         if (!useFloatIdct) return Image.LoadRgba32(path);
         if (!isJpeg) return Image.LoadRgba32(path);
