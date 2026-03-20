@@ -196,10 +196,17 @@ namespace SharpImageConverter.Formats.Gif
 
                     if (ctx.Mode == DecodeMode.Rgba32)
                     {
-                        ctx.RgbaFrame = new Image<Rgba32>(width, height, (byte[])canvas.Clone());
-                        return; // Single frame for RGBA32
+                        ctx.RgbaFrame = new Image<Rgba32>(width, height, canvas);
+                        return;
                     }
-                    
+
+                    if (ctx.Mode == DecodeMode.Rgb24)
+                    {
+                        ctx.RgbFrames!.Add(new Image<Rgb24>(width, height, canvas));
+                        ctx.Durations!.Add(delayCs * 10 < 10 ? 10 : delayCs * 10);
+                        return;
+                    }
+
                     ctx.RgbFrames!.Add(new Image<Rgb24>(width, height, (byte[])canvas.Clone()));
                     ctx.Durations!.Add(delayCs * 10 < 10 ? 10 : delayCs * 10);
 

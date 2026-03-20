@@ -36,33 +36,50 @@ public static class JpegDecoder
 
     private static byte[] ReadAllBytesFromStreamPooled(Stream stream)
     {
+        if (stream.CanSeek)
+        {
+            long remaining = stream.Length - stream.Position;
+            if (remaining < 0) throw new InvalidDataException("Invalid stream position.");
+            if (remaining > int.MaxValue) throw new InvalidDataException("Stream too large.");
+            int length = (int)remaining;
+            byte[] data = new byte[length];
+            int read = 0;
+            while (read < length)
+            {
+                int n = stream.Read(data, read, length - read);
+                if (n == 0) throw new InvalidDataException("Unexpected EOF");
+                read += n;
+            }
+            return data;
+        }
+
         byte[] rented = ArrayPool<byte>.Shared.Rent(16 * 1024);
-        int length = 0;
+        int total = 0;
         try
         {
             while (true)
             {
-                if (length == rented.Length)
+                if (total == rented.Length)
                 {
                     int newSize = checked(rented.Length << 1);
                     byte[] enlarged = ArrayPool<byte>.Shared.Rent(newSize);
-                    Buffer.BlockCopy(rented, 0, enlarged, 0, length);
+                    Buffer.BlockCopy(rented, 0, enlarged, 0, total);
                     ArrayPool<byte>.Shared.Return(rented);
                     rented = enlarged;
                 }
 
-                int read = stream.Read(rented, length, rented.Length - length);
+                int read = stream.Read(rented, total, rented.Length - total);
                 if (read == 0)
                 {
                     break;
                 }
-                length += read;
+                total += read;
             }
 
-            byte[] data = new byte[length];
-            if (length != 0)
+            byte[] data = new byte[total];
+            if (total != 0)
             {
-                Buffer.BlockCopy(rented, 0, data, 0, length);
+                Buffer.BlockCopy(rented, 0, data, 0, total);
             }
             return data;
         }
@@ -279,11 +296,105 @@ public static class JpegDecoder
             int[] planeStrides = new int[components.Length];
             int[] planeWidths = new int[components.Length];
             int[] planeHeights = new int[components.Length];
-            byte[] output;
+            byte[]? output = null;
 
             try
             {
-                if (colorSpace == JpegColorSpace.YCbCr && !useFloatingPointIdct && Sse2.IsSupported)
+                bool handled = false;
+
+                if (colorSpace == JpegColorSpace.Gray && components.Length == 1)
+                {
+                    ComponentState c = components[0];
+                    int w = frame.McuX * c.H * 8;
+                    int h = frame.McuY * c.V * 8;
+                    if (w >= width && h >= height)
+                    {
+                        output = new byte[checked(width * height)];
+                        if (w == width && h == height)
+                        {
+                            c.DecodeSpatial(output.AsSpan(0, w * h), w, h, w, quantTables[c.QuantTableId].Table, useFloatingPointIdct);
+                        }
+                        else
+                        {
+                            byte[] plane = ArrayPool<byte>.Shared.Rent(w * h);
+                            try
+                            {
+                                c.DecodeSpatial(plane.AsSpan(0, w * h), w, h, w, quantTables[c.QuantTableId].Table, useFloatingPointIdct);
+                                for (int y = 0; y < height; y++)
+                                {
+                                    Buffer.BlockCopy(plane, y * w, output, y * width, width);
+                                }
+                            }
+                            finally
+                            {
+                                ArrayPool<byte>.Shared.Return(plane);
+                            }
+                        }
+                        handled = true;
+                    }
+                }
+
+                if (!handled && colorSpace == JpegColorSpace.Rgb && channelCount == 3)
+                {
+                    bool fullRes = true;
+                    for (int channel = 0; channel < 3; channel++)
+                    {
+                        int compIndex = componentOrder[channel];
+                        ComponentState c = components[compIndex];
+                        if (c.H != maxH || c.V != maxV)
+                        {
+                            fullRes = false;
+                            break;
+                        }
+                    }
+
+                    if (fullRes)
+                    {
+                        output = new byte[checked(width * height * 3)];
+                        for (int channel = 0; channel < 3; channel++)
+                        {
+                            int compIndex = componentOrder[channel];
+                            ComponentState c = components[compIndex];
+                            int w = frame.McuX * c.H * 8;
+                            int h = frame.McuY * c.V * 8;
+                            if (w < width || h < height)
+                            {
+                                fullRes = false;
+                                break;
+                            }
+
+                            byte[] plane = ArrayPool<byte>.Shared.Rent(w * h);
+                            try
+                            {
+                                c.DecodeSpatial(plane.AsSpan(0, w * h), w, h, w, quantTables[c.QuantTableId].Table, useFloatingPointIdct);
+                                for (int y = 0; y < height; y++)
+                                {
+                                    int srcRow = y * w;
+                                    int dstRow = y * width * 3 + channel;
+                                    for (int x = 0; x < width; x++)
+                                    {
+                                        output[dstRow + x * 3] = plane[srcRow + x];
+                                    }
+                                }
+                            }
+                            finally
+                            {
+                                ArrayPool<byte>.Shared.Return(plane);
+                            }
+                        }
+                    }
+
+                    if (fullRes)
+                    {
+                        handled = true;
+                    }
+                    else
+                    {
+                        output = null;
+                    }
+                }
+
+                if (!handled && colorSpace == JpegColorSpace.YCbCr && !useFloatingPointIdct && Sse2.IsSupported)
                 {
                     output = new byte[checked(width * height * channelCount)];
                     if (TryDecodeInterleavedYCbCrSimd(components, output, width, height, fullWidth, fullHeight, componentOrder, quantTables, useFloatingPointIdct, frame))
@@ -299,24 +410,27 @@ public static class JpegDecoder
                     }
                 }
 
-                for (int i = 0; i < components.Length; i++)
+                if (!handled)
                 {
-                    ComponentState c = components[i];
-                    int w = frame.McuX * c.H * 8;
-                    int h = frame.McuY * c.V * 8;
+                    for (int i = 0; i < components.Length; i++)
+                    {
+                        ComponentState c = components[i];
+                        int w = frame.McuX * c.H * 8;
+                        int h = frame.McuY * c.V * 8;
 
-                    planeWidths[i] = w;
-                    planeHeights[i] = h;
-                    planeStrides[i] = w;
+                        planeWidths[i] = w;
+                        planeHeights[i] = h;
+                        planeStrides[i] = w;
 
-                    byte[] plane = ArrayPool<byte>.Shared.Rent(w * h);
-                    planes[i] = plane;
+                        byte[] plane = ArrayPool<byte>.Shared.Rent(w * h);
+                        planes[i] = plane;
 
-                    c.DecodeSpatial(plane.AsSpan(0, w * h), w, h, w, quantTables[c.QuantTableId].Table, useFloatingPointIdct);
+                        c.DecodeSpatial(plane.AsSpan(0, w * h), w, h, w, quantTables[c.QuantTableId].Table, useFloatingPointIdct);
+                    }
+
+                    output ??= new byte[checked(width * height * channelCount)];
+                    InterleaveComponents(planes, planeStrides, planeWidths, planeHeights, fullWidth, fullHeight, width, height, componentOrder, output);
                 }
-
-                output = new byte[checked(width * height * channelCount)];
-                InterleaveComponents(planes, planeStrides, planeWidths, planeHeights, fullWidth, fullHeight, width, height, componentOrder, output);
             }
             finally
             {
@@ -332,7 +446,7 @@ public static class JpegDecoder
 
             byte[]? iccProfile = iccCollector?.GetProfile();
             var colorInfo = new JpegColorInfo(colorSpace, hasAdobe, adobeTransform, iccProfile);
-            var result = new JpegImage(width, height, pixelFormat, bitsPerSample, colorInfo, output);
+            var result = new JpegImage(width, height, pixelFormat, bitsPerSample, colorInfo, output!);
             result.Metadata.ExifRaw = exifRaw;
             result.Metadata.Orientation = exifOrientation;
             result.Metadata.IccProfile = iccProfile;

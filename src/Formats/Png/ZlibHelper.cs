@@ -129,6 +129,34 @@ public static class ZlibHelper
             throw new InvalidDataException($"Adler32 Checksum failed. Expected {expectedAdler:X8}, got {adler:X8}");
     }
 
+    public static void DecompressTo(Stream input, Span<byte> destination)
+    {
+        using var zs = new ZLibStream(input, CompressionMode.Decompress, leaveOpen: true);
+        int totalRead = 0;
+        byte[] tempBuffer = ArrayPool<byte>.Shared.Rent(32 * 1024);
+        try
+        {
+            while (true)
+            {
+                int read = zs.Read(tempBuffer, 0, tempBuffer.Length);
+                if (read <= 0) break;
+
+                if (totalRead + read > destination.Length)
+                    throw new InvalidDataException("Decompressed data exceeds destination size");
+
+                new ReadOnlySpan<byte>(tempBuffer, 0, read).CopyTo(destination.Slice(totalRead));
+                totalRead += read;
+            }
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(tempBuffer);
+        }
+
+        if (totalRead < destination.Length)
+            throw new InvalidDataException($"Decompressed data size mismatch. Expected {destination.Length}, got {totalRead}");
+    }
+
     public static byte[] Compress(byte[] data)
     {
         using var outMs = new PooledMemoryStream(data.Length + 64);

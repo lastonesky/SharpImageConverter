@@ -94,104 +94,232 @@ public sealed class JpegImage
             return pixelData;
         }
 
-        int count = checked(Width * Height);
+        int width = Width;
+        int height = Height;
+        int count = checked(width * height);
         byte[] dst = new byte[checked(count * 3)];
+        bool useParallel = count >= 200000 && Environment.ProcessorCount > 1;
         int di = 0;
 
         if (PixelFormat == JpegPixelFormat.Gray8)
         {
-            ReadOnlySpan<byte> src = pixelData.AsSpan(0, count);
-            for (int i = 0; i < count; i++)
+            if (useParallel)
             {
-                byte lum = src[i];
-                dst[di++] = lum;
-                dst[di++] = lum;
-                dst[di++] = lum;
+                byte[] srcArray = pixelData;
+                Parallel.For(0, height, y =>
+                {
+                    int srcRow = y * width;
+                    int dstRow = y * width * 3;
+                    for (int x = 0; x < width; x++)
+                    {
+                        byte lum = srcArray[srcRow + x];
+                        int d = dstRow + x * 3;
+                        dst[d] = lum;
+                        dst[d + 1] = lum;
+                        dst[d + 2] = lum;
+                    }
+                });
+            }
+            else
+            {
+                ReadOnlySpan<byte> src = pixelData.AsSpan(0, count);
+                for (int i = 0; i < count; i++)
+                {
+                    byte lum = src[i];
+                    dst[di++] = lum;
+                    dst[di++] = lum;
+                    dst[di++] = lum;
+                }
             }
             return dst;
         }
 
         if (PixelFormat == JpegPixelFormat.YCbCr24)
         {
-            ReadOnlySpan<byte> src = pixelData.AsSpan(0, checked(count * 3));
-            int si = 0;
-            for (int i = 0; i < count; i++)
+            if (useParallel)
             {
-                byte y = src[si++];
-                byte cb = src[si++];
-                byte cr = src[si++];
-                YCbCrToRgb(y, cb, cr, out byte r, out byte g, out byte b);
-                dst[di++] = r;
-                dst[di++] = g;
-                dst[di++] = b;
+                byte[] srcArray = pixelData;
+                int rowStride = width * 3;
+                Parallel.For(0, height, y =>
+                {
+                    int si = y * rowStride;
+                    int diLocal = y * rowStride;
+                    for (int x = 0; x < width; x++)
+                    {
+                        byte yy = srcArray[si++];
+                        byte cb = srcArray[si++];
+                        byte cr = srcArray[si++];
+                        YCbCrToRgb(yy, cb, cr, out byte r, out byte g, out byte b);
+                        dst[diLocal++] = r;
+                        dst[diLocal++] = g;
+                        dst[diLocal++] = b;
+                    }
+                });
+            }
+            else
+            {
+                ReadOnlySpan<byte> src = pixelData.AsSpan(0, checked(count * 3));
+                int si = 0;
+                for (int i = 0; i < count; i++)
+                {
+                    byte y = src[si++];
+                    byte cb = src[si++];
+                    byte cr = src[si++];
+                    YCbCrToRgb(y, cb, cr, out byte r, out byte g, out byte b);
+                    dst[di++] = r;
+                    dst[di++] = g;
+                    dst[di++] = b;
+                }
             }
             return dst;
         }
 
         if (PixelFormat == JpegPixelFormat.Cmyk32)
         {
-            ReadOnlySpan<byte> src = pixelData.AsSpan(0, checked(count * 4));
-            int si = 0;
             bool invert = ColorInfo.HasAdobeTransform || !ColorInfo.HasAdobeTransform;
             bool accurate = CmykConversionMode == JpegCmykConversionMode.Accurate;
-            for (int i = 0; i < count; i++)
+            if (useParallel)
             {
-                int c = src[si++];
-                int m = src[si++];
-                int y = src[si++];
-                int k = src[si++];
-                if (invert)
+                byte[] srcArray = pixelData;
+                int rowStride = width * 4;
+                Parallel.For(0, height, y =>
                 {
-                    c = 255 - c;
-                    m = 255 - m;
-                    y = 255 - y;
-                    k = 255 - k;
+                    int si = y * rowStride;
+                    int diLocal = y * width * 3;
+                    for (int x = 0; x < width; x++)
+                    {
+                        int c = srcArray[si++];
+                        int m = srcArray[si++];
+                        int yy = srcArray[si++];
+                        int k = srcArray[si++];
+                        if (invert)
+                        {
+                            c = 255 - c;
+                            m = 255 - m;
+                            yy = 255 - yy;
+                            k = 255 - k;
+                        }
+                        ConvertCmykToRgb(c, m, yy, k, accurate, out byte r, out byte g, out byte b);
+                        dst[diLocal++] = r;
+                        dst[diLocal++] = g;
+                        dst[diLocal++] = b;
+                    }
+                });
+            }
+            else
+            {
+                ReadOnlySpan<byte> src = pixelData.AsSpan(0, checked(count * 4));
+                int si = 0;
+                for (int i = 0; i < count; i++)
+                {
+                    int c = src[si++];
+                    int m = src[si++];
+                    int y = src[si++];
+                    int k = src[si++];
+                    if (invert)
+                    {
+                        c = 255 - c;
+                        m = 255 - m;
+                        y = 255 - y;
+                        k = 255 - k;
+                    }
+                    ConvertCmykToRgb(c, m, y, k, accurate, out byte r, out byte g, out byte b);
+                    dst[di++] = r;
+                    dst[di++] = g;
+                    dst[di++] = b;
                 }
-                ConvertCmykToRgb(c, m, y, k, accurate, out byte r, out byte g, out byte b);
-                dst[di++] = r;
-                dst[di++] = g;
-                dst[di++] = b;
             }
             return dst;
         }
 
         if (PixelFormat == JpegPixelFormat.Ycck32)
         {
-            ReadOnlySpan<byte> src = pixelData.AsSpan(0, checked(count * 4));
-            int si = 0;
             bool invert = ColorInfo.HasAdobeTransform || !ColorInfo.HasAdobeTransform;
             bool accurate = CmykConversionMode == JpegCmykConversionMode.Accurate;
-            for (int i = 0; i < count; i++)
+            if (useParallel)
             {
-                int y = src[si++];
-                int cb = src[si++];
-                int cr = src[si++];
-                int k = src[si++];
-                if (invert)
+                byte[] srcArray = pixelData;
+                int rowStride = width * 4;
+                Parallel.For(0, height, y =>
                 {
-                    y = 255 - y;
-                    cb = 255 - cb;
-                    cr = 255 - cr;
-                    k = 255 - k;
+                    int si = y * rowStride;
+                    int diLocal = y * width * 3;
+                    for (int x = 0; x < width; x++)
+                    {
+                        int yy = srcArray[si++];
+                        int cb = srcArray[si++];
+                        int cr = srcArray[si++];
+                        int k = srcArray[si++];
+                        if (invert)
+                        {
+                            yy = 255 - yy;
+                            cb = 255 - cb;
+                            cr = 255 - cr;
+                            k = 255 - k;
+                        }
+                        ConvertYcckToRgb(yy, cb, cr, k, accurate, out byte r, out byte g, out byte b);
+                        dst[diLocal++] = r;
+                        dst[diLocal++] = g;
+                        dst[diLocal++] = b;
+                    }
+                });
+            }
+            else
+            {
+                ReadOnlySpan<byte> src = pixelData.AsSpan(0, checked(count * 4));
+                int si = 0;
+                for (int i = 0; i < count; i++)
+                {
+                    int y = src[si++];
+                    int cb = src[si++];
+                    int cr = src[si++];
+                    int k = src[si++];
+                    if (invert)
+                    {
+                        y = 255 - y;
+                        cb = 255 - cb;
+                        cr = 255 - cr;
+                        k = 255 - k;
+                    }
+                    ConvertYcckToRgb(y, cb, cr, k, accurate, out byte r, out byte g, out byte b);
+                    dst[di++] = r;
+                    dst[di++] = g;
+                    dst[di++] = b;
                 }
-                ConvertYcckToRgb(y, cb, cr, k, accurate, out byte r, out byte g, out byte b);
-                dst[di++] = r;
-                dst[di++] = g;
-                dst[di++] = b;
             }
             return dst;
         }
 
         if (PixelFormat == JpegPixelFormat.Rgba32)
         {
-            ReadOnlySpan<byte> src = pixelData.AsSpan(0, checked(count * 4));
-            int si = 0;
-            for (int i = 0; i < count; i++)
+            if (useParallel)
             {
-                dst[di++] = src[si++];
-                dst[di++] = src[si++];
-                dst[di++] = src[si++];
-                si++; // skip alpha
+                byte[] srcArray = pixelData;
+                int rowStride = width * 4;
+                Parallel.For(0, height, y =>
+                {
+                    int si = y * rowStride;
+                    int diLocal = y * width * 3;
+                    for (int x = 0; x < width; x++)
+                    {
+                        dst[diLocal++] = srcArray[si++];
+                        dst[diLocal++] = srcArray[si++];
+                        dst[diLocal++] = srcArray[si++];
+                        si++;
+                    }
+                });
+            }
+            else
+            {
+                ReadOnlySpan<byte> src = pixelData.AsSpan(0, checked(count * 4));
+                int si = 0;
+                for (int i = 0; i < count; i++)
+                {
+                    dst[di++] = src[si++];
+                    dst[di++] = src[si++];
+                    dst[di++] = src[si++];
+                    si++;
+                }
             }
             return dst;
         }
@@ -202,34 +330,76 @@ public sealed class JpegImage
             GuessUnknown32(src, count, out bool treatAsYcck, out bool invert);
             bool accurate = CmykConversionMode == JpegCmykConversionMode.Accurate;
 
-            int si = 0;
-            for (int i = 0; i < count; i++)
+            if (useParallel)
             {
-                int v0 = src[si++];
-                int v1 = src[si++];
-                int v2 = src[si++];
-                int v3 = src[si++];
-                if (invert)
+                byte[] srcArray = pixelData;
+                int rowStride = width * 4;
+                Parallel.For(0, height, y =>
                 {
-                    v0 = 255 - v0;
-                    v1 = 255 - v1;
-                    v2 = 255 - v2;
-                    v3 = 255 - v3;
-                }
+                    int si = y * rowStride;
+                    int diLocal = y * width * 3;
+                    for (int x = 0; x < width; x++)
+                    {
+                        int v0 = srcArray[si++];
+                        int v1 = srcArray[si++];
+                        int v2 = srcArray[si++];
+                        int v3 = srcArray[si++];
+                        if (invert)
+                        {
+                            v0 = 255 - v0;
+                            v1 = 255 - v1;
+                            v2 = 255 - v2;
+                            v3 = 255 - v3;
+                        }
 
-                if (treatAsYcck)
+                        if (treatAsYcck)
+                        {
+                            ConvertYcckToRgb(v0, v1, v2, v3, accurate, out byte r, out byte g, out byte b);
+                            dst[diLocal++] = r;
+                            dst[diLocal++] = g;
+                            dst[diLocal++] = b;
+                        }
+                        else
+                        {
+                            ConvertCmykToRgb(v0, v1, v2, v3, accurate, out byte r, out byte g, out byte b);
+                            dst[diLocal++] = r;
+                            dst[diLocal++] = g;
+                            dst[diLocal++] = b;
+                        }
+                    }
+                });
+            }
+            else
+            {
+                int si = 0;
+                for (int i = 0; i < count; i++)
                 {
-                    ConvertYcckToRgb(v0, v1, v2, v3, accurate, out byte r, out byte g, out byte b);
-                    dst[di++] = r;
-                    dst[di++] = g;
-                    dst[di++] = b;
-                }
-                else
-                {
-                    ConvertCmykToRgb(v0, v1, v2, v3, accurate, out byte r, out byte g, out byte b);
-                    dst[di++] = r;
-                    dst[di++] = g;
-                    dst[di++] = b;
+                    int v0 = src[si++];
+                    int v1 = src[si++];
+                    int v2 = src[si++];
+                    int v3 = src[si++];
+                    if (invert)
+                    {
+                        v0 = 255 - v0;
+                        v1 = 255 - v1;
+                        v2 = 255 - v2;
+                        v3 = 255 - v3;
+                    }
+
+                    if (treatAsYcck)
+                    {
+                        ConvertYcckToRgb(v0, v1, v2, v3, accurate, out byte r, out byte g, out byte b);
+                        dst[di++] = r;
+                        dst[di++] = g;
+                        dst[di++] = b;
+                    }
+                    else
+                    {
+                        ConvertCmykToRgb(v0, v1, v2, v3, accurate, out byte r, out byte g, out byte b);
+                        dst[di++] = r;
+                        dst[di++] = g;
+                        dst[di++] = b;
+                    }
                 }
             }
 

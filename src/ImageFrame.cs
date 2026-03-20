@@ -255,7 +255,7 @@ public sealed class ImageFrame
 
         if (img.Metadata.Orientation != 1)
         {
-            var t = ApplyExifOrientation(rgb, img.Width, img.Height, img.Metadata.Orientation);
+            var t = ApplyExifOrientationInPlace(rgb, img.Width, img.Height, img.Metadata.Orientation);
             img.Metadata.Orientation = 1;
             return new ImageFrame(t.width, t.height, t.pixels, img.Metadata);
         }
@@ -551,5 +551,78 @@ public sealed class ImageFrame
             }
         }
         return (dst, newW, newH);
+    }
+
+    private static (byte[] pixels, int width, int height) ApplyExifOrientationInPlace(byte[] src, int width, int height, int orientation)
+    {
+        switch (orientation)
+        {
+            case 1:
+                return (src, width, height);
+            case 2:
+            {
+                for (int y = 0; y < height; y++)
+                {
+                    int left = (y * width) * 3;
+                    int right = (y * width + (width - 1)) * 3;
+                    while (left < right)
+                    {
+                        byte r = src[left];
+                        byte g = src[left + 1];
+                        byte b = src[left + 2];
+                        src[left] = src[right];
+                        src[left + 1] = src[right + 1];
+                        src[left + 2] = src[right + 2];
+                        src[right] = r;
+                        src[right + 1] = g;
+                        src[right + 2] = b;
+                        left += 3;
+                        right -= 3;
+                    }
+                }
+                return (src, width, height);
+            }
+            case 3:
+            {
+                int total = width * height;
+                int left = 0;
+                int right = (total - 1) * 3;
+                while (left < right)
+                {
+                    byte r = src[left];
+                    byte g = src[left + 1];
+                    byte b = src[left + 2];
+                    src[left] = src[right];
+                    src[left + 1] = src[right + 1];
+                    src[left + 2] = src[right + 2];
+                    src[right] = r;
+                    src[right + 1] = g;
+                    src[right + 2] = b;
+                    left += 3;
+                    right -= 3;
+                }
+                return (src, width, height);
+            }
+            case 4:
+            {
+                int rowBytes = width * 3;
+                int top = 0;
+                int bottom = (height - 1) * rowBytes;
+                while (top < bottom)
+                {
+                    for (int i = 0; i < rowBytes; i++)
+                    {
+                        byte tmp = src[top + i];
+                        src[top + i] = src[bottom + i];
+                        src[bottom + i] = tmp;
+                    }
+                    top += rowBytes;
+                    bottom -= rowBytes;
+                }
+                return (src, width, height);
+            }
+            default:
+                return ApplyExifOrientation(src, width, height, orientation);
+        }
     }
 }

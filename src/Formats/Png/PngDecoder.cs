@@ -87,18 +87,33 @@ public class PngDecoder
         ReadExact(stream, sig, 0, 8);
         if (!IsPngSignature(sig)) throw new InvalidDataException("Not a PNG file");
 
-        using var idatStream = new PooledMemoryStream(4096);
-        bool endChunkFound = false;
         byte[] lenBytes = new byte[4];
         byte[] typeBytes = new byte[4];
         byte[] crcBytes = new byte[4];
-        while (!endChunkFound)
+        while (true)
         {
             if (!TryReadExact(stream, lenBytes, 0, 4)) break;
             uint length = ReadBigEndianUint32(lenBytes, 0);
             if (length > int.MaxValue) throw new InvalidDataException("Chunk too large");
             ReadExact(stream, typeBytes, 0, 4);
             uint type = ReadBigEndianUint32(typeBytes, 0);
+
+            if (type == TypeIDAT)
+            {
+                int idatLength = (int)length;
+                int expectedDecompressedSize = GetExpectedDecompressedSize();
+                byte[] decompressed = ArrayPool<byte>.Shared.Rent(expectedDecompressedSize);
+                try
+                {
+                    using var idatStream = new IdatStream(stream, idatLength, ValidateChunkCrc);
+                    ZlibHelper.DecompressTo(idatStream, decompressed.AsSpan(0, expectedDecompressedSize));
+                    return ProcessImage(decompressed);
+                }
+                finally
+                {
+                    ArrayPool<byte>.Shared.Return(decompressed);
+                }
+            }
 
             byte[] data;
             byte[]? rented = null;
@@ -142,9 +157,6 @@ public class PngDecoder
                 case TypePLTE:
                     _palette = data;
                     break;
-                case TypeIDAT:
-                    idatStream.Write(data, 0, dataLength);
-                    break;
                 case TypeTRNS:
                     _transparency = data;
                     break;
@@ -158,31 +170,18 @@ public class PngDecoder
                     ParseSrgbChunk();
                     break;
                 case TypeIEND:
-                    endChunkFound = true;
                     break;
                 default:
                     break;
             }
+            if (type == TypeIEND) break;
 
             if (rented != null)
             {
                 ArrayPool<byte>.Shared.Return(rented);
             }
         }
-
-        ArraySegment<byte> idatSegment = idatStream.GetBuffer();
-        int expectedDecompressedSize = GetExpectedDecompressedSize();
-        
-        byte[] decompressed = ArrayPool<byte>.Shared.Rent(expectedDecompressedSize);
-        try
-        {
-            ZlibHelper.DecompressTo(idatSegment.Array, idatSegment.Offset, idatSegment.Count, decompressed.AsSpan(0, expectedDecompressedSize));
-            return ProcessImage(decompressed);
-        }
-        finally
-        {
-            ArrayPool<byte>.Shared.Return(decompressed);
-        }
+        throw new InvalidDataException("Missing IDAT chunk.");
     }
 
     /// <summary>
@@ -209,18 +208,33 @@ public class PngDecoder
         byte[] sig = new byte[8];
         ReadExact(stream, sig, 0, 8);
         if (!IsPngSignature(sig)) throw new InvalidDataException("Not a PNG file");
-        using var idatStream = new PooledMemoryStream(4096);
-        bool endChunkFound = false;
         byte[] lenBytes = new byte[4];
         byte[] typeBytes = new byte[4];
         byte[] crcBytes = new byte[4];
-        while (!endChunkFound)
+        while (true)
         {
             if (!TryReadExact(stream, lenBytes, 0, 4)) break;
             uint length = ReadBigEndianUint32(lenBytes, 0);
             if (length > int.MaxValue) throw new InvalidDataException("Chunk too large");
             ReadExact(stream, typeBytes, 0, 4);
             uint type = ReadBigEndianUint32(typeBytes, 0);
+
+            if (type == TypeIDAT)
+            {
+                int idatLength = (int)length;
+                int expectedDecompressedSize = GetExpectedDecompressedSize();
+                byte[] decompressed = ArrayPool<byte>.Shared.Rent(expectedDecompressedSize);
+                try
+                {
+                    using var idatStream = new IdatStream(stream, idatLength, ValidateChunkCrc);
+                    ZlibHelper.DecompressTo(idatStream, decompressed.AsSpan(0, expectedDecompressedSize));
+                    return ProcessImageRgba(decompressed);
+                }
+                finally
+                {
+                    ArrayPool<byte>.Shared.Return(decompressed);
+                }
+            }
             byte[] data;
             byte[]? rented = null;
             int dataLength = (int)length;
@@ -261,9 +275,6 @@ public class PngDecoder
                 case TypePLTE:
                     _palette = data;
                     break;
-                case TypeIDAT:
-                    idatStream.Write(data, 0, dataLength);
-                    break;
                 case TypeTRNS:
                     _transparency = data;
                     break;
@@ -277,29 +288,17 @@ public class PngDecoder
                     ParseSrgbChunk();
                     break;
                 case TypeIEND:
-                    endChunkFound = true;
                     break;
                 default:
                     break;
             }
+            if (type == TypeIEND) break;
             if (rented != null)
             {
                 ArrayPool<byte>.Shared.Return(rented);
             }
         }
-        ArraySegment<byte> idatSegment = idatStream.GetBuffer();
-        int expectedDecompressedSize = GetExpectedDecompressedSize();
-        
-        byte[] decompressed = ArrayPool<byte>.Shared.Rent(expectedDecompressedSize);
-        try
-        {
-            ZlibHelper.DecompressTo(idatSegment.Array, idatSegment.Offset, idatSegment.Count, decompressed.AsSpan(0, expectedDecompressedSize));
-            return ProcessImageRgba(decompressed);
-        }
-        finally
-        {
-            ArrayPool<byte>.Shared.Return(decompressed);
-        }
+        throw new InvalidDataException("Missing IDAT chunk.");
     }
 
     private static bool TryReadExact(Stream stream, byte[] buffer, int offset, int count)
@@ -322,6 +321,137 @@ public class PngDecoder
     {
         if (!TryReadExact(stream, buffer, offset, count))
             throw new InvalidDataException("Unexpected EOF");
+    }
+
+    private sealed class IdatStream : Stream
+    {
+        private static readonly byte[] IdatType = [(byte)'I', (byte)'D', (byte)'A', (byte)'T'];
+        private static readonly byte[] IendType = [(byte)'I', (byte)'E', (byte)'N', (byte)'D'];
+
+        private readonly Stream _stream;
+        private readonly bool _validateCrc;
+        private readonly byte[] _header = new byte[8];
+        private readonly byte[] _crcBytes = new byte[4];
+        private int _remaining;
+        private uint _crc;
+        private bool _done;
+
+        public IdatStream(Stream stream, int firstChunkLength, bool validateCrc)
+        {
+            _stream = stream;
+            _validateCrc = validateCrc;
+            _remaining = firstChunkLength;
+            if (_validateCrc) _crc = Crc32.Compute(IdatType);
+        }
+
+        public override bool CanRead => true;
+        public override bool CanSeek => false;
+        public override bool CanWrite => false;
+        public override long Length => throw new NotSupportedException();
+        public override long Position
+        {
+            get => throw new NotSupportedException();
+            set => throw new NotSupportedException();
+        }
+
+        public override int Read(byte[] buffer, int offset, int count)
+        {
+            if (_done) return 0;
+            if (_remaining == 0)
+            {
+                MoveNextChunk();
+                if (_done) return 0;
+            }
+
+            int toRead = count;
+            if (toRead > _remaining) toRead = _remaining;
+            int read = _stream.Read(buffer, offset, toRead);
+            if (read == 0) throw new InvalidDataException("Unexpected EOF");
+            if (_validateCrc) _crc = Crc32.Update(_crc, buffer, offset, read);
+            _remaining -= read;
+            if (_remaining == 0)
+            {
+                MoveNextChunk();
+            }
+            return read;
+        }
+
+        private void MoveNextChunk()
+        {
+            while (true)
+            {
+                ReadExact(_stream, _crcBytes, 0, 4);
+                if (_validateCrc)
+                {
+                    uint fileCrc = ReadBigEndianUint32(_crcBytes, 0);
+                    if (_crc != fileCrc) throw new InvalidDataException("CRC mismatch in IDAT chunk.");
+                }
+
+                ReadExact(_stream, _header, 0, 8);
+                uint length = ReadBigEndianUint32(_header, 0);
+                if (length > int.MaxValue) throw new InvalidDataException("Chunk too large");
+                uint type = ReadBigEndianUint32(_header, 4);
+
+                if (type == TypeIDAT)
+                {
+                    if (_validateCrc) _crc = Crc32.Compute(IdatType);
+                    int len = (int)length;
+                    if (len == 0)
+                    {
+                        ReadExact(_stream, _crcBytes, 0, 4);
+                        if (_validateCrc)
+                        {
+                            uint fileCrc = ReadBigEndianUint32(_crcBytes, 0);
+                            if (_crc != fileCrc) throw new InvalidDataException("CRC mismatch in IDAT chunk.");
+                        }
+                        continue;
+                    }
+                    _remaining = len;
+                    return;
+                }
+
+                if (type == TypeIEND)
+                {
+                    uint crc = _validateCrc ? Crc32.Compute(IendType) : 0;
+                    int len = (int)length;
+                    if (len > 0)
+                    {
+                        byte[] buffer = ArrayPool<byte>.Shared.Rent(32 * 1024);
+                        try
+                        {
+                            int remaining = len;
+                            while (remaining > 0)
+                            {
+                                int chunk = remaining > buffer.Length ? buffer.Length : remaining;
+                                ReadExact(_stream, buffer, 0, chunk);
+                                if (_validateCrc) crc = Crc32.Update(crc, buffer, 0, chunk);
+                                remaining -= chunk;
+                            }
+                        }
+                        finally
+                        {
+                            ArrayPool<byte>.Shared.Return(buffer);
+                        }
+                    }
+                    ReadExact(_stream, _crcBytes, 0, 4);
+                    if (_validateCrc)
+                    {
+                        uint fileCrc = ReadBigEndianUint32(_crcBytes, 0);
+                        if (crc != fileCrc) throw new InvalidDataException("CRC mismatch in IEND chunk.");
+                    }
+                    _done = true;
+                    _remaining = 0;
+                    return;
+                }
+
+                throw new InvalidDataException("Unexpected chunk after IDAT.");
+            }
+        }
+
+        public override void Flush() { }
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
     }
 
     private void ParseExifChunk(byte[] data)
@@ -486,8 +616,7 @@ public class PngDecoder
             int stride = (passW * GetBitsPerPixel() + 7) / 8;
             int passSize = (stride + 1) * passH; // +1 for filter byte
 
-            byte[] passData = new byte[passSize];
-            Array.Copy(rawData, dataOffset, passData, 0, passSize);
+            ReadOnlySpan<byte> passData = rawData.AsSpan(dataOffset, passSize);
             dataOffset += passSize;
 
             byte[] decodedPass = Unfilter(passData, passW, passH, bpp, stride);
@@ -514,8 +643,7 @@ public class PngDecoder
             if (passW == 0 || passH == 0) continue;
             int stride = (passW * GetBitsPerPixel() + 7) / 8;
             int passSize = (stride + 1) * passH;
-            byte[] passData = new byte[passSize];
-            Array.Copy(rawData, dataOffset, passData, 0, passSize);
+            ReadOnlySpan<byte> passData = rawData.AsSpan(dataOffset, passSize);
             dataOffset += passSize;
             byte[] decodedPass = Unfilter(passData, passW, passH, bpp, stride);
             byte[] rgbaPass = (ColorType == 6 && BitDepth == 8) ? decodedPass : ConvertToRGBA(decodedPass, passW, passH);
@@ -565,7 +693,11 @@ public class PngDecoder
 
     private byte[] Unfilter(byte[] rawData, int w, int h, int bpp, int stride)
     {
-        // Output size is same as input minus filter bytes
+        return Unfilter(rawData.AsSpan(), w, h, bpp, stride);
+    }
+
+    private byte[] Unfilter(ReadOnlySpan<byte> rawData, int w, int h, int bpp, int stride)
+    {
         byte[] recon = new byte[stride * h];
         int reconIdx = 0;
         int rawIdx = 0;
@@ -579,7 +711,7 @@ public class PngDecoder
         for (int y = 0; y < h; y++)
         {
             byte filterType = rawData[rawIdx++];
-            rawData.AsSpan(rawIdx, stride).CopyTo(cur.Span.Slice(0, stride));
+            rawData.Slice(rawIdx, stride).CopyTo(cur.Span.Slice(0, stride));
             rawIdx += stride;
 
             Span<byte> curSpan = cur.Span.Slice(0, stride);
@@ -618,6 +750,7 @@ public class PngDecoder
                             x += PaethPredictor(a, b, c);
                             break;
                     }
+
                     curSpan[i] = x;
                 }
             }
@@ -673,6 +806,26 @@ public class PngDecoder
             return;
         }
 
+        if (ColorType == 2 && BitDepth == 16)
+        {
+            for (int y = 0; y < h; y++)
+            {
+                for (int x = 0; x < w; x++)
+                {
+                    int finalY = sy + y * dy;
+                    int finalX = sx + x * dx;
+
+                    int srcIdx = (y * w + x) * 6;
+                    int dstIdx = (finalY * Width + finalX) * 3;
+
+                    finalImage[dstIdx] = decodedPass[srcIdx];
+                    finalImage[dstIdx + 1] = decodedPass[srcIdx + 2];
+                    finalImage[dstIdx + 2] = decodedPass[srcIdx + 4];
+                }
+            }
+            return;
+        }
+
         if (ColorType == 6 && BitDepth == 8)
         {
             for (int y = 0; y < h; y++)
@@ -688,6 +841,131 @@ public class PngDecoder
                     finalImage[dstIdx] = decodedPass[srcIdx];
                     finalImage[dstIdx + 1] = decodedPass[srcIdx + 1];
                     finalImage[dstIdx + 2] = decodedPass[srcIdx + 2];
+                }
+            }
+            return;
+        }
+
+        if (ColorType == 6 && BitDepth == 16)
+        {
+            for (int y = 0; y < h; y++)
+            {
+                for (int x = 0; x < w; x++)
+                {
+                    int finalY = sy + y * dy;
+                    int finalX = sx + x * dx;
+
+                    int srcIdx = (y * w + x) * 8;
+                    int dstIdx = (finalY * Width + finalX) * 3;
+
+                    finalImage[dstIdx] = decodedPass[srcIdx];
+                    finalImage[dstIdx + 1] = decodedPass[srcIdx + 2];
+                    finalImage[dstIdx + 2] = decodedPass[srcIdx + 4];
+                }
+            }
+            return;
+        }
+
+        if (ColorType == 0 && BitDepth == 8)
+        {
+            for (int y = 0; y < h; y++)
+            {
+                for (int x = 0; x < w; x++)
+                {
+                    int finalY = sy + y * dy;
+                    int finalX = sx + x * dx;
+
+                    int srcIdx = y * w + x;
+                    int dstIdx = (finalY * Width + finalX) * 3;
+                    byte v = decodedPass[srcIdx];
+                    finalImage[dstIdx] = v;
+                    finalImage[dstIdx + 1] = v;
+                    finalImage[dstIdx + 2] = v;
+                }
+            }
+            return;
+        }
+
+        if (ColorType == 0 && BitDepth == 16)
+        {
+            for (int y = 0; y < h; y++)
+            {
+                for (int x = 0; x < w; x++)
+                {
+                    int finalY = sy + y * dy;
+                    int finalX = sx + x * dx;
+
+                    int srcIdx = (y * w + x) * 2;
+                    int dstIdx = (finalY * Width + finalX) * 3;
+                    byte v = decodedPass[srcIdx];
+                    finalImage[dstIdx] = v;
+                    finalImage[dstIdx + 1] = v;
+                    finalImage[dstIdx + 2] = v;
+                }
+            }
+            return;
+        }
+
+        if (ColorType == 4 && BitDepth == 8)
+        {
+            for (int y = 0; y < h; y++)
+            {
+                for (int x = 0; x < w; x++)
+                {
+                    int finalY = sy + y * dy;
+                    int finalX = sx + x * dx;
+
+                    int srcIdx = (y * w + x) * 2;
+                    int dstIdx = (finalY * Width + finalX) * 3;
+                    byte v = decodedPass[srcIdx];
+                    finalImage[dstIdx] = v;
+                    finalImage[dstIdx + 1] = v;
+                    finalImage[dstIdx + 2] = v;
+                }
+            }
+            return;
+        }
+
+        if (ColorType == 4 && BitDepth == 16)
+        {
+            for (int y = 0; y < h; y++)
+            {
+                for (int x = 0; x < w; x++)
+                {
+                    int finalY = sy + y * dy;
+                    int finalX = sx + x * dx;
+
+                    int srcIdx = (y * w + x) * 4;
+                    int dstIdx = (finalY * Width + finalX) * 3;
+                    byte v = decodedPass[srcIdx];
+                    finalImage[dstIdx] = v;
+                    finalImage[dstIdx + 1] = v;
+                    finalImage[dstIdx + 2] = v;
+                }
+            }
+            return;
+        }
+
+        if (ColorType == 3 && BitDepth == 8)
+        {
+            byte[]? pal = _palette;
+            int palLen = pal?.Length ?? 0;
+            for (int y = 0; y < h; y++)
+            {
+                for (int x = 0; x < w; x++)
+                {
+                    int finalY = sy + y * dy;
+                    int finalX = sx + x * dx;
+
+                    int srcIdx = y * w + x;
+                    int dstIdx = (finalY * Width + finalX) * 3;
+                    int p = decodedPass[srcIdx] * 3;
+                    if (p + 2 < palLen)
+                    {
+                        finalImage[dstIdx] = pal![p];
+                        finalImage[dstIdx + 1] = pal[p + 1];
+                        finalImage[dstIdx + 2] = pal[p + 2];
+                    }
                 }
             }
             return;
