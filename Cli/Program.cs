@@ -634,7 +634,7 @@ class Program
             rgba[i + 2] = image.Buffer[j + 2];
             rgba[i + 3] = 255;
         }
-        return new Image<Rgba32>(image.Width, image.Height, rgba);
+        return new Image<Rgba32>(image.Width, image.Height, rgba, image.Metadata);
     }
 
     static bool IsGrayRgb(Image<Rgb24> image)
@@ -692,13 +692,15 @@ class Program
                 Console.WriteLine($"[stream] 开始解码: {Path.GetFileName(path)} ({fileLength} bytes)");
                 using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 20, FileOptions.SequentialScan);
                 var sw = Stopwatch.StartNew();
-                var jpeg = JpegDecoder.Decode(fs, useFloatIdct);
+                var streaming = JpegDecoder.DecodeFromStreamAsync(fs, cancellationToken: default, useFloatingPointIdct: useFloatIdct).GetAwaiter().GetResult();
+                var jpeg = streaming.Image;
                 sw.Stop();
                 Console.WriteLine($"[stream] 解码完成: {sw.ElapsedMilliseconds} ms");
-                if (jpeg.Metadata.Orientation != 1)
+                int orientation = streaming.ExifOrientation;
+                if (orientation != 1)
                 {
                     var frame = new ImageFrame(jpeg.Width, jpeg.Height, jpeg.ToRgb24(), jpeg.Metadata);
-                    frame = frame.ApplyExifOrientation(jpeg.Metadata.Orientation);
+                    frame = frame.ApplyExifOrientation(orientation);
                     jpeg.Metadata.Orientation = 1;
                     return new Image<Rgb24>(frame.Width, frame.Height, frame.Pixels, frame.Metadata);
                 }
@@ -725,14 +727,22 @@ class Program
 
     static Image<Rgba32> LoadRgba32(string path, bool useFloatIdct, bool useStreamingDecoder)
     {
-        if (!useFloatIdct) return Image.LoadRgba32(path);
         string ext = Path.GetExtension(path);
-        if (!ext.Equals(".jpg", StringComparison.OrdinalIgnoreCase) && !ext.Equals(".jpeg", StringComparison.OrdinalIgnoreCase))
+        bool isJpeg = ext.Equals(".jpg", StringComparison.OrdinalIgnoreCase) || ext.Equals(".jpeg", StringComparison.OrdinalIgnoreCase);
+        if (useStreamingDecoder && isJpeg)
         {
-            return Image.LoadRgba32(path);
+            var rgb = LoadRgb24(path, useFloatIdct, true);
+            return ToRgba32(rgb);
         }
-        var rgb = LoadRgb24(path, true, useStreamingDecoder);
-        return ToRgba32(rgb);
+        if (!useFloatIdct && isJpeg)
+        {
+            var frame = ImageFrame.LoadJpeg(path);
+            return ToRgba32(new Image<Rgb24>(frame.Width, frame.Height, frame.Pixels, frame.Metadata));
+        }
+        if (!useFloatIdct) return Image.LoadRgba32(path);
+        if (!isJpeg) return Image.LoadRgba32(path);
+        var rgb2 = LoadRgb24(path, true, useStreamingDecoder);
+        return ToRgba32(rgb2);
     }
 
     private static string ResolveOutputPath(string inputPath, string? outputPath, string defaultExtension)
