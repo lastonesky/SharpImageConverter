@@ -712,22 +712,25 @@ public class PngDecoder
         }
     }
 
-    private byte[] ConvertToRGB(byte[] data, int w, int h)
+    private unsafe byte[] ConvertToRGB(byte[] data, int w, int h)
     {
         if (BitDepth == 8)
         {
             if (ColorType == 0)
             {
                 byte[] rgb0 = new byte[w * h * 3];
-                int src = 0;
-                int dst = 0;
                 int end = w * h;
-                for (int i = 0; i < end; i++)
+                fixed (byte* pSrc = data, pDst = rgb0)
                 {
-                    byte v = data[src++];
-                    rgb0[dst++] = v;
-                    rgb0[dst++] = v;
-                    rgb0[dst++] = v;
+                    byte* src = pSrc;
+                    byte* dst = pDst;
+                    for (int i = 0; i < end; i++)
+                    {
+                        byte v = *src++;
+                        *dst++ = v;
+                        *dst++ = v;
+                        *dst++ = v;
+                    }
                 }
                 return rgb0;
             }
@@ -742,16 +745,19 @@ public class PngDecoder
             if (ColorType == 4)
             {
                 byte[] rgb4 = new byte[w * h * 3];
-                int src = 0;
-                int dst = 0;
                 int end = w * h;
-                for (int i = 0; i < end; i++)
+                fixed (byte* pSrc = data, pDst = rgb4)
                 {
-                    byte v = data[src];
-                    src += 2;
-                    rgb4[dst++] = v;
-                    rgb4[dst++] = v;
-                    rgb4[dst++] = v;
+                    byte* src = pSrc;
+                    byte* dst = pDst;
+                    for (int i = 0; i < end; i++)
+                    {
+                        byte v = *src;
+                        src += 2;
+                        *dst++ = v;
+                        *dst++ = v;
+                        *dst++ = v;
+                    }
                 }
                 return rgb4;
             }
@@ -759,15 +765,18 @@ public class PngDecoder
             if (ColorType == 6)
             {
                 byte[] rgb6 = new byte[w * h * 3];
-                int src = 0;
-                int dst = 0;
                 int end = w * h;
-                for (int i = 0; i < end; i++)
+                fixed (byte* pSrc = data, pDst = rgb6)
                 {
-                    rgb6[dst++] = data[src++];
-                    rgb6[dst++] = data[src++];
-                    rgb6[dst++] = data[src++];
-                    src++;
+                    byte* src = pSrc;
+                    byte* dst = pDst;
+                    for (int i = 0; i < end; i++)
+                    {
+                        *dst++ = *src++;
+                        *dst++ = *src++;
+                        *dst++ = *src++;
+                        src++;
+                    }
                 }
                 return rgb6;
             }
@@ -775,24 +784,41 @@ public class PngDecoder
             if (ColorType == 3)
             {
                 byte[] rgb3 = new byte[w * h * 3];
-                int src = 0;
-                int dst = 0;
                 int end = w * h;
-                for (int i = 0; i < end; i++)
+                fixed (byte* pSrc = data, pDst = rgb3)
                 {
-                    int index = data[src++];
+                    byte* src = pSrc;
+                    byte* dst = pDst;
                     if (_palette != null)
                     {
-                        int p = index * 3;
-                        if (p + 2 < _palette.Length)
+                        fixed (byte* pPal = _palette)
                         {
-                            rgb3[dst++] = _palette[p];
-                            rgb3[dst++] = _palette[p + 1];
-                            rgb3[dst++] = _palette[p + 2];
-                            continue;
+                            int palLen = _palette.Length;
+                            for (int i = 0; i < end; i++)
+                            {
+                                int index = *src++;
+                                int p = index * 3;
+                                if (p + 2 < palLen)
+                                {
+                                    *dst++ = pPal[p];
+                                    *dst++ = pPal[p + 1];
+                                    *dst++ = pPal[p + 2];
+                                }
+                                else
+                                {
+                                    dst += 3;
+                                }
+                            }
                         }
                     }
-                    dst += 3;
+                    else
+                    {
+                        for (int i = 0; i < end; i++)
+                        {
+                            src++;
+                            dst += 3;
+                        }
+                    }
                 }
                 return rgb3;
             }
@@ -803,16 +829,19 @@ public class PngDecoder
             if (ColorType == 0)
             {
                 byte[] rgb016 = new byte[w * h * 3];
-                int src = 0;
-                int dst = 0;
                 int end = w * h;
-                for (int i = 0; i < end; i++)
+                fixed (byte* pSrc = data, pDst = rgb016)
                 {
-                    byte v = data[src];
-                    src += 2;
-                    rgb016[dst++] = v;
-                    rgb016[dst++] = v;
-                    rgb016[dst++] = v;
+                    byte* src = pSrc;
+                    byte* dst = pDst;
+                    for (int i = 0; i < end; i++)
+                    {
+                        byte v = *src;
+                        src += 2;
+                        *dst++ = v;
+                        *dst++ = v;
+                        *dst++ = v;
+                    }
                 }
                 return rgb016;
             }
@@ -820,15 +849,18 @@ public class PngDecoder
             if (ColorType == 2)
             {
                 byte[] rgb216 = new byte[w * h * 3];
-                int src = 0;
-                int dst = 0;
                 int end = w * h;
-                for (int i = 0; i < end; i++)
+                fixed (byte* pSrc = data, pDst = rgb216)
                 {
-                    rgb216[dst++] = data[src];
-                    rgb216[dst++] = data[src + 2];
-                    rgb216[dst++] = data[src + 4];
-                    src += 6;
+                    byte* src = pSrc;
+                    byte* dst = pDst;
+                    for (int i = 0; i < end; i++)
+                    {
+                        *dst++ = *src;
+                        *dst++ = *(src + 2);
+                        *dst++ = *(src + 4);
+                        src += 6;
+                    }
                 }
                 return rgb216;
             }
@@ -836,15 +868,18 @@ public class PngDecoder
             if (ColorType == 6)
             {
                 byte[] rgb616 = new byte[w * h * 3];
-                int src = 0;
-                int dst = 0;
                 int end = w * h;
-                for (int i = 0; i < end; i++)
+                fixed (byte* pSrc = data, pDst = rgb616)
                 {
-                    rgb616[dst++] = data[src];
-                    rgb616[dst++] = data[src + 2];
-                    rgb616[dst++] = data[src + 4];
-                    src += 8;
+                    byte* src = pSrc;
+                    byte* dst = pDst;
+                    for (int i = 0; i < end; i++)
+                    {
+                        *dst++ = *src;
+                        *dst++ = *(src + 2);
+                        *dst++ = *(src + 4);
+                        src += 8;
+                    }
                 }
                 return rgb616;
             }
@@ -852,16 +887,19 @@ public class PngDecoder
             if (ColorType == 4)
             {
                 byte[] rgb416 = new byte[w * h * 3];
-                int src = 0;
-                int dst = 0;
                 int end = w * h;
-                for (int i = 0; i < end; i++)
+                fixed (byte* pSrc = data, pDst = rgb416)
                 {
-                    byte v = data[src];
-                    src += 4;
-                    rgb416[dst++] = v;
-                    rgb416[dst++] = v;
-                    rgb416[dst++] = v;
+                    byte* src = pSrc;
+                    byte* dst = pDst;
+                    for (int i = 0; i < end; i++)
+                    {
+                        byte v = *src;
+                        src += 4;
+                        *dst++ = v;
+                        *dst++ = v;
+                        *dst++ = v;
+                    }
                 }
                 return rgb416;
             }
@@ -973,28 +1011,45 @@ public class PngDecoder
         return rgb;
     }
 
-    private byte[] ConvertToRGBA(byte[] data, int w, int h)
+    private unsafe byte[] ConvertToRGBA(byte[] data, int w, int h)
     {
         if (BitDepth == 8)
         {
             if (ColorType == 0)
             {
                 byte[] rgba0 = new byte[w * h * 4];
-                int src = 0;
-                int dst = 0;
                 int end = w * h;
                 int ts = -1;
                 if (_transparency != null && _transparency.Length >= 2)
                 {
                     ts = (_transparency[0] << 8) | _transparency[1];
                 }
-                for (int i = 0; i < end; i++)
+                fixed (byte* pSrc = data, pDst = rgba0)
                 {
-                    byte v = data[src++];
-                    rgba0[dst++] = v;
-                    rgba0[dst++] = v;
-                    rgba0[dst++] = v;
-                    rgba0[dst++] = (ts >= 0 && v == ts) ? (byte)0 : (byte)255;
+                    byte* src = pSrc;
+                    byte* dst = pDst;
+                    if (ts >= 0)
+                    {
+                        for (int i = 0; i < end; i++)
+                        {
+                            byte v = *src++;
+                            *dst++ = v;
+                            *dst++ = v;
+                            *dst++ = v;
+                            *dst++ = (v == ts) ? (byte)0 : (byte)255;
+                        }
+                    }
+                    else
+                    {
+                        for (int i = 0; i < end; i++)
+                        {
+                            byte v = *src++;
+                            *dst++ = v;
+                            *dst++ = v;
+                            *dst++ = v;
+                            *dst++ = 255;
+                        }
+                    }
                 }
                 return rgba0;
             }
@@ -1002,8 +1057,6 @@ public class PngDecoder
             if (ColorType == 2)
             {
                 byte[] rgba2 = new byte[w * h * 4];
-                int src = 0;
-                int dst = 0;
                 int end = w * h;
                 bool hasTrns = _transparency != null && _transparency.Length >= 6;
                 byte tr = 0, tg = 0, tb = 0;
@@ -1013,15 +1066,33 @@ public class PngDecoder
                     tg = _transparency![3];
                     tb = _transparency![5];
                 }
-                for (int i = 0; i < end; i++)
+                fixed (byte* pSrc = data, pDst = rgba2)
                 {
-                    byte r = data[src++];
-                    byte g = data[src++];
-                    byte b = data[src++];
-                    rgba2[dst++] = r;
-                    rgba2[dst++] = g;
-                    rgba2[dst++] = b;
-                    rgba2[dst++] = (hasTrns && r == tr && g == tg && b == tb) ? (byte)0 : (byte)255;
+                    byte* src = pSrc;
+                    byte* dst = pDst;
+                    if (hasTrns)
+                    {
+                        for (int i = 0; i < end; i++)
+                        {
+                            byte r = *src++;
+                            byte g = *src++;
+                            byte b = *src++;
+                            *dst++ = r;
+                            *dst++ = g;
+                            *dst++ = b;
+                            *dst++ = (r == tr && g == tg && b == tb) ? (byte)0 : (byte)255;
+                        }
+                    }
+                    else
+                    {
+                        for (int i = 0; i < end; i++)
+                        {
+                            *dst++ = *src++;
+                            *dst++ = *src++;
+                            *dst++ = *src++;
+                            *dst++ = 255;
+                        }
+                    }
                 }
                 return rgba2;
             }
@@ -1029,28 +1100,55 @@ public class PngDecoder
             if (ColorType == 3)
             {
                 byte[] rgba3 = new byte[w * h * 4];
-                int src = 0;
-                int dst = 0;
                 int end = w * h;
                 bool hasTrns = _transparency != null;
-                for (int i = 0; i < end; i++)
+                fixed (byte* pSrc = data, pDst = rgba3)
                 {
-                    int index = data[src++];
-                    byte r = 0, g = 0, b = 0;
-                    if (_palette != null)
+                    byte* src = pSrc;
+                    byte* dst = pDst;
+                    fixed (byte* pPal = _palette, pTrns = _transparency)
                     {
-                        int p = index * 3;
-                        if (p + 2 < _palette.Length)
+                        int palLen = _palette?.Length ?? 0;
+                        int trnsLen = _transparency?.Length ?? 0;
+                        if (hasTrns && pPal != null)
                         {
-                            r = _palette[p];
-                            g = _palette[p + 1];
-                            b = _palette[p + 2];
+                            for (int i = 0; i < end; i++)
+                            {
+                                int index = *src++;
+                                int p = index * 3;
+                                if (p + 2 < palLen)
+                                {
+                                    *dst++ = pPal[p];
+                                    *dst++ = pPal[p + 1];
+                                    *dst++ = pPal[p + 2];
+                                }
+                                else
+                                {
+                                    *dst++ = 0; *dst++ = 0; *dst++ = 0;
+                                }
+                                *dst++ = index < trnsLen ? pTrns[index] : (byte)255;
+                            }
+                        }
+                        else if (pPal != null)
+                        {
+                            for (int i = 0; i < end; i++)
+                            {
+                                int index = *src++;
+                                int p = index * 3;
+                                if (p + 2 < palLen)
+                                {
+                                    *dst++ = pPal[p];
+                                    *dst++ = pPal[p + 1];
+                                    *dst++ = pPal[p + 2];
+                                }
+                                else
+                                {
+                                    *dst++ = 0; *dst++ = 0; *dst++ = 0;
+                                }
+                                *dst++ = 255;
+                            }
                         }
                     }
-                    rgba3[dst++] = r;
-                    rgba3[dst++] = g;
-                    rgba3[dst++] = b;
-                    rgba3[dst++] = (hasTrns && index < _transparency!.Length) ? _transparency![index] : (byte)255;
                 }
                 return rgba3;
             }
@@ -1058,17 +1156,20 @@ public class PngDecoder
             if (ColorType == 4)
             {
                 byte[] rgba4 = new byte[w * h * 4];
-                int src = 0;
-                int dst = 0;
                 int end = w * h;
-                for (int i = 0; i < end; i++)
+                fixed (byte* pSrc = data, pDst = rgba4)
                 {
-                    byte v = data[src++];
-                    byte a = data[src++];
-                    rgba4[dst++] = v;
-                    rgba4[dst++] = v;
-                    rgba4[dst++] = v;
-                    rgba4[dst++] = a;
+                    byte* src = pSrc;
+                    byte* dst = pDst;
+                    for (int i = 0; i < end; i++)
+                    {
+                        byte v = *src++;
+                        byte a = *src++;
+                        *dst++ = v;
+                        *dst++ = v;
+                        *dst++ = v;
+                        *dst++ = a;
+                    }
                 }
                 return rgba4;
             }
@@ -1086,8 +1187,6 @@ public class PngDecoder
             if (ColorType == 0)
             {
                 byte[] rgba016 = new byte[w * h * 4];
-                int src = 0;
-                int dst = 0;
                 int end = w * h;
                 int ts = -1;
                 if (_transparency != null && _transparency.Length >= 2)
@@ -1095,14 +1194,34 @@ public class PngDecoder
                     int t = (_transparency[0] << 8) | _transparency[1];
                     ts = t >> 8;
                 }
-                for (int i = 0; i < end; i++)
+                fixed (byte* pSrc = data, pDst = rgba016)
                 {
-                    byte v = data[src];
-                    src += 2;
-                    rgba016[dst++] = v;
-                    rgba016[dst++] = v;
-                    rgba016[dst++] = v;
-                    rgba016[dst++] = (ts >= 0 && v == ts) ? (byte)0 : (byte)255;
+                    byte* src = pSrc;
+                    byte* dst = pDst;
+                    if (ts >= 0)
+                    {
+                        for (int i = 0; i < end; i++)
+                        {
+                            byte v = *src;
+                            src += 2;
+                            *dst++ = v;
+                            *dst++ = v;
+                            *dst++ = v;
+                            *dst++ = (v == ts) ? (byte)0 : (byte)255;
+                        }
+                    }
+                    else
+                    {
+                        for (int i = 0; i < end; i++)
+                        {
+                            byte v = *src;
+                            src += 2;
+                            *dst++ = v;
+                            *dst++ = v;
+                            *dst++ = v;
+                            *dst++ = 255;
+                        }
+                    }
                 }
                 return rgba016;
             }
@@ -1110,19 +1229,19 @@ public class PngDecoder
             if (ColorType == 2)
             {
                 byte[] rgba216 = new byte[w * h * 4];
-                int src = 0;
-                int dst = 0;
                 int end = w * h;
-                for (int i = 0; i < end; i++)
+                fixed (byte* pSrc = data, pDst = rgba216)
                 {
-                    byte r = data[src];
-                    byte g = data[src + 2];
-                    byte b = data[src + 4];
-                    rgba216[dst++] = r;
-                    rgba216[dst++] = g;
-                    rgba216[dst++] = b;
-                    rgba216[dst++] = 255;
-                    src += 6;
+                    byte* src = pSrc;
+                    byte* dst = pDst;
+                    for (int i = 0; i < end; i++)
+                    {
+                        *dst++ = *src;
+                        *dst++ = *(src + 2);
+                        *dst++ = *(src + 4);
+                        *dst++ = 255;
+                        src += 6;
+                    }
                 }
                 return rgba216;
             }
@@ -1130,16 +1249,19 @@ public class PngDecoder
             if (ColorType == 6)
             {
                 byte[] rgba616 = new byte[w * h * 4];
-                int src = 0;
-                int dst = 0;
                 int end = w * h;
-                for (int i = 0; i < end; i++)
+                fixed (byte* pSrc = data, pDst = rgba616)
                 {
-                    rgba616[dst++] = data[src];
-                    rgba616[dst++] = data[src + 2];
-                    rgba616[dst++] = data[src + 4];
-                    rgba616[dst++] = data[src + 6];
-                    src += 8;
+                    byte* src = pSrc;
+                    byte* dst = pDst;
+                    for (int i = 0; i < end; i++)
+                    {
+                        *dst++ = *src;
+                        *dst++ = *(src + 2);
+                        *dst++ = *(src + 4);
+                        *dst++ = *(src + 6);
+                        src += 8;
+                    }
                 }
                 return rgba616;
             }
@@ -1147,18 +1269,21 @@ public class PngDecoder
             if (ColorType == 4)
             {
                 byte[] rgba416 = new byte[w * h * 4];
-                int src = 0;
-                int dst = 0;
                 int end = w * h;
-                for (int i = 0; i < end; i++)
+                fixed (byte* pSrc = data, pDst = rgba416)
                 {
-                    byte v = data[src];
-                    byte a = data[src + 2];
-                    src += 4;
-                    rgba416[dst++] = v;
-                    rgba416[dst++] = v;
-                    rgba416[dst++] = v;
-                    rgba416[dst++] = a;
+                    byte* src = pSrc;
+                    byte* dst = pDst;
+                    for (int i = 0; i < end; i++)
+                    {
+                        byte v = *src;
+                        byte a = *(src + 2);
+                        src += 4;
+                        *dst++ = v;
+                        *dst++ = v;
+                        *dst++ = v;
+                        *dst++ = a;
+                    }
                 }
                 return rgba416;
             }
@@ -1301,7 +1426,7 @@ public class PngDecoder
         if (depth == 2) return val * 85;
         if (depth == 4) return val * 17;
         if (depth == 8) return val;
-        if (depth == 16) return val >> 8;
+        if (depth == 16) return (val * 255 + 32895) >> 16;
         return val;
     }
 
