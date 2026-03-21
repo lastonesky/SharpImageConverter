@@ -1,5 +1,4 @@
 using System;
-using System.IO;
 using SharpImageConverter.Metadata;
 
 namespace SharpImageConverter.Core
@@ -32,6 +31,7 @@ namespace SharpImageConverter.Core
         /// <param name="buffer">像素缓冲区</param>
         public Image(int width, int height, byte[] buffer, ImageMetadata? metadata = null)
         {
+            ValidateDimensionsAndBuffer(width, height, buffer);
             Width = width;
             Height = height;
             Buffer = buffer;
@@ -46,9 +46,31 @@ namespace SharpImageConverter.Core
         /// <param name="buffer">新像素缓冲区</param>
         public void Update(int width, int height, byte[] buffer)
         {
+            ValidateDimensionsAndBuffer(width, height, buffer);
             Width = width;
             Height = height;
             Buffer = buffer;
+        }
+
+        private static void ValidateDimensionsAndBuffer(int width, int height, byte[] buffer)
+        {
+            ArgumentOutOfRangeException.ThrowIfNegative(width, nameof(width));
+            ArgumentOutOfRangeException.ThrowIfNegative(height, nameof(height));
+            ArgumentNullException.ThrowIfNull(buffer, nameof(buffer));
+
+            var pixel = default(TPixel);
+            int bytesPerPixel = pixel.BytesPerPixel;
+            if (bytesPerPixel <= 0) throw new ArgumentOutOfRangeException(nameof(TPixel));
+
+            long expectedLength = (long)width * height * bytesPerPixel;
+            if (expectedLength > int.MaxValue)
+            {
+                throw new ArgumentException("图像尺寸超出可表示的缓冲区范围");
+            }
+            if (buffer.Length != expectedLength)
+            {
+                throw new ArgumentException("像素缓冲区长度与尺寸不匹配", nameof(buffer));
+            }
         }
     }
 
