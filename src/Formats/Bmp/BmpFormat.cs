@@ -9,6 +9,7 @@ namespace SharpImageConverter.Formats.Bmp
     /// </summary>
     public sealed class BmpFormat : IImageFormat
     {
+        private static readonly string[] s_extensions = [".bmp"];
         /// <summary>
         /// 格式名称
         /// </summary>
@@ -16,7 +17,7 @@ namespace SharpImageConverter.Formats.Bmp
         /// <summary>
         /// 支持扩展名
         /// </summary>
-        public string[] Extensions => new[] { ".bmp" };
+        public string[] Extensions => s_extensions;
         /// <summary>
         /// 判断输入流是否为 BMP（BM 头）
         /// </summary>

@@ -8,8 +8,9 @@ namespace SharpImageConverter.Formats
 
     public sealed class JpegFormat : IImageFormat
     {
+        private static readonly string[] s_extensions = [".jpg", ".jpeg"];
         public string Name => "JPEG";
-        public string[] Extensions => [".jpg", ".jpeg"];
+        public string[] Extensions => s_extensions;
         public bool IsMatch(Stream s)
         {
             long origin = 0;

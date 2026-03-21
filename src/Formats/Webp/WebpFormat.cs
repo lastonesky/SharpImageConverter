@@ -9,6 +9,7 @@ namespace SharpImageConverter.Formats.Webp
     /// </summary>
     public sealed class WebpFormat : IImageFormat
     {
+        private static readonly string[] s_extensions = [".webp"];
         /// <summary>
         /// 格式名称
         /// </summary>
@@ -16,7 +17,7 @@ namespace SharpImageConverter.Formats.Webp
         /// <summary>
         /// 支持的文件扩展名
         /// </summary>
-        public string[] Extensions => [".webp"];
+        public string[] Extensions => s_extensions;
         /// <summary>
         /// 判断流是否为 WebP 文件（RIFF/WEBP 头）
         /// </summary>

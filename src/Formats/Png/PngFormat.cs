@@ -9,6 +9,7 @@ namespace SharpImageConverter.Formats
     /// </summary>
     public sealed class PngFormat : IImageFormat
     {
+        private static readonly string[] s_extensions = [".png"];
         /// <summary>
         /// 格式名称
         /// </summary>
@@ -16,7 +17,7 @@ namespace SharpImageConverter.Formats
         /// <summary>
         /// 支持扩展名
         /// </summary>
-        public string[] Extensions => new[] { ".png" };
+        public string[] Extensions => s_extensions;
         /// <summary>
         /// 判断输入流是否为 PNG（8 字节签名）
         /// </summary>
