@@ -1,5 +1,6 @@
 using Xunit;
 using System;
+using System.Buffers;
 using System.IO;
 using SharpImageConverter;
 using SharpImageConverter.Formats.Png;
@@ -111,6 +112,23 @@ namespace Jpeg2Bmp.Tests
             Assert.Equal(frameFromBytes.Width, frameFromStream.Width);
             Assert.Equal(frameFromBytes.Height, frameFromStream.Height);
             BufferAssert.EqualExact(frameFromBytes.Pixels, frameFromStream.Pixels);
+        }
+
+        [Fact]
+        public void ImageFrame_Load_ReadOnlyMemory_NonArrayBacked_Matches_ByteArray()
+        {
+            var img = TestImageFactory.CreateChecker(16, 16, (10, 20, 30), (200, 210, 220), 2);
+            using var ms = new MemoryStream();
+            PngWriter.Write(ms, img.Width, img.Height, img.Buffer, img.Metadata);
+            byte[] data = ms.ToArray();
+            using var manager = new NonArrayBackedMemory(data);
+            ReadOnlyMemory<byte> memory = manager.Memory.Slice(0, data.Length);
+
+            var frameFromBytes = ImageFrame.Load(data);
+            var frameFromMemory = ImageFrame.Load(memory);
+            Assert.Equal(frameFromBytes.Width, frameFromMemory.Width);
+            Assert.Equal(frameFromBytes.Height, frameFromMemory.Height);
+            BufferAssert.EqualExact(frameFromBytes.Pixels, frameFromMemory.Pixels);
         }
 
         [Fact]
@@ -302,6 +320,29 @@ namespace Jpeg2Bmp.Tests
             public override void Write(byte[] buffer, int offset, int count)
             {
                 throw new NotSupportedException();
+            }
+        }
+
+        private sealed class NonArrayBackedMemory(byte[] data) : MemoryManager<byte>
+        {
+            private readonly byte[] data = data;
+
+            public override Span<byte> GetSpan()
+            {
+                return data;
+            }
+
+            public override MemoryHandle Pin(int elementIndex = 0)
+            {
+                throw new NotSupportedException();
+            }
+
+            public override void Unpin()
+            {
+            }
+
+            protected override void Dispose(bool disposing)
+            {
             }
         }
     }

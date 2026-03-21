@@ -99,7 +99,8 @@ public sealed class ImageFrame
             using var ms = new MemoryStream(segment.Array, segment.Offset, segment.Count, writable: false);
             return Load(ms);
         }
-        return Load(data.ToArray());
+        using var rom = new ReadOnlyMemoryStream(data);
+        return Load(rom);
     }
 
     /// <summary>
@@ -219,6 +220,70 @@ public sealed class ImageFrame
         public override long Seek(long offset, SeekOrigin origin)
         {
             throw new NotSupportedException();
+        }
+
+        public override void SetLength(long value)
+        {
+            throw new NotSupportedException();
+        }
+
+        public override void Write(byte[] buffer, int offset, int count)
+        {
+            throw new NotSupportedException();
+        }
+    }
+
+    private sealed class ReadOnlyMemoryStream(ReadOnlyMemory<byte> memory) : Stream
+    {
+        private readonly ReadOnlyMemory<byte> memory = memory;
+        private int position;
+
+        public override bool CanRead => true;
+        public override bool CanSeek => true;
+        public override bool CanWrite => false;
+        public override long Length => memory.Length;
+        public override long Position
+        {
+            get => position;
+            set
+            {
+                if (value < 0 || value > memory.Length) throw new ArgumentOutOfRangeException(nameof(value));
+                position = (int)value;
+            }
+        }
+
+        public override int Read(byte[] buffer, int offset, int count)
+        {
+            return Read(buffer.AsSpan(offset, count));
+        }
+
+        public override int Read(Span<byte> buffer)
+        {
+            int available = memory.Length - position;
+            if (available <= 0) return 0;
+            int toCopy = Math.Min(available, buffer.Length);
+            memory.Span.Slice(position, toCopy).CopyTo(buffer);
+            position += toCopy;
+            return toCopy;
+        }
+
+        public override void Flush()
+        {
+        }
+
+        public override long Seek(long offset, SeekOrigin origin)
+        {
+            long basePosition = origin switch
+            {
+                SeekOrigin.Begin => 0,
+                SeekOrigin.Current => position,
+                SeekOrigin.End => memory.Length,
+                _ => throw new ArgumentOutOfRangeException(nameof(origin))
+            };
+            long newPosition = basePosition + offset;
+            if (newPosition < 0 || newPosition > memory.Length) throw new IOException("尝试将位置移动到无效范围");
+            position = (int)newPosition;
+            return newPosition;
         }
 
         public override void SetLength(long value)

@@ -9,6 +9,7 @@ namespace SharpImageConverter.Formats.Gif
     /// </summary>
     public sealed class GifFormat : IImageFormat
     {
+        private static readonly string[] s_extensions = [".gif"];
         /// <summary>
         /// 格式名称
         /// </summary>
@@ -16,7 +17,7 @@ namespace SharpImageConverter.Formats.Gif
         /// <summary>
         /// 支持扩展名
         /// </summary>
-        public string[] Extensions => new[] { ".gif" };
+        public string[] Extensions => s_extensions;
         /// <summary>
         /// 判断输入流是否为 GIF（GIF 头）
         /// </summary>

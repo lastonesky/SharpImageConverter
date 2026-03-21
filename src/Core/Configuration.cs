@@ -73,7 +73,8 @@ namespace SharpImageConverter.Core
                 if (f.IsMatch(fs))
                 {
                     var dec = _decoders[f.GetType()];
-                    return dec.DecodeRgb24(path);
+                    fs.Position = 0;
+                    return dec.DecodeRgb24(fs);
                 }
             }
             throw new NotSupportedException("未知图像格式");
@@ -134,9 +135,11 @@ namespace SharpImageConverter.Core
                 {
                     if (_decodersRgba.TryGetValue(f.GetType(), out var decRgba))
                     {
-                        return decRgba.DecodeRgba32(path);
+                        fs.Position = 0;
+                        return decRgba.DecodeRgba32(fs);
                     }
-                    var rgb = _decoders[f.GetType()].DecodeRgb24(path);
+                    fs.Position = 0;
+                    var rgb = _decoders[f.GetType()].DecodeRgb24(fs);
                     var rgbaBuf = new byte[rgb.Width * rgb.Height * 4];
                     for (int i = 0, j = 0; j < rgb.Buffer.Length; i += 4, j += 3)
                     {
