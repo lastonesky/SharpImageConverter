@@ -9,6 +9,21 @@ namespace Jpeg2Bmp.Tests
     public class ProcessingTests
     {
         [Fact]
+        public void ImageCtor_InvalidBufferLength_Throws()
+        {
+            Assert.Throws<ArgumentException>(() => new Image<Rgb24>(2, 2, new byte[11]));
+            Assert.Throws<ArgumentException>(() => new Image<Rgba32>(2, 2, new byte[15]));
+            Assert.Throws<ArgumentException>(() => new Image<Gray8>(2, 2, new byte[3]));
+        }
+
+        [Fact]
+        public void ImageUpdate_InvalidBufferLength_Throws()
+        {
+            var img = new Image<Rgb24>(2, 2, new byte[12]);
+            Assert.Throws<ArgumentException>(() => img.Update(3, 3, new byte[26]));
+        }
+
+        [Fact]
         public void Resize_2x2_To_1x1_Downscale_Uses_AreaAverage()
         {
             var img = TestImageFactory.CreateChecker(2, 2, (100, 110, 120), (200, 210, 220));
