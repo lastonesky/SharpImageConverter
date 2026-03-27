@@ -256,7 +256,7 @@ public class Quantizer
     private byte[] BuildMappingLut(byte[] palette)
     {
         int paletteCount = palette.Length / 3;
-        byte[] lut = new byte[SIZE * SIZE * SIZE];
+        byte[] lut = new byte[HistogramVolume];
         Parallel.For(0, SIZE, r =>
         {
             float fr = (r == 0) ? 0 : (r - 0.5f) * 8;
@@ -283,26 +283,54 @@ public class Quantizer
     private byte[] ApplyDitheringWithLut(byte[] pixels, int width, int height, byte[] palette, byte[] lut)
     {
         byte[] indices = new byte[width * height];
-        float[] currentRowError = new float[(width + 2) * 3], nextRowError = new float[(width + 2) * 3];
-        for (int y = 0; y < height; y++)
+        int errorBufferLength = (width + 2) * 3;
+        float[] currentRowError = ArrayPool<float>.Shared.Rent(errorBufferLength);
+        float[] nextRowError = ArrayPool<float>.Shared.Rent(errorBufferLength);
+        try
         {
-            int rowOffset = y * width * 3;
-            for (int x = 0; x < width; x++)
+            Array.Clear(currentRowError, 0, errorBufferLength);
+            Array.Clear(nextRowError, 0, errorBufferLength);
+
+            for (int y = 0; y < height; y++)
             {
-                int pxOff = rowOffset + x * 3;
-                float r = Math.Clamp(pixels[pxOff] + currentRowError[(x + 1) * 3], 0, 255);
-                float g = Math.Clamp(pixels[pxOff + 1] + currentRowError[(x + 1) * 3 + 1], 0, 255);
-                float b = Math.Clamp(pixels[pxOff + 2] + currentRowError[(x + 1) * 3 + 2], 0, 255);
-                int bestIndex = lut[(((int)r >> 3) + 1) * SIZE * SIZE + (((int)g >> 3) + 1) * SIZE + (((int)b >> 3) + 1)];
-                indices[y * width + x] = (byte)bestIndex;
-                int palOff = bestIndex * 3;
-                float er = (r - palette[palOff]) / 16f, eg = (g - palette[palOff + 1]) / 16f, eb = (b - palette[palOff + 2]) / 16f;
-                currentRowError[(x + 2) * 3] += er * 7; currentRowError[(x + 2) * 3 + 1] += eg * 7; currentRowError[(x + 2) * 3 + 2] += eb * 7;
-                nextRowError[x * 3] += er * 3; nextRowError[x * 3 + 1] += eg * 3; nextRowError[x * 3 + 2] += eb * 3;
-                nextRowError[(x + 1) * 3] += er * 5; nextRowError[(x + 1) * 3 + 1] += eg * 5; nextRowError[(x + 1) * 3 + 2] += eb * 5;
-                nextRowError[(x + 2) * 3] += er; nextRowError[(x + 2) * 3 + 1] += eg; nextRowError[(x + 2) * 3 + 2] += eb;
+                int rowOffset = y * width * 3;
+                for (int x = 0; x < width; x++)
+                {
+                    int pxOff = rowOffset + x * 3;
+                    int errorIndex = (x + 1) * 3;
+                    float r = Math.Clamp(pixels[pxOff] + currentRowError[errorIndex], 0, 255);
+                    float g = Math.Clamp(pixels[pxOff + 1] + currentRowError[errorIndex + 1], 0, 255);
+                    float b = Math.Clamp(pixels[pxOff + 2] + currentRowError[errorIndex + 2], 0, 255);
+                    int bestIndex = lut[(((int)r >> 3) + 1) * SIZE * SIZE + (((int)g >> 3) + 1) * SIZE + (((int)b >> 3) + 1)];
+                    indices[y * width + x] = (byte)bestIndex;
+                    int palOff = bestIndex * 3;
+                    float er = (r - palette[palOff]) / 16f;
+                    float eg = (g - palette[palOff + 1]) / 16f;
+                    float eb = (b - palette[palOff + 2]) / 16f;
+                    int rightErrorIndex = (x + 2) * 3;
+                    currentRowError[rightErrorIndex] += er * 7;
+                    currentRowError[rightErrorIndex + 1] += eg * 7;
+                    currentRowError[rightErrorIndex + 2] += eb * 7;
+                    int downLeftErrorIndex = x * 3;
+                    nextRowError[downLeftErrorIndex] += er * 3;
+                    nextRowError[downLeftErrorIndex + 1] += eg * 3;
+                    nextRowError[downLeftErrorIndex + 2] += eb * 3;
+                    nextRowError[errorIndex] += er * 5;
+                    nextRowError[errorIndex + 1] += eg * 5;
+                    nextRowError[errorIndex + 2] += eb * 5;
+                    nextRowError[rightErrorIndex] += er;
+                    nextRowError[rightErrorIndex + 1] += eg;
+                    nextRowError[rightErrorIndex + 2] += eb;
+                }
+
+                (currentRowError, nextRowError) = (nextRowError, currentRowError);
+                Array.Clear(nextRowError, 0, errorBufferLength);
             }
-            Array.Copy(nextRowError, currentRowError, nextRowError.Length); Array.Clear(nextRowError, 0, nextRowError.Length);
+        }
+        finally
+        {
+            ArrayPool<float>.Shared.Return(currentRowError);
+            ArrayPool<float>.Shared.Return(nextRowError);
         }
         return indices;
     }

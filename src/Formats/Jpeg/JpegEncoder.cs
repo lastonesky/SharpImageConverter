@@ -38,11 +38,6 @@ public static class JpegEncoder
         (byte)'I',(byte)'C',(byte)'C',(byte)'_',(byte)'P',(byte)'R',(byte)'O',(byte)'F',(byte)'I',(byte)'L',(byte)'E',0x00
     ];
 
-    /// <summary>
-    /// 是否在编码时打印配置（质量、采样）
-    /// </summary>
-    public static bool DebugPrintConfig { get; set; }
-
     private static readonly int[] YR = BuildScale(77);
     private static readonly int[] YG = BuildScale(150);
     private static readonly int[] YB = BuildScale(29);
@@ -410,7 +405,7 @@ public static class JpegEncoder
     {
         ArgumentNullException.ThrowIfNull(rgb24);
         if (rgb24.Length != checked(width * height * 3)) throw new ArgumentException("RGB24 像素长度不匹配", nameof(rgb24));
-        WriteInternal(stream, width, height, rgb24, NormalizeQuality(quality), true, null, false, DebugPrintConfig);
+        WriteInternal(stream, width, height, rgb24, NormalizeQuality(quality), true, null, false, false);
     }
 
     /// <summary>
@@ -420,14 +415,14 @@ public static class JpegEncoder
     {
         ArgumentNullException.ThrowIfNull(rgb24);
         if (rgb24.Length != checked(width * height * 3)) throw new ArgumentException("RGB24 像素长度不匹配", nameof(rgb24));
-        WriteInternal(stream, width, height, rgb24, NormalizeQuality(quality), subsample420, null, false, DebugPrintConfig);
+        WriteInternal(stream, width, height, rgb24, NormalizeQuality(quality), subsample420, null, false, false);
     }
 
     public static void Write(Stream stream, int width, int height, byte[] rgb24, int quality, bool subsample420, ImageMetadata? metadata, bool keepMetadata)
     {
         ArgumentNullException.ThrowIfNull(rgb24);
         if (rgb24.Length != checked(width * height * 3)) throw new ArgumentException("RGB24 像素长度不匹配", nameof(rgb24));
-        WriteInternal(stream, width, height, rgb24, NormalizeQuality(quality), subsample420, metadata, keepMetadata, DebugPrintConfig);
+        WriteInternal(stream, width, height, rgb24, NormalizeQuality(quality), subsample420, metadata, keepMetadata, false);
     }
 
     public static void Write(Stream stream, int width, int height, byte[] rgb24, JpegEncoderOptions options)
@@ -454,7 +449,7 @@ public static class JpegEncoder
     {
         ArgumentNullException.ThrowIfNull(gray8);
         if (gray8.Length != checked(width * height)) throw new ArgumentException("Gray8 像素长度不匹配", nameof(gray8));
-        WriteInternalGray(stream, width, height, gray8, NormalizeQuality(quality), null, false, DebugPrintConfig);
+        WriteInternalGray(stream, width, height, gray8, NormalizeQuality(quality), null, false, false);
     }
 
     public static void WriteGray8(Stream stream, int width, int height, byte[] gray8, JpegEncoderOptions options, ImageMetadata? metadata = null)
@@ -475,7 +470,7 @@ public static class JpegEncoder
     /// <param name="keepMetadata">是否保留元数据</param>
     public static void Encode<T>(Image<T> image, Stream stream, int quality = 75, bool subsample420 = true, bool keepMetadata = true) where T : struct, IPixel
     {
-        var options = new JpegEncoderOptions(quality, subsample420, keepMetadata, DebugPrintConfig);
+        var options = new JpegEncoderOptions(quality, subsample420, keepMetadata, false);
         Encode(image, stream, options);
     }
 
@@ -507,7 +502,7 @@ public static class JpegEncoder
     public static void Encode<T>(Image<T> image, string path, int quality = 75, bool subsample420 = true, bool keepMetadata = true) where T : struct, IPixel
     {
         using var fs = new FileStream(path, FileMode.Create, FileAccess.Write);
-        Encode(image, fs, new JpegEncoderOptions(quality, subsample420, keepMetadata, DebugPrintConfig));
+        Encode(image, fs, new JpegEncoderOptions(quality, subsample420, keepMetadata, false));
     }
 
     public static void Encode<T>(Image<T> image, string path, JpegEncoderOptions options) where T : struct, IPixel
