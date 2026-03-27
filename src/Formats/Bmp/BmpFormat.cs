@@ -17,7 +17,7 @@ namespace SharpImageConverter.Formats.Bmp
         /// <summary>
         /// 支持扩展名
         /// </summary>
-        public string[] Extensions => s_extensions;
+        public string[] Extensions => (string[])s_extensions.Clone();
         /// <summary>
         /// 判断输入流是否为 BMP（BM 头）
         /// </summary>

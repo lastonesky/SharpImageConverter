@@ -10,7 +10,7 @@ namespace SharpImageConverter.Formats
     {
         private static readonly string[] s_extensions = [".jpg", ".jpeg"];
         public string Name => "JPEG";
-        public string[] Extensions => s_extensions;
+        public string[] Extensions => (string[])s_extensions.Clone();
         public bool IsMatch(Stream s)
         {
             long origin = 0;

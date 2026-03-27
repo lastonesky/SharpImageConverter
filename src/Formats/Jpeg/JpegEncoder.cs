@@ -11,6 +11,22 @@ using SharpImageConverter.Formats.Jpeg;
 
 namespace SharpImageConverter;
 
+public readonly struct JpegEncoderOptions
+{
+    public JpegEncoderOptions(int quality = 75, bool subsample420 = true, bool keepMetadata = true, bool enableDiagnostics = false)
+    {
+        Quality = quality;
+        Subsample420 = subsample420;
+        KeepMetadata = keepMetadata;
+        EnableDiagnostics = enableDiagnostics;
+    }
+
+    public int Quality { get; }
+    public bool Subsample420 { get; }
+    public bool KeepMetadata { get; }
+    public bool EnableDiagnostics { get; }
+}
+
 /// <summary>
 /// JPEG 编码器，支持 4:2:0 与 4:4:4 采样，将 RGB24 编码为 JPEG。
 /// </summary>
@@ -381,6 +397,12 @@ public static class JpegEncoder
         Write(fs, width, height, rgb24, quality);
     }
 
+    public static void Write(string path, int width, int height, byte[] rgb24, JpegEncoderOptions options)
+    {
+        using var fs = new FileStream(path, FileMode.Create, FileAccess.Write);
+        Write(fs, width, height, rgb24, options);
+    }
+
     /// <summary>
     /// 将 RGB24 编码为 JPEG 流（默认使用 4:2:0 采样）
     /// </summary>
@@ -388,11 +410,7 @@ public static class JpegEncoder
     {
         ArgumentNullException.ThrowIfNull(rgb24);
         if (rgb24.Length != checked(width * height * 3)) throw new ArgumentException("RGB24 像素长度不匹配", nameof(rgb24));
-        if (quality < 1) quality = 1;
-        if (quality > 100) quality = 100;
-
-        bool subsample420 = true;
-        WriteInternal(stream, width, height, rgb24, quality, subsample420, null, false);
+        WriteInternal(stream, width, height, rgb24, NormalizeQuality(quality), true, null, false, DebugPrintConfig);
     }
 
     /// <summary>
@@ -402,20 +420,28 @@ public static class JpegEncoder
     {
         ArgumentNullException.ThrowIfNull(rgb24);
         if (rgb24.Length != checked(width * height * 3)) throw new ArgumentException("RGB24 像素长度不匹配", nameof(rgb24));
-        if (quality < 1) quality = 1;
-        if (quality > 100) quality = 100;
-
-        WriteInternal(stream, width, height, rgb24, quality, subsample420, null, false);
+        WriteInternal(stream, width, height, rgb24, NormalizeQuality(quality), subsample420, null, false, DebugPrintConfig);
     }
 
     public static void Write(Stream stream, int width, int height, byte[] rgb24, int quality, bool subsample420, ImageMetadata? metadata, bool keepMetadata)
     {
         ArgumentNullException.ThrowIfNull(rgb24);
         if (rgb24.Length != checked(width * height * 3)) throw new ArgumentException("RGB24 像素长度不匹配", nameof(rgb24));
-        if (quality < 1) quality = 1;
-        if (quality > 100) quality = 100;
+        WriteInternal(stream, width, height, rgb24, NormalizeQuality(quality), subsample420, metadata, keepMetadata, DebugPrintConfig);
+    }
 
-        WriteInternal(stream, width, height, rgb24, quality, subsample420, metadata, keepMetadata);
+    public static void Write(Stream stream, int width, int height, byte[] rgb24, JpegEncoderOptions options)
+    {
+        ArgumentNullException.ThrowIfNull(rgb24);
+        if (rgb24.Length != checked(width * height * 3)) throw new ArgumentException("RGB24 像素长度不匹配", nameof(rgb24));
+        WriteInternal(stream, width, height, rgb24, NormalizeQuality(options.Quality), options.Subsample420, null, options.KeepMetadata, options.EnableDiagnostics);
+    }
+
+    public static void Write(Stream stream, int width, int height, byte[] rgb24, JpegEncoderOptions options, ImageMetadata? metadata)
+    {
+        ArgumentNullException.ThrowIfNull(rgb24);
+        if (rgb24.Length != checked(width * height * 3)) throw new ArgumentException("RGB24 像素长度不匹配", nameof(rgb24));
+        WriteInternal(stream, width, height, rgb24, NormalizeQuality(options.Quality), options.Subsample420, metadata, options.KeepMetadata, options.EnableDiagnostics);
     }
 
     public static void WriteGray8(string path, int width, int height, byte[] gray8, int quality = 75)
@@ -428,10 +454,14 @@ public static class JpegEncoder
     {
         ArgumentNullException.ThrowIfNull(gray8);
         if (gray8.Length != checked(width * height)) throw new ArgumentException("Gray8 像素长度不匹配", nameof(gray8));
-        if (quality < 1) quality = 1;
-        if (quality > 100) quality = 100;
+        WriteInternalGray(stream, width, height, gray8, NormalizeQuality(quality), null, false, DebugPrintConfig);
+    }
 
-        WriteInternalGray(stream, width, height, gray8, quality, null, false);
+    public static void WriteGray8(Stream stream, int width, int height, byte[] gray8, JpegEncoderOptions options, ImageMetadata? metadata = null)
+    {
+        ArgumentNullException.ThrowIfNull(gray8);
+        if (gray8.Length != checked(width * height)) throw new ArgumentException("Gray8 像素长度不匹配", nameof(gray8));
+        WriteInternalGray(stream, width, height, gray8, NormalizeQuality(options.Quality), metadata, options.KeepMetadata, options.EnableDiagnostics);
     }
 
     /// <summary>
@@ -445,13 +475,19 @@ public static class JpegEncoder
     /// <param name="keepMetadata">是否保留元数据</param>
     public static void Encode<T>(Image<T> image, Stream stream, int quality = 75, bool subsample420 = true, bool keepMetadata = true) where T : struct, IPixel
     {
+        var options = new JpegEncoderOptions(quality, subsample420, keepMetadata, DebugPrintConfig);
+        Encode(image, stream, options);
+    }
+
+    public static void Encode<T>(Image<T> image, Stream stream, JpegEncoderOptions options) where T : struct, IPixel
+    {
         if (typeof(T) == typeof(Gray8))
         {
-            WriteInternalGray(stream, image.Width, image.Height, image.Buffer, quality, image.Metadata, keepMetadata);
+            WriteInternalGray(stream, image.Width, image.Height, image.Buffer, NormalizeQuality(options.Quality), image.Metadata, options.KeepMetadata, options.EnableDiagnostics);
         }
         else if (typeof(T) == typeof(Rgb24))
         {
-            WriteInternal(stream, image.Width, image.Height, image.Buffer, quality, subsample420, image.Metadata, keepMetadata);
+            WriteInternal(stream, image.Width, image.Height, image.Buffer, NormalizeQuality(options.Quality), options.Subsample420, image.Metadata, options.KeepMetadata, options.EnableDiagnostics);
         }
         else
         {
@@ -471,17 +507,30 @@ public static class JpegEncoder
     public static void Encode<T>(Image<T> image, string path, int quality = 75, bool subsample420 = true, bool keepMetadata = true) where T : struct, IPixel
     {
         using var fs = new FileStream(path, FileMode.Create, FileAccess.Write);
-        Encode(image, fs, quality, subsample420, keepMetadata);
+        Encode(image, fs, new JpegEncoderOptions(quality, subsample420, keepMetadata, DebugPrintConfig));
     }
 
-    private static void WriteInternal(Stream stream, int width, int height, byte[] rgb24, int quality, bool subsample420, ImageMetadata? metadata, bool keepMetadata)
+    public static void Encode<T>(Image<T> image, string path, JpegEncoderOptions options) where T : struct, IPixel
+    {
+        using var fs = new FileStream(path, FileMode.Create, FileAccess.Write);
+        Encode(image, fs, options);
+    }
+
+    private static int NormalizeQuality(int quality)
+    {
+        if (quality < 1) return 1;
+        if (quality > 100) return 100;
+        return quality;
+    }
+
+    private static void WriteInternal(Stream stream, int width, int height, byte[] rgb24, int quality, bool subsample420, ImageMetadata? metadata, bool keepMetadata, bool enableDiagnostics)
     {
         long totalStartTicks = Stopwatch.GetTimestamp();
-        EncodeMetrics? metrics = DebugPrintConfig ? new EncodeMetrics() : null;
+        EncodeMetrics? metrics = enableDiagnostics ? new EncodeMetrics() : null;
 
-        if (DebugPrintConfig)
+        if (enableDiagnostics)
         {
-            Console.WriteLine($"[jpeg] quality={quality} subsample={(subsample420 ? "420" : "444")}");
+            Trace.WriteLine($"[jpeg] quality={quality} subsample={(subsample420 ? "420" : "444")}");
         }
 
         byte[] qY = BuildQuantTable(StdLumaQuant, quality);
@@ -511,7 +560,7 @@ public static class JpegEncoder
 
         long totalEndTicks = Stopwatch.GetTimestamp();
 
-        if (DebugPrintConfig)
+        if (enableDiagnostics)
         {
             long totalTicks = totalEndTicks - totalStartTicks;
             double totalMs = totalTicks * 1000.0 / Stopwatch.Frequency;
@@ -522,17 +571,17 @@ public static class JpegEncoder
             double mcu420Pct = totalTicks != 0 ? (double)ticksFillMcu420 * 100.0 / totalTicks : 0.0;
             double block444Pct = totalTicks != 0 ? (double)ticksFillBlock444 * 100.0 / totalTicks : 0.0;
 
-            Console.WriteLine($"[jpeg-timing] total={totalMs:F3}ms FillMcu420={mcu420Ms:F3}ms ({mcu420Pct:F1}%) FillBlock444={block444Ms:F3}ms ({block444Pct:F1}%)");
+            Trace.WriteLine($"[jpeg-timing] total={totalMs:F3}ms FillMcu420={mcu420Ms:F3}ms ({mcu420Pct:F1}%) FillBlock444={block444Ms:F3}ms ({block444Pct:F1}%)");
         }
     }
 
-    private static void WriteInternalGray(Stream stream, int width, int height, byte[] gray8, int quality, ImageMetadata? metadata, bool keepMetadata)
+    private static void WriteInternalGray(Stream stream, int width, int height, byte[] gray8, int quality, ImageMetadata? metadata, bool keepMetadata, bool enableDiagnostics)
     {
         long totalStartTicks = Stopwatch.GetTimestamp();
 
-        if (DebugPrintConfig)
+        if (enableDiagnostics)
         {
-            Console.WriteLine($"[jpeg] quality={quality} grayscale");
+            Trace.WriteLine($"[jpeg] quality={quality} grayscale");
         }
 
         byte[] qY = BuildQuantTable(StdLumaQuant, quality);
@@ -557,11 +606,11 @@ public static class JpegEncoder
 
         long totalEndTicks = Stopwatch.GetTimestamp();
 
-        if (DebugPrintConfig)
+        if (enableDiagnostics)
         {
             long totalTicks = totalEndTicks - totalStartTicks;
             double totalMs = totalTicks * 1000.0 / Stopwatch.Frequency;
-            Console.WriteLine($"[jpeg-timing] total={totalMs:F3}ms Gray8");
+            Trace.WriteLine($"[jpeg-timing] total={totalMs:F3}ms Gray8");
         }
     }
 

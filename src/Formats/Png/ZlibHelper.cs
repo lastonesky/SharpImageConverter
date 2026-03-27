@@ -20,10 +20,10 @@ public static class ZlibHelper
 
     public static byte[] Decompress(byte[] data, int offset, int count, int expectedDecompressedSize)
     {
-        if (data == null || count < 6)
-            throw new ArgumentException("Invalid Zlib data");
+        ValidateBufferRange(data, offset, count);
+        if (count < 6)
+            throw new ArgumentException("Invalid Zlib data", nameof(count));
 
-        // 如果已知解压大小，直接分配最终数组并解压，避免 MemoryStream 的扩容和 ToArray 复制
         if (expectedDecompressedSize > 0)
         {
             var result = new byte[expectedDecompressedSize];
@@ -31,7 +31,6 @@ public static class ZlibHelper
             return result;
         }
 
-        // ... existing fallback logic for unknown size ...
         byte cmf = data[offset];
         byte flg = data[offset + 1];
         if ((cmf & 0x0F) != 8)
@@ -76,8 +75,9 @@ public static class ZlibHelper
     /// </summary>
     public static void DecompressTo(byte[] data, int offset, int count, Span<byte> destination)
     {
-        if (data == null || count < 6)
-            throw new ArgumentException("Invalid Zlib data");
+        ValidateBufferRange(data, offset, count);
+        if (count < 6)
+            throw new ArgumentException("Invalid Zlib data", nameof(count));
 
         byte cmf = data[offset];
         byte flg = data[offset + 1];
@@ -97,7 +97,6 @@ public static class ZlibHelper
         uint adler = 1u;
         int totalRead = 0;
         
-        // 分块读取以计算 Adler32，同时写入 destination
         byte[] tempBuffer = ArrayPool<byte>.Shared.Rent(32 * 1024);
         try
         {
@@ -109,10 +108,7 @@ public static class ZlibHelper
                 if (totalRead + read > destination.Length)
                     throw new InvalidDataException("Decompressed data exceeds destination size");
 
-                // 复制到目标 Span
                 new ReadOnlySpan<byte>(tempBuffer, 0, read).CopyTo(destination.Slice(totalRead));
-                
-                // 更新校验和
                 adler = Adler32.Update(adler, tempBuffer, 0, read);
                 totalRead += read;
             }
@@ -155,6 +151,15 @@ public static class ZlibHelper
 
         if (totalRead < destination.Length)
             throw new InvalidDataException($"Decompressed data size mismatch. Expected {destination.Length}, got {totalRead}");
+    }
+
+    private static void ValidateBufferRange(byte[] data, int offset, int count)
+    {
+        ArgumentNullException.ThrowIfNull(data);
+        if ((uint)offset > (uint)data.Length)
+            throw new ArgumentOutOfRangeException(nameof(offset));
+        if (count < 0 || count > data.Length - offset)
+            throw new ArgumentOutOfRangeException(nameof(count));
     }
 
     public static byte[] Compress(byte[] data)
