@@ -105,21 +105,19 @@ namespace SharpImageConverter.Formats.Webp
     /// </summary>
     public sealed class WebpEncoderAdapter : IImageEncoder
     {
-        private static WebpEncoderOptions _defaultOptions = WebpEncoderOptions.Default;
+        public WebpEncoderOptions Options { get; set; } = WebpEncoderOptions.Default;
 
-        public static float Quality
+        public float Quality
         {
-            get => _defaultOptions.Quality;
-            set => _defaultOptions = new WebpEncoderOptions(value, _defaultOptions.ConcurrencyStrategy);
+            get => Options.Quality;
+            set => Options = new WebpEncoderOptions(value, Options.ConcurrencyStrategy);
         }
 
-        public static WebpConcurrencyStrategy ConcurrencyStrategy
+        public WebpConcurrencyStrategy ConcurrencyStrategy
         {
-            get => _defaultOptions.ConcurrencyStrategy;
-            set => _defaultOptions = new WebpEncoderOptions(_defaultOptions.Quality, value);
+            get => Options.ConcurrencyStrategy;
+            set => Options = new WebpEncoderOptions(Options.Quality, value);
         }
-
-        internal static WebpEncoderOptions DefaultOptions => _defaultOptions;
 
         /// <summary>
         /// 将 RGB24 图像编码为 WebP 文件
@@ -139,7 +137,7 @@ namespace SharpImageConverter.Formats.Webp
         /// <param name="image">输入图像</param>
         public void EncodeRgb24(Stream stream, Image<Rgb24> image)
         {
-            WebpCodec.EncodeRgbToStream(stream, image.Buffer, image.Width, image.Height, DefaultOptions);
+            WebpCodec.EncodeRgbToStream(stream, image.Buffer, image.Width, image.Height, Options);
         }
     }
 
@@ -148,27 +146,19 @@ namespace SharpImageConverter.Formats.Webp
     /// </summary>
     public sealed class WebpEncoderAdapterRgba : IImageEncoderRgba
     {
-        private static WebpEncoderOptions _defaultOptions = WebpEncoderOptions.Default;
+        public WebpEncoderOptions Options { get; set; } = WebpEncoderOptions.Default;
 
-        public static float Quality
+        public float Quality
         {
-            get => _defaultOptions.Quality;
-            set => _defaultOptions = new WebpEncoderOptions(value, _defaultOptions.ConcurrencyStrategy);
+            get => Options.Quality;
+            set => Options = new WebpEncoderOptions(value, Options.ConcurrencyStrategy);
         }
 
-        public static float DefaultQuality
+        public WebpConcurrencyStrategy ConcurrencyStrategy
         {
-            get => Quality;
-            set => Quality = value;
+            get => Options.ConcurrencyStrategy;
+            set => Options = new WebpEncoderOptions(Options.Quality, value);
         }
-
-        public static WebpConcurrencyStrategy ConcurrencyStrategy
-        {
-            get => _defaultOptions.ConcurrencyStrategy;
-            set => _defaultOptions = new WebpEncoderOptions(_defaultOptions.Quality, value);
-        }
-
-        internal static WebpEncoderOptions DefaultOptions => _defaultOptions;
 
         /// <summary>
         /// 将 RGBA32 图像编码为 WebP 文件
@@ -188,7 +178,7 @@ namespace SharpImageConverter.Formats.Webp
         /// <param name="image">输入图像</param>
         public void EncodeRgba32(Stream stream, Image<Rgba32> image)
         {
-            WebpCodec.EncodeRgbaToStream(stream, image.Buffer, image.Width, image.Height, DefaultOptions);
+            WebpCodec.EncodeRgbaToStream(stream, image.Buffer, image.Width, image.Height, Options);
         }
     }
 

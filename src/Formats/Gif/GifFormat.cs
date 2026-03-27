@@ -17,7 +17,7 @@ namespace SharpImageConverter.Formats.Gif
         /// <summary>
         /// 支持扩展名
         /// </summary>
-        public string[] Extensions => s_extensions;
+        public string[] Extensions => (string[])s_extensions.Clone();
         /// <summary>
         /// 判断输入流是否为 GIF（GIF 头）
         /// </summary>
@@ -25,9 +25,26 @@ namespace SharpImageConverter.Formats.Gif
         /// <returns>匹配返回 true</returns>
         public bool IsMatch(Stream s)
         {
+            long origin = 0;
+            bool restorePosition = s.CanSeek;
+            if (restorePosition)
+            {
+                origin = s.Position;
+            }
+
             Span<byte> b = stackalloc byte[3];
-            if (s.Read(b) != b.Length) return false;
-            return b[0] == (byte)'G' && b[1] == (byte)'I' && b[2] == (byte)'F';
+            try
+            {
+                if (s.Read(b) != b.Length) return false;
+                return b[0] == (byte)'G' && b[1] == (byte)'I' && b[2] == (byte)'F';
+            }
+            finally
+            {
+                if (restorePosition)
+                {
+                    s.Position = origin;
+                }
+            }
         }
     }
 }

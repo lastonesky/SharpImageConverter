@@ -19,13 +19,18 @@ public sealed class JpegDecoderAdapter : IImageDecoder
 
 public sealed class JpegEncoderAdapter : IImageEncoder
 {
+    public int Quality { get; set; } = 75;
+    public bool Subsample420 { get; set; } = true;
+    public bool KeepMetadata { get; set; } = true;
+    public bool EnableDiagnostics { get; set; }
+
     public void EncodeRgb24(string path, Image<Rgb24> image)
     {
-        JpegEncoder.Write(path, image.Width, image.Height, image.Buffer, 75);
+        JpegEncoder.Encode(image, path, new JpegEncoderOptions(Quality, Subsample420, KeepMetadata, EnableDiagnostics));
     }
 
     public void EncodeRgb24(Stream stream, Image<Rgb24> image)
     {
-        JpegEncoder.Write(stream, image.Width, image.Height, image.Buffer, 75);
+        JpegEncoder.Encode(image, stream, new JpegEncoderOptions(Quality, Subsample420, KeepMetadata, EnableDiagnostics));
     }
 }

@@ -17,7 +17,7 @@ namespace SharpImageConverter.Formats.Webp
         /// <summary>
         /// 支持的文件扩展名
         /// </summary>
-        public string[] Extensions => s_extensions;
+        public string[] Extensions => (string[])s_extensions.Clone();
         /// <summary>
         /// 判断流是否为 WebP 文件（RIFF/WEBP 头）
         /// </summary>
@@ -25,10 +25,27 @@ namespace SharpImageConverter.Formats.Webp
         /// <returns>是 WebP 则为 true，否则为 false</returns>
         public bool IsMatch(Stream s)
         {
+            long origin = 0;
+            bool restorePosition = s.CanSeek;
+            if (restorePosition)
+            {
+                origin = s.Position;
+            }
+
             Span<byte> b = stackalloc byte[12];
-            if (s.Read(b) != b.Length) return false;
-            return b[0] == (byte)'R' && b[1] == (byte)'I' && b[2] == (byte)'F' && b[3] == (byte)'F'
-                && b[8] == (byte)'W' && b[9] == (byte)'E' && b[10] == (byte)'B' && b[11] == (byte)'P';
+            try
+            {
+                if (s.Read(b) != b.Length) return false;
+                return b[0] == (byte)'R' && b[1] == (byte)'I' && b[2] == (byte)'F' && b[3] == (byte)'F'
+                    && b[8] == (byte)'W' && b[9] == (byte)'E' && b[10] == (byte)'B' && b[11] == (byte)'P';
+            }
+            finally
+            {
+                if (restorePosition)
+                {
+                    s.Position = origin;
+                }
+            }
         }
     }
 }

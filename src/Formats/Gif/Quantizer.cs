@@ -1,5 +1,5 @@
 using System;
-using System.Diagnostics;
+using System.Buffers;
 using System.Numerics;
 using System.Threading.Tasks;
 
@@ -13,12 +13,13 @@ public class Quantizer
     private const int BITS = 5;
     private const int SIZE = 33; // 2^5 + 1
     private const int MaxColors = 256;
+    private const int HistogramVolume = SIZE * SIZE * SIZE;
 
-    private readonly long[] _vwt = new long[SIZE * SIZE * SIZE];
-    private readonly long[] _vmr = new long[SIZE * SIZE * SIZE];
-    private readonly long[] _vmg = new long[SIZE * SIZE * SIZE];
-    private readonly long[] _vmb = new long[SIZE * SIZE * SIZE];
-    private readonly double[] _m2 = new double[SIZE * SIZE * SIZE];
+    private readonly long[] _vwt = new long[HistogramVolume];
+    private readonly long[] _vmr = new long[HistogramVolume];
+    private readonly long[] _vmg = new long[HistogramVolume];
+    private readonly long[] _vmb = new long[HistogramVolume];
+    private readonly double[] _m2 = new double[HistogramVolume];
 
     private struct Box
     {
@@ -44,13 +45,8 @@ public class Quantizer
 
     private (byte[] Palette, byte[] Indices) QuantizeInternal(byte[] pixels, int width, int height, bool enableDithering)
     {
-        Stopwatch sw = Stopwatch.StartNew();
-        
         BuildHistogramParallel(pixels);
-        long tHistogram = sw.ElapsedMilliseconds;
-        
         CalculateMoments();
-        long tMoments = sw.ElapsedMilliseconds - tHistogram;
 
         Box[] cube = new Box[MaxColors];
         cube[0].r0 = cube[0].g0 = cube[0].b0 = 0;
@@ -84,7 +80,6 @@ public class Quantizer
             if (temp <= 0) { actualK = i + 1; break; }
             actualK = i + 1;
         }
-        long tSplitting = sw.ElapsedMilliseconds - tHistogram - tMoments;
 
         byte[] palette = new byte[actualK * 3];
         for (int i = 0; i < actualK; i++)
@@ -97,10 +92,8 @@ public class Quantizer
                 palette[i * 3 + 2] = (byte)(Vol(ref cube[i], _vmb) / weight);
             }
         }
-        long tPalette = sw.ElapsedMilliseconds - tHistogram - tMoments - tSplitting;
 
         byte[] mappingLut = BuildMappingLut(palette);
-        long tLut = sw.ElapsedMilliseconds - tHistogram - tMoments - tSplitting - tPalette;
 
         byte[] indices;
         if (enableDithering)
@@ -111,10 +104,6 @@ public class Quantizer
         {
             indices = ApplyMappingOnly(pixels, width, height, mappingLut);
         }
-        long tMapping = sw.ElapsedMilliseconds - tHistogram - tMoments - tSplitting - tPalette - tLut;
-
-        Console.WriteLine($"[Quantizer] Perf: Dithering={enableDithering}, Hist={tHistogram}ms, Moments={tMoments}ms, Split={tSplitting}ms, Palette={tPalette}ms, LUT={tLut}ms, Map={tMapping}ms, Total={sw.ElapsedMilliseconds}ms");
-        
         return (palette, indices);
     }
 
@@ -126,45 +115,62 @@ public class Quantizer
         Array.Clear(_vmb, 0, _vmb.Length);
         Array.Clear(_m2, 0, _m2.Length);
 
-        int threadCount = Environment.ProcessorCount;
+        int threadCount = Math.Min(Environment.ProcessorCount, Math.Max(1, pixels.Length / 3));
         int len = pixels.Length / 3;
         int blockSize = len / threadCount;
 
         Parallel.For(0, threadCount, t =>
         {
-            long[] tVwt = new long[SIZE * SIZE * SIZE];
-            long[] tVmr = new long[SIZE * SIZE * SIZE];
-            long[] tVmg = new long[SIZE * SIZE * SIZE];
-            long[] tVmb = new long[SIZE * SIZE * SIZE];
-            double[] tM2 = new double[SIZE * SIZE * SIZE];
+            long[] tVwt = ArrayPool<long>.Shared.Rent(HistogramVolume);
+            long[] tVmr = ArrayPool<long>.Shared.Rent(HistogramVolume);
+            long[] tVmg = ArrayPool<long>.Shared.Rent(HistogramVolume);
+            long[] tVmb = ArrayPool<long>.Shared.Rent(HistogramVolume);
+            double[] tM2 = ArrayPool<double>.Shared.Rent(HistogramVolume);
 
-            int start = t * blockSize;
-            int end = (t == threadCount - 1) ? len : (t + 1) * blockSize;
-
-            for (int i = start; i < end; i++)
+            try
             {
-                int baseIdx = i * 3;
-                int r = (pixels[baseIdx] >> 3) + 1;
-                int g = (pixels[baseIdx + 1] >> 3) + 1;
-                int b = (pixels[baseIdx + 2] >> 3) + 1;
-                int idx = (r * SIZE * SIZE) + (g * SIZE) + b;
-                tVwt[idx]++;
-                tVmr[idx] += pixels[baseIdx];
-                tVmg[idx] += pixels[baseIdx + 1];
-                tVmb[idx] += pixels[baseIdx + 2];
-                tM2[idx] += (double)pixels[baseIdx] * pixels[baseIdx] + (double)pixels[baseIdx + 1] * pixels[baseIdx + 1] + (double)pixels[baseIdx + 2] * pixels[baseIdx + 2];
-            }
+                Array.Clear(tVwt, 0, HistogramVolume);
+                Array.Clear(tVmr, 0, HistogramVolume);
+                Array.Clear(tVmg, 0, HistogramVolume);
+                Array.Clear(tVmb, 0, HistogramVolume);
+                Array.Clear(tM2, 0, HistogramVolume);
 
-            lock (_vwt)
-            {
-                for (int i = 0; i < _vwt.Length; i++)
+                int start = t * blockSize;
+                int end = (t == threadCount - 1) ? len : (t + 1) * blockSize;
+
+                for (int i = start; i < end; i++)
                 {
-                    _vwt[i] += tVwt[i];
-                    _vmr[i] += tVmr[i];
-                    _vmg[i] += tVmg[i];
-                    _vmb[i] += tVmb[i];
-                    _m2[i] += tM2[i];
+                    int baseIdx = i * 3;
+                    int r = (pixels[baseIdx] >> 3) + 1;
+                    int g = (pixels[baseIdx + 1] >> 3) + 1;
+                    int b = (pixels[baseIdx + 2] >> 3) + 1;
+                    int idx = (r * SIZE * SIZE) + (g * SIZE) + b;
+                    tVwt[idx]++;
+                    tVmr[idx] += pixels[baseIdx];
+                    tVmg[idx] += pixels[baseIdx + 1];
+                    tVmb[idx] += pixels[baseIdx + 2];
+                    tM2[idx] += (double)pixels[baseIdx] * pixels[baseIdx] + (double)pixels[baseIdx + 1] * pixels[baseIdx + 1] + (double)pixels[baseIdx + 2] * pixels[baseIdx + 2];
                 }
+
+                lock (_vwt)
+                {
+                    for (int i = 0; i < HistogramVolume; i++)
+                    {
+                        _vwt[i] += tVwt[i];
+                        _vmr[i] += tVmr[i];
+                        _vmg[i] += tVmg[i];
+                        _vmb[i] += tVmb[i];
+                        _m2[i] += tM2[i];
+                    }
+                }
+            }
+            finally
+            {
+                ArrayPool<long>.Shared.Return(tVwt);
+                ArrayPool<long>.Shared.Return(tVmr);
+                ArrayPool<long>.Shared.Return(tVmg);
+                ArrayPool<long>.Shared.Return(tVmb);
+                ArrayPool<double>.Shared.Return(tM2);
             }
         });
     }
@@ -173,8 +179,11 @@ public class Quantizer
     {
         for (int r = 1; r < SIZE; r++)
         {
-            long[] areaWt = new long[SIZE], areaMr = new long[SIZE], areaMg = new long[SIZE], areaMb = new long[SIZE];
-            double[] areaM2 = new double[SIZE];
+            Span<long> areaWt = stackalloc long[SIZE];
+            Span<long> areaMr = stackalloc long[SIZE];
+            Span<long> areaMg = stackalloc long[SIZE];
+            Span<long> areaMb = stackalloc long[SIZE];
+            Span<double> areaM2 = stackalloc double[SIZE];
             for (int g = 1; g < SIZE; g++)
             {
                 long lineWt = 0, lineMr = 0, lineMg = 0, lineMb = 0;

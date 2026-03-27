@@ -10,10 +10,7 @@ namespace SharpImageConverter.Formats.Gif
     /// </summary>
     public sealed class GifEncoderAdapter : IImageEncoder
     {
-        /// <summary>
-        /// 是否开启抖动。
-        /// </summary>
-        public static bool EnableDithering { get; set; } = true;
+        public bool EnableDithering { get; set; } = true;
 
         /// <summary>
         /// 将 RGB24 图像编码为 GIF 文件
@@ -46,6 +43,8 @@ namespace SharpImageConverter.Formats.Gif
     /// </summary>
     public sealed class GifEncoderAdapterRgba : IImageEncoderRgba
     {
+        public bool EnableDithering { get; set; } = true;
+
         /// <summary>
         /// 将 RGBA32 图像编码为 GIF 文件
         /// </summary>
@@ -53,7 +52,7 @@ namespace SharpImageConverter.Formats.Gif
         /// <param name="image">输入图像</param>
         public void EncodeRgba32(string path, Image<Rgba32> image)
         {
-            var encoder = new GifEncoder { EnableDithering = GifEncoderAdapter.EnableDithering };
+            var encoder = new GifEncoder { EnableDithering = EnableDithering };
             using var fs = File.Create(path);
             encoder.EncodeRgba(image.Width, image.Height, image.Buffer, fs);
         }
@@ -65,7 +64,7 @@ namespace SharpImageConverter.Formats.Gif
         /// <param name="image">输入图像</param>
         public void EncodeRgba32(Stream stream, Image<Rgba32> image)
         {
-            var encoder = new GifEncoder { EnableDithering = GifEncoderAdapter.EnableDithering };
+            var encoder = new GifEncoder { EnableDithering = EnableDithering };
             encoder.EncodeRgba(image.Width, image.Height, image.Buffer, stream);
         }
     }

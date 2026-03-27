@@ -69,7 +69,7 @@ class Program
             }
             if (string.Equals(a, "--jpeg-debug", StringComparison.OrdinalIgnoreCase))
             {
-                JpegEncoder.DebugPrintConfig = true;
+                options.JpegDebug = true;
                 continue;
             }
             if (string.Equals(a, "--dithering", StringComparison.OrdinalIgnoreCase))
@@ -301,11 +301,6 @@ class Program
         string outputPath = options.OutputPath ?? throw new InvalidOperationException("输出路径为空");
         string outExt = Path.GetExtension(outputPath).ToLowerInvariant();
 
-        if (outExt == ".gif")
-        {
-            GifEncoderAdapter.EnableDithering = options.Dithering;
-        }
-
         // GIF -> WebP：保留动画信息
         if (inExt == ".gif" && outExt == ".webp")
         {
@@ -340,21 +335,16 @@ class Program
             return;
         }
 
-        if (outExt == ".webp")
-        {
-            WebpEncoderAdapterRgba.DefaultQuality = (options.JpegQuality ?? 75);
-        }
-
         bool isInputGray = IsGrayRgba(rgbaImage);
-        if ((outExt == ".bmp" || outExt == ".png" || outExt == ".webp") && (options.Gray || isInputGray))
+        if ((outExt == ".bmp" || outExt == ".png" || outExt == ".webp" || outExt == ".gif") && (options.Gray || isInputGray))
         {
             var rgb = new Image<Rgb24>(rgbaImage.Width, rgbaImage.Height, RgbaToRgb(rgbaImage.Buffer), rgbaImage.Metadata);
             var grayImage = ToGray8(rgb);
-            Image.Save(grayImage, outputPath);
+            SaveGrayWithOptions(grayImage, outputPath, options);
             return;
         }
 
-        Image.Save(rgbaImage, outputPath);
+        SaveRgbaWithOptions(rgbaImage, outputPath, options);
     }
 
     static void ProcessWithOps(CliOptions options, string inExt)
@@ -363,11 +353,6 @@ class Program
         options.OutputPath = EnsureOutputPath(options.InputPath, options.OutputPath, ".bmp");
         string outputPath = options.OutputPath ?? throw new InvalidOperationException("输出路径为空");
         string outExt = Path.GetExtension(outputPath).ToLowerInvariant();
-
-        if (outExt == ".gif")
-        {
-            GifEncoderAdapter.EnableDithering = options.Dithering;
-        }
 
         // 带操作的 GIF -> WebP 动画
         if (inExt == ".gif" && outExt == ".webp")
@@ -386,26 +371,18 @@ class Program
 
         if (outExt is ".jpg" or ".jpeg")
         {
-            int q = options.JpegQuality ?? 75;
-            bool effectiveSubsample420 = options.Subsample420 ?? true;
-            new ImageFrame(image.Width, image.Height, image.Buffer, image.Metadata)
-                .SaveAsJpeg(outputPath, q, effectiveSubsample420, options.KeepMetadata);
+            SaveJpegFromRgb(image, options, outputPath, options.KeepMetadata);
             return;
         }
 
-        if (outExt == ".webp")
-        {
-            WebpEncoderAdapter.Quality = (options.JpegQuality ?? 75);
-        }
-
-        if ((outExt == ".bmp" || outExt == ".png" || outExt == ".webp") && (options.Gray || isInputGray))
+        if ((outExt == ".bmp" || outExt == ".png" || outExt == ".webp" || outExt == ".gif") && (options.Gray || isInputGray))
         {
             var grayImage = ToGray8(image);
-            Image.Save(grayImage, outputPath);
+            SaveGrayWithOptions(grayImage, outputPath, options);
             return;
         }
 
-        Image.Save(image, outputPath);
+        SaveRgbWithOptions(image, outputPath, options);
     }
 
     static void ConvertGifToWebp(CliOptions options)
@@ -425,8 +402,7 @@ class Program
         if (anim.Frames.Count == 1)
         {
             var rgbaImage = ToRgba32(anim.Frames[0]);
-            WebpEncoderAdapterRgba.DefaultQuality = (options.JpegQuality ?? 75);
-            Image.Save(rgbaImage, outputPath);
+            SaveRgbaWithOptions(rgbaImage, outputPath, options);
             return;
         }
 
@@ -479,32 +455,87 @@ class Program
     {
         int q = options.JpegQuality ?? 75;
         bool isInputGray = IsGrayRgb(image);
+        bool effectiveSubsample420 = options.Subsample420 ?? true;
+        var encoderOptions = new JpegEncoderOptions(q, effectiveSubsample420, keepMetadata, options.JpegDebug);
         if (options.Gray || isInputGray)
         {
             var grayImage = ToGray8(image);
-            JpegEncoder.Encode(grayImage, outputPath, q, true, keepMetadata);
+            JpegEncoder.Encode(grayImage, outputPath, encoderOptions);
             return;
         }
 
-        bool effectiveSubsample420 = options.Subsample420 ?? true;
-        JpegEncoder.Encode(image, outputPath, q, effectiveSubsample420, keepMetadata);
+        JpegEncoder.Encode(image, outputPath, encoderOptions);
     }
 
     static void SaveJpegFromRgba(Image<Rgba32> rgbaImage, CliOptions options, string outputPath)
     {
         int q = options.JpegQuality ?? 75;
         bool isInputGray = IsGrayRgba(rgbaImage);
+        bool effectiveSubsample420 = options.Subsample420 ?? true;
+        var encoderOptions = new JpegEncoderOptions(q, effectiveSubsample420, keepMetadata: true, enableDiagnostics: options.JpegDebug);
         if (options.Gray || isInputGray)
         {
             var rgb = new Image<Rgb24>(rgbaImage.Width, rgbaImage.Height, RgbaToRgb(rgbaImage.Buffer), rgbaImage.Metadata);
             var grayImage = ToGray8(rgb);
-            JpegEncoder.Encode(grayImage, outputPath, q);
+            JpegEncoder.Encode(grayImage, outputPath, encoderOptions);
             return;
         }
 
         var rgbImage = new Image<Rgb24>(rgbaImage.Width, rgbaImage.Height, RgbaToRgb(rgbaImage.Buffer), rgbaImage.Metadata);
-        bool effectiveSubsample420 = options.Subsample420 ?? true;
-        JpegEncoder.Encode(rgbImage, outputPath, q, effectiveSubsample420);
+        JpegEncoder.Encode(rgbImage, outputPath, encoderOptions);
+    }
+
+    static void SaveRgbWithOptions(Image<Rgb24> image, string outputPath, CliOptions options)
+    {
+        string ext = Path.GetExtension(outputPath).ToLowerInvariant();
+        if (ext == ".gif")
+        {
+            var encoder = new GifEncoderAdapter { EnableDithering = options.Dithering };
+            encoder.EncodeRgb24(outputPath, image);
+            return;
+        }
+
+        if (ext == ".webp")
+        {
+            var encoder = new WebpEncoderAdapter { Quality = options.JpegQuality ?? 75 };
+            encoder.EncodeRgb24(outputPath, image);
+            return;
+        }
+
+        Image.Save(image, outputPath);
+    }
+
+    static void SaveGrayWithOptions(Image<Gray8> image, string outputPath, CliOptions options)
+    {
+        string ext = Path.GetExtension(outputPath).ToLowerInvariant();
+        if (ext is ".gif" or ".webp")
+        {
+            var rgb = new Image<Rgb24>(image.Width, image.Height, GrayToRgb(image.Buffer), image.Metadata);
+            SaveRgbWithOptions(rgb, outputPath, options);
+            return;
+        }
+
+        Image.Save(image, outputPath);
+    }
+
+    static void SaveRgbaWithOptions(Image<Rgba32> image, string outputPath, CliOptions options)
+    {
+        string ext = Path.GetExtension(outputPath).ToLowerInvariant();
+        if (ext == ".gif")
+        {
+            var encoder = new GifEncoderAdapterRgba { EnableDithering = options.Dithering };
+            encoder.EncodeRgba32(outputPath, image);
+            return;
+        }
+
+        if (ext == ".webp")
+        {
+            var encoder = new WebpEncoderAdapterRgba { Quality = options.JpegQuality ?? 75 };
+            encoder.EncodeRgba32(outputPath, image);
+            return;
+        }
+
+        Image.Save(image, outputPath);
     }
 
     static string NormalizeOutputExtension(string ext)
@@ -620,6 +651,19 @@ class Program
             rgb[j + 0] = rgba[i + 0];
             rgb[j + 1] = rgba[i + 1];
             rgb[j + 2] = rgba[i + 2];
+        }
+        return rgb;
+    }
+
+    static byte[] GrayToRgb(byte[] gray)
+    {
+        var rgb = new byte[gray.Length * 3];
+        for (int i = 0, j = 0; i < gray.Length; i++, j += 3)
+        {
+            byte value = gray[i];
+            rgb[j + 0] = value;
+            rgb[j + 1] = value;
+            rgb[j + 2] = value;
         }
         return rgb;
     }
@@ -760,6 +804,7 @@ class Program
         public bool UseFloatIdct { get; set; }
         public bool UseStreamingDecoder { get; set; }
         public bool Gray { get; set; }
+        public bool JpegDebug { get; set; }
         public List<Action<ImageProcessingContext>> Operations { get; } = [];
         public bool IsDirectoryInput { get; set; }
         public bool Recursive { get; set; }
