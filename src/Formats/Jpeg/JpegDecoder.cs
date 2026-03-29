@@ -3,6 +3,7 @@ using SharpImageConverter.Metadata;
 using System.Buffers;
 using System.Runtime.CompilerServices;
 using System.Runtime.Intrinsics;
+using System.Runtime.Intrinsics.Arm;
 using System.Runtime.Intrinsics.X86;
 using System.Threading;
 using System.Threading.Tasks;
@@ -394,7 +395,7 @@ public static class JpegDecoder
                     }
                 }
 
-                if (!handled && colorSpace == JpegColorSpace.YCbCr && !useFloatingPointIdct && Sse2.IsSupported)
+                if (!handled && colorSpace == JpegColorSpace.YCbCr && !useFloatingPointIdct && (Sse2.IsSupported || AdvSimd.Arm64.IsSupported))
                 {
                     output = new byte[checked(width * height * channelCount)];
                     if (TryDecodeInterleavedYCbCrSimd(components, output, width, height, fullWidth, fullHeight, componentOrder, quantTables, useFloatingPointIdct, frame))
@@ -1415,7 +1416,7 @@ public static class JpegDecoder
 
             try
             {
-                if (colorSpace == JpegColorSpace.YCbCr && !useFloatingPointIdct && Sse2.IsSupported)
+                if (colorSpace == JpegColorSpace.YCbCr && !useFloatingPointIdct && (Sse2.IsSupported || AdvSimd.Arm64.IsSupported))
                 {
                     output = new byte[checked(width * height * channelCount)];
                     if (TryDecodeInterleavedYCbCrSimd(components, output, width, height, fullWidth, fullHeight, componentOrder, quantTables, useFloatingPointIdct, frame))
