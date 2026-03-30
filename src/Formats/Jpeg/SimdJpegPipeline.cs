@@ -235,17 +235,8 @@ internal static class SimdJpegPipeline
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static Vector128<int> Multiply32(Vector128<int> a, int b)
-    {
-        if (Avx2.IsSupported)
-        {
-            return Avx2.MultiplyLow(a, Vector128.Create(b));
-        }
-        Vector128<int> bVec = Vector128.Create(b);
-        Vector128<long> low = Sse2.Multiply(a.AsUInt32(), bVec.AsUInt32()).AsInt64();
-        Vector128<long> high = Sse2.Multiply(Sse2.ShiftRightLogical(a, 32).AsUInt32(), bVec.AsUInt32()).AsInt64();
-        return Sse2.UnpackLow(Sse2.Shuffle(low.AsInt32(), 0x08), Sse2.Shuffle(high.AsInt32(), 0x08));
-    }
+    private static Vector128<int> Multiply32(Vector128<int> a, int b) 
+    => a * Vector128.Create(b);
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static Vector128<int> Descale32Pass1(Vector128<int> v)

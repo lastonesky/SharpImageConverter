@@ -2383,19 +2383,12 @@ public static class JpegDecoder
 
     private static int[] BuildComponentOrder(ComponentState[] components, ReadOnlySpan<byte> expectedIds)
     {
-        int[] order = new int[expectedIds.Length];
-        for (int i = 0; i < expectedIds.Length; i++)
+        if (TryBuildComponentOrder(components, expectedIds, out int[] order))
         {
-            int index = FindComponentIndex(components, expectedIds[i]);
-            if (index < 0)
-            {
-                return BuildSequentialOrder(components.Length);
-            }
-
-            order[i] = index;
+            return order;
         }
 
-        return order;
+        return BuildSequentialOrder(components.Length);
     }
 
     private static int[] BuildSequentialOrder(int count)
@@ -2411,19 +2404,35 @@ public static class JpegDecoder
 
     private static int[] BuildComponentOrderWithFallback(ComponentState[] components, ReadOnlySpan<byte> expectedIds, ReadOnlySpan<byte> fallbackIds)
     {
-        int[] order = BuildComponentOrder(components, expectedIds);
-        if (order.Length == expectedIds.Length)
+        if (TryBuildComponentOrder(components, expectedIds, out int[] order))
         {
             return order;
         }
 
-        int[] fallback = BuildComponentOrder(components, fallbackIds);
-        if (fallback.Length == fallbackIds.Length)
+        if (TryBuildComponentOrder(components, fallbackIds, out int[] fallback))
         {
             return fallback;
         }
 
-        return order;
+        return BuildSequentialOrder(components.Length);
+    }
+
+    private static bool TryBuildComponentOrder(ComponentState[] components, ReadOnlySpan<byte> expectedIds, out int[] order)
+    {
+        order = new int[expectedIds.Length];
+        for (int i = 0; i < expectedIds.Length; i++)
+        {
+            int index = FindComponentIndex(components, expectedIds[i]);
+            if (index < 0)
+            {
+                order = Array.Empty<int>();
+                return false;
+            }
+
+            order[i] = index;
+        }
+
+        return true;
     }
 
     private static bool IsSequential(ReadOnlySpan<int> order)
