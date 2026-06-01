@@ -2507,6 +2507,7 @@ public static class JpegDecoder
 
         if (directSample)
         {
+            Span<byte> outputSpan = output;
             for (int y = 0; y < height; y++)
             {
                 int rowOut = y * outStride;
@@ -2514,11 +2515,11 @@ public static class JpegDecoder
                 {
                     int planeIndex = componentOrder[c];
                     int srcRow = y * planeStrides[planeIndex];
-                    byte[] plane = planes[planeIndex];
+                    ReadOnlySpan<byte> plane = planes[planeIndex];
                     int outIndex = rowOut + c;
                     for (int x = 0; x < width; x++)
                     {
-                        output[outIndex] = plane[srcRow + x];
+                        outputSpan[outIndex] = plane[srcRow + x];
                         outIndex += channels;
                     }
                 }
@@ -2550,6 +2551,7 @@ public static class JpegDecoder
             for (int y = 0; y < height; y++)
             {
                 int rowOut = y * outStride;
+                Span<byte> outputRow = output.AsSpan(rowOut, outStride);
                 for (int c = 0; c < channels; c++)
                 {
                     int planeIndex = componentOrder[c];
@@ -2557,9 +2559,9 @@ public static class JpegDecoder
                     ComputeLinearSample(y, height, planeH, fullHeight, out int sy0, out int sy1, out byte yWeight);
                     int srcRow0 = sy0 * planeStrides[planeIndex];
                     int srcRow1 = sy1 * planeStrides[planeIndex];
-                    byte[] plane = planes[planeIndex];
+                    ReadOnlySpan<byte> plane = planes[planeIndex];
                     int mapBase = c * width;
-                    int outIndex = rowOut + c;
+                    int outIndex = c;
                     for (int x = 0; x < width; x++)
                     {
                         int mapIndex = mapBase + x;
@@ -2569,7 +2571,7 @@ public static class JpegDecoder
                         int top = ((plane[srcRow0 + sx0] * (256 - wx)) + (plane[srcRow0 + sx1] * wx) + 128) >> 8;
                         int bottom = ((plane[srcRow1 + sx0] * (256 - wx)) + (plane[srcRow1 + sx1] * wx) + 128) >> 8;
                         int value = ((top * (256 - yWeight)) + (bottom * yWeight) + 128) >> 8;
-                        output[outIndex] = (byte)value;
+                        outputRow[outIndex] = (byte)value;
                         outIndex += channels;
                     }
                 }

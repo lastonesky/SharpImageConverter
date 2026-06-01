@@ -107,7 +107,7 @@ public class PngDecoder
                 {
                     using var idatStream = new IdatStream(stream, idatLength, ValidateChunkCrc);
                     ZlibHelper.DecompressTo(idatStream, decompressed.AsSpan(0, expectedDecompressedSize));
-                    return ProcessImage(decompressed);
+                    return ProcessImage(decompressed.AsSpan(0, expectedDecompressedSize));
                 }
                 finally
                 {
@@ -228,7 +228,7 @@ public class PngDecoder
                 {
                     using var idatStream = new IdatStream(stream, idatLength, ValidateChunkCrc);
                     ZlibHelper.DecompressTo(idatStream, decompressed.AsSpan(0, expectedDecompressedSize));
-                    return ProcessImageRgba(decompressed);
+                    return ProcessImageRgba(decompressed.AsSpan(0, expectedDecompressedSize));
                 }
                 finally
                 {
@@ -549,7 +549,7 @@ public class PngDecoder
         if (InterlaceMethod > 1) throw new NotSupportedException("Unknown interlace method");
     }
 
-    private byte[] ProcessImage(byte[] rawData)
+    private byte[] ProcessImage(ReadOnlySpan<byte> rawData)
     {
         // Calculate bytes per pixel
         int bpp = GetBytesPerPixel();
@@ -564,7 +564,7 @@ public class PngDecoder
         }
     }
 
-    private byte[] ProcessImageRgba(byte[] rawData)
+    private byte[] ProcessImageRgba(ReadOnlySpan<byte> rawData)
     {
         int bpp = GetBytesPerPixel();
         if (InterlaceMethod == 0)
@@ -577,7 +577,7 @@ public class PngDecoder
         }
     }
 
-    private byte[] ProcessInterlaced(byte[] rawData, int bpp)
+    private byte[] ProcessInterlaced(ReadOnlySpan<byte> rawData, int bpp)
     {
         // Adam7 passes
         // Pass 1: start (0,0), step (8,8)
@@ -616,7 +616,7 @@ public class PngDecoder
             int stride = (passW * GetBitsPerPixel() + 7) / 8;
             int passSize = (stride + 1) * passH; // +1 for filter byte
 
-            ReadOnlySpan<byte> passData = rawData.AsSpan(dataOffset, passSize);
+            ReadOnlySpan<byte> passData = rawData.Slice(dataOffset, passSize);
             dataOffset += passSize;
 
             byte[] decodedPass = Unfilter(passData, passW, passH, bpp, stride);
@@ -628,7 +628,7 @@ public class PngDecoder
         return finalImage;
     }
 
-    private byte[] ProcessInterlacedRgba(byte[] rawData, int bpp)
+    private byte[] ProcessInterlacedRgba(ReadOnlySpan<byte> rawData, int bpp)
     {
         int[] startX = Adam7StartX;
         int[] startY = Adam7StartY;
@@ -643,7 +643,7 @@ public class PngDecoder
             if (passW == 0 || passH == 0) continue;
             int stride = (passW * GetBitsPerPixel() + 7) / 8;
             int passSize = (stride + 1) * passH;
-            ReadOnlySpan<byte> passData = rawData.AsSpan(dataOffset, passSize);
+            ReadOnlySpan<byte> passData = rawData.Slice(dataOffset, passSize);
             dataOffset += passSize;
             byte[] decodedPass = Unfilter(passData, passW, passH, bpp, stride);
             byte[] rgbaPass = (ColorType == 6 && BitDepth == 8) ? decodedPass : ConvertToRGBA(decodedPass, passW, passH);
@@ -665,9 +665,20 @@ public class PngDecoder
         return finalImage;
     }
 
-    private byte[] ProcessPass(byte[] rawData, int w, int h, int bpp)
+    private byte[] ProcessPass(ReadOnlySpan<byte> rawData, int w, int h, int bpp)
     {
         int stride = (w * GetBitsPerPixel() + 7) / 8;
+
+        if (ColorType == 2 && BitDepth == 8)
+        {
+            return UnfilterRgb8Direct(rawData, h, bpp, stride);
+        }
+
+        if (ColorType == 6 && BitDepth == 8)
+        {
+            return UnfilterRgba8ToRgbDirect(rawData, w, h, bpp, stride);
+        }
+
         byte[] decoded = Unfilter(rawData, w, h, bpp, stride);
 
         if (ColorType == 2 && BitDepth == 8 && decoded.Length == w * h * 3)
@@ -678,9 +689,20 @@ public class PngDecoder
         return ConvertToRGB(decoded, w, h);
     }
 
-    private byte[] ProcessPassRgba(byte[] rawData, int w, int h, int bpp)
+    private byte[] ProcessPassRgba(ReadOnlySpan<byte> rawData, int w, int h, int bpp)
     {
         int stride = (w * GetBitsPerPixel() + 7) / 8;
+
+        if (ColorType == 6 && BitDepth == 8)
+        {
+            return UnfilterRgba8Direct(rawData, h, bpp, stride);
+        }
+
+        if (ColorType == 2 && BitDepth == 8)
+        {
+            return UnfilterRgb8ToRgbaDirect(rawData, w, h, bpp, stride);
+        }
+
         byte[] decoded = Unfilter(rawData, w, h, bpp, stride);
 
         if (ColorType == 6 && BitDepth == 8 && decoded.Length == w * h * 4)
@@ -716,44 +738,7 @@ public class PngDecoder
 
             Span<byte> curSpan = cur.Span.Slice(0, stride);
             ReadOnlySpan<byte> prevSpan = prev.Span.Slice(0, stride);
-
-            if (filterType == 0)
-            {
-                curSpan.CopyTo(recon.AsSpan(reconIdx, stride));
-                reconIdx += stride;
-                (cur, prev) = (prev, cur);
-                continue;
-            }
-
-            if (filterType == 2)
-            {
-                SimdHelper.AddBytesInPlace(curSpan, prevSpan);
-            }
-            else
-            {
-                for (int i = 0; i < stride; i++)
-                {
-                    byte x = curSpan[i];
-                    byte a = (i >= bpp) ? curSpan[i - bpp] : (byte)0;
-                    byte b = prevSpan[i];
-                    byte c = (i >= bpp) ? prevSpan[i - bpp] : (byte)0;
-
-                    switch (filterType)
-                    {
-                        case 1:
-                            x += a;
-                            break;
-                        case 3:
-                            x += (byte)((a + b) / 2);
-                            break;
-                        case 4:
-                            x += PaethPredictor(a, b, c);
-                            break;
-                    }
-
-                    curSpan[i] = x;
-                }
-            }
+            UnfilterScanline(filterType, curSpan, prevSpan, bpp);
 
             curSpan.CopyTo(recon.AsSpan(reconIdx, stride));
             reconIdx += stride;
@@ -761,6 +746,167 @@ public class PngDecoder
         }
 
         return recon;
+    }
+
+    private byte[] UnfilterRgb8Direct(ReadOnlySpan<byte> rawData, int h, int bpp, int stride)
+    {
+        byte[] output = new byte[stride * h];
+        int rawIdx = 0;
+        using var prevRow = SimdHelper.AllocateAlignedBytes(stride, alignment: SimdHelper.DefaultAlignment, clear: true, padToMultiple: Vector<byte>.Count);
+        using var curRow = SimdHelper.AllocateAlignedBytes(stride, alignment: SimdHelper.DefaultAlignment, clear: false, padToMultiple: Vector<byte>.Count);
+
+        var prev = prevRow;
+        var cur = curRow;
+
+        for (int y = 0; y < h; y++)
+        {
+            byte filterType = rawData[rawIdx++];
+            rawData.Slice(rawIdx, stride).CopyTo(cur.Span.Slice(0, stride));
+            rawIdx += stride;
+
+            Span<byte> curSpan = cur.Span.Slice(0, stride);
+            ReadOnlySpan<byte> prevSpan = prev.Span.Slice(0, stride);
+            UnfilterScanline(filterType, curSpan, prevSpan, bpp);
+            curSpan.CopyTo(output.AsSpan(y * stride, stride));
+            (cur, prev) = (prev, cur);
+        }
+
+        return output;
+    }
+
+    private byte[] UnfilterRgba8Direct(ReadOnlySpan<byte> rawData, int h, int bpp, int stride)
+    {
+        byte[] output = new byte[stride * h];
+        int rawIdx = 0;
+        using var prevRow = SimdHelper.AllocateAlignedBytes(stride, alignment: SimdHelper.DefaultAlignment, clear: true, padToMultiple: Vector<byte>.Count);
+        using var curRow = SimdHelper.AllocateAlignedBytes(stride, alignment: SimdHelper.DefaultAlignment, clear: false, padToMultiple: Vector<byte>.Count);
+
+        var prev = prevRow;
+        var cur = curRow;
+
+        for (int y = 0; y < h; y++)
+        {
+            byte filterType = rawData[rawIdx++];
+            rawData.Slice(rawIdx, stride).CopyTo(cur.Span.Slice(0, stride));
+            rawIdx += stride;
+
+            Span<byte> curSpan = cur.Span.Slice(0, stride);
+            ReadOnlySpan<byte> prevSpan = prev.Span.Slice(0, stride);
+            UnfilterScanline(filterType, curSpan, prevSpan, bpp);
+            curSpan.CopyTo(output.AsSpan(y * stride, stride));
+            (cur, prev) = (prev, cur);
+        }
+
+        return output;
+    }
+
+    private byte[] UnfilterRgba8ToRgbDirect(ReadOnlySpan<byte> rawData, int w, int h, int bpp, int stride)
+    {
+        byte[] output = new byte[w * h * 3];
+        int rawIdx = 0;
+        using var prevRow = SimdHelper.AllocateAlignedBytes(stride, alignment: SimdHelper.DefaultAlignment, clear: true, padToMultiple: Vector<byte>.Count);
+        using var curRow = SimdHelper.AllocateAlignedBytes(stride, alignment: SimdHelper.DefaultAlignment, clear: false, padToMultiple: Vector<byte>.Count);
+
+        var prev = prevRow;
+        var cur = curRow;
+
+        for (int y = 0; y < h; y++)
+        {
+            byte filterType = rawData[rawIdx++];
+            rawData.Slice(rawIdx, stride).CopyTo(cur.Span.Slice(0, stride));
+            rawIdx += stride;
+
+            Span<byte> curSpan = cur.Span.Slice(0, stride);
+            ReadOnlySpan<byte> prevSpan = prev.Span.Slice(0, stride);
+            UnfilterScanline(filterType, curSpan, prevSpan, bpp);
+
+            Span<byte> dst = output.AsSpan(y * w * 3, w * 3);
+            int src = 0;
+            int dstIndex = 0;
+            for (int x = 0; x < w; x++)
+            {
+                dst[dstIndex++] = curSpan[src++];
+                dst[dstIndex++] = curSpan[src++];
+                dst[dstIndex++] = curSpan[src++];
+                src++;
+            }
+            (cur, prev) = (prev, cur);
+        }
+
+        return output;
+    }
+
+    private byte[] UnfilterRgb8ToRgbaDirect(ReadOnlySpan<byte> rawData, int w, int h, int bpp, int stride)
+    {
+        byte[] output = new byte[w * h * 4];
+        int rawIdx = 0;
+        using var prevRow = SimdHelper.AllocateAlignedBytes(stride, alignment: SimdHelper.DefaultAlignment, clear: true, padToMultiple: Vector<byte>.Count);
+        using var curRow = SimdHelper.AllocateAlignedBytes(stride, alignment: SimdHelper.DefaultAlignment, clear: false, padToMultiple: Vector<byte>.Count);
+
+        var prev = prevRow;
+        var cur = curRow;
+
+        for (int y = 0; y < h; y++)
+        {
+            byte filterType = rawData[rawIdx++];
+            rawData.Slice(rawIdx, stride).CopyTo(cur.Span.Slice(0, stride));
+            rawIdx += stride;
+
+            Span<byte> curSpan = cur.Span.Slice(0, stride);
+            ReadOnlySpan<byte> prevSpan = prev.Span.Slice(0, stride);
+            UnfilterScanline(filterType, curSpan, prevSpan, bpp);
+
+            Span<byte> dst = output.AsSpan(y * w * 4, w * 4);
+            int src = 0;
+            int dstIndex = 0;
+            for (int x = 0; x < w; x++)
+            {
+                dst[dstIndex++] = curSpan[src++];
+                dst[dstIndex++] = curSpan[src++];
+                dst[dstIndex++] = curSpan[src++];
+                dst[dstIndex++] = 255;
+            }
+            (cur, prev) = (prev, cur);
+        }
+
+        return output;
+    }
+
+    private static void UnfilterScanline(byte filterType, Span<byte> curSpan, ReadOnlySpan<byte> prevSpan, int bpp)
+    {
+        if (filterType == 0)
+        {
+            return;
+        }
+
+        if (filterType == 2)
+        {
+            SimdHelper.AddBytesInPlace(curSpan, prevSpan);
+            return;
+        }
+
+        for (int i = 0; i < curSpan.Length; i++)
+        {
+            byte x = curSpan[i];
+            byte a = (i >= bpp) ? curSpan[i - bpp] : (byte)0;
+            byte b = prevSpan[i];
+            byte c = (i >= bpp) ? prevSpan[i - bpp] : (byte)0;
+
+            switch (filterType)
+            {
+                case 1:
+                    x += a;
+                    break;
+                case 3:
+                    x += (byte)((a + b) / 2);
+                    break;
+                case 4:
+                    x += PaethPredictor(a, b, c);
+                    break;
+            }
+
+            curSpan[i] = x;
+        }
     }
 
     private static void ApplyUpFilterDecodeSimd(byte[] curRow, byte[] prevRow, int length)
