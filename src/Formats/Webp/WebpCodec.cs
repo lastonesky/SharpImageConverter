@@ -273,9 +273,7 @@ namespace SharpImageConverter.Formats.Webp
                     }
                     var seg = ms.GetBuffer();
                     if (seg.Count <= 0) throw new InvalidDataException("WebP 流数据为空");
-                    byte[] data = new byte[seg.Count];
-                    Buffer.BlockCopy(seg.Array!, seg.Offset, data, 0, seg.Count);
-                    return DecodeRgba(data, out width, out height);
+                    return DecodeRgba(seg.Array!.AsSpan(seg.Offset, seg.Count), out width, out height);
                 }
                 finally
                 {

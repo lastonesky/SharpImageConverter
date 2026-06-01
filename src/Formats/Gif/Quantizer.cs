@@ -8,18 +8,18 @@ namespace SharpImageConverter.Formats.Gif;
 /// <summary>
 /// 高质量颜色量化器，实现 Wu's Color Quantizer 算法并支持极限优化后的 Floyd-Steinberg 抖动。
 /// </summary>
-public class Quantizer
+public sealed class Quantizer : IDisposable
 {
     private const int BITS = 5;
     private const int SIZE = 33; // 2^5 + 1
     private const int MaxColors = 256;
     private const int HistogramVolume = SIZE * SIZE * SIZE;
 
-    private readonly long[] _vwt = new long[HistogramVolume];
-    private readonly long[] _vmr = new long[HistogramVolume];
-    private readonly long[] _vmg = new long[HistogramVolume];
-    private readonly long[] _vmb = new long[HistogramVolume];
-    private readonly double[] _m2 = new double[HistogramVolume];
+    private readonly long[] _vwt;
+    private readonly long[] _vmr;
+    private readonly long[] _vmg;
+    private readonly long[] _vmb;
+    private readonly double[] _m2;
 
     private struct Box
     {
@@ -27,6 +27,15 @@ public class Quantizer
         public int g0, g1;
         public int b0, b1;
         public int vol;
+    }
+
+    public Quantizer()
+    {
+        _vwt = ArrayPool<long>.Shared.Rent(HistogramVolume);
+        _vmr = ArrayPool<long>.Shared.Rent(HistogramVolume);
+        _vmg = ArrayPool<long>.Shared.Rent(HistogramVolume);
+        _vmb = ArrayPool<long>.Shared.Rent(HistogramVolume);
+        _m2 = ArrayPool<double>.Shared.Rent(HistogramVolume);
     }
 
     /// <summary>
@@ -39,7 +48,7 @@ public class Quantizer
     /// <returns>调色板与像素索引</returns>
     public static (byte[] Palette, byte[] Indices) Quantize(byte[] pixels, int width, int height, bool enableDithering = true)
     {
-        var q = new Quantizer();
+        using var q = new Quantizer();
         return q.QuantizeInternal(pixels, width, height, enableDithering);
     }
 
@@ -349,5 +358,14 @@ public class Quantizer
             }
         });
         return indices;
+    }
+
+    public void Dispose()
+    {
+        ArrayPool<long>.Shared.Return(_vwt);
+        ArrayPool<long>.Shared.Return(_vmr);
+        ArrayPool<long>.Shared.Return(_vmg);
+        ArrayPool<long>.Shared.Return(_vmb);
+        ArrayPool<double>.Shared.Return(_m2);
     }
 }
