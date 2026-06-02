@@ -298,6 +298,36 @@ namespace Jpeg2Bmp.Tests
         }
 
         [Fact]
+        public void Jpeg_Decode_Rejects_MultipleSofMarkers()
+        {
+            byte[] data =
+            [
+                0xFF, 0xD8,
+                0xFF, 0xC0, 0x00, 0x0B, 0x08, 0x00, 0x01, 0x00, 0x01, 0x01, 0x01, 0x11, 0x00,
+                0xFF, 0xC0, 0x00, 0x0B, 0x08, 0x00, 0x01, 0x00, 0x01, 0x01, 0x01, 0x11, 0x00,
+                0xFF, 0xD9
+            ];
+
+            var ex = Assert.Throws<InvalidDataException>(() => JpegDecoder.Decode(data));
+            Assert.Contains("Multiple SOF", ex.Message);
+        }
+
+        [Fact]
+        public void Jpeg_Decode_Rejects_ComponentBufferOverflow()
+        {
+            byte[] data =
+            [
+                0xFF, 0xD8,
+                0xFF, 0xC0, 0x00, 0x0B, 0x08, 0xFF, 0xFF, 0xFF, 0xFF, 0x01, 0x01, 0x44, 0x00,
+                0xFF, 0xDA, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x3F, 0x00,
+                0xFF, 0xD9
+            ];
+
+            var ex = Assert.Throws<InvalidDataException>(() => JpegDecoder.Decode(data));
+            Assert.Contains("buffer too large", ex.Message);
+        }
+
+        [Fact]
         public void Webp_Rgba_Alpha_Roundtrip_Preserves_Transparency()
         {
             int w = 32, h = 32;
