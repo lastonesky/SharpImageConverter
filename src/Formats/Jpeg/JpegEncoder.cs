@@ -6,7 +6,6 @@ using System.Diagnostics;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Runtime.CompilerServices;
-using System.Runtime.InteropServices;
 using SharpImageConverter.Metadata;
 using SharpImageConverter.Core;
 using SharpImageConverter.Formats.Jpeg;
@@ -62,21 +61,21 @@ public static class JpegEncoder
         public byte Length;
     }
 
-    private sealed unsafe class JpegBitWriter(Stream stream) : IDisposable
+    private sealed class JpegBitWriter(Stream stream) : IDisposable
     {
         private const int OutSize = 64 * 1024;
 
         private readonly Stream _stream = stream;
+        private readonly NativeBufferOwner<byte> _outBuffer = NativeBufferOwner<byte>.Allocate(OutSize);
         private ulong _bitBuffer;
         private int _bitCount;
-        private byte* _outPtr = (byte*)NativeMemory.Alloc(OutSize);
         private int _outPos;
 
         private void EnsureOutCapacity(int count)
         {
             if (_outPos + count > OutSize)
             {
-                _stream.Write(new ReadOnlySpan<byte>(_outPtr, _outPos));
+                _stream.Write(_outBuffer.Span.Slice(0, _outPos));
                 _outPos = 0;
             }
         }
@@ -85,10 +84,10 @@ public static class JpegEncoder
         {
             if (_outPos == OutSize)
             {
-                _stream.Write(new ReadOnlySpan<byte>(_outPtr, _outPos));
+                _stream.Write(_outBuffer.Span.Slice(0, _outPos));
                 _outPos = 0;
             }
-            _outPtr[_outPos++] = b;
+            _outBuffer.Span[_outPos++] = b;
         }
 
         private void WriteByteStuffed(byte b)
@@ -111,10 +110,11 @@ public static class JpegEncoder
             if (!Contains0xFF(value))
             {
                 EnsureOutCapacity(4);
-                _outPtr[_outPos++] = (byte)(value >> 24);
-                _outPtr[_outPos++] = (byte)(value >> 16);
-                _outPtr[_outPos++] = (byte)(value >> 8);
-                _outPtr[_outPos++] = (byte)value;
+                Span<byte> buffer = _outBuffer.Span;
+                buffer[_outPos++] = (byte)(value >> 24);
+                buffer[_outPos++] = (byte)(value >> 16);
+                buffer[_outPos++] = (byte)(value >> 8);
+                buffer[_outPos++] = (byte)value;
                 return;
             }
 
@@ -163,18 +163,14 @@ public static class JpegEncoder
             }
             if (_outPos > 0)
             {
-                _stream.Write(new ReadOnlySpan<byte>(_outPtr, _outPos));
+                _stream.Write(_outBuffer.Span.Slice(0, _outPos));
                 _outPos = 0;
             }
         }
 
         public void Dispose()
         {
-            if (_outPtr != null)
-            {
-                NativeMemory.Free(_outPtr);
-                _outPtr = null;
-            }
+            _outBuffer.Dispose();
         }
     }
 
@@ -220,26 +216,23 @@ public static class JpegEncoder
         }
     }
 
-    private unsafe struct SampledMcuRef
+    private struct SampledMcuRef
     {
         public int BlockCount;
         public int Sequence;
         public byte[]? Order;
-        public IntPtr Data;
+        public NativeBufferOwner<int>? Buffer;
         public int BlockStride;
 
         public readonly Span<int> GetBlockSpan(int index)
         {
-            return new Span<int>((void*)Data, BlockStride * 64).Slice(index * 64, 64);
+            return Buffer!.Span.Slice(index * 64, 64);
         }
 
         public void Free()
         {
-            if (Data != IntPtr.Zero)
-            {
-                NativeMemory.Free((void*)Data);
-                Data = IntPtr.Zero;
-            }
+            Buffer?.Dispose();
+            Buffer = null;
         }
     }
 
@@ -707,7 +700,7 @@ public static class JpegEncoder
         }
     }
 
-    private static unsafe void ProduceRgbSamples(
+    private static void ProduceRgbSamples(
         PipeQueue<McuBatch> output,
         byte[] rgb24,
         int width,
@@ -737,7 +730,7 @@ public static class JpegEncoder
                             Sequence = sequence++,
                             Order = Order420,
                             BlockStride = 6,
-                            Data = (IntPtr)NativeMemory.Alloc(6, 64 * sizeof(int))
+                            Buffer = NativeBufferOwner<int>.Allocate(6 * 64)
                         };
                         try
                         {
@@ -779,7 +772,7 @@ public static class JpegEncoder
                             Sequence = sequence++,
                             Order = Order444,
                             BlockStride = 3,
-                            Data = (IntPtr)NativeMemory.Alloc(3, 64 * sizeof(int))
+                            Buffer = NativeBufferOwner<int>.Allocate(3 * 64)
                         };
                         try
                         {
@@ -825,7 +818,7 @@ public static class JpegEncoder
         }
     }
 
-    private static unsafe void ProduceGraySamples(
+    private static void ProduceGraySamples(
         PipeQueue<McuBatch> output,
         byte[] gray8,
         int width,
@@ -850,7 +843,7 @@ public static class JpegEncoder
                         Sequence = sequence++,
                         Order = OrderGray,
                         BlockStride = 1,
-                        Data = (IntPtr)NativeMemory.Alloc(1, 64 * sizeof(int))
+                        Buffer = NativeBufferOwner<int>.Allocate(64)
                     };
                     try
                     {
@@ -1786,7 +1779,7 @@ public static class JpegEncoder
         WriteAppSegment(s, markerLow, payload.AsSpan());
     }
 
-    private static unsafe void WriteIccProfile(Stream s, byte[] profile)
+    private static void WriteIccProfile(Stream s, byte[] profile)
     {
         const int overhead = 14;
         int maxPayload = 0xFFFD - overhead;
@@ -1794,25 +1787,18 @@ public static class JpegEncoder
         if (count <= 0) count = 1;
         if (count > 255) throw new ArgumentOutOfRangeException(nameof(profile), "ICC Profile 过大");
 
-        byte* bufferPtr = (byte*)NativeMemory.Alloc(0xFFFD);
-        try
+        using var bufferOwner = NativeBufferOwner<byte>.Allocate(0xFFFD);
+        Span<byte> buffer = bufferOwner.Span;
+        int offset = 0;
+        for (int i = 0; i < count; i++)
         {
-            Span<byte> buffer = new Span<byte>(bufferPtr, 0xFFFD);
-            int offset = 0;
-            for (int i = 0; i < count; i++)
-            {
-                int take = Math.Min(maxPayload, profile.Length - offset);
-                IccProfileSignature.CopyTo(buffer);
-                buffer[12] = (byte)(i + 1);
-                buffer[13] = (byte)count;
-                profile.AsSpan(offset, take).CopyTo(buffer.Slice(overhead, take));
-                WriteAppSegment(s, 0xE2, buffer.Slice(0, overhead + take));
-                offset += take;
-            }
-        }
-        finally
-        {
-            NativeMemory.Free(bufferPtr);
+            int take = Math.Min(maxPayload, profile.Length - offset);
+            IccProfileSignature.CopyTo(buffer);
+            buffer[12] = (byte)(i + 1);
+            buffer[13] = (byte)count;
+            profile.AsSpan(offset, take).CopyTo(buffer.Slice(overhead, take));
+            WriteAppSegment(s, 0xE2, buffer.Slice(0, overhead + take));
+            offset += take;
         }
     }
 

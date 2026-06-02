@@ -2,7 +2,6 @@ using SharpImageConverter.Core;
 using SharpImageConverter.Metadata;
 using System.Buffers;
 using System.Runtime.CompilerServices;
-using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
 using System.Threading;
@@ -2708,7 +2707,7 @@ public static class JpegDecoder
 
     private readonly record struct FrameHeader(int Width, int Height, int Precision, int MaxH, int MaxV, int McuX, int McuY);
 
-    private sealed unsafe class ComponentState
+    private sealed class ComponentState
     {
         public byte Id { get; }
         public byte H { get; }
@@ -2721,8 +2720,7 @@ public static class JpegDecoder
         public byte DcTableId { get; private set; }
         public byte AcTableId { get; private set; }
 
-        internal short* _coeffPtr;
-        private int _totalShorts;
+        private NativeBufferOwner<short>? _coeffBuffer;
 
         public ComponentState(byte id, byte h, byte v, byte quantTableId)
         {
@@ -2740,7 +2738,7 @@ public static class JpegDecoder
 
         public void EnsureCoefficientBuffer(bool isProgressive)
         {
-            if (_coeffPtr == null)
+            if (_coeffBuffer == null)
             {
                 nuint totalShorts = checked((nuint)BlocksX * (nuint)BlocksY * 64u);
                 if (totalShorts > int.MaxValue)
@@ -2748,19 +2746,14 @@ public static class JpegDecoder
                     ThrowHelper.ThrowInvalidData("JPEG component buffer too large.");
                 }
 
-                _totalShorts = (int)totalShorts;
-                _coeffPtr = (short*)NativeMemory.AllocZeroed(totalShorts, (nuint)sizeof(short));
+                _coeffBuffer = NativeBufferOwner<short>.Allocate((int)totalShorts, clear: isProgressive);
             }
         }
 
         public void FreeCoefficientBuffer()
         {
-            if (_coeffPtr != null)
-            {
-                NativeMemory.Free(_coeffPtr);
-                _coeffPtr = null;
-                _totalShorts = 0;
-            }
+            _coeffBuffer?.Dispose();
+            _coeffBuffer = null;
         }
 
         public void AssignTables(byte dc, byte ac)
@@ -2776,12 +2769,12 @@ public static class JpegDecoder
 
         public Span<short> GetBlockSpan(int blockIndex)
         {
-            return new Span<short>(_coeffPtr + blockIndex * 64, 64);
+            return _coeffBuffer!.Span.Slice(blockIndex * 64, 64);
         }
 
         public void DecodeSpatial(Span<byte> output, int width, int height, int stride, ushort[] quantTable, bool useFloatingPointIdct)
         {
-            if (_coeffPtr == null) return;
+            if (_coeffBuffer == null) return;
 
             for (int by = 0; by < BlocksY; by++)
             {
