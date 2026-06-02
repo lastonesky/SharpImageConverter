@@ -5,6 +5,8 @@ using System.Numerics;
 using System.Diagnostics;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using SharpImageConverter.Metadata;
 using SharpImageConverter.Core;
 using SharpImageConverter.Formats.Jpeg;
@@ -60,31 +62,33 @@ public static class JpegEncoder
         public byte Length;
     }
 
-    private sealed class JpegBitWriter(Stream stream) : IDisposable
+    private sealed unsafe class JpegBitWriter(Stream stream) : IDisposable
     {
+        private const int OutSize = 64 * 1024;
+
         private readonly Stream _stream = stream;
         private ulong _bitBuffer;
         private int _bitCount;
-        private readonly byte[] _out = ArrayPool<byte>.Shared.Rent(64 * 1024);
+        private byte* _outPtr = (byte*)NativeMemory.Alloc(OutSize);
         private int _outPos;
 
         private void EnsureOutCapacity(int count)
         {
-            if (_outPos + count > _out.Length)
+            if (_outPos + count > OutSize)
             {
-                _stream.Write(_out, 0, _outPos);
+                _stream.Write(new ReadOnlySpan<byte>(_outPtr, _outPos));
                 _outPos = 0;
             }
         }
 
         private void WriteByteBuffered(byte b)
         {
-            if (_outPos == _out.Length)
+            if (_outPos == OutSize)
             {
-                _stream.Write(_out, 0, _outPos);
+                _stream.Write(new ReadOnlySpan<byte>(_outPtr, _outPos));
                 _outPos = 0;
             }
-            _out[_outPos++] = b;
+            _outPtr[_outPos++] = b;
         }
 
         private void WriteByteStuffed(byte b)
@@ -107,10 +111,10 @@ public static class JpegEncoder
             if (!Contains0xFF(value))
             {
                 EnsureOutCapacity(4);
-                _out[_outPos++] = (byte)(value >> 24);
-                _out[_outPos++] = (byte)(value >> 16);
-                _out[_outPos++] = (byte)(value >> 8);
-                _out[_outPos++] = (byte)value;
+                _outPtr[_outPos++] = (byte)(value >> 24);
+                _outPtr[_outPos++] = (byte)(value >> 16);
+                _outPtr[_outPos++] = (byte)(value >> 8);
+                _outPtr[_outPos++] = (byte)value;
                 return;
             }
 
@@ -159,14 +163,18 @@ public static class JpegEncoder
             }
             if (_outPos > 0)
             {
-                _stream.Write(_out, 0, _outPos);
+                _stream.Write(new ReadOnlySpan<byte>(_outPtr, _outPos));
                 _outPos = 0;
             }
         }
 
         public void Dispose()
         {
-            ArrayPool<byte>.Shared.Return(_out);
+            if (_outPtr != null)
+            {
+                NativeMemory.Free(_outPtr);
+                _outPtr = null;
+            }
         }
     }
 
@@ -212,54 +220,35 @@ public static class JpegEncoder
         }
     }
 
-    private sealed class SampledMcu
+    private unsafe struct SampledMcuRef
     {
         public int BlockCount;
         public int Sequence;
-        public byte[] Order = null!;
-        public int[]? B0;
-        public int[]? B1;
-        public int[]? B2;
-        public int[]? B3;
-        public int[]? B4;
-        public int[]? B5;
+        public byte[]? Order;
+        public IntPtr Data;
+        public int BlockStride;
 
-        public Span<int> GetBlockSpan(int index)
+        public readonly Span<int> GetBlockSpan(int index)
         {
-            return index switch
-            {
-                0 => B0!.AsSpan(0, 64),
-                1 => B1!.AsSpan(0, 64),
-                2 => B2!.AsSpan(0, 64),
-                3 => B3!.AsSpan(0, 64),
-                4 => B4!.AsSpan(0, 64),
-                _ => B5!.AsSpan(0, 64)
-            };
+            return new Span<int>((void*)Data, BlockStride * 64).Slice(index * 64, 64);
         }
 
-        public void Release(ArrayPool<int> pool)
+        public void Free()
         {
-            if (B0 != null) pool.Return(B0);
-            if (B1 != null) pool.Return(B1);
-            if (B2 != null) pool.Return(B2);
-            if (B3 != null) pool.Return(B3);
-            if (B4 != null) pool.Return(B4);
-            if (B5 != null) pool.Return(B5);
-            B0 = null;
-            B1 = null;
-            B2 = null;
-            B3 = null;
-            B4 = null;
-            B5 = null;
+            if (Data != IntPtr.Zero)
+            {
+                NativeMemory.Free((void*)Data);
+                Data = IntPtr.Zero;
+            }
         }
     }
 
     private sealed class McuBatch
     {
-        public readonly SampledMcu?[] Items;
+        public readonly SampledMcuRef[] Items;
         public int Count;
 
-        public McuBatch(SampledMcu?[] items)
+        public McuBatch(SampledMcuRef[] items)
         {
             Items = items;
         }
@@ -273,20 +262,20 @@ public static class JpegEncoder
 
     private static McuBatch RentMcuBatch(int batchSize)
     {
-        return new McuBatch(ArrayPool<SampledMcu?>.Shared.Rent(batchSize));
+        return new McuBatch(ArrayPool<SampledMcuRef>.Shared.Rent(batchSize));
     }
 
     private static void ReturnMcuBatch(McuBatch batch)
     {
-        Array.Clear(batch.Items, 0, batch.Items.Length);
+        batch.Items.AsSpan(0, batch.Items.Length).Clear();
         batch.Count = 0;
-        ArrayPool<SampledMcu?>.Shared.Return(batch.Items);
+        ArrayPool<SampledMcuRef>.Shared.Return(batch.Items);
     }
 
     private static void EnqueueSampledMcu(
         PipeQueue<McuBatch> output,
         ref McuBatch? currentBatch,
-        SampledMcu mcu,
+        SampledMcuRef mcu,
         int batchSize,
         CancellationToken token)
     {
@@ -403,8 +392,7 @@ public static class JpegEncoder
     /// </summary>
     public static void Write(Stream stream, int width, int height, byte[] rgb24, int quality = 75)
     {
-        ArgumentNullException.ThrowIfNull(rgb24);
-        if (rgb24.Length != checked(width * height * 3)) throw new ArgumentException("RGB24 像素长度不匹配", nameof(rgb24));
+        ValidateRgb24Input(stream, width, height, rgb24);
         WriteInternal(stream, width, height, rgb24, NormalizeQuality(quality), true, null, false, false);
     }
 
@@ -413,29 +401,25 @@ public static class JpegEncoder
     /// </summary>
     public static void Write(Stream stream, int width, int height, byte[] rgb24, int quality, bool subsample420)
     {
-        ArgumentNullException.ThrowIfNull(rgb24);
-        if (rgb24.Length != checked(width * height * 3)) throw new ArgumentException("RGB24 像素长度不匹配", nameof(rgb24));
+        ValidateRgb24Input(stream, width, height, rgb24);
         WriteInternal(stream, width, height, rgb24, NormalizeQuality(quality), subsample420, null, false, false);
     }
 
     public static void Write(Stream stream, int width, int height, byte[] rgb24, int quality, bool subsample420, ImageMetadata? metadata, bool keepMetadata)
     {
-        ArgumentNullException.ThrowIfNull(rgb24);
-        if (rgb24.Length != checked(width * height * 3)) throw new ArgumentException("RGB24 像素长度不匹配", nameof(rgb24));
+        ValidateRgb24Input(stream, width, height, rgb24);
         WriteInternal(stream, width, height, rgb24, NormalizeQuality(quality), subsample420, metadata, keepMetadata, false);
     }
 
     public static void Write(Stream stream, int width, int height, byte[] rgb24, JpegEncoderOptions options)
     {
-        ArgumentNullException.ThrowIfNull(rgb24);
-        if (rgb24.Length != checked(width * height * 3)) throw new ArgumentException("RGB24 像素长度不匹配", nameof(rgb24));
+        ValidateRgb24Input(stream, width, height, rgb24);
         WriteInternal(stream, width, height, rgb24, NormalizeQuality(options.Quality), options.Subsample420, null, options.KeepMetadata, options.EnableDiagnostics);
     }
 
     public static void Write(Stream stream, int width, int height, byte[] rgb24, JpegEncoderOptions options, ImageMetadata? metadata)
     {
-        ArgumentNullException.ThrowIfNull(rgb24);
-        if (rgb24.Length != checked(width * height * 3)) throw new ArgumentException("RGB24 像素长度不匹配", nameof(rgb24));
+        ValidateRgb24Input(stream, width, height, rgb24);
         WriteInternal(stream, width, height, rgb24, NormalizeQuality(options.Quality), options.Subsample420, metadata, options.KeepMetadata, options.EnableDiagnostics);
     }
 
@@ -447,15 +431,13 @@ public static class JpegEncoder
 
     public static void WriteGray8(Stream stream, int width, int height, byte[] gray8, int quality = 75)
     {
-        ArgumentNullException.ThrowIfNull(gray8);
-        if (gray8.Length != checked(width * height)) throw new ArgumentException("Gray8 像素长度不匹配", nameof(gray8));
+        ValidateGray8Input(stream, width, height, gray8);
         WriteInternalGray(stream, width, height, gray8, NormalizeQuality(quality), null, false, false);
     }
 
     public static void WriteGray8(Stream stream, int width, int height, byte[] gray8, JpegEncoderOptions options, ImageMetadata? metadata = null)
     {
-        ArgumentNullException.ThrowIfNull(gray8);
-        if (gray8.Length != checked(width * height)) throw new ArgumentException("Gray8 像素长度不匹配", nameof(gray8));
+        ValidateGray8Input(stream, width, height, gray8);
         WriteInternalGray(stream, width, height, gray8, NormalizeQuality(options.Quality), metadata, options.KeepMetadata, options.EnableDiagnostics);
     }
 
@@ -476,13 +458,14 @@ public static class JpegEncoder
 
     public static void Encode<T>(Image<T> image, Stream stream, JpegEncoderOptions options) where T : struct, IPixel
     {
+        ArgumentNullException.ThrowIfNull(image);
         if (typeof(T) == typeof(Gray8))
         {
-            WriteInternalGray(stream, image.Width, image.Height, image.Buffer, NormalizeQuality(options.Quality), image.Metadata, options.KeepMetadata, options.EnableDiagnostics);
+            WriteGray8(stream, image.Width, image.Height, image.Buffer, options, image.Metadata);
         }
         else if (typeof(T) == typeof(Rgb24))
         {
-            WriteInternal(stream, image.Width, image.Height, image.Buffer, NormalizeQuality(options.Quality), options.Subsample420, image.Metadata, options.KeepMetadata, options.EnableDiagnostics);
+            Write(stream, image.Width, image.Height, image.Buffer, options, image.Metadata);
         }
         else
         {
@@ -516,6 +499,42 @@ public static class JpegEncoder
         if (quality < 1) return 1;
         if (quality > 100) return 100;
         return quality;
+    }
+
+    private static void ValidateWritableStream(Stream stream)
+    {
+        ArgumentNullException.ThrowIfNull(stream);
+        if (!stream.CanWrite)
+        {
+            throw new ArgumentException("输出流不可写", nameof(stream));
+        }
+    }
+
+    private static int GetExpectedPixelCount(int width, int height)
+    {
+        if (width <= 0) throw new ArgumentOutOfRangeException(nameof(width), "图像宽度必须大于 0");
+        if (height <= 0) throw new ArgumentOutOfRangeException(nameof(height), "图像高度必须大于 0");
+        return checked(width * height);
+    }
+
+    private static void ValidateRgb24Input(Stream stream, int width, int height, byte[] rgb24)
+    {
+        ValidateWritableStream(stream);
+        ArgumentNullException.ThrowIfNull(rgb24);
+        if (rgb24.Length != checked(GetExpectedPixelCount(width, height) * 3))
+        {
+            throw new ArgumentException("RGB24 像素长度不匹配", nameof(rgb24));
+        }
+    }
+
+    private static void ValidateGray8Input(Stream stream, int width, int height, byte[] gray8)
+    {
+        ValidateWritableStream(stream);
+        ArgumentNullException.ThrowIfNull(gray8);
+        if (gray8.Length != GetExpectedPixelCount(width, height))
+        {
+            throw new ArgumentException("Gray8 像素长度不匹配", nameof(gray8));
+        }
     }
 
     private static void WriteInternal(Stream stream, int width, int height, byte[] rgb24, int quality, bool subsample420, ImageMetadata? metadata, bool keepMetadata, bool enableDiagnostics)
@@ -626,19 +645,18 @@ public static class JpegEncoder
         int capacity = Math.Clamp(Environment.ProcessorCount, 2, 16);
         var sampleQueue = new PipeQueue<McuBatch>(capacity);
         var dctQueue = new PipeQueue<McuBatch>(capacity);
-        var pool = ArrayPool<int>.Shared;
         int dctWorkers = Math.Clamp(Environment.ProcessorCount - 1, 1, 8);
 
         using var cts = new CancellationTokenSource();
         CancellationToken token = cts.Token;
 
-        var t1 = Task.Run(() => RunStage(() => ProduceRgbSamples(sampleQueue, pool, rgb24, width, height, subsample420, dctWorkers, McuBatchSize, token, metrics), cts), token);
+        var t1 = Task.Run(() => RunStage(() => ProduceRgbSamples(sampleQueue, rgb24, width, height, subsample420, dctWorkers, McuBatchSize, token, metrics), cts), token);
         Task[] dctTasks = new Task[dctWorkers];
         for (int i = 0; i < dctWorkers; i++)
         {
-            dctTasks[i] = Task.Run(() => RunStage(() => ProcessDct(sampleQueue, dctQueue, qYRecip, qCRecip, pool, token), cts), token);
+            dctTasks[i] = Task.Run(() => RunStage(() => ProcessDct(sampleQueue, dctQueue, qYRecip, qCRecip, token), cts), token);
         }
-        var t4 = Task.Run(() => RunStage(() => ProcessHuffmanOrdered(dctQueue, dctWorkers, pool, bw, dcY, acY, dcC, acC, token), cts), token);
+        var t4 = Task.Run(() => RunStage(() => ProcessHuffmanOrdered(dctQueue, dctWorkers, bw, dcY, acY, dcC, acC, token), cts), token);
 
         Task.WaitAll(dctTasks);
         Task.WaitAll(t1, t4);
@@ -656,19 +674,18 @@ public static class JpegEncoder
         int capacity = Math.Clamp(Environment.ProcessorCount, 2, 16);
         var sampleQueue = new PipeQueue<McuBatch>(capacity);
         var dctQueue = new PipeQueue<McuBatch>(capacity);
-        var pool = ArrayPool<int>.Shared;
         int dctWorkers = Math.Clamp(Environment.ProcessorCount - 1, 1, 8);
 
         using var cts = new CancellationTokenSource();
         CancellationToken token = cts.Token;
 
-        var t1 = Task.Run(() => RunStage(() => ProduceGraySamples(sampleQueue, pool, gray8, width, height, dctWorkers, McuBatchSize, token), cts), token);
+        var t1 = Task.Run(() => RunStage(() => ProduceGraySamples(sampleQueue, gray8, width, height, dctWorkers, McuBatchSize, token), cts), token);
         Task[] dctTasks = new Task[dctWorkers];
         for (int i = 0; i < dctWorkers; i++)
         {
-            dctTasks[i] = Task.Run(() => RunStage(() => ProcessDctGray(sampleQueue, dctQueue, qYRecip, pool, token), cts), token);
+            dctTasks[i] = Task.Run(() => RunStage(() => ProcessDctGray(sampleQueue, dctQueue, qYRecip, token), cts), token);
         }
-        var t4 = Task.Run(() => RunStage(() => ProcessHuffmanGrayOrdered(dctQueue, dctWorkers, pool, bw, dcY, acY, token), cts), token);
+        var t4 = Task.Run(() => RunStage(() => ProcessHuffmanGrayOrdered(dctQueue, dctWorkers, bw, dcY, acY, token), cts), token);
 
         Task.WaitAll(dctTasks);
         Task.WaitAll(t1, t4);
@@ -690,9 +707,8 @@ public static class JpegEncoder
         }
     }
 
-    private static void ProduceRgbSamples(
+    private static unsafe void ProduceRgbSamples(
         PipeQueue<McuBatch> output,
-        ArrayPool<int> pool,
         byte[] rgb24,
         int width,
         int height,
@@ -715,17 +731,13 @@ public static class JpegEncoder
                 {
                     for (int mx = 0; mx < mcusX; mx++)
                     {
-                        var mcu = new SampledMcu
+                        var mcu = new SampledMcuRef
                         {
                             BlockCount = 6,
                             Sequence = sequence++,
                             Order = Order420,
-                            B0 = pool.Rent(64),
-                            B1 = pool.Rent(64),
-                            B2 = pool.Rent(64),
-                            B3 = pool.Rent(64),
-                            B4 = pool.Rent(64),
-                            B5 = pool.Rent(64)
+                            BlockStride = 6,
+                            Data = (IntPtr)NativeMemory.Alloc(6, 64 * sizeof(int))
                         };
                         try
                         {
@@ -735,18 +747,18 @@ public static class JpegEncoder
                                 height,
                                 mx * 16,
                                 my * 16,
-                                mcu.B0!.AsSpan(0, 64),
-                                mcu.B1!.AsSpan(0, 64),
-                                mcu.B2!.AsSpan(0, 64),
-                                mcu.B3!.AsSpan(0, 64),
-                                mcu.B4!.AsSpan(0, 64),
-                                mcu.B5!.AsSpan(0, 64),
+                                mcu.GetBlockSpan(0),
+                                mcu.GetBlockSpan(1),
+                                mcu.GetBlockSpan(2),
+                                mcu.GetBlockSpan(3),
+                                mcu.GetBlockSpan(4),
+                                mcu.GetBlockSpan(5),
                                 metrics);
                             EnqueueSampledMcu(output, ref batch, mcu, batchSize, token);
                         }
                         catch
                         {
-                            mcu.Release(pool);
+                            mcu.Free();
                             throw;
                         }
                     }
@@ -761,14 +773,13 @@ public static class JpegEncoder
                 {
                     for (int bx = 0; bx < blocksX; bx++)
                     {
-                        var mcu = new SampledMcu
+                        var mcu = new SampledMcuRef
                         {
                             BlockCount = 3,
                             Sequence = sequence++,
                             Order = Order444,
-                            B0 = pool.Rent(64),
-                            B1 = pool.Rent(64),
-                            B2 = pool.Rent(64)
+                            BlockStride = 3,
+                            Data = (IntPtr)NativeMemory.Alloc(3, 64 * sizeof(int))
                         };
                         try
                         {
@@ -778,15 +789,15 @@ public static class JpegEncoder
                                 height,
                                 bx * 8,
                                 by * 8,
-                                mcu.B0!.AsSpan(0, 64),
-                                mcu.B1!.AsSpan(0, 64),
-                                mcu.B2!.AsSpan(0, 64),
+                                mcu.GetBlockSpan(0),
+                                mcu.GetBlockSpan(1),
+                                mcu.GetBlockSpan(2),
                                 metrics);
                             EnqueueSampledMcu(output, ref batch, mcu, batchSize, token);
                         }
                         catch
                         {
-                            mcu.Release(pool);
+                            mcu.Free();
                             throw;
                         }
                     }
@@ -805,7 +816,7 @@ public static class JpegEncoder
             {
                 for (int i = 0; i < batch.Count; i++)
                 {
-                    batch.Items[i]?.Release(pool);
+                    batch.Items[i].Free();
                 }
                 ReturnMcuBatch(batch);
                 batch = null;
@@ -814,9 +825,8 @@ public static class JpegEncoder
         }
     }
 
-    private static void ProduceGraySamples(
+    private static unsafe void ProduceGraySamples(
         PipeQueue<McuBatch> output,
-        ArrayPool<int> pool,
         byte[] gray8,
         int width,
         int height,
@@ -834,21 +844,22 @@ public static class JpegEncoder
             {
                 for (int bx = 0; bx < blocksX; bx++)
                 {
-                    var mcu = new SampledMcu
+                    var mcu = new SampledMcuRef
                     {
                         BlockCount = 1,
                         Sequence = sequence++,
                         Order = OrderGray,
-                        B0 = pool.Rent(64)
+                        BlockStride = 1,
+                        Data = (IntPtr)NativeMemory.Alloc(1, 64 * sizeof(int))
                     };
                     try
                     {
-                        FillBlockGray8ToY(gray8, width, height, bx * 8, by * 8, mcu.B0!.AsSpan(0, 64));
+                        FillBlockGray8ToY(gray8, width, height, bx * 8, by * 8, mcu.GetBlockSpan(0));
                         EnqueueSampledMcu(output, ref batch, mcu, batchSize, token);
                     }
                     catch
                     {
-                        mcu.Release(pool);
+                        mcu.Free();
                         throw;
                     }
                 }
@@ -866,7 +877,7 @@ public static class JpegEncoder
             {
                 for (int i = 0; i < batch.Count; i++)
                 {
-                    batch.Items[i]?.Release(pool);
+                    batch.Items[i].Free();
                 }
                 ReturnMcuBatch(batch);
                 batch = null;
@@ -880,7 +891,6 @@ public static class JpegEncoder
         PipeQueue<McuBatch> output,
         int[] qYRecip,
         int[] qCRecip,
-        ArrayPool<int> pool,
         CancellationToken token)
     {
         for (; ; )
@@ -895,15 +905,11 @@ public static class JpegEncoder
             for (int m = 0; m < batch.Count; m++)
             {
                 var mcu = batch.Items[m];
-                if (mcu == null)
-                {
-                    continue;
-                }
                 try
                 {
                     for (int i = 0; i < mcu.BlockCount; i++)
                     {
-                        int[] q = mcu.Order[i] == 0 ? qYRecip : qCRecip;
+                        int[] q = mcu.Order![i] == 0 ? qYRecip : qCRecip;
                         DctQuantizeInPlace(mcu.GetBlockSpan(i), q);
                     }
                 }
@@ -911,7 +917,7 @@ public static class JpegEncoder
                 {
                     for (int j = m; j < batch.Count; j++)
                     {
-                        batch.Items[j]?.Release(pool);
+                        batch.Items[j].Free();
                     }
                     ReturnMcuBatch(batch);
                     throw;
@@ -926,7 +932,6 @@ public static class JpegEncoder
         PipeQueue<McuBatch> input,
         PipeQueue<McuBatch> output,
         int[] qYRecip,
-        ArrayPool<int> pool,
         CancellationToken token)
     {
         for (; ; )
@@ -941,10 +946,6 @@ public static class JpegEncoder
             for (int m = 0; m < batch.Count; m++)
             {
                 var mcu = batch.Items[m];
-                if (mcu == null)
-                {
-                    continue;
-                }
                 try
                 {
                     DctQuantizeInPlace(mcu.GetBlockSpan(0), qYRecip);
@@ -953,7 +954,7 @@ public static class JpegEncoder
                 {
                     for (int j = m; j < batch.Count; j++)
                     {
-                        batch.Items[j]?.Release(pool);
+                        batch.Items[j].Free();
                     }
                     ReturnMcuBatch(batch);
                     throw;
@@ -966,21 +967,21 @@ public static class JpegEncoder
 
     private static void RentPendingState(
         int minimumCapacity,
-        out SampledMcu?[] pendingItems,
+        out SampledMcuRef[] pendingItems,
         out int[] pendingSequences,
         out int pendingCapacity,
         out int pendingMask)
     {
         pendingCapacity = (int)BitOperations.RoundUpToPowerOf2((uint)Math.Max(2, minimumCapacity));
-        pendingItems = ArrayPool<SampledMcu?>.Shared.Rent(pendingCapacity);
+        pendingItems = ArrayPool<SampledMcuRef>.Shared.Rent(pendingCapacity);
         pendingSequences = ArrayPool<int>.Shared.Rent(pendingCapacity);
-        Array.Clear(pendingItems, 0, pendingCapacity);
+        pendingItems.AsSpan(0, pendingCapacity).Clear();
         Array.Fill(pendingSequences, -1, 0, pendingCapacity);
         pendingMask = pendingCapacity - 1;
     }
 
     private static void EnsurePendingCapacity(
-        ref SampledMcu?[] pendingItems,
+        ref SampledMcuRef[] pendingItems,
         ref int[] pendingSequences,
         ref int pendingCapacity,
         ref int pendingMask,
@@ -989,28 +990,28 @@ public static class JpegEncoder
         while (true)
         {
             int index = requiredSequence & pendingMask;
-            if (pendingItems[index] == null || pendingSequences[index] == requiredSequence)
+            if (pendingSequences[index] == -1 || pendingSequences[index] == requiredSequence)
             {
                 return;
             }
 
             int newCapacity = pendingCapacity << 1;
-            var newItems = ArrayPool<SampledMcu?>.Shared.Rent(newCapacity);
+            var newItems = ArrayPool<SampledMcuRef>.Shared.Rent(newCapacity);
             var newSequences = ArrayPool<int>.Shared.Rent(newCapacity);
-            Array.Clear(newItems, 0, newCapacity);
+            newItems.AsSpan(0, newCapacity).Clear();
             Array.Fill(newSequences, -1, 0, newCapacity);
             int newMask = newCapacity - 1;
 
             for (int i = 0; i < pendingCapacity; i++)
             {
-                var item = pendingItems[i];
-                if (item == null)
+                int sequence = pendingSequences[i];
+                if (sequence == -1)
                 {
                     continue;
                 }
-                int sequence = pendingSequences[i];
+                var item = pendingItems[i];
                 int newIndex = sequence & newMask;
-                while (newItems[newIndex] != null)
+                while (newSequences[newIndex] != -1)
                 {
                     newIndex = (newIndex + 1) & newMask;
                 }
@@ -1018,8 +1019,8 @@ public static class JpegEncoder
                 newSequences[newIndex] = sequence;
             }
 
-            Array.Clear(pendingItems, 0, pendingCapacity);
-            ArrayPool<SampledMcu?>.Shared.Return(pendingItems, clearArray: false);
+            pendingItems.AsSpan(0, pendingCapacity).Clear();
+            ArrayPool<SampledMcuRef>.Shared.Return(pendingItems, clearArray: false);
             ArrayPool<int>.Shared.Return(pendingSequences, clearArray: false);
             pendingItems = newItems;
             pendingSequences = newSequences;
@@ -1029,22 +1030,24 @@ public static class JpegEncoder
     }
 
     private static void ReturnPendingState(
-        SampledMcu?[] pendingItems,
+        SampledMcuRef[] pendingItems,
         int[] pendingSequences,
-        int pendingCapacity,
-        ArrayPool<int> pool)
+        int pendingCapacity)
     {
         for (int i = 0; i < pendingCapacity; i++)
         {
-            pendingItems[i]?.Release(pool);
+            if (pendingSequences[i] != -1)
+            {
+                pendingItems[i].Free();
+            }
         }
-        Array.Clear(pendingItems, 0, pendingCapacity);
-        ArrayPool<SampledMcu?>.Shared.Return(pendingItems, clearArray: false);
+        pendingItems.AsSpan(0, pendingCapacity).Clear();
+        ArrayPool<SampledMcuRef>.Shared.Return(pendingItems, clearArray: false);
         ArrayPool<int>.Shared.Return(pendingSequences, clearArray: false);
     }
 
     private static void WriteMcuHuffman(
-        SampledMcu mcu,
+        SampledMcuRef mcu,
         JpegBitWriter bw,
         HuffCode[] dcY,
         HuffCode[] acY,
@@ -1056,7 +1059,7 @@ public static class JpegEncoder
     {
         for (int i = 0; i < mcu.BlockCount; i++)
         {
-            byte comp = mcu.Order[i];
+            byte comp = mcu.Order![i];
             if (comp == 0)
             {
                 HuffmanWriteBlock(bw, mcu.GetBlockSpan(i), dcY, acY, ref prevYdc);
@@ -1075,7 +1078,6 @@ public static class JpegEncoder
     private static void ProcessHuffmanOrdered(
         PipeQueue<McuBatch> input,
         int completionCount,
-        ArrayPool<int> pool,
         JpegBitWriter bw,
         HuffCode[] dcY,
         HuffCode[] acY,
@@ -1105,27 +1107,25 @@ public static class JpegEncoder
                 {
                     for (int i = 0; i < batch.Count; i++)
                     {
-                        var mcu = batch.Items[i]!;
-                        batch.Items[i] = null;
+                        ref SampledMcuRef mcu = ref batch.Items[i];
                         if (mcu.Sequence == expected)
                         {
                             WriteMcuHuffman(mcu, bw, dcY, acY, dcC, acC, ref prevYdc, ref prevCbdc, ref prevCrdc);
-                            mcu.Release(pool);
+                            mcu.Free();
                             expected++;
 
                             while (true)
                             {
                                 int expectedIndex = expected & pendingMask;
-                                var pending = pendingItems[expectedIndex];
-                                if (pending == null || pendingSequences[expectedIndex] != expected)
+                                if (pendingSequences[expectedIndex] != expected)
                                 {
                                     break;
                                 }
 
-                                pendingItems[expectedIndex] = null;
+                                ref SampledMcuRef pending = ref pendingItems[expectedIndex];
                                 pendingSequences[expectedIndex] = -1;
                                 WriteMcuHuffman(pending, bw, dcY, acY, dcC, acC, ref prevYdc, ref prevCbdc, ref prevCrdc);
-                                pending.Release(pool);
+                                pending.Free();
                                 expected++;
                             }
                         }
@@ -1133,12 +1133,13 @@ public static class JpegEncoder
                         {
                             EnsurePendingCapacity(ref pendingItems, ref pendingSequences, ref pendingCapacity, ref pendingMask, mcu.Sequence);
                             int index = mcu.Sequence & pendingMask;
-                            while (pendingItems[index] != null && pendingSequences[index] != mcu.Sequence)
+                            while (pendingSequences[index] != -1 && pendingSequences[index] != mcu.Sequence)
                             {
                                 index = (index + 1) & pendingMask;
                             }
                             pendingItems[index] = mcu;
                             pendingSequences[index] = mcu.Sequence;
+                            mcu = default;
                         }
                     }
                 }
@@ -1146,7 +1147,7 @@ public static class JpegEncoder
                 {
                     for (int i = 0; i < batch.Count; i++)
                     {
-                        batch.Items[i]?.Release(pool);
+                        batch.Items[i].Free();
                     }
                     ReturnMcuBatch(batch);
                 }
@@ -1155,28 +1156,26 @@ public static class JpegEncoder
             while (true)
             {
                 int index = expected & pendingMask;
-                var pending = pendingItems[index];
-                if (pending == null || pendingSequences[index] != expected)
+                if (pendingSequences[index] != expected)
                 {
                     break;
                 }
-                pendingItems[index] = null;
+                ref SampledMcuRef pending = ref pendingItems[index];
                 pendingSequences[index] = -1;
                 WriteMcuHuffman(pending, bw, dcY, acY, dcC, acC, ref prevYdc, ref prevCbdc, ref prevCrdc);
-                pending.Release(pool);
+                pending.Free();
                 expected++;
             }
         }
         finally
         {
-            ReturnPendingState(pendingItems, pendingSequences, pendingCapacity, pool);
+            ReturnPendingState(pendingItems, pendingSequences, pendingCapacity);
         }
     }
 
     private static void ProcessHuffmanGrayOrdered(
         PipeQueue<McuBatch> input,
         int completionCount,
-        ArrayPool<int> pool,
         JpegBitWriter bw,
         HuffCode[] dcY,
         HuffCode[] acY,
@@ -1202,27 +1201,25 @@ public static class JpegEncoder
                 {
                     for (int i = 0; i < batch.Count; i++)
                     {
-                        var mcu = batch.Items[i]!;
-                        batch.Items[i] = null;
+                        ref SampledMcuRef mcu = ref batch.Items[i];
                         if (mcu.Sequence == expected)
                         {
                             HuffmanWriteBlock(bw, mcu.GetBlockSpan(0), dcY, acY, ref prevYdc);
-                            mcu.Release(pool);
+                            mcu.Free();
                             expected++;
 
                             while (true)
                             {
                                 int expectedIndex = expected & pendingMask;
-                                var pending = pendingItems[expectedIndex];
-                                if (pending == null || pendingSequences[expectedIndex] != expected)
+                                if (pendingSequences[expectedIndex] != expected)
                                 {
                                     break;
                                 }
 
-                                pendingItems[expectedIndex] = null;
+                                ref SampledMcuRef pending = ref pendingItems[expectedIndex];
                                 pendingSequences[expectedIndex] = -1;
                                 HuffmanWriteBlock(bw, pending.GetBlockSpan(0), dcY, acY, ref prevYdc);
-                                pending.Release(pool);
+                                pending.Free();
                                 expected++;
                             }
                         }
@@ -1230,12 +1227,13 @@ public static class JpegEncoder
                         {
                             EnsurePendingCapacity(ref pendingItems, ref pendingSequences, ref pendingCapacity, ref pendingMask, mcu.Sequence);
                             int index = mcu.Sequence & pendingMask;
-                            while (pendingItems[index] != null && pendingSequences[index] != mcu.Sequence)
+                            while (pendingSequences[index] != -1 && pendingSequences[index] != mcu.Sequence)
                             {
                                 index = (index + 1) & pendingMask;
                             }
                             pendingItems[index] = mcu;
                             pendingSequences[index] = mcu.Sequence;
+                            mcu = default;
                         }
                     }
                 }
@@ -1243,7 +1241,7 @@ public static class JpegEncoder
                 {
                     for (int i = 0; i < batch.Count; i++)
                     {
-                        batch.Items[i]?.Release(pool);
+                        batch.Items[i].Free();
                     }
                     ReturnMcuBatch(batch);
                 }
@@ -1252,21 +1250,20 @@ public static class JpegEncoder
             while (true)
             {
                 int index = expected & pendingMask;
-                var pending = pendingItems[index];
-                if (pending == null || pendingSequences[index] != expected)
+                if (pendingSequences[index] != expected)
                 {
                     break;
                 }
-                pendingItems[index] = null;
+                ref SampledMcuRef pending = ref pendingItems[index];
                 pendingSequences[index] = -1;
                 HuffmanWriteBlock(bw, pending.GetBlockSpan(0), dcY, acY, ref prevYdc);
-                pending.Release(pool);
+                pending.Free();
                 expected++;
             }
         }
         finally
         {
-            ReturnPendingState(pendingItems, pendingSequences, pendingCapacity, pool);
+            ReturnPendingState(pendingItems, pendingSequences, pendingCapacity);
         }
     }
 
@@ -1789,7 +1786,7 @@ public static class JpegEncoder
         WriteAppSegment(s, markerLow, payload.AsSpan());
     }
 
-    private static void WriteIccProfile(Stream s, byte[] profile)
+    private static unsafe void WriteIccProfile(Stream s, byte[] profile)
     {
         const int overhead = 14;
         int maxPayload = 0xFFFD - overhead;
@@ -1797,18 +1794,25 @@ public static class JpegEncoder
         if (count <= 0) count = 1;
         if (count > 255) throw new ArgumentOutOfRangeException(nameof(profile), "ICC Profile 过大");
 
-        using IMemoryOwner<byte> owner = MemoryPool<byte>.Shared.Rent(0xFFFD);
-        Span<byte> buffer = owner.Memory.Span;
-        int offset = 0;
-        for (int i = 0; i < count; i++)
+        byte* bufferPtr = (byte*)NativeMemory.Alloc(0xFFFD);
+        try
         {
-            int take = Math.Min(maxPayload, profile.Length - offset);
-            IccProfileSignature.CopyTo(buffer);
-            buffer[12] = (byte)(i + 1);
-            buffer[13] = (byte)count;
-            profile.AsSpan(offset, take).CopyTo(buffer.Slice(overhead, take));
-            WriteAppSegment(s, 0xE2, buffer.Slice(0, overhead + take));
-            offset += take;
+            Span<byte> buffer = new Span<byte>(bufferPtr, 0xFFFD);
+            int offset = 0;
+            for (int i = 0; i < count; i++)
+            {
+                int take = Math.Min(maxPayload, profile.Length - offset);
+                IccProfileSignature.CopyTo(buffer);
+                buffer[12] = (byte)(i + 1);
+                buffer[13] = (byte)count;
+                profile.AsSpan(offset, take).CopyTo(buffer.Slice(overhead, take));
+                WriteAppSegment(s, 0xE2, buffer.Slice(0, overhead + take));
+                offset += take;
+            }
+        }
+        finally
+        {
+            NativeMemory.Free(bufferPtr);
         }
     }
 

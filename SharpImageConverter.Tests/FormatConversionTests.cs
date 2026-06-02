@@ -191,6 +191,39 @@ namespace Jpeg2Bmp.Tests
         }
 
         [Fact]
+        public void Jpeg_Repeated_MultiMcu_Encode_Does_Not_Crash()
+        {
+            var img = TestImageFactory.CreateGradient(257, 257);
+
+            for (int i = 0; i < 6; i++)
+            {
+                using var ms420 = new MemoryStream();
+                JpegEncoder.Write(ms420, img.Width, img.Height, img.Buffer, new JpegEncoderOptions(85, true, false, false));
+                byte[] data420 = ms420.ToArray();
+                var decoded420 = JpegDecoder.Decode(data420);
+                Assert.Equal(img.Width, decoded420.Width);
+                Assert.Equal(img.Height, decoded420.Height);
+
+                using var ms444 = new MemoryStream();
+                JpegEncoder.Write(ms444, img.Width, img.Height, img.Buffer, new JpegEncoderOptions(85, false, false, false));
+                byte[] data444 = ms444.ToArray();
+                var decoded444 = JpegDecoder.Decode(data444);
+                Assert.Equal(img.Width, decoded444.Width);
+                Assert.Equal(img.Height, decoded444.Height);
+            }
+        }
+
+        [Fact]
+        public void Jpeg_Write_Rejects_NonWritable_Stream()
+        {
+            var img = TestImageFactory.CreateGradient(8, 8);
+            using var stream = new MemoryStream(Array.Empty<byte>(), writable: false);
+
+            var ex = Assert.Throws<ArgumentException>(() => JpegEncoder.Write(stream, img.Width, img.Height, img.Buffer, 85));
+            Assert.Contains("不可写", ex.Message);
+        }
+
+        [Fact]
         public void Jpeg_Gray8_Encodes_As_SingleComponent_Gray()
         {
             int w = 16, h = 16;
