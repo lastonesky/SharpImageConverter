@@ -2,6 +2,7 @@ using SharpImageConverter.Core;
 using SharpImageConverter.Metadata;
 using System.Buffers;
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
 using System.Threading;
@@ -204,6 +205,10 @@ public static class JpegDecoder
             }
             finally
             {
+                for (int i = 0; i < components.Length; i++)
+                {
+                    components[i].FreeCoefficientBuffer();
+                }
                 iccCollector?.Dispose();
             }
         }
@@ -937,6 +942,11 @@ public static class JpegDecoder
                 ThrowHelper.ThrowNotSupported("Only 8-bit JPEG is supported.");
             }
 
+            if (hasFrame)
+            {
+                ThrowHelper.ThrowInvalidData("Multiple SOF markers are not supported.");
+            }
+
             ushort height = ReadU16(segment.Slice(1));
             ushort width = ReadU16(segment.Slice(3));
             byte count = segment[5];
@@ -1280,6 +1290,10 @@ public static class JpegDecoder
             }
             finally
             {
+                for (int i = 0; i < components.Length; i++)
+                {
+                    components[i].FreeCoefficientBuffer();
+                }
                 iccCollector?.Dispose();
             }
         }
@@ -2106,6 +2120,11 @@ public static class JpegDecoder
                 ThrowHelper.ThrowNotSupported("Only 8-bit JPEG is supported.");
             }
 
+            if (hasFrame)
+            {
+                ThrowHelper.ThrowInvalidData("Multiple SOF markers are not supported.");
+            }
+
             ushort height = (ushort)((span[1] << 8) | span[2]);
             ushort width = (ushort)((span[3] << 8) | span[4]);
             byte count = span[5];
@@ -2689,7 +2708,7 @@ public static class JpegDecoder
 
     private readonly record struct FrameHeader(int Width, int Height, int Precision, int MaxH, int MaxV, int McuX, int McuY);
 
-    private sealed class ComponentState
+    private sealed unsafe class ComponentState
     {
         public byte Id { get; }
         public byte H { get; }
@@ -2697,11 +2716,13 @@ public static class JpegDecoder
         public byte QuantTableId { get; }
         public int BlocksX { get; private set; }
         public int BlocksY { get; private set; }
-        public short[]? Coefficients { get; private set; }
         public bool HasCoefficients { get; set; }
         public int DcPredictor { get; set; }
         public byte DcTableId { get; private set; }
         public byte AcTableId { get; private set; }
+
+        internal short* _coeffPtr;
+        private int _totalShorts;
 
         public ComponentState(byte id, byte h, byte v, byte quantTableId)
         {
@@ -2713,15 +2734,32 @@ public static class JpegDecoder
 
         public void SetGeometry(int mcuX, int mcuY)
         {
-            BlocksX = mcuX * H;
-            BlocksY = mcuY * V;
+            BlocksX = checked(mcuX * H);
+            BlocksY = checked(mcuY * V);
         }
 
         public void EnsureCoefficientBuffer(bool isProgressive)
         {
-            if (Coefficients == null)
+            if (_coeffPtr == null)
             {
-                Coefficients = new short[BlocksX * BlocksY * 64];
+                nuint totalShorts = checked((nuint)BlocksX * (nuint)BlocksY * 64u);
+                if (totalShorts > int.MaxValue)
+                {
+                    ThrowHelper.ThrowInvalidData("JPEG component buffer too large.");
+                }
+
+                _totalShorts = (int)totalShorts;
+                _coeffPtr = (short*)NativeMemory.AllocZeroed(totalShorts, (nuint)sizeof(short));
+            }
+        }
+
+        public void FreeCoefficientBuffer()
+        {
+            if (_coeffPtr != null)
+            {
+                NativeMemory.Free(_coeffPtr);
+                _coeffPtr = null;
+                _totalShorts = 0;
             }
         }
 
@@ -2738,12 +2776,12 @@ public static class JpegDecoder
 
         public Span<short> GetBlockSpan(int blockIndex)
         {
-            return Coefficients.AsSpan(blockIndex * 64, 64);
+            return new Span<short>(_coeffPtr + blockIndex * 64, 64);
         }
 
         public void DecodeSpatial(Span<byte> output, int width, int height, int stride, ushort[] quantTable, bool useFloatingPointIdct)
         {
-            if (Coefficients == null) return;
+            if (_coeffPtr == null) return;
 
             for (int by = 0; by < BlocksY; by++)
             {
