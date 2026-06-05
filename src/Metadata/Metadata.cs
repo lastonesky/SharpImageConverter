@@ -9,6 +9,16 @@ namespace SharpImageConverter.Metadata
 
         public byte[]? IccProfile { get; set; }
         public IccProfileKind IccProfileKind { get; set; } = IccProfileKind.Unknown;
+
+        /// <summary>
+        /// 水平分辨率（DPI），0 表示未知。
+        /// </summary>
+        public double HorizontalDpi { get; set; }
+
+        /// <summary>
+        /// 垂直分辨率（DPI），0 表示未知。
+        /// </summary>
+        public double VerticalDpi { get; set; }
     }
 
     public enum IccProfileKind

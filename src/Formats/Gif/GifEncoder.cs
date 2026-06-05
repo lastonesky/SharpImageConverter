@@ -54,7 +54,8 @@ public class GifEncoder
         stream.Write(_headerBuf, 0, ptr);
 
         // LZW
-        new LzwEncoder(stream).Encode(indices, image.Width, image.Height, Math.Max(2, depth + 1));
+        using var lzwEncoder = new LzwEncoder(stream);
+        lzwEncoder.Encode(indices, image.Width, image.Height, Math.Max(2, depth + 1));
         stream.WriteByte(0x3B); // Trailer
     }
 
@@ -101,7 +102,8 @@ public class GifEncoder
         _headerBuf[ptr++] = 0;
         stream.Write(_headerBuf, 0, ptr);
 
-        new LzwEncoder(stream).Encode(indices, width, height, Math.Max(2, depth + 1));
+        using var lzwEncoder = new LzwEncoder(stream);
+        lzwEncoder.Encode(indices, width, height, Math.Max(2, depth + 1));
         stream.WriteByte(0x3B);
     }
 
@@ -118,6 +120,7 @@ public class GifEncoder
         stream.Write(_headerBuf, 0, ptr);
 
         WriteNetscapeExtension(stream, loopCount);
+        using var lzwEncoder = new LzwEncoder(stream);
 
         for (int i = 0; i < frames.Count; i++)
         {
@@ -144,7 +147,7 @@ public class GifEncoder
             int pad = (1 << (depth + 1)) * 3 - pal.Length;
             if (pad > 0) stream.Write(new byte[pad]);
 
-            new LzwEncoder(stream).Encode(inds, w, h, Math.Max(2, depth + 1));
+            lzwEncoder.Encode(inds, w, h, Math.Max(2, depth + 1));
         }
         stream.WriteByte(0x3B);
     }
@@ -161,6 +164,7 @@ public class GifEncoder
         stream.Write(_headerBuf, 0, ptr);
 
         WriteNetscapeExtension(stream, loopCount);
+        using var lzwEncoder = new LzwEncoder(stream);
 
         for (int i = 0; i < rgbaFrames.Count; i++)
         {
@@ -183,7 +187,7 @@ public class GifEncoder
             stream.Write(_headerBuf, 0, ptr);
 
             stream.Write(pal);
-            new LzwEncoder(stream).Encode(inds, width, height, Math.Max(2, depth + 1));
+            lzwEncoder.Encode(inds, width, height, Math.Max(2, depth + 1));
         }
         stream.WriteByte(0x3B);
     }

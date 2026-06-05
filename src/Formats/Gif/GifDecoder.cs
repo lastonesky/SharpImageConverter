@@ -125,6 +125,7 @@ namespace SharpImageConverter.Formats.Gif
             byte[] desc = new byte[9];
             byte[] lct = new byte[768];
             var pool = ArrayPool<byte>.Shared;
+            using var lzwDecoder = new LzwDecoder(stream);
 
             while (true)
             {
@@ -183,7 +184,7 @@ namespace SharpImageConverter.Formats.Gif
 
                     int lzwMin = stream.ReadByte();
                     byte[] indices = pool.Rent(iw * ih);
-                    new LzwDecoder(stream).Decode(indices.AsSpan(0, iw * ih), iw, ih, lzwMin);
+                    lzwDecoder.Decode(indices.AsSpan(0, iw * ih), iw, ih, lzwMin);
 
                     if (disposal == 3)
                     {

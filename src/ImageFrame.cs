@@ -390,7 +390,7 @@ public sealed class ImageFrame
     /// <returns>图像帧</returns>
     public static ImageFrame LoadBmp(Stream stream)
     {
-        byte[] rgb = BmpReader.Read(stream, out int width, out int height);
+        byte[] rgb = BmpReader.Read(stream, out int width, out int height, out _, out _);
         return new ImageFrame(width, height, rgb);
     }
 

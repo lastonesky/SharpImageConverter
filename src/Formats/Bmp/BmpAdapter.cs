@@ -1,6 +1,7 @@
 using System;
 using SharpImageConverter.Core;
 using SharpImageConverter;
+using SharpImageConverter.Metadata;
 using System.IO;
 
 namespace SharpImageConverter.Formats.Bmp
@@ -28,8 +29,11 @@ namespace SharpImageConverter.Formats.Bmp
         /// <returns>Rgb24 图像</returns>
         public Image<Rgb24> DecodeRgb24(Stream stream)
         {
-            var rgb = BmpReader.Read(stream, out int width, out int height);
-            return new Image<Rgb24>(width, height, rgb);
+            var rgb = BmpReader.Read(stream, out int width, out int height, out double xDpi, out double yDpi);
+            var metadata = new ImageMetadata();
+            if (xDpi > 0) metadata.HorizontalDpi = xDpi;
+            if (yDpi > 0) metadata.VerticalDpi = yDpi;
+            return new Image<Rgb24>(width, height, rgb, metadata);
         }
     }
 
@@ -45,7 +49,7 @@ namespace SharpImageConverter.Formats.Bmp
         /// <param name="image">Rgb24 图像</param>
         public void EncodeRgb24(string path, Image<Rgb24> image)
         {
-            BmpWriter.Write24(path, image.Width, image.Height, image.Buffer);
+            BmpWriter.Write24(path, image.Width, image.Height, image.Buffer, image.Metadata);
         }
 
         /// <summary>
@@ -55,7 +59,7 @@ namespace SharpImageConverter.Formats.Bmp
         /// <param name="image">Rgb24 图像</param>
         public void EncodeRgb24(Stream stream, Image<Rgb24> image)
         {
-            BmpWriter.Write24(stream, image.Width, image.Height, image.Buffer);
+            BmpWriter.Write24(stream, image.Width, image.Height, image.Buffer, image.Metadata);
         }
     }
 }
