@@ -1,9 +1,11 @@
 using System;
+using System.Buffers;
 using System.IO;
+using SharpImageConverter.Core;
 
 namespace SharpImageConverter.Formats.Gif
 {
-    internal sealed class LzwDecoder(Stream stream)
+    internal sealed class LzwDecoder(Stream stream) : IDisposable
     {
         private readonly Stream _stream = stream;
         private readonly byte[] _blockBuffer = new byte[256];
@@ -13,12 +15,15 @@ namespace SharpImageConverter.Formats.Gif
         private int _bitBuffer;
         private int _bitCount;
 
-        private readonly int[] _prefix = new int[4096];
-        private readonly byte[] _suffix = new byte[4096];
-        private readonly byte[] _pixelStack = new byte[4096 + 1];
+        private readonly NativeBufferOwner<int> _prefix = NativeBufferOwner<int>.Allocate(4096);
+        private readonly NativeBufferOwner<byte> _suffix = NativeBufferOwner<byte>.Allocate(4096);
+        private readonly NativeBufferOwner<byte> _pixelStack = NativeBufferOwner<byte>.Allocate(4097);
 
         public void Decode(Span<byte> pixels, int width, int height, int dataSize)
         {
+            Span<int> prefix = _prefix.Span;
+            Span<byte> suffix = _suffix.Span;
+            Span<byte> pixelStack = _pixelStack.Span;
             int clearCode = 1 << dataSize;
             int endCode = clearCode + 1;
             int available = clearCode + 2;
@@ -37,8 +42,8 @@ namespace SharpImageConverter.Formats.Gif
             _bitCount = 0;
 
             // Pre-allocate and clear tables for better cache performance
-            Array.Clear(_prefix, 0, _prefix.Length);
-            Array.Clear(_suffix, 0, _suffix.Length);
+            prefix.Clear();
+            suffix.Clear();
 
             while (pixelIndex < pixelCount)
             {
@@ -91,7 +96,7 @@ namespace SharpImageConverter.Formats.Gif
                     // First code case
                     if (oldCode == -1)
                     {
-                        _pixelStack[top++] = (byte)code; // code < clearCode implies suffix is code
+                        pixelStack[top++] = (byte)code; // code < clearCode implies suffix is code
                         oldCode = code;
                         continue;
                     }
@@ -106,27 +111,27 @@ namespace SharpImageConverter.Formats.Gif
                         int temp = oldCode;
                         while (temp >= clearCode)
                         {
-                            temp = _prefix[temp];
+                            temp = prefix[temp];
                         }
                         firstChar = temp;
-                        _pixelStack[top++] = (byte)firstChar;
+                        pixelStack[top++] = (byte)firstChar;
                         code = oldCode;
                     }
 
                     // Expand code into pixel stack
                     while (code >= clearCode)
                     {
-                        _pixelStack[top++] = _suffix[code];
-                        code = _prefix[code];
+                        pixelStack[top++] = suffix[code];
+                        code = prefix[code];
                     }
                     firstChar = code;
-                    _pixelStack[top++] = (byte)firstChar;
+                    pixelStack[top++] = (byte)firstChar;
 
                     // Add new code to table if possible
                     if (available < 4096)
                     {
-                        _prefix[available] = oldCode;
-                        _suffix[available] = (byte)firstChar;
+                        prefix[available] = oldCode;
+                        suffix[available] = (byte)firstChar;
                         available++;
                         // Increase code size when needed
                         if ((available & codeMask) == 0 && available < 4096)
@@ -140,7 +145,7 @@ namespace SharpImageConverter.Formats.Gif
 
                 // Pop stack and write pixel
                 top--;
-                pixels[pixelIndex++] = _pixelStack[top];
+                pixels[pixelIndex++] = pixelStack[top];
             }
 
             // Flush remaining sub-blocks
@@ -152,17 +157,31 @@ namespace SharpImageConverter.Formats.Gif
                     _stream.Seek(len, SeekOrigin.Current);
                  else
                  {
-                    // Skip bytes efficiently
-                    byte[] skipBuffer = new byte[len];
-                    int skipped = 0;
-                    while (skipped < len)
+                    byte[] skipBuffer = ArrayPool<byte>.Shared.Rent(Math.Min(len, 256));
+                    try
                     {
-                        int n = _stream.Read(skipBuffer, skipped, len - skipped);
-                        if (n == 0) break;
-                        skipped += n;
+                        int skipped = 0;
+                        while (skipped < len)
+                        {
+                            int chunk = Math.Min(len - skipped, skipBuffer.Length);
+                            int n = _stream.Read(skipBuffer, 0, chunk);
+                            if (n == 0) break;
+                            skipped += n;
+                        }
+                    }
+                    finally
+                    {
+                        ArrayPool<byte>.Shared.Return(skipBuffer);
                     }
                  }
             }
+        }
+
+        public void Dispose()
+        {
+            _prefix.Dispose();
+            _suffix.Dispose();
+            _pixelStack.Dispose();
         }
     }
 }
