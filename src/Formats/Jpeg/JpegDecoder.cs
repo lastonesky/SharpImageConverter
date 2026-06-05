@@ -89,6 +89,112 @@ public static class JpegDecoder
         }
     }
 
+    private static void TryStoreExifApp1(ReadOnlySpan<byte> segment, ref byte[]? exifRaw, ref int exifOrientation)
+    {
+        if (segment.Length < 6)
+        {
+            return;
+        }
+
+        if (segment[0] != (byte)'E' ||
+            segment[1] != (byte)'x' ||
+            segment[2] != (byte)'i' ||
+            segment[3] != (byte)'f' ||
+            segment[4] != 0 ||
+            segment[5] != 0)
+        {
+            return;
+        }
+
+        exifRaw ??= segment.ToArray();
+
+        if (exifOrientation == 1)
+        {
+            int orientation = ParseExifOrientation(segment);
+            if (orientation >= 1 && orientation <= 8)
+            {
+                exifOrientation = orientation;
+            }
+        }
+    }
+
+    private static bool TryReconstructGrayDirect(FrameHeader frame, ComponentState component, QuantizationTable[] quantTables, bool useFloatingPointIdct, byte[] output)
+    {
+        int width = frame.Width;
+        int height = frame.Height;
+        int w = frame.McuX * component.H * 8;
+        int h = frame.McuY * component.V * 8;
+        if (w < width || h < height)
+        {
+            return false;
+        }
+
+        if (w == width && h == height)
+        {
+            component.DecodeSpatial(output.AsSpan(0, w * h), w, h, w, quantTables[component.QuantTableId].Table, useFloatingPointIdct);
+            return true;
+        }
+
+        byte[] plane = ArrayPool<byte>.Shared.Rent(w * h);
+        try
+        {
+            component.DecodeSpatial(plane.AsSpan(0, w * h), w, h, w, quantTables[component.QuantTableId].Table, useFloatingPointIdct);
+            for (int y = 0; y < height; y++)
+            {
+                Buffer.BlockCopy(plane, y * w, output, y * width, width);
+            }
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(plane);
+        }
+
+        return true;
+    }
+
+    private static bool TryReconstructRgbDirect(FrameHeader frame, ComponentState[] components, QuantizationTable[] quantTables, ReadOnlySpan<int> componentOrder, bool useFloatingPointIdct, byte[] output)
+    {
+        int maxH = frame.MaxH;
+        int maxV = frame.MaxV;
+        for (int channel = 0; channel < 3; channel++)
+        {
+            ComponentState component = components[componentOrder[channel]];
+            if (component.H != maxH || component.V != maxV)
+            {
+                return false;
+            }
+        }
+
+        int width = frame.Width;
+        int height = frame.Height;
+        int fullWidth = frame.McuX * maxH * 8;
+        int fullHeight = frame.McuY * maxV * 8;
+        for (int channel = 0; channel < 3; channel++)
+        {
+            ComponentState component = components[componentOrder[channel]];
+            byte[] plane = ArrayPool<byte>.Shared.Rent(fullWidth * fullHeight);
+            try
+            {
+                component.DecodeSpatial(plane.AsSpan(0, fullWidth * fullHeight), fullWidth, fullHeight, fullWidth, quantTables[component.QuantTableId].Table, useFloatingPointIdct);
+                for (int y = 0; y < height; y++)
+                {
+                    int srcRow = y * fullWidth;
+                    int dstRow = y * width * 3 + channel;
+                    for (int x = 0; x < width; x++)
+                    {
+                        output[dstRow + x * 3] = plane[srcRow + x];
+                    }
+                }
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(plane);
+            }
+        }
+
+        return true;
+    }
+
     private ref struct Parser
     {
         private readonly ReadOnlySpan<byte> data;
@@ -233,21 +339,8 @@ public static class JpegDecoder
         private void ParseApp1()
         {
             ReadOnlySpan<byte> segment = ReadSegment(out _, out int segmentLength);
-            if (segmentLength < 6)
-            {
-                return;
-            }
-
-            if (segment[0] == (byte)'E' &&
-                segment[1] == (byte)'x' &&
-                segment[2] == (byte)'i' &&
-                segment[3] == (byte)'f' &&
-                segment[4] == 0 &&
-                segment[5] == 0)
-            {
-                exifRaw = segment.ToArray();
-                exifOrientation = ParseExifOrientation(segment);
-            }
+            _ = segmentLength;
+            TryStoreExifApp1(segment, ref exifRaw, ref exifOrientation);
         }
 
         private void ParseApp14()
@@ -308,91 +401,19 @@ public static class JpegDecoder
 
                 if (colorSpace == JpegColorSpace.Gray && components.Length == 1)
                 {
-                    ComponentState c = components[0];
-                    int w = frame.McuX * c.H * 8;
-                    int h = frame.McuY * c.V * 8;
-                    if (w >= width && h >= height)
+                    output = new byte[checked(width * height)];
+                    handled = TryReconstructGrayDirect(frame, components[0], quantTables, useFloatingPointIdct, output);
+                    if (!handled)
                     {
-                        output = new byte[checked(width * height)];
-                        if (w == width && h == height)
-                        {
-                            c.DecodeSpatial(output.AsSpan(0, w * h), w, h, w, quantTables[c.QuantTableId].Table, useFloatingPointIdct);
-                        }
-                        else
-                        {
-                            byte[] plane = ArrayPool<byte>.Shared.Rent(w * h);
-                            try
-                            {
-                                c.DecodeSpatial(plane.AsSpan(0, w * h), w, h, w, quantTables[c.QuantTableId].Table, useFloatingPointIdct);
-                                for (int y = 0; y < height; y++)
-                                {
-                                    Buffer.BlockCopy(plane, y * w, output, y * width, width);
-                                }
-                            }
-                            finally
-                            {
-                                ArrayPool<byte>.Shared.Return(plane);
-                            }
-                        }
-                        handled = true;
+                        output = null;
                     }
                 }
 
                 if (!handled && colorSpace == JpegColorSpace.Rgb && channelCount == 3)
                 {
-                    bool fullRes = true;
-                    for (int channel = 0; channel < 3; channel++)
-                    {
-                        int compIndex = componentOrder[channel];
-                        ComponentState c = components[compIndex];
-                        if (c.H != maxH || c.V != maxV)
-                        {
-                            fullRes = false;
-                            break;
-                        }
-                    }
-
-                    if (fullRes)
-                    {
-                        output = new byte[checked(width * height * 3)];
-                        for (int channel = 0; channel < 3; channel++)
-                        {
-                            int compIndex = componentOrder[channel];
-                            ComponentState c = components[compIndex];
-                            int w = frame.McuX * c.H * 8;
-                            int h = frame.McuY * c.V * 8;
-                            if (w < width || h < height)
-                            {
-                                fullRes = false;
-                                break;
-                            }
-
-                            byte[] plane = ArrayPool<byte>.Shared.Rent(w * h);
-                            try
-                            {
-                                c.DecodeSpatial(plane.AsSpan(0, w * h), w, h, w, quantTables[c.QuantTableId].Table, useFloatingPointIdct);
-                                for (int y = 0; y < height; y++)
-                                {
-                                    int srcRow = y * w;
-                                    int dstRow = y * width * 3 + channel;
-                                    for (int x = 0; x < width; x++)
-                                    {
-                                        output[dstRow + x * 3] = plane[srcRow + x];
-                                    }
-                                }
-                            }
-                            finally
-                            {
-                                ArrayPool<byte>.Shared.Return(plane);
-                            }
-                        }
-                    }
-
-                    if (fullRes)
-                    {
-                        handled = true;
-                    }
-                    else
+                    output = new byte[checked(width * height * 3)];
+                    handled = TryReconstructRgbDirect(frame, components, quantTables, componentOrder, useFloatingPointIdct, output);
+                    if (!handled)
                     {
                         output = null;
                     }
@@ -1329,29 +1350,7 @@ public static class JpegDecoder
             SegmentBuffer segment = await ReadSegmentAsync(cancellationToken).ConfigureAwait(false);
             try
             {
-                if (segment.Length < 6)
-                {
-                    return;
-                }
-
-                ReadOnlySpan<byte> span = segment.Span;
-                if (span[0] == (byte)'E' &&
-                    span[1] == (byte)'x' &&
-                    span[2] == (byte)'i' &&
-                    span[3] == (byte)'f' &&
-                    span[4] == 0 &&
-                    span[5] == 0)
-                {
-                    exifRaw ??= span.ToArray();
-                    if (exifOrientation == 1)
-                    {
-                        int orientation = ParseExifOrientation(span);
-                        if (orientation >= 1 && orientation <= 8)
-                        {
-                            exifOrientation = orientation;
-                        }
-                    }
-                }
+                TryStoreExifApp1(segment.Span, ref exifRaw, ref exifOrientation);
             }
             finally
             {
@@ -1428,6 +1427,40 @@ public static class JpegDecoder
 
             try
             {
+                bool handled = false;
+
+                if (colorSpace == JpegColorSpace.Gray && components.Length == 1)
+                {
+                    output = new byte[checked(width * height)];
+                    handled = TryReconstructGrayDirect(frame, components[0], quantTables, useFloatingPointIdct, output);
+                    if (handled)
+                    {
+                        byte[]? iccProfileGray = iccCollector?.GetProfile();
+                        var colorInfoGray = new JpegColorInfo(colorSpace, hasAdobe, adobeTransform, iccProfileGray);
+                        var grayImg = new JpegImage(width, height, pixelFormat, bitsPerSample, colorInfoGray, output);
+                        grayImg.Metadata.ExifRaw = exifRaw;
+                        grayImg.Metadata.Orientation = exifOrientation;
+                        grayImg.Metadata.IccProfile = iccProfileGray;
+                        return grayImg;
+                    }
+                }
+
+                if (!handled && colorSpace == JpegColorSpace.Rgb && channelCount == 3)
+                {
+                    output = new byte[checked(width * height * 3)];
+                    handled = TryReconstructRgbDirect(frame, components, quantTables, componentOrder, useFloatingPointIdct, output);
+                    if (handled)
+                    {
+                        byte[]? iccProfileRgb = iccCollector?.GetProfile();
+                        var colorInfoRgb = new JpegColorInfo(colorSpace, hasAdobe, adobeTransform, iccProfileRgb);
+                        var rgbImg = new JpegImage(width, height, pixelFormat, bitsPerSample, colorInfoRgb, output);
+                        rgbImg.Metadata.ExifRaw = exifRaw;
+                        rgbImg.Metadata.Orientation = exifOrientation;
+                        rgbImg.Metadata.IccProfile = iccProfileRgb;
+                        return rgbImg;
+                    }
+                }
+
                 if (colorSpace == JpegColorSpace.YCbCr && !useFloatingPointIdct && Sse2.IsSupported)
                 {
                     output = new byte[checked(width * height * channelCount)];
