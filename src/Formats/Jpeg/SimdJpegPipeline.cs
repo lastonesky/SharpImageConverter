@@ -137,9 +137,9 @@ internal static class SimdJpegPipeline
         Vector128<int> tmp1 = Sse2.Subtract(v0, v4);
         tmp1 = Sse2.ShiftLeftLogical(tmp1, ConstBits);
 
-        Vector128<int> z1 = Multiply32(Sse2.Add(v2, v6), Fix_0_541196100);
-        Vector128<int> tmp2 = Sse2.Add(z1, Multiply32(v6, -Fix_1_847759065));
-        Vector128<int> tmp3 = Sse2.Add(z1, Multiply32(v2, Fix_0_765366865));
+        Vector128<int> z1 = Sse2.Add(v2, v6) * Fix_0_541196100;
+        Vector128<int> tmp2 = Sse2.Add(z1, v6 * -Fix_1_847759065);
+        Vector128<int> tmp3 = Sse2.Add(z1, v2 * Fix_0_765366865);
 
         Vector128<int> tmp10 = Sse2.Add(tmp0, tmp3);
         Vector128<int> tmp13 = Sse2.Subtract(tmp0, tmp3);
@@ -155,16 +155,16 @@ internal static class SimdJpegPipeline
         Vector128<int> z2o = Sse2.Add(tmp1o, tmp2o);
         Vector128<int> z3o = Sse2.Add(tmp0o, tmp2o);
         Vector128<int> z4o = Sse2.Add(tmp1o, tmp3o);
-        Vector128<int> z5o = Multiply32(Sse2.Add(z3o, z4o), Fix_1_175875602);
+        Vector128<int> z5o = Sse2.Add(z3o, z4o) * Fix_1_175875602;
 
-        tmp0o = Multiply32(tmp0o, Fix_0_298631336);
-        tmp1o = Multiply32(tmp1o, Fix_2_053119869);
-        tmp2o = Multiply32(tmp2o, Fix_3_072711026);
-        tmp3o = Multiply32(tmp3o, Fix_1_501321110);
-        z1o = Multiply32(z1o, -Fix_0_899976223);
-        z2o = Multiply32(z2o, -Fix_2_562915447);
-        z3o = Sse2.Add(Multiply32(z3o, -Fix_1_961570560), z5o);
-        z4o = Sse2.Add(Multiply32(z4o, -Fix_0_390180644), z5o);
+        tmp0o = tmp0o * Fix_0_298631336;
+        tmp1o = tmp1o * Fix_2_053119869;
+        tmp2o = tmp2o * Fix_3_072711026;
+        tmp3o = tmp3o * Fix_1_501321110;
+        z1o = z1o * -Fix_0_899976223;
+        z2o = z2o * -Fix_2_562915447;
+        z3o = Sse2.Add(z3o * -Fix_1_961570560, z5o);
+        z4o = Sse2.Add(z4o * -Fix_0_390180644, z5o);
 
         tmp0o = Sse2.Add(tmp0o, Sse2.Add(z1o, z3o));
         tmp1o = Sse2.Add(tmp1o, Sse2.Add(z2o, z4o));
@@ -190,9 +190,9 @@ internal static class SimdJpegPipeline
         Vector128<int> tmp1 = Sse2.Subtract(v0, v4);
         tmp1 = Sse2.ShiftLeftLogical(tmp1, ConstBits);
 
-        Vector128<int> z1 = Multiply32(Sse2.Add(v2, v6), Fix_0_541196100);
-        Vector128<int> tmp2 = Sse2.Add(z1, Multiply32(v6, -Fix_1_847759065));
-        Vector128<int> tmp3 = Sse2.Add(z1, Multiply32(v2, Fix_0_765366865));
+        Vector128<int> z1 = Sse2.Add(v2, v6) * Fix_0_541196100;
+        Vector128<int> tmp2 = Sse2.Add(z1, v6 * -Fix_1_847759065);
+        Vector128<int> tmp3 = Sse2.Add(z1, v2 * Fix_0_765366865);
 
         Vector128<int> tmp10 = Sse2.Add(tmp0, tmp3);
         Vector128<int> tmp13 = Sse2.Subtract(tmp0, tmp3);
@@ -208,16 +208,16 @@ internal static class SimdJpegPipeline
         Vector128<int> z2o = Sse2.Add(tmp1o, tmp2o);
         Vector128<int> z3o = Sse2.Add(tmp0o, tmp2o);
         Vector128<int> z4o = Sse2.Add(tmp1o, tmp3o);
-        Vector128<int> z5o = Multiply32(Sse2.Add(z3o, z4o), Fix_1_175875602);
+        Vector128<int> z5o = Sse2.Add(z3o, z4o) * Fix_1_175875602;
 
-        tmp0o = Multiply32(tmp0o, Fix_0_298631336);
-        tmp1o = Multiply32(tmp1o, Fix_2_053119869);
-        tmp2o = Multiply32(tmp2o, Fix_3_072711026);
-        tmp3o = Multiply32(tmp3o, Fix_1_501321110);
-        z1o = Multiply32(z1o, -Fix_0_899976223);
-        z2o = Multiply32(z2o, -Fix_2_562915447);
-        z3o = Sse2.Add(Multiply32(z3o, -Fix_1_961570560), z5o);
-        z4o = Sse2.Add(Multiply32(z4o, -Fix_0_390180644), z5o);
+        tmp0o = tmp0o * Fix_0_298631336;
+        tmp1o = tmp1o * Fix_2_053119869;
+        tmp2o = tmp2o * Fix_3_072711026;
+        tmp3o = tmp3o * Fix_1_501321110;
+        z1o = z1o * -Fix_0_899976223;
+        z2o = z2o * -Fix_2_562915447;
+        z3o = Sse2.Add(z3o * -Fix_1_961570560, z5o);
+        z4o = Sse2.Add(z4o * -Fix_0_390180644, z5o);
 
         tmp0o = Sse2.Add(tmp0o, Sse2.Add(z1o, z3o));
         tmp1o = Sse2.Add(tmp1o, Sse2.Add(z2o, z4o));
@@ -233,10 +233,6 @@ internal static class SimdJpegPipeline
         v3 = Descale32Pass2(Sse2.Add(tmp13, tmp0o));
         v4 = Descale32Pass2(Sse2.Subtract(tmp13, tmp0o));
     }
-
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static Vector128<int> Multiply32(Vector128<int> a, int b) 
-    => a * Vector128.Create(b);
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static Vector128<int> Descale32Pass1(Vector128<int> v)
@@ -398,7 +394,7 @@ internal static class SimdJpegPipeline
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static void ConvertRowYCbCrToRgb(Vector128<short> y, Vector128<short> cb, Vector128<short> cr, Span<byte> dest)
+    private unsafe static void ConvertRowYCbCrToRgb(Vector128<short> y, Vector128<short> cb, Vector128<short> cr, Span<byte> dest)
     {
         Vector128<short> bias128 = Vector128.Create((short)128);
         y = Sse2.Add(y, bias128);
@@ -413,29 +409,58 @@ internal static class SimdJpegPipeline
         ConvertCore(yl, cbl, crl, out Vector128<int> rl, out Vector128<int> gl, out Vector128<int> bl);
         ConvertCore(yh, cbh, crh, out Vector128<int> rh, out Vector128<int> gh, out Vector128<int> bh);
 
-        Vector128<short> rs = Sse2.PackSignedSaturate(rl, rh);
-        Vector128<short> gs = Sse2.PackSignedSaturate(gl, gh);
-        Vector128<short> bs = Sse2.PackSignedSaturate(bl, bh);
+        // 1. 正确打包成 byte (把低 4 位和高 4 位拼成完整的 8 字节有效数据)
+        Vector128<byte> r = Sse2.PackUnsignedSaturate(Sse2.PackSignedSaturate(rl, rh), Vector128<short>.Zero);
+        Vector128<byte> g = Sse2.PackUnsignedSaturate(Sse2.PackSignedSaturate(gl, gh), Vector128<short>.Zero);
+        Vector128<byte> b = Sse2.PackUnsignedSaturate(Sse2.PackSignedSaturate(bl, bh), Vector128<short>.Zero);
 
-        Vector128<byte> rb = Sse2.PackUnsignedSaturate(rs, rs);
-        Vector128<byte> gb = Sse2.PackUnsignedSaturate(gs, gs);
-        Vector128<byte> bb = Sse2.PackUnsignedSaturate(bs, bs);
+        // 2. 使用正确的转换函数：使用 .As<short>() 或 .AsInt16()
+        // 我们可以利用 UnpackLow 将 R、G、B 分量交错配对
+        Vector128<byte> rgLow = Sse2.UnpackLow(r, g); // R0 G0 R1 G1 R2 G2 R3 G3 R4 G4 ...
+        
+        // 获取目标缓冲区的指针
+        byte* pDest = (byte*)Unsafe.AsPointer(ref MemoryMarshal.GetReference(dest));
 
-        ref byte d = ref MemoryMarshal.GetReference(dest);
-        for (int i = 0; i < 8; i++)
-        {
-            Unsafe.Add(ref d, i * 3 + 0) = rb.GetElement(i);
-            Unsafe.Add(ref d, i * 3 + 1) = gb.GetElement(i);
-            Unsafe.Add(ref d, i * 3 + 2) = bb.GetElement(i);
-        }
+        // 3. 提取交错后的 64 位数据 (前 4 个像素的 RG)
+        // 修正语法：使用 .AsInt64() 转换为长整型向量
+        ulong rg0 = (ulong)rgLow.AsInt64().GetElement(0); 
+        ulong rg1 = (ulong)rgLow.AsInt64().GetElement(1); // 后 4 个像素的 RG
+
+        // 提取 B 分量的 64 位数据
+        ulong bData = (ulong)b.AsInt64().GetElement(0); // B0 B1 B2 B3 B4 B5 B6 B7
+
+        // 4. 精准且无循环的分批拼装写入 (24 字节)
+        // 像素 0 & 1
+        *(ushort*)(pDest + 0)  = (ushort)rg0;          // R0 G0
+        *(pDest + 2)           = (byte)bData;          // B0
+        *(ushort*)(pDest + 3)  = (ushort)(rg0 >> 16);   // R1 G1
+        *(pDest + 5)           = (byte)(bData >> 8);   // B1
+
+        // 像素 2 & 3
+        *(ushort*)(pDest + 6)  = (ushort)(rg0 >> 32);   // R2 G2
+        *(pDest + 8)           = (byte)(bData >> 16);  // B2
+        *(ushort*)(pDest + 9)  = (ushort)(rg0 >> 48);   // R3 G3
+        *(pDest + 11)          = (byte)(bData >> 24);  // B3
+
+        // 像素 4 & 5
+        *(ushort*)(pDest + 12) = (ushort)rg1;          // R4 G4
+        *(pDest + 14)          = (byte)(bData >> 32);  // B4
+        *(ushort*)(pDest + 15) = (ushort)(rg1 >> 16);  // R5 G5
+        *(pDest + 17)          = (byte)(bData >> 40);  // B5
+
+        // 像素 6 & 7
+        *(ushort*)(pDest + 18) = (ushort)(rg1 >> 32);  // R6 G6
+        *(pDest + 20)          = (byte)(bData >> 48);  // B6
+        *(ushort*)(pDest + 21) = (ushort)(rg1 >> 48);  // R7 G7
+        *(pDest + 23)          = (byte)(bData >> 56);  // B7
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static void ConvertCore(Vector128<int> y, Vector128<int> cb, Vector128<int> cr, out Vector128<int> r, out Vector128<int> g, out Vector128<int> b)
     {
-        Vector128<int> r_off = Sse2.ShiftRightArithmetic(Multiply32(cr, Fix_1_402), ColorShift);
-        Vector128<int> g_off = Sse2.ShiftRightArithmetic(Sse2.Add(Multiply32(cb, Fix_0_34414), Multiply32(cr, Fix_0_71414)), ColorShift);
-        Vector128<int> b_off = Sse2.ShiftRightArithmetic(Multiply32(cb, Fix_1_772), ColorShift);
+        Vector128<int> r_off = cr * Fix_1_402 >> ColorShift;
+        Vector128<int> g_off = ((cb * Fix_0_34414) + (cr * Fix_0_71414)) >> ColorShift;
+        Vector128<int> b_off = cb * Fix_1_772 >> ColorShift;
 
         r = Sse2.Add(y, r_off);
         g = Sse2.Subtract(y, g_off);
