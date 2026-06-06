@@ -224,8 +224,10 @@ public class GifEncoder
     private void QuantizeRgbaWithTransparency(int width, int height, byte[] rgba, out byte[] palette, out byte[] indices, out int depth)
     {
         int pixelCount = width * height;
-        byte[] opaque = new byte[pixelCount * 3];
-        byte[] mask = new byte[pixelCount];
+        using var opaqueOwner = NativeBufferOwner<byte>.Allocate(pixelCount * 3);
+        var opaque = opaqueOwner.Span;
+        using var maskOwner = NativeBufferOwner<byte>.Allocate(pixelCount);
+        var mask = maskOwner.Span;
         int opPtr = 0;
         for (int i = 0; i < pixelCount; i++)
         {

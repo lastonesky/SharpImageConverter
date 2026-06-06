@@ -1,6 +1,7 @@
 using System;
 using System.Buffers;
 using System.Numerics;
+using System.Runtime.InteropServices;
 using System.Threading.Tasks;
 
 namespace SharpImageConverter.Formats.Gif;
@@ -49,12 +50,29 @@ public sealed class Quantizer : IDisposable
     public static (byte[] Palette, byte[] Indices) Quantize(byte[] pixels, int width, int height, bool enableDithering = true)
     {
         using var q = new Quantizer();
+        return q.QuantizeInternal(pixels.AsSpan(), width, height, enableDithering);
+    }
+
+    /// <summary>
+    /// 对图像进行高质量量化（ReadOnlySpan 重载，适合 NativeBufferOwner 等非托管源）。
+    /// </summary>
+    public static (byte[] Palette, byte[] Indices) Quantize(ReadOnlySpan<byte> pixels, int width, int height, bool enableDithering = true)
+    {
+        using var q = new Quantizer();
         return q.QuantizeInternal(pixels, width, height, enableDithering);
     }
 
-    private (byte[] Palette, byte[] Indices) QuantizeInternal(byte[] pixels, int width, int height, bool enableDithering)
+    private unsafe (byte[] Palette, byte[] Indices) QuantizeInternal(ReadOnlySpan<byte> pixels, int width, int height, bool enableDithering)
     {
-        BuildHistogramParallel(pixels);
+        fixed (byte* pPixels = &MemoryMarshal.GetReference(pixels))
+        {
+            return QuantizeInternalPtr(pPixels, pixels.Length, width, height, enableDithering);
+        }
+    }
+
+    private unsafe (byte[] Palette, byte[] Indices) QuantizeInternalPtr(byte* pixels, int pixelLength, int width, int height, bool enableDithering)
+    {
+        BuildHistogramParallel(pixels, pixelLength);
         CalculateMoments();
 
         Box[] cube = new Box[MaxColors];
@@ -105,18 +123,19 @@ public sealed class Quantizer : IDisposable
         byte[] mappingLut = BuildMappingLut(palette);
 
         byte[] indices;
+        var pxSpan = new ReadOnlySpan<byte>(pixels, pixelLength);
         if (enableDithering)
         {
-            indices = ApplyDitheringWithLut(pixels, width, height, palette, mappingLut);
+            indices = ApplyDitheringWithLut(pxSpan, width, height, palette, mappingLut);
         }
         else
         {
-            indices = ApplyMappingOnly(pixels, width, height, mappingLut);
+            indices = ApplyMappingOnly(pixels, pixelLength, width, height, mappingLut);
         }
         return (palette, indices);
     }
 
-    private void BuildHistogramParallel(byte[] pixels)
+    private unsafe void BuildHistogramParallel(byte* pixels, int pixelLength)
     {
         Array.Clear(_vwt, 0, _vwt.Length);
         Array.Clear(_vmr, 0, _vmr.Length);
@@ -124,8 +143,8 @@ public sealed class Quantizer : IDisposable
         Array.Clear(_vmb, 0, _vmb.Length);
         Array.Clear(_m2, 0, _m2.Length);
 
-        int threadCount = Math.Min(Environment.ProcessorCount, Math.Max(1, pixels.Length / 3));
-        int len = pixels.Length / 3;
+        int threadCount = Math.Min(Environment.ProcessorCount, Math.Max(1, pixelLength / 3));
+        int len = pixelLength / 3;
         int blockSize = len / threadCount;
 
         Parallel.For(0, threadCount, t =>
@@ -289,7 +308,7 @@ public sealed class Quantizer : IDisposable
         return lut;
     }
 
-    private byte[] ApplyDitheringWithLut(byte[] pixels, int width, int height, byte[] palette, byte[] lut)
+    private byte[] ApplyDitheringWithLut(ReadOnlySpan<byte> pixels, int width, int height, byte[] palette, byte[] lut)
     {
         byte[] indices = new byte[width * height];
         int errorBufferLength = (width + 2) * 3;
@@ -344,7 +363,7 @@ public sealed class Quantizer : IDisposable
         return indices;
     }
 
-    private byte[] ApplyMappingOnly(byte[] pixels, int width, int height, byte[] lut)
+    private unsafe byte[] ApplyMappingOnly(byte* pixels, int pixelLength, int width, int height, byte[] lut)
     {
         byte[] indices = new byte[width * height];
         Parallel.For(0, height, y =>
