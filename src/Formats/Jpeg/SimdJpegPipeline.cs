@@ -219,10 +219,10 @@ internal static class SimdJpegPipeline
         z3o = Sse2.Add(z3o * -Fix_1_961570560, z5o);
         z4o = Sse2.Add(z4o * -Fix_0_390180644, z5o);
 
-        tmp0o = Sse2.Add(tmp0o, Sse2.Add(z1o, z3o));
-        tmp1o = Sse2.Add(tmp1o, Sse2.Add(z2o, z4o));
-        tmp2o = Sse2.Add(tmp2o, Sse2.Add(z2o, z3o));
-        tmp3o = Sse2.Add(tmp3o, Sse2.Add(z1o, z4o));
+        tmp0o += z1o + z3o;
+        tmp1o += z2o + z4o;
+        tmp2o += z2o + z3o;
+        tmp3o += z1o + z4o;
 
         v0 = Descale32Pass2(Sse2.Add(tmp10, tmp3o));
         v7 = Descale32Pass2(Sse2.Subtract(tmp10, tmp3o));
@@ -238,14 +238,14 @@ internal static class SimdJpegPipeline
     private static Vector128<int> Descale32Pass1(Vector128<int> v)
     {
         Vector128<int> half = Vector128.Create(1 << (Pass1Shift - 1));
-        return Sse2.ShiftRightArithmetic(Sse2.Add(v, half), (byte)Pass1Shift);
+        return (v + half) >> Pass1Shift;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static Vector128<int> Descale32Pass2(Vector128<int> v)
     {
         Vector128<int> half = Vector128.Create(1 << (Pass2Shift - 1));
-        return Sse2.ShiftRightArithmetic(Sse2.Add(v, half), (byte)Pass2Shift);
+        return (v + half) >> Pass2Shift;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -297,7 +297,7 @@ internal static class SimdJpegPipeline
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public static void TransformAndConvertYCbCr8x8(
+    public unsafe static void TransformAndConvertYCbCr8x8(
         ReadOnlySpan<short> yCoef, ushort[] yQuant,
         ReadOnlySpan<short> cbCoef, ushort[] cbQuant,
         ReadOnlySpan<short> crCoef, ushort[] crQuant,
@@ -307,22 +307,25 @@ internal static class SimdJpegPipeline
         Block8x8Vectors cb = Idct8x8ToVectors(cbCoef, cbQuant);
         Block8x8Vectors cr = Idct8x8ToVectors(crCoef, crQuant);
 
-        ConvertRowYCbCrToRgb(y.V0, cb.V0, cr.V0, dest.Slice(0 * stride));
-        ConvertRowYCbCrToRgb(y.V1, cb.V1, cr.V1, dest.Slice(1 * stride));
-        ConvertRowYCbCrToRgb(y.V2, cb.V2, cr.V2, dest.Slice(2 * stride));
-        ConvertRowYCbCrToRgb(y.V3, cb.V3, cr.V3, dest.Slice(3 * stride));
-        ConvertRowYCbCrToRgb(y.V4, cb.V4, cr.V4, dest.Slice(4 * stride));
-        ConvertRowYCbCrToRgb(y.V5, cb.V5, cr.V5, dest.Slice(5 * stride));
-        ConvertRowYCbCrToRgb(y.V6, cb.V6, cr.V6, dest.Slice(6 * stride));
-        ConvertRowYCbCrToRgb(y.V7, cb.V7, cr.V7, dest.Slice(7 * stride));
+        // 在最外层只获取一次核心指针，消除后续所有 Slice 损耗
+        byte* pDestBase = (byte*)Unsafe.AsPointer(ref MemoryMarshal.GetReference(dest));
+        //ConvertRowYCbCrToRgb(yL, cbL, crL, pRowDest);
+        ConvertRowYCbCrToRgb(y.V0, cb.V0, cr.V0, pDestBase + 0 * stride);
+        ConvertRowYCbCrToRgb(y.V1, cb.V1, cr.V1, pDestBase + 1 * stride);
+        ConvertRowYCbCrToRgb(y.V2, cb.V2, cr.V2, pDestBase + 2 * stride);
+        ConvertRowYCbCrToRgb(y.V3, cb.V3, cr.V3, pDestBase + 3 * stride);
+        ConvertRowYCbCrToRgb(y.V4, cb.V4, cr.V4, pDestBase + 4 * stride);
+        ConvertRowYCbCrToRgb(y.V5, cb.V5, cr.V5, pDestBase + 5 * stride);
+        ConvertRowYCbCrToRgb(y.V6, cb.V6, cr.V6, pDestBase + 6 * stride);
+        ConvertRowYCbCrToRgb(y.V7, cb.V7, cr.V7, pDestBase + 7 * stride);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public static void TransformAndConvertYCbCr420(
-        ReadOnlySpan<short> y0Coef, ReadOnlySpan<short> y1Coef, ReadOnlySpan<short> y2Coef, ReadOnlySpan<short> y3Coef, ushort[] yQuant,
-        ReadOnlySpan<short> cbCoef, ushort[] cbQuant,
-        ReadOnlySpan<short> crCoef, ushort[] crQuant,
-        Span<byte> dest, int stride)
+    public static unsafe void TransformAndConvertYCbCr420(
+    ReadOnlySpan<short> y0Coef, ReadOnlySpan<short> y1Coef, ReadOnlySpan<short> y2Coef, ReadOnlySpan<short> y3Coef, ushort[] yQuant,
+    ReadOnlySpan<short> cbCoef, ushort[] cbQuant,
+    ReadOnlySpan<short> crCoef, ushort[] crQuant,
+    Span<byte> dest, int stride)
     {
         Block8x8Vectors vy0 = Idct8x8ToVectors(y0Coef, yQuant);
         Block8x8Vectors vy1 = Idct8x8ToVectors(y1Coef, yQuant);
@@ -331,37 +334,44 @@ internal static class SimdJpegPipeline
         Block8x8Vectors vcb = Idct8x8ToVectors(cbCoef, cbQuant);
         Block8x8Vectors vcr = Idct8x8ToVectors(crCoef, crQuant);
 
+        // 在最外层只获取一次核心指针，消除后续所有 Slice 损耗
+        byte* pDestBase = (byte*)Unsafe.AsPointer(ref MemoryMarshal.GetReference(dest));
+
         // Top 8 rows of MCU (VY0 and VY1)
-        UpsampleAndConvert(vy0.V0, vy1.V0, vcb.V0, vcr.V0, dest, 0, stride);
-        UpsampleAndConvert(vy0.V1, vy1.V1, vcb.V0, vcr.V0, dest, 1, stride);
-        UpsampleAndConvert(vy0.V2, vy1.V2, vcb.V1, vcr.V1, dest, 2, stride);
-        UpsampleAndConvert(vy0.V3, vy1.V3, vcb.V1, vcr.V1, dest, 3, stride);
-        UpsampleAndConvert(vy0.V4, vy1.V4, vcb.V2, vcr.V2, dest, 4, stride);
-        UpsampleAndConvert(vy0.V5, vy1.V5, vcb.V2, vcr.V2, dest, 5, stride);
-        UpsampleAndConvert(vy0.V6, vy1.V6, vcb.V3, vcr.V3, dest, 6, stride);
-        UpsampleAndConvert(vy0.V7, vy1.V7, vcb.V3, vcr.V3, dest, 7, stride);
+        UpsampleAndConvert(vy0.V0, vy1.V0, vcb.V0, vcr.V0, pDestBase + 0 * stride);
+        UpsampleAndConvert(vy0.V1, vy1.V1, vcb.V0, vcr.V0, pDestBase + 1 * stride);
+        UpsampleAndConvert(vy0.V2, vy1.V2, vcb.V1, vcr.V1, pDestBase + 2 * stride);
+        UpsampleAndConvert(vy0.V3, vy1.V3, vcb.V1, vcr.V1, pDestBase + 3 * stride);
+        UpsampleAndConvert(vy0.V4, vy1.V4, vcb.V2, vcr.V2, pDestBase + 4 * stride);
+        UpsampleAndConvert(vy0.V5, vy1.V5, vcb.V2, vcr.V2, pDestBase + 5 * stride);
+        UpsampleAndConvert(vy0.V6, vy1.V6, vcb.V3, vcr.V3, pDestBase + 6 * stride);
+        UpsampleAndConvert(vy0.V7, vy1.V7, vcb.V3, vcr.V3, pDestBase + 7 * stride);
 
         // Bottom 8 rows of MCU (VY2 and VY3)
-        UpsampleAndConvert(vy2.V0, vy3.V0, vcb.V4, vcr.V4, dest, 8, stride);
-        UpsampleAndConvert(vy2.V1, vy3.V1, vcb.V4, vcr.V4, dest, 9, stride);
-        UpsampleAndConvert(vy2.V2, vy3.V2, vcb.V5, vcr.V5, dest, 10, stride);
-        UpsampleAndConvert(vy2.V3, vy3.V3, vcb.V5, vcr.V5, dest, 11, stride);
-        UpsampleAndConvert(vy2.V4, vy3.V4, vcb.V6, vcr.V6, dest, 12, stride);
-        UpsampleAndConvert(vy2.V5, vy3.V5, vcb.V6, vcr.V6, dest, 13, stride);
-        UpsampleAndConvert(vy2.V6, vy3.V6, vcb.V7, vcr.V7, dest, 14, stride);
-        UpsampleAndConvert(vy2.V7, vy3.V7, vcb.V7, vcr.V7, dest, 15, stride);
+        UpsampleAndConvert(vy2.V0, vy3.V0, vcb.V4, vcr.V4, pDestBase + 8 * stride);
+        UpsampleAndConvert(vy2.V1, vy3.V1, vcb.V4, vcr.V4, pDestBase + 9 * stride);
+        UpsampleAndConvert(vy2.V2, vy3.V2, vcb.V5, vcr.V5, pDestBase + 10 * stride);
+        UpsampleAndConvert(vy2.V3, vy3.V3, vcb.V5, vcr.V5, pDestBase + 11 * stride);
+        UpsampleAndConvert(vy2.V4, vy3.V4, vcb.V6, vcr.V6, pDestBase + 12 * stride);
+        UpsampleAndConvert(vy2.V5, vy3.V5, vcb.V6, vcr.V6, pDestBase + 13 * stride);
+        UpsampleAndConvert(vy2.V6, vy3.V6, vcb.V7, vcr.V7, pDestBase + 14 * stride);
+        UpsampleAndConvert(vy2.V7, vy3.V7, vcb.V7, vcr.V7, pDestBase + 15 * stride);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static void UpsampleAndConvert(Vector128<short> yL, Vector128<short> yR, Vector128<short> cbRow, Vector128<short> crRow, Span<byte> dest, int row, int stride)
+    private static unsafe void UpsampleAndConvert(Vector128<short> yL, Vector128<short> yR, Vector128<short> cbRow, Vector128<short> crRow, byte* pRowDest)
     {
+        // 水平上采样：用 Unpack 完美将 8 个像素拉伸为两组包含 8 个像素的 128位 向量
         Vector128<short> cbL = Sse2.UnpackLow(cbRow, cbRow);
         Vector128<short> cbR = Sse2.UnpackHigh(cbRow, cbRow);
         Vector128<short> crL = Sse2.UnpackLow(crRow, crRow);
         Vector128<short> crR = Sse2.UnpackHigh(crRow, crRow);
 
-        ConvertRowYCbCrToRgb(yL, cbL, crL, dest.Slice(row * stride));
-        ConvertRowYCbCrToRgb(yR, cbR, crR, dest.Slice(row * stride + 8 * 3));
+        // 转换左边 8 个像素，直接传入当前行的起始指针
+        ConvertRowYCbCrToRgb(yL, cbL, crL, pRowDest);
+        
+        // 转换右边 8 个像素，指针向后偏移 8 个像素的 RGB 长度（8 * 3 = 24 字节）
+        ConvertRowYCbCrToRgb(yR, cbR, crR, pRowDest + 24);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -392,9 +402,8 @@ internal static class SimdJpegPipeline
             return new Block8x8Vectors { V0 = v0, V1 = v1, V2 = v2, V3 = v3, V4 = v4, V5 = v5, V6 = v6, V7 = v7 };
         }
     }
-
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private unsafe static void ConvertRowYCbCrToRgb(Vector128<short> y, Vector128<short> cb, Vector128<short> cr, Span<byte> dest)
+    private unsafe static void ConvertRowYCbCrToRgb(Vector128<short> y, Vector128<short> cb, Vector128<short> cr, byte* pDest)
     {
         Vector128<short> bias128 = Vector128.Create((short)128);
         y = Sse2.Add(y, bias128);
@@ -418,9 +427,6 @@ internal static class SimdJpegPipeline
         // 我们可以利用 UnpackLow 将 R、G、B 分量交错配对
         Vector128<byte> rgLow = Sse2.UnpackLow(r, g); // R0 G0 R1 G1 R2 G2 R3 G3 R4 G4 ...
         
-        // 获取目标缓冲区的指针
-        byte* pDest = (byte*)Unsafe.AsPointer(ref MemoryMarshal.GetReference(dest));
-
         // 3. 提取交错后的 64 位数据 (前 4 个像素的 RG)
         // 修正语法：使用 .AsInt64() 转换为长整型向量
         ulong rg0 = (ulong)rgLow.AsInt64().GetElement(0); 
@@ -456,14 +462,21 @@ internal static class SimdJpegPipeline
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private unsafe static void ConvertRowYCbCrToRgb(Vector128<short> y, Vector128<short> cb, Vector128<short> cr, Span<byte> dest)
+    {
+        byte* pDest = (byte*)Unsafe.AsPointer(ref MemoryMarshal.GetReference(dest));
+        ConvertRowYCbCrToRgb(y, cb, cr, pDest);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static void ConvertCore(Vector128<int> y, Vector128<int> cb, Vector128<int> cr, out Vector128<int> r, out Vector128<int> g, out Vector128<int> b)
     {
         Vector128<int> r_off = cr * Fix_1_402 >> ColorShift;
         Vector128<int> g_off = ((cb * Fix_0_34414) + (cr * Fix_0_71414)) >> ColorShift;
         Vector128<int> b_off = cb * Fix_1_772 >> ColorShift;
 
-        r = Sse2.Add(y, r_off);
-        g = Sse2.Subtract(y, g_off);
-        b = Sse2.Add(y, b_off);
+        r = y + r_off;
+        g = y - g_off;
+        b = y + b_off;
     }
 }
