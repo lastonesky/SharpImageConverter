@@ -98,7 +98,7 @@ namespace SharpImageConverter.Formats.Gif
             int pixelCount = width * height;
             int components = ctx.Mode == DecodeMode.Rgba32 ? 4 : 3;
             byte[] canvas = new byte[pixelCount * components];
-            byte[]? backBuffer = null; // For disposal == 3
+            NativeBufferOwner<byte>? backBuffer = null; // For disposal == 3
 
             if (hasGct && bgIndex < gctColors)
             {
@@ -188,8 +188,8 @@ namespace SharpImageConverter.Formats.Gif
 
                     if (disposal == 3)
                     {
-                        backBuffer ??= new byte[canvas.Length];
-                        Buffer.BlockCopy(canvas, 0, backBuffer, 0, canvas.Length);
+                        backBuffer ??= NativeBufferOwner<byte>.Allocate(canvas.Length);
+                        canvas.AsSpan().CopyTo(backBuffer.Span);
                     }
 
                     RenderFrame(canvas, indices, width, height, ix, iy, iw, ih, interlace, transIndex, palette, palCount, ctx.Mode == DecodeMode.Rgba32);
@@ -218,7 +218,7 @@ namespace SharpImageConverter.Formats.Gif
                     }
                     else if (disposal == 3 && backBuffer != null) // Restore to previous
                     {
-                        Buffer.BlockCopy(backBuffer, 0, canvas, 0, canvas.Length);
+                        backBuffer.Span.CopyTo(canvas.AsSpan());
                     }
 
                     disposal = 0; transIndex = -1; delayCs = 0;
