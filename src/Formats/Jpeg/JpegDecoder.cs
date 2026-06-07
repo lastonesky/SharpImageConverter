@@ -3,7 +3,7 @@ using SharpImageConverter.Metadata;
 using System.Buffers;
 using System.Runtime.CompilerServices;
 using System.Runtime.Intrinsics;
-using System.Runtime.Intrinsics.X86;
+// Cross-platform: all SIMD via Vector128<T> (no X86-specific intrinsics)
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -419,7 +419,7 @@ public static class JpegDecoder
                     }
                 }
 
-                if (!handled && colorSpace == JpegColorSpace.YCbCr && !useFloatingPointIdct && Sse2.IsSupported)
+                if (!handled && colorSpace == JpegColorSpace.YCbCr && !useFloatingPointIdct && Vector128.IsHardwareAccelerated)
                 {
                     output = new byte[checked(width * height * channelCount)];
                     if (TryDecodeInterleavedYCbCrSimd(components, output, width, height, fullWidth, fullHeight, componentOrder, quantTables, useFloatingPointIdct, frame))
@@ -1461,7 +1461,7 @@ public static class JpegDecoder
                     }
                 }
 
-                if (colorSpace == JpegColorSpace.YCbCr && !useFloatingPointIdct && Sse2.IsSupported)
+                if (colorSpace == JpegColorSpace.YCbCr && !useFloatingPointIdct && Vector128.IsHardwareAccelerated)
                 {
                     output = new byte[checked(width * height * channelCount)];
                     if (TryDecodeInterleavedYCbCrSimd(components, output, width, height, fullWidth, fullHeight, componentOrder, quantTables, useFloatingPointIdct, frame))
@@ -2233,7 +2233,7 @@ public static class JpegDecoder
 
     private static bool TryDecodeInterleavedYCbCrSimd(ComponentState[] components, byte[] output, int width, int height, int fullWidth, int fullHeight, int[] componentOrder, QuantizationTable[] quantTables, bool useFloatingPointIdct, FrameHeader frame)
     {
-        if (!Sse2.IsSupported || useFloatingPointIdct) return false;
+        if (!Vector128.IsHardwareAccelerated || useFloatingPointIdct) return false;
         if (componentOrder.Length != 3) return false;
         int yIdx = componentOrder[0];
         int cbIdx = componentOrder[1];

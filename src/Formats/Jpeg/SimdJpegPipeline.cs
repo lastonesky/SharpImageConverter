@@ -1,7 +1,7 @@
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics;
-using System.Runtime.Intrinsics.X86;
+// Cross-platform: no platform-specific intrinsics
 
 namespace SharpImageConverter.Formats.Jpeg;
 
@@ -127,46 +127,122 @@ internal static class SimdJpegPipeline
     }
 
 
+    // Shuffle masks for emulating UnpackLow/High on shorts (2-byte elements)
+    // Each mask selects bytes from one source; OR combines two sources.
+    // Byte value >= 128 → zero in output (Vector128.Shuffle semantics)
+    private static readonly Vector128<byte> ShortUnpackLowMaskA = Vector128.Create(
+        (byte)0, 1, 0x80, 0x80, 2, 3, 0x80, 0x80, 4, 5, 0x80, 0x80, 6, 7, 0x80, 0x80);
+    private static readonly Vector128<byte> ShortUnpackLowMaskB = Vector128.Create(
+        (byte)0x80, 0x80, 0, 1, 0x80, 0x80, 2, 3, 0x80, 0x80, 4, 5, 0x80, 0x80, 6, 7);
+    private static readonly Vector128<byte> ShortUnpackHighMaskA = Vector128.Create(
+        (byte)8, 9, 0x80, 0x80, 10, 11, 0x80, 0x80, 12, 13, 0x80, 0x80, 14, 15, 0x80, 0x80);
+    private static readonly Vector128<byte> ShortUnpackHighMaskB = Vector128.Create(
+        (byte)0x80, 0x80, 8, 9, 0x80, 0x80, 10, 11, 0x80, 0x80, 12, 13, 0x80, 0x80, 14, 15);
+
+    // Masks for int32 UnpackLow/High (4-byte elements)
+    private static readonly Vector128<byte> IntUnpackLowMaskA = Vector128.Create(
+        (byte)0, 1, 2, 3, 0x80, 0x80, 0x80, 0x80, 4, 5, 6, 7, 0x80, 0x80, 0x80, 0x80);
+    private static readonly Vector128<byte> IntUnpackLowMaskB = Vector128.Create(
+        (byte)0x80, 0x80, 0x80, 0x80, 0, 1, 2, 3, 0x80, 0x80, 0x80, 0x80, 4, 5, 6, 7);
+    private static readonly Vector128<byte> IntUnpackHighMaskA = Vector128.Create(
+        (byte)8, 9, 10, 11, 0x80, 0x80, 0x80, 0x80, 12, 13, 14, 15, 0x80, 0x80, 0x80, 0x80);
+    private static readonly Vector128<byte> IntUnpackHighMaskB = Vector128.Create(
+        (byte)0x80, 0x80, 0x80, 0x80, 8, 9, 10, 11, 0x80, 0x80, 0x80, 0x80, 12, 13, 14, 15);
+
+    // Masks for int64 UnpackLow/High (8-byte elements) — only 2 elements per vector
+    private static readonly Vector128<byte> LongUnpackLowMaskA = Vector128.Create(
+        (byte)0, 1, 2, 3, 4, 5, 6, 7, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80);
+    private static readonly Vector128<byte> LongUnpackLowMaskB = Vector128.Create(
+        (byte)0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0, 1, 2, 3, 4, 5, 6, 7);
+    private static readonly Vector128<byte> LongUnpackHighMaskA = Vector128.Create(
+        (byte)8, 9, 10, 11, 12, 13, 14, 15, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80);
+    private static readonly Vector128<byte> LongUnpackHighMaskB = Vector128.Create(
+        (byte)0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 8, 9, 10, 11, 12, 13, 14, 15);
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static void Transpose8x8Sse2(ref Vector128<short> v0, ref Vector128<short> v1, ref Vector128<short> v2, ref Vector128<short> v3,
-                                         ref Vector128<short> v4, ref Vector128<short> v5, ref Vector128<short> v6, ref Vector128<short> v7)
+    private static Vector128<short> InterleaveLowShort(Vector128<short> a, Vector128<short> b)
     {
-        Vector128<short> t0 = Sse2.UnpackLow(v0, v1);
-        Vector128<short> t1 = Sse2.UnpackHigh(v0, v1);
-        Vector128<short> t2 = Sse2.UnpackLow(v2, v3);
-        Vector128<short> t3 = Sse2.UnpackHigh(v2, v3);
-        Vector128<short> t4 = Sse2.UnpackLow(v4, v5);
-        Vector128<short> t5 = Sse2.UnpackHigh(v4, v5);
-        Vector128<short> t6 = Sse2.UnpackLow(v6, v7);
-        Vector128<short> t7 = Sse2.UnpackHigh(v6, v7);
-
-        Vector128<int> q0 = Sse2.UnpackLow(t0.AsInt32(), t2.AsInt32());
-        Vector128<int> q1 = Sse2.UnpackHigh(t0.AsInt32(), t2.AsInt32());
-        Vector128<int> q2 = Sse2.UnpackLow(t1.AsInt32(), t3.AsInt32());
-        Vector128<int> q3 = Sse2.UnpackHigh(t1.AsInt32(), t3.AsInt32());
-        Vector128<int> q4 = Sse2.UnpackLow(t4.AsInt32(), t6.AsInt32());
-        Vector128<int> q5 = Sse2.UnpackHigh(t4.AsInt32(), t6.AsInt32());
-        Vector128<int> q6 = Sse2.UnpackLow(t5.AsInt32(), t7.AsInt32());
-        Vector128<int> q7 = Sse2.UnpackHigh(t5.AsInt32(), t7.AsInt32());
-
-        v0 = Sse2.UnpackLow(q0.AsInt64(), q4.AsInt64()).AsInt16();
-        v1 = Sse2.UnpackHigh(q0.AsInt64(), q4.AsInt64()).AsInt16();
-        v2 = Sse2.UnpackLow(q1.AsInt64(), q5.AsInt64()).AsInt16();
-        v3 = Sse2.UnpackHigh(q1.AsInt64(), q5.AsInt64()).AsInt16();
-        v4 = Sse2.UnpackLow(q2.AsInt64(), q6.AsInt64()).AsInt16();
-        v5 = Sse2.UnpackHigh(q2.AsInt64(), q6.AsInt64()).AsInt16();
-        v6 = Sse2.UnpackLow(q3.AsInt64(), q7.AsInt64()).AsInt16();
-        v7 = Sse2.UnpackHigh(q3.AsInt64(), q7.AsInt64()).AsInt16();
+        var aS = Vector128.Shuffle(a.AsByte(), ShortUnpackLowMaskA);
+        var bS = Vector128.Shuffle(b.AsByte(), ShortUnpackLowMaskB);
+        return (aS | bS).AsInt16();
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static void StoreRowSse2(Vector128<short> v, Span<byte> dest, int y, int stride)
+    private static Vector128<short> InterleaveHighShort(Vector128<short> a, Vector128<short> b)
     {
-        Vector128<short> bias = Vector128.Create((short)128);
-        v = (v + bias);
-        Vector128<byte> b = Sse2.PackUnsignedSaturate(v, v);
-        Unsafe.WriteUnaligned(ref dest[y * stride], b.GetLower());
+        var aS = Vector128.Shuffle(a.AsByte(), ShortUnpackHighMaskA);
+        var bS = Vector128.Shuffle(b.AsByte(), ShortUnpackHighMaskB);
+        return (aS | bS).AsInt16();
     }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static Vector128<int> InterleaveLowInt(Vector128<int> a, Vector128<int> b)
+    {
+        var aS = Vector128.Shuffle(a.AsByte(), IntUnpackLowMaskA);
+        var bS = Vector128.Shuffle(b.AsByte(), IntUnpackLowMaskB);
+        return (aS | bS).AsInt32();
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static Vector128<int> InterleaveHighInt(Vector128<int> a, Vector128<int> b)
+    {
+        var aS = Vector128.Shuffle(a.AsByte(), IntUnpackHighMaskA);
+        var bS = Vector128.Shuffle(b.AsByte(), IntUnpackHighMaskB);
+        return (aS | bS).AsInt32();
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static Vector128<long> InterleaveLowLong(Vector128<long> a, Vector128<long> b)
+    {
+        var aS = Vector128.Shuffle(a.AsByte(), LongUnpackLowMaskA);
+        var bS = Vector128.Shuffle(b.AsByte(), LongUnpackLowMaskB);
+        return (aS | bS).AsInt64();
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static Vector128<long> InterleaveHighLong(Vector128<long> a, Vector128<long> b)
+    {
+        var aS = Vector128.Shuffle(a.AsByte(), LongUnpackHighMaskA);
+        var bS = Vector128.Shuffle(b.AsByte(), LongUnpackHighMaskB);
+        return (aS | bS).AsInt64();
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void Transpose8x8(ref Vector128<short> v0, ref Vector128<short> v1, ref Vector128<short> v2, ref Vector128<short> v3,
+                                     ref Vector128<short> v4, ref Vector128<short> v5, ref Vector128<short> v6, ref Vector128<short> v7)
+    {
+        // Level 1: interleave short pairs (same algorithm as SSE2 but using Shuffle + OR)
+        Vector128<short> t0 = InterleaveLowShort(v0, v1);
+        Vector128<short> t1 = InterleaveHighShort(v0, v1);
+        Vector128<short> t2 = InterleaveLowShort(v2, v3);
+        Vector128<short> t3 = InterleaveHighShort(v2, v3);
+        Vector128<short> t4 = InterleaveLowShort(v4, v5);
+        Vector128<short> t5 = InterleaveHighShort(v4, v5);
+        Vector128<short> t6 = InterleaveLowShort(v6, v7);
+        Vector128<short> t7 = InterleaveHighShort(v6, v7);
+
+        // Level 2: interleave int pairs
+        Vector128<int> q0 = InterleaveLowInt(t0.AsInt32(), t2.AsInt32());
+        Vector128<int> q1 = InterleaveHighInt(t0.AsInt32(), t2.AsInt32());
+        Vector128<int> q2 = InterleaveLowInt(t1.AsInt32(), t3.AsInt32());
+        Vector128<int> q3 = InterleaveHighInt(t1.AsInt32(), t3.AsInt32());
+        Vector128<int> q4 = InterleaveLowInt(t4.AsInt32(), t6.AsInt32());
+        Vector128<int> q5 = InterleaveHighInt(t4.AsInt32(), t6.AsInt32());
+        Vector128<int> q6 = InterleaveLowInt(t5.AsInt32(), t7.AsInt32());
+        Vector128<int> q7 = InterleaveHighInt(t5.AsInt32(), t7.AsInt32());
+
+        // Level 3: interleave long pairs, reinterpret as short
+        v0 = InterleaveLowLong(q0.AsInt64(), q4.AsInt64()).AsInt16();
+        v1 = InterleaveHighLong(q0.AsInt64(), q4.AsInt64()).AsInt16();
+        v2 = InterleaveLowLong(q1.AsInt64(), q5.AsInt64()).AsInt16();
+        v3 = InterleaveHighLong(q1.AsInt64(), q5.AsInt64()).AsInt16();
+        v4 = InterleaveLowLong(q2.AsInt64(), q6.AsInt64()).AsInt16();
+        v5 = InterleaveHighLong(q2.AsInt64(), q6.AsInt64()).AsInt16();
+        v6 = InterleaveLowLong(q3.AsInt64(), q7.AsInt64()).AsInt16();
+        v7 = InterleaveHighLong(q3.AsInt64(), q7.AsInt64()).AsInt16();
+    }
+
+    // StoreRowSse2 was unused — removed.
 
     // --- Full-link vectorized methods ---
 
@@ -237,19 +313,23 @@ internal static class SimdJpegPipeline
         UpsampleAndConvert(vy2.V7, vy3.V7, vcb.V7, vcr.V7, pDestBase + 15 * stride);
     }
 
+    // Shuffle mask for duplicating low 4 shorts (each 2-byte element repeated)
+    private static readonly Vector128<byte> DupLowShortsMask = Vector128.Create(
+        (byte)0, 1, 0, 1, 2, 3, 2, 3, 4, 5, 4, 5, 6, 7, 6, 7);
+    // Shuffle mask for duplicating high 4 shorts (each 2-byte element repeated)
+    private static readonly Vector128<byte> DupHighShortsMask = Vector128.Create(
+        (byte)8, 9, 8, 9, 10, 11, 10, 11, 12, 13, 12, 13, 14, 15, 14, 15);
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static unsafe void UpsampleAndConvert(Vector128<short> yL, Vector128<short> yR, Vector128<short> cbRow, Vector128<short> crRow, byte* pRowDest)
     {
-        // 水平上采样：用 Unpack 完美将 8 个像素拉伸为两组包含 8 个像素的 128位 向量
-        Vector128<short> cbL = Sse2.UnpackLow(cbRow, cbRow);
-        Vector128<short> cbR = Sse2.UnpackHigh(cbRow, cbRow);
-        Vector128<short> crL = Sse2.UnpackLow(crRow, crRow);
-        Vector128<short> crR = Sse2.UnpackHigh(crRow, crRow);
+        // 水平上采样：用 Shuffle 将 8 个像素的色度伸为两组 8 个像素（重复每个元素）
+        Vector128<short> cbL = Vector128.Shuffle(cbRow.AsByte(), DupLowShortsMask).AsInt16();
+        Vector128<short> cbR = Vector128.Shuffle(cbRow.AsByte(), DupHighShortsMask).AsInt16();
+        Vector128<short> crL = Vector128.Shuffle(crRow.AsByte(), DupLowShortsMask).AsInt16();
+        Vector128<short> crR = Vector128.Shuffle(crRow.AsByte(), DupHighShortsMask).AsInt16();
 
-        // 转换左边 8 个像素，直接传入当前行的起始指针
         ConvertRowYCbCrToRgb(yL, cbL, crL, pRowDest);
-        
-        // 转换右边 8 个像素，指针向后偏移 8 个像素的 RGB 长度（8 * 3 = 24 字节）
         ConvertRowYCbCrToRgb(yR, cbR, crR, pRowDest + 24);
     }
 
@@ -272,12 +352,12 @@ internal static class SimdJpegPipeline
             // Pass 1: IDCT on columns
             Idct8ElementsSIMD2Pass(ref v0, ref v1, ref v2, ref v3, ref v4, ref v5, ref v6, ref v7, Pass1Shift, half);
             // Transpose to make rows vertical
-            Transpose8x8Sse2(ref v0, ref v1, ref v2, ref v3, ref v4, ref v5, ref v6, ref v7);
+            Transpose8x8(ref v0, ref v1, ref v2, ref v3, ref v4, ref v5, ref v6, ref v7);
             // Pass 2: IDCT on original rows
             half = Vector128.Create(1 << (Pass2Shift - 1));
             Idct8ElementsSIMD2Pass(ref v0, ref v1, ref v2, ref v3, ref v4, ref v5, ref v6, ref v7, Pass2Shift, half);
             // Transpose back to row-major
-            Transpose8x8Sse2(ref v0, ref v1, ref v2, ref v3, ref v4, ref v5, ref v6, ref v7);
+            Transpose8x8(ref v0, ref v1, ref v2, ref v3, ref v4, ref v5, ref v6, ref v7);
 
             return new Block8x8Vectors { V0 = v0, V1 = v1, V2 = v2, V3 = v3, V4 = v4, V5 = v5, V6 = v6, V7 = v7 };
         }
@@ -298,47 +378,63 @@ internal static class SimdJpegPipeline
         ConvertCore(yl, cbl, crl, out Vector128<int> rl, out Vector128<int> gl, out Vector128<int> bl);
         ConvertCore(yh, cbh, crh, out Vector128<int> rh, out Vector128<int> gh, out Vector128<int> bh);
 
-        // 1. 正确打包成 byte (把低 4 位和高 4 位拼成完整的 8 字节有效数据)
-        Vector128<byte> r = Sse2.PackUnsignedSaturate(Sse2.PackSignedSaturate(rl, rh), Vector128<short>.Zero);
-        Vector128<byte> g = Sse2.PackUnsignedSaturate(Sse2.PackSignedSaturate(gl, gh), Vector128<short>.Zero);
-        Vector128<byte> b = Sse2.PackUnsignedSaturate(Sse2.PackSignedSaturate(bl, bh), Vector128<short>.Zero);
+        // Cross-platform: clamp int to [0, 255], then Narrow int→short→byte
+        var zero = Vector128<int>.Zero;
+        var c255 = Vector128.Create(255);
 
-        // 2. 使用正确的转换函数：使用 .As<short>() 或 .AsInt16()
-        // 我们可以利用 UnpackLow 将 R、G、B 分量交错配对
-        Vector128<byte> rgLow = Sse2.UnpackLow(r, g); // R0 G0 R1 G1 R2 G2 R3 G3 R4 G4 ...
-        
-        // 3. 提取交错后的 64 位数据 (前 4 个像素的 RG)
-        // 修正语法：使用 .AsInt64() 转换为长整型向量
-        ulong rg0 = (ulong)rgLow.AsInt64().GetElement(0); 
-        ulong rg1 = (ulong)rgLow.AsInt64().GetElement(1); // 后 4 个像素的 RG
+        rl = Vector128.Max(Vector128.Min(rl, c255), zero);
+        rh = Vector128.Max(Vector128.Min(rh, c255), zero);
+        gl = Vector128.Max(Vector128.Min(gl, c255), zero);
+        gh = Vector128.Max(Vector128.Min(gh, c255), zero);
+        bl = Vector128.Max(Vector128.Min(bl, c255), zero);
+        bh = Vector128.Max(Vector128.Min(bh, c255), zero);
 
-        // 提取 B 分量的 64 位数据
-        ulong bData = (ulong)b.AsInt64().GetElement(0); // B0 B1 B2 B3 B4 B5 B6 B7
+        // Narrow int→short, then short→byte (values already clamped, so truncation is safe)
+        ulong rData = Vector128.Narrow(
+            Vector128.Narrow(rl, rh), Vector128<short>.Zero).AsUInt64().GetElement(0);
+        ulong gData = Vector128.Narrow(
+            Vector128.Narrow(gl, gh), Vector128<short>.Zero).AsUInt64().GetElement(0);
+        ulong bData = Vector128.Narrow(
+            Vector128.Narrow(bl, bh), Vector128<short>.Zero).AsUInt64().GetElement(0);
 
-        // 4. 精准且无循环的分批拼装写入 (24 字节)
-        // 像素 0 & 1
-        *(ushort*)(pDest + 0)  = (ushort)rg0;          // R0 G0
-        *(pDest + 2)           = (byte)bData;          // B0
-        *(ushort*)(pDest + 3)  = (ushort)(rg0 >> 16);   // R1 G1
-        *(pDest + 5)           = (byte)(bData >> 8);   // B1
+        // Interleave R and G bytes into rg0 (R0,G0,R1,G1,R2,G2,R3,G3) and rg1 (R4,G4,R5,G5,R6,G6,R7,G7)
+        // Each line: extract byte i from rData/gData, shift to output byte position
+        ulong rg0 =
+            ((rData >> 0)  & 0xFFUL)       | ((gData >> 0)  & 0xFFUL) << 8 |
+            ((rData >> 8)  & 0xFFUL) << 16 | ((gData >> 8)  & 0xFFUL) << 24 |
+            ((rData >> 16) & 0xFFUL) << 32 | ((gData >> 16) & 0xFFUL) << 40 |
+            ((rData >> 24) & 0xFFUL) << 48 | ((gData >> 24) & 0xFFUL) << 56;
 
-        // 像素 2 & 3
-        *(ushort*)(pDest + 6)  = (ushort)(rg0 >> 32);   // R2 G2
-        *(pDest + 8)           = (byte)(bData >> 16);  // B2
-        *(ushort*)(pDest + 9)  = (ushort)(rg0 >> 48);   // R3 G3
-        *(pDest + 11)          = (byte)(bData >> 24);  // B3
+        ulong rg1 =
+            ((rData >> 32) & 0xFFUL)       | ((gData >> 32) & 0xFFUL) << 8 |
+            ((rData >> 40) & 0xFFUL) << 16 | ((gData >> 40) & 0xFFUL) << 24 |
+            ((rData >> 48) & 0xFFUL) << 32 | ((gData >> 48) & 0xFFUL) << 40 |
+            ((rData >> 56) & 0xFFUL) << 48 | ((gData >> 56) & 0xFFUL) << 56;
 
-        // 像素 4 & 5
-        *(ushort*)(pDest + 12) = (ushort)rg1;          // R4 G4
-        *(pDest + 14)          = (byte)(bData >> 32);  // B4
-        *(ushort*)(pDest + 15) = (ushort)(rg1 >> 16);  // R5 G5
-        *(pDest + 17)          = (byte)(bData >> 40);  // B5
+        // Manual bit-packing: write RGB24 (same as original, cross-platform C#)
+        // Pixels 0 & 1
+        *(ushort*)(pDest + 0)  = (ushort)rg0;
+        *(pDest + 2)           = (byte)bData;
+        *(ushort*)(pDest + 3)  = (ushort)(rg0 >> 16);
+        *(pDest + 5)           = (byte)(bData >> 8);
 
-        // 像素 6 & 7
-        *(ushort*)(pDest + 18) = (ushort)(rg1 >> 32);  // R6 G6
-        *(pDest + 20)          = (byte)(bData >> 48);  // B6
-        *(ushort*)(pDest + 21) = (ushort)(rg1 >> 48);  // R7 G7
-        *(pDest + 23)          = (byte)(bData >> 56);  // B7
+        // Pixels 2 & 3
+        *(ushort*)(pDest + 6)  = (ushort)(rg0 >> 32);
+        *(pDest + 8)           = (byte)(bData >> 16);
+        *(ushort*)(pDest + 9)  = (ushort)(rg0 >> 48);
+        *(pDest + 11)          = (byte)(bData >> 24);
+
+        // Pixels 4 & 5
+        *(ushort*)(pDest + 12) = (ushort)rg1;
+        *(pDest + 14)          = (byte)(bData >> 32);
+        *(ushort*)(pDest + 15) = (ushort)(rg1 >> 16);
+        *(pDest + 17)          = (byte)(bData >> 40);
+
+        // Pixels 6 & 7
+        *(ushort*)(pDest + 18) = (ushort)(rg1 >> 32);
+        *(pDest + 20)          = (byte)(bData >> 48);
+        *(ushort*)(pDest + 21) = (ushort)(rg1 >> 48);
+        *(pDest + 23)          = (byte)(bData >> 56);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
