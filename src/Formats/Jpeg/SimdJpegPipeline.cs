@@ -58,14 +58,14 @@ internal static class SimdJpegPipeline
         Idct8Core32Pass(ref i0l, ref i1l, ref i2l, ref i3l, ref i4l, ref i5l, ref i6l, ref i7l, PassShift, half);
         Idct8Core32Pass(ref i0h, ref i1h, ref i2h, ref i3h, ref i4h, ref i5h, ref i6h, ref i7h, PassShift, half);
 
-        v0 = Sse2.PackSignedSaturate(i0l, i0h);
-        v1 = Sse2.PackSignedSaturate(i1l, i1h);
-        v2 = Sse2.PackSignedSaturate(i2l, i2h);
-        v3 = Sse2.PackSignedSaturate(i3l, i3h);
-        v4 = Sse2.PackSignedSaturate(i4l, i4h);
-        v5 = Sse2.PackSignedSaturate(i5l, i5h);
-        v6 = Sse2.PackSignedSaturate(i6l, i6h);
-        v7 = Sse2.PackSignedSaturate(i7l, i7h);
+        v0 = Vector128.Narrow(i0l, i0h);
+        v1 = Vector128.Narrow(i1l, i1h);
+        v2 = Vector128.Narrow(i2l, i2h);
+        v3 = Vector128.Narrow(i3l, i3h);
+        v4 = Vector128.Narrow(i4l, i4h);
+        v5 = Vector128.Narrow(i5l, i5h);
+        v6 = Vector128.Narrow(i6l, i6h);
+        v7 = Vector128.Narrow(i7l, i7h);
     }
 
     
@@ -260,14 +260,14 @@ internal static class SimdJpegPipeline
         fixed (ushort* qPtr = quant)
         {
             short* sqPtr = (short*)qPtr;
-            Vector128<short> v0 = Sse2.MultiplyLow(Sse2.LoadVector128(cPtr), Sse2.LoadVector128(sqPtr));
-            Vector128<short> v1 = Sse2.MultiplyLow(Sse2.LoadVector128(cPtr + 8), Sse2.LoadVector128(sqPtr + 8));
-            Vector128<short> v2 = Sse2.MultiplyLow(Sse2.LoadVector128(cPtr + 16), Sse2.LoadVector128(sqPtr + 16));
-            Vector128<short> v3 = Sse2.MultiplyLow(Sse2.LoadVector128(cPtr + 24), Sse2.LoadVector128(sqPtr + 24));
-            Vector128<short> v4 = Sse2.MultiplyLow(Sse2.LoadVector128(cPtr + 32), Sse2.LoadVector128(sqPtr + 32));
-            Vector128<short> v5 = Sse2.MultiplyLow(Sse2.LoadVector128(cPtr + 40), Sse2.LoadVector128(sqPtr + 40));
-            Vector128<short> v6 = Sse2.MultiplyLow(Sse2.LoadVector128(cPtr + 48), Sse2.LoadVector128(sqPtr + 48));
-            Vector128<short> v7 = Sse2.MultiplyLow(Sse2.LoadVector128(cPtr + 56), Sse2.LoadVector128(sqPtr + 56));
+            Vector128<short> v0 = Vector128.Load(cPtr) * Vector128.Load(sqPtr);
+            Vector128<short> v1 = Vector128.Load(cPtr + 8) * Vector128.Load(sqPtr + 8);
+            Vector128<short> v2 = Vector128.Load(cPtr + 16) * Vector128.Load(sqPtr + 16);
+            Vector128<short> v3 = Vector128.Load(cPtr + 24) * Vector128.Load(sqPtr + 24);
+            Vector128<short> v4 = Vector128.Load(cPtr + 32) * Vector128.Load(sqPtr + 32);
+            Vector128<short> v5 = Vector128.Load(cPtr + 40) * Vector128.Load(sqPtr + 40);
+            Vector128<short> v6 = Vector128.Load(cPtr + 48) * Vector128.Load(sqPtr + 48);
+            Vector128<short> v7 = Vector128.Load(cPtr + 56) * Vector128.Load(sqPtr + 56);
             Vector128<int> half = Vector128.Create(1 << (Pass1Shift - 1));
             // Pass 1: IDCT on columns
             Idct8ElementsSse2Pass(ref v0, ref v1, ref v2, ref v3, ref v4, ref v5, ref v6, ref v7, Pass1Shift, half);
