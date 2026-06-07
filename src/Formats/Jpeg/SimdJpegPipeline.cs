@@ -74,30 +74,28 @@ internal static class SimdJpegPipeline
                                          ref Vector128<int> v4, ref Vector128<int> v5, ref Vector128<int> v6, ref Vector128<int> v7,
                                          int PassShift, Vector128<int> half)
     {
-        Vector128<int> tmp0 = Sse2.Add(v0, v4);
-        tmp0 = Sse2.ShiftLeftLogical(tmp0, ConstBits);
-        Vector128<int> tmp1 = Sse2.Subtract(v0, v4);
-        tmp1 = Sse2.ShiftLeftLogical(tmp1, ConstBits);
+        Vector128<int> tmp0 = (v0 + v4) << ConstBits;        
+        Vector128<int> tmp1 = (v0 - v4) << ConstBits;
 
-        Vector128<int> z1 = Sse2.Add(v2, v6) * Fix_0_541196100;
-        Vector128<int> tmp2 = Sse2.Add(z1, v6 * -Fix_1_847759065);
-        Vector128<int> tmp3 = Sse2.Add(z1, v2 * Fix_0_765366865);
+        Vector128<int> z1 = (v2 + v6) * Fix_0_541196100;
+        Vector128<int> tmp2 = (z1 + v6 * -Fix_1_847759065);
+        Vector128<int> tmp3 = (z1 + v2 * Fix_0_765366865);
 
-        Vector128<int> tmp10 = Sse2.Add(tmp0, tmp3);
-        Vector128<int> tmp13 = Sse2.Subtract(tmp0, tmp3);
-        Vector128<int> tmp11 = Sse2.Add(tmp1, tmp2);
-        Vector128<int> tmp12 = Sse2.Subtract(tmp1, tmp2);
+        Vector128<int> tmp10 = (tmp0 + tmp3);
+        Vector128<int> tmp13 = (tmp0 - tmp3);
+        Vector128<int> tmp11 = (tmp1 + tmp2);
+        Vector128<int> tmp12 = (tmp1 - tmp2);
 
         Vector128<int> tmp0o = v7;
         Vector128<int> tmp1o = v5;
         Vector128<int> tmp2o = v3;
         Vector128<int> tmp3o = v1;
 
-        Vector128<int> z1o = Sse2.Add(tmp0o, tmp3o);
-        Vector128<int> z2o = Sse2.Add(tmp1o, tmp2o);
-        Vector128<int> z3o = Sse2.Add(tmp0o, tmp2o);
-        Vector128<int> z4o = Sse2.Add(tmp1o, tmp3o);
-        Vector128<int> z5o = Sse2.Add(z3o, z4o) * Fix_1_175875602;
+        Vector128<int> z1o = (tmp0o + tmp3o);
+        Vector128<int> z2o = (tmp1o + tmp2o);
+        Vector128<int> z3o = (tmp0o + tmp2o);
+        Vector128<int> z4o = (tmp1o + tmp3o);
+        Vector128<int> z5o = (z3o + z4o) * Fix_1_175875602;
 
         tmp0o = tmp0o * Fix_0_298631336;
         tmp1o = tmp1o * Fix_2_053119869;
@@ -105,21 +103,21 @@ internal static class SimdJpegPipeline
         tmp3o = tmp3o * Fix_1_501321110;
         z1o = z1o * -Fix_0_899976223;
         z2o = z2o * -Fix_2_562915447;
-        z3o = Sse2.Add(z3o * -Fix_1_961570560, z5o);
-        z4o = Sse2.Add(z4o * -Fix_0_390180644, z5o);
+        z3o = (z3o * -Fix_1_961570560 + z5o);
+        z4o = (z4o * -Fix_0_390180644 + z5o);
 
-        tmp0o = Sse2.Add(tmp0o, Sse2.Add(z1o, z3o));
-        tmp1o = Sse2.Add(tmp1o, Sse2.Add(z2o, z4o));
-        tmp2o = Sse2.Add(tmp2o, Sse2.Add(z2o, z3o));
-        tmp3o = Sse2.Add(tmp3o, Sse2.Add(z1o, z4o));
-        v0 = Descale32Pass(Sse2.Add(tmp10, tmp3o), PassShift, half);
-        v7 = Descale32Pass(Sse2.Subtract(tmp10, tmp3o), PassShift, half);
-        v1 = Descale32Pass(Sse2.Add(tmp11, tmp2o), PassShift, half);
-        v6 = Descale32Pass(Sse2.Subtract(tmp11, tmp2o), PassShift, half);
-        v2 = Descale32Pass(Sse2.Add(tmp12, tmp1o), PassShift, half);
-        v5 = Descale32Pass(Sse2.Subtract(tmp12, tmp1o), PassShift, half);
-        v3 = Descale32Pass(Sse2.Add(tmp13, tmp0o), PassShift, half);
-        v4 = Descale32Pass(Sse2.Subtract(tmp13, tmp0o), PassShift, half);
+        tmp0o = tmp0o + (z1o + z3o);
+        tmp1o = tmp1o + (z2o + z4o);
+        tmp2o = tmp2o + (z2o + z3o);
+        tmp3o = tmp3o + (z1o + z4o);
+        v0 = Descale32Pass((tmp10 + tmp3o), PassShift, half);
+        v7 = Descale32Pass((tmp10 - tmp3o), PassShift, half);
+        v1 = Descale32Pass((tmp11 + tmp2o), PassShift, half);
+        v6 = Descale32Pass((tmp11 - tmp2o), PassShift, half);
+        v2 = Descale32Pass((tmp12 + tmp1o), PassShift, half);
+        v5 = Descale32Pass((tmp12 - tmp1o), PassShift, half);
+        v3 = Descale32Pass((tmp13 + tmp0o), PassShift, half);
+        v4 = Descale32Pass((tmp13 - tmp0o), PassShift, half);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -165,7 +163,7 @@ internal static class SimdJpegPipeline
     private static void StoreRowSse2(Vector128<short> v, Span<byte> dest, int y, int stride)
     {
         Vector128<short> bias = Vector128.Create((short)128);
-        v = Sse2.Add(v, bias);
+        v = (v + bias);
         Vector128<byte> b = Sse2.PackUnsignedSaturate(v, v);
         Unsafe.WriteUnaligned(ref dest[y * stride], b.GetLower());
     }
@@ -288,7 +286,7 @@ internal static class SimdJpegPipeline
     private unsafe static void ConvertRowYCbCrToRgb(Vector128<short> y, Vector128<short> cb, Vector128<short> cr, byte* pDest)
     {
         Vector128<short> bias128 = Vector128.Create((short)128);
-        y = Sse2.Add(y, bias128);
+        y = (y + bias128);
 
         Vector128<int> yl = Vector128.WidenLower(y);
         Vector128<int> yh = Vector128.WidenUpper(y);
