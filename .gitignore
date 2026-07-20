@@ -12,6 +12,7 @@
 .DS_Store
 # User-specific files (MonoDevelop/Xamarin Studio)
 *.userprefs
+reasonix.toml
 
 # Mono auto generated files
 mono_crash.*

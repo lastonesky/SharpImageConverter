@@ -78,6 +78,19 @@ namespace SharpImageConverter.Formats.Gif
 
         private void ExecuteDecode(DecodeContext ctx)
         {
+            NativeBufferOwner<byte>? backBuffer = null;
+            try
+            {
+                ExecuteDecodeCore(ctx, ref backBuffer);
+            }
+            finally
+            {
+                backBuffer?.Dispose();
+            }
+        }
+
+        private void ExecuteDecodeCore(DecodeContext ctx, ref NativeBufferOwner<byte>? backBuffer)
+        {
             var stream = ctx.Stream;
             byte[] sig = new byte[6];
             ReadExact(stream, sig, 0, 6);
@@ -98,7 +111,6 @@ namespace SharpImageConverter.Formats.Gif
             int pixelCount = width * height;
             int components = ctx.Mode == DecodeMode.Rgba32 ? 4 : 3;
             byte[] canvas = new byte[pixelCount * components];
-            NativeBufferOwner<byte>? backBuffer = null; // For disposal == 3
 
             if (hasGct && bgIndex < gctColors)
             {

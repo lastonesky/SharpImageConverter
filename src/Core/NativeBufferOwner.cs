@@ -14,6 +14,11 @@ internal sealed unsafe class NativeBufferOwner<T> : IDisposable where T : unmana
         Length = length;
     }
 
+    ~NativeBufferOwner()
+    {
+        Dispose(false);
+    }
+
     public int Length { get; }
 
     public Span<T> Span
@@ -55,6 +60,12 @@ internal sealed unsafe class NativeBufferOwner<T> : IDisposable where T : unmana
     }
 
     public void Dispose()
+    {
+        Dispose(true);
+        GC.SuppressFinalize(this);
+    }
+
+    private void Dispose(bool disposing)
     {
         if (_disposed)
         {
