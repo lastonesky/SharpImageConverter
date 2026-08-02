@@ -186,7 +186,7 @@ dotnet run -- <输入文件或文件夹路径> [输出文件或文件夹路径] 
   - `--subsample 420|444` / `--subsample=420|444`：JPEG 子采样（默认 420）。
   - `--keep-metadata`：JPEG 重编码保留元数据（EXIF/ICC）。
   - `--idct int|float` / `--idct=int|float`：JPEG IDCT 实现选择。
-  - `--stream`：JPEG 优先走流式解码路径（非 JPEG 自动回退常规解码）。
+  - `--stream`：JPEG 优先走流式解码路径（非 JPEG 自动回退常规解码）。注意：仅 marker/segment 头解析为异步读取，熵编码数据解码阶段为同步阻塞读取（受限于解码器结构，见 `JpegDecoder.DecodeFromStreamAsync` 的文档注释）。
   - `--jpeg-debug`：打印 JPEG 编码配置与耗时信息。
 - GIF/灰度相关：
   - `--gif-frames`：GIF 拆帧导出。

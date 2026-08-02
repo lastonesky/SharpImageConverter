@@ -19,6 +19,14 @@ public static partial class JpegDecoder
         return Decode(data, useFloatingPointIdct);
     }
 
+    /// <summary>
+    /// 流式解码 JPEG（异步 API）。
+    /// marker/segment 头解析为真正的异步读取；熵编码数据解码阶段为同步阻塞读取
+    /// （<see cref="JpegBitReader"/> 是 ref struct，熵解码为不可切分的顺序循环，
+    /// 无法跨 await 暂停恢复），因此调用线程会在熵解码期间阻塞。
+    /// 如需完全异步且内存有界，可自行先异步读入数据后调用
+    /// <see cref="Decode(ReadOnlySpan{byte}, bool)"/>。
+    /// </summary>
     public static async Task<StreamingDecodeResult> DecodeFromStreamAsync(Stream stream, CancellationToken cancellationToken = default, bool useFloatingPointIdct = false)
     {
         ArgumentNullException.ThrowIfNull(stream);

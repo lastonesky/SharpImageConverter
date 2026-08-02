@@ -350,6 +350,10 @@ internal sealed class JpegStreamInput(Stream stream, int bufferSize = 16 * 1024)
 
     public bool TryReadByteBlocking(CancellationToken cancellationToken, out byte value)
     {
+        // 熵解码阶段使用同步阻塞读取：JpegBitReader 是 ref struct，无法跨 await 存活，
+        // 且熵解码为不可切分的顺序循环（DC 差分链、RST 序列、EOB run），无法在字节边界
+        // 暂停恢复。保持同步阻塞以换取实现简单；marker/segment 解析（ReadAsync/ReadByteAsync）
+        // 仍是真正的异步读取。
         cancellationToken.ThrowIfCancellationRequested();
         if (bufferPos >= bufferLen)
         {
