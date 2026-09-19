@@ -116,4 +116,7 @@ StyleCopReport.xml
 *.snupkg
 
 
-example/
+examples/
+.trae/
+.workbuddy/
+.github/
