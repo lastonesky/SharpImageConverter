@@ -154,6 +154,27 @@ public static class JpegEncoder
             WriteBits(hc.Code, hc.Length);
         }
 
+        /// <summary>将 Huffman code 与幅值位合并为一次位写入，减少调用与中间刷新开销。</summary>
+        public void WriteHuffAndBits(HuffCode hc, uint bits, int count)
+        {
+            if (count == 0)
+            {
+                WriteBits(hc.Code, hc.Length);
+                return;
+            }
+
+            int total = hc.Length + count;
+            if (total > 32)
+            {
+                WriteBits(hc.Code, hc.Length);
+                WriteBits(bits, count);
+                return;
+            }
+
+            uint value = ((uint)hc.Code << count) | (bits & ((1u << count) - 1u));
+            WriteBits(value, total);
+        }
+
         public void FlushFinal()
         {
             if (_bitCount != 0)
@@ -221,18 +242,23 @@ public static class JpegEncoder
         public int BlockCount;
         public int Sequence;
         public byte[]? Order;
-        public NativeBufferOwner<int>? Buffer;
+        public int[]? Buffer;
         public int BlockStride;
+        /// <summary>每个块 lastNz（0..63）按 6 位打包，由 DCT 阶段预计算，避免熵编码阶段重复扫描。</summary>
+        public ulong LastNzPacked;
 
         public readonly Span<int> GetBlockSpan(int index)
         {
-            return Buffer!.Span.Slice(index * 64, 64);
+            return Buffer!.AsSpan(index * 64, 64);
         }
 
         public void Free()
         {
-            Buffer?.Dispose();
-            Buffer = null;
+            if (Buffer is not null)
+            {
+                ArrayPool<int>.Shared.Return(Buffer);
+                Buffer = null;
+            }
         }
     }
 
@@ -247,7 +273,7 @@ public static class JpegEncoder
         }
     }
 
-    private sealed class EncodeMetrics
+    internal sealed class EncodeMetrics
     {
         public long TicksFillMcu420;
         public long TicksFillBlock444;
@@ -730,7 +756,7 @@ public static class JpegEncoder
                             Sequence = sequence++,
                             Order = Order420,
                             BlockStride = 6,
-                            Buffer = NativeBufferOwner<int>.Allocate(6 * 64)
+                            Buffer = ArrayPool<int>.Shared.Rent(6 * 64)
                         };
                         try
                         {
@@ -772,7 +798,7 @@ public static class JpegEncoder
                             Sequence = sequence++,
                             Order = Order444,
                             BlockStride = 3,
-                            Buffer = NativeBufferOwner<int>.Allocate(3 * 64)
+                            Buffer = ArrayPool<int>.Shared.Rent(3 * 64)
                         };
                         try
                         {
@@ -843,7 +869,7 @@ public static class JpegEncoder
                         Sequence = sequence++,
                         Order = OrderGray,
                         BlockStride = 1,
-                        Buffer = NativeBufferOwner<int>.Allocate(64)
+                        Buffer = ArrayPool<int>.Shared.Rent(64)
                     };
                     try
                     {
@@ -897,14 +923,17 @@ public static class JpegEncoder
 
             for (int m = 0; m < batch.Count; m++)
             {
-                var mcu = batch.Items[m];
+                ref SampledMcuRef mcu = ref batch.Items[m];
                 try
                 {
+                    ulong packed = 0;
                     for (int i = 0; i < mcu.BlockCount; i++)
                     {
                         int[] q = mcu.Order![i] == 0 ? qYRecip : qCRecip;
-                        DctQuantizeInPlace(mcu.GetBlockSpan(i), q);
+                        int lastNz = DctQuantizeInPlace(mcu.GetBlockSpan(i), q);
+                        packed |= (ulong)lastNz << (i * 6);
                     }
+                    mcu.LastNzPacked = packed;
                 }
                 catch
                 {
@@ -938,10 +967,10 @@ public static class JpegEncoder
 
             for (int m = 0; m < batch.Count; m++)
             {
-                var mcu = batch.Items[m];
+                ref SampledMcuRef mcu = ref batch.Items[m];
                 try
                 {
-                    DctQuantizeInPlace(mcu.GetBlockSpan(0), qYRecip);
+                    mcu.LastNzPacked = (ulong)DctQuantizeInPlace(mcu.GetBlockSpan(0), qYRecip);
                 }
                 catch
                 {
@@ -1052,18 +1081,19 @@ public static class JpegEncoder
     {
         for (int i = 0; i < mcu.BlockCount; i++)
         {
+            int lastNz = (int)((mcu.LastNzPacked >> (i * 6)) & 0x3F);
             byte comp = mcu.Order![i];
             if (comp == 0)
             {
-                HuffmanWriteBlock(bw, mcu.GetBlockSpan(i), dcY, acY, ref prevYdc);
+                HuffmanWriteBlock(bw, mcu.GetBlockSpan(i), lastNz, dcY, acY, ref prevYdc);
             }
             else if (comp == 1)
             {
-                HuffmanWriteBlock(bw, mcu.GetBlockSpan(i), dcC, acC, ref prevCbdc);
+                HuffmanWriteBlock(bw, mcu.GetBlockSpan(i), lastNz, dcC, acC, ref prevCbdc);
             }
             else
             {
-                HuffmanWriteBlock(bw, mcu.GetBlockSpan(i), dcC, acC, ref prevCrdc);
+                HuffmanWriteBlock(bw, mcu.GetBlockSpan(i), lastNz, dcC, acC, ref prevCrdc);
             }
         }
     }
@@ -1197,7 +1227,7 @@ public static class JpegEncoder
                         ref SampledMcuRef mcu = ref batch.Items[i];
                         if (mcu.Sequence == expected)
                         {
-                            HuffmanWriteBlock(bw, mcu.GetBlockSpan(0), dcY, acY, ref prevYdc);
+                            HuffmanWriteBlock(bw, mcu.GetBlockSpan(0), (int)(mcu.LastNzPacked & 0x3F), dcY, acY, ref prevYdc);
                             mcu.Free();
                             expected++;
 
@@ -1211,7 +1241,7 @@ public static class JpegEncoder
 
                                 ref SampledMcuRef pending = ref pendingItems[expectedIndex];
                                 pendingSequences[expectedIndex] = -1;
-                                HuffmanWriteBlock(bw, pending.GetBlockSpan(0), dcY, acY, ref prevYdc);
+                                HuffmanWriteBlock(bw, pending.GetBlockSpan(0), (int)(pending.LastNzPacked & 0x3F), dcY, acY, ref prevYdc);
                                 pending.Free();
                                 expected++;
                             }
@@ -1249,7 +1279,7 @@ public static class JpegEncoder
                 }
                 ref SampledMcuRef pending = ref pendingItems[index];
                 pendingSequences[index] = -1;
-                HuffmanWriteBlock(bw, pending.GetBlockSpan(0), dcY, acY, ref prevYdc);
+                HuffmanWriteBlock(bw, pending.GetBlockSpan(0), (int)(pending.LastNzPacked & 0x3F), dcY, acY, ref prevYdc);
                 pending.Free();
                 expected++;
             }
@@ -1260,8 +1290,15 @@ public static class JpegEncoder
         }
     }
 
-    private static void DctQuantizeInPlace(Span<int> block, int[] quantRecip)
+    private static int DctQuantizeInPlace(Span<int> block, int[] quantRecip)
     {
+        if (SimdJpegEncodePipeline.FdctSupported)
+        {
+            // FDCT 与量化融合，避免对 64 个系数再做一次独立遍历。
+            SimdJpegEncodePipeline.ForwardDctQuantize8x8(block, quantRecip);
+            return ComputeLastNz(block);
+        }
+
         FDCT8x8IntInPlace(block);
 
         if (Vector.IsHardwareAccelerated
@@ -1288,7 +1325,7 @@ public static class JpegEncoder
                 int v = block[i];
                 block[i] = QuantizeNearest(v, quantRecip[i]);
             }
-            return;
+            return ComputeLastNz(block);
         }
 
         for (int i = 0; i < 64; i++)
@@ -1296,32 +1333,30 @@ public static class JpegEncoder
             int v = block[i];
             block[i] = QuantizeNearest(v, quantRecip[i]);
         }
+        return ComputeLastNz(block);
     }
 
-    private static void HuffmanWriteBlock(JpegBitWriter bw, Span<int> block, HuffCode[] dc, HuffCode[] ac, ref int prevDc)
+    /// <summary>返回 zigzag 序中最后一个非零系数的下标（0 表示 AC 全零）。</summary>
+    private static int ComputeLastNz(Span<int> block)
+    {
+        for (int k = 63; k >= 1; k--)
+        {
+            if (block[JpegConstants.ZigZag[k]] != 0)
+            {
+                return k;
+            }
+        }
+        return 0;
+    }
+
+    private static void HuffmanWriteBlock(JpegBitWriter bw, Span<int> block, int lastNz, HuffCode[] dc, HuffCode[] ac, ref int prevDc)
     {
         int dcCoeff = block[0];
         int diff = dcCoeff - prevDc;
         prevDc = dcCoeff;
 
         int dcCat = MagnitudeCategory(diff);
-        bw.WriteHuff(dc[dcCat]);
-        if (dcCat != 0)
-        {
-            uint bits = EncodeMagnitudeBits(diff, dcCat);
-            bw.WriteBits(bits, dcCat);
-        }
-
-        int lastNz = 0;
-        for (int k = 63; k >= 1; k--)
-        {
-            int idx = JpegConstants.ZigZag[k];
-            if (block[idx] != 0)
-            {
-                lastNz = k;
-                break;
-            }
-        }
+        bw.WriteHuffAndBits(dc[dcCat], dcCat == 0 ? 0u : EncodeMagnitudeBits(diff, dcCat), dcCat);
 
         if (lastNz == 0)
         {
@@ -1348,9 +1383,7 @@ public static class JpegEncoder
 
             int cat = MagnitudeCategory(v);
             int sym = (run << 4) | cat;
-            bw.WriteHuff(ac[sym]);
-            uint bits = EncodeMagnitudeBits(v, cat);
-            bw.WriteBits(bits, cat);
+            bw.WriteHuffAndBits(ac[sym], EncodeMagnitudeBits(v, cat), cat);
             run = 0;
         }
 
@@ -1359,7 +1392,7 @@ public static class JpegEncoder
 
     // float FDCT removed; always use integer FDCT
 
-    private static unsafe void FillMcu420RgbToYCbCr(
+    internal static unsafe void FillMcu420RgbToYCbCr(
         byte[] rgb,
         int width,
         int height,
@@ -1373,7 +1406,17 @@ public static class JpegEncoder
         Span<int> cr,
         EncodeMetrics? metrics)
     {
-        long startTicks = Stopwatch.GetTimestamp();
+        long startTicks = metrics is not null ? Stopwatch.GetTimestamp() : 0;
+
+        if (SimdJpegEncodePipeline.ColorSupported && baseX + 16 <= width && baseY + 16 <= height)
+        {
+            SimdJpegEncodePipeline.RgbToYCbCr420(rgb, width, baseX, baseY, y00, y10, y01, y11, cb, cr);
+            if (metrics is not null)
+            {
+                Interlocked.Add(ref metrics.TicksFillMcu420, Stopwatch.GetTimestamp() - startTicks);
+            }
+            return;
+        }
 
         Span<int> cbAcc = stackalloc int[64];
         Span<int> crAcc = stackalloc int[64];
@@ -1467,16 +1510,26 @@ public static class JpegEncoder
             }
         }
 
-        long endTicks = Stopwatch.GetTimestamp();
         if (metrics is not null)
         {
+            long endTicks = Stopwatch.GetTimestamp();
             Interlocked.Add(ref metrics.TicksFillMcu420, endTicks - startTicks);
         }
     }
 
-    private static unsafe void FillBlockRgbToYCbCr444(byte[] rgb, int width, int height, int baseX, int baseY, Span<int> y, Span<int> cb, Span<int> cr, EncodeMetrics? metrics)
+    internal static unsafe void FillBlockRgbToYCbCr444(byte[] rgb, int width, int height, int baseX, int baseY, Span<int> y, Span<int> cb, Span<int> cr, EncodeMetrics? metrics)
     {
-        long startTicks = Stopwatch.GetTimestamp();
+        long startTicks = metrics is not null ? Stopwatch.GetTimestamp() : 0;
+
+        if (SimdJpegEncodePipeline.ColorSupported && baseX + 8 <= width && baseY + 8 <= height)
+        {
+            SimdJpegEncodePipeline.RgbToYCbCr444(rgb, width, baseX, baseY, y, cb, cr);
+            if (metrics is not null)
+            {
+                Interlocked.Add(ref metrics.TicksFillBlock444, Stopwatch.GetTimestamp() - startTicks);
+            }
+            return;
+        }
 
         fixed (byte* rgbPtr = rgb)
         {
@@ -1510,9 +1563,9 @@ public static class JpegEncoder
             }
         }
 
-        long endTicks = Stopwatch.GetTimestamp();
         if (metrics is not null)
         {
+            long endTicks = Stopwatch.GetTimestamp();
             Interlocked.Add(ref metrics.TicksFillBlock444, endTicks - startTicks);
         }
     }
@@ -1629,7 +1682,7 @@ public static class JpegEncoder
         return x * c;
     }
 
-    private static void FDCT8x8IntInPlace(Span<int> data)
+    internal static void FDCT8x8IntInPlace(Span<int> data)
     {
         for (int row = 0; row < 64; row += 8)
         {
