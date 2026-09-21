@@ -1,37 +1,56 @@
 using System;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using System.Threading;
 
 namespace SharpImageConverter.Core;
 
 internal sealed unsafe class NativeBufferOwner<T> : IDisposable where T : unmanaged
 {
     private T* _ptr;
-    private bool _disposed;
+    private int _length;
 
     private NativeBufferOwner(T* ptr, int length)
     {
         _ptr = ptr;
-        Length = length;
+        _length = length;
+
+        if (ptr is not null && length > 0)
+        {
+            GC.AddMemoryPressure((long)length * sizeof(T));
+        }
     }
 
     ~NativeBufferOwner()
     {
-        Dispose(false);
+        DisposeUnmanaged();
     }
 
-    public int Length { get; }
+    public int Length
+    {
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        get => _length;
+    }
 
     public Span<T> Span
     {
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         get
         {
-            if (_disposed)
+            T* ptr = _ptr;
+            if (ptr is null)
             {
-                throw new ObjectDisposedException(nameof(NativeBufferOwner<T>));
+                ThrowObjectDisposed();
             }
 
-            return new Span<T>(_ptr, Length);
+            return new Span<T>(ptr, _length);
         }
+    }
+
+    public ReadOnlySpan<T> ReadOnlySpan
+    {
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        get => Span;
     }
 
     public static NativeBufferOwner<T> Allocate(int length, bool clear = false)
@@ -59,25 +78,44 @@ internal sealed unsafe class NativeBufferOwner<T> : IDisposable where T : unmana
         return new NativeBufferOwner<T>((T*)ptr, length);
     }
 
+    public static NativeBufferOwner<T> FromSpan(ReadOnlySpan<T> source)
+    {
+        if (source.IsEmpty)
+        {
+            return new NativeBufferOwner<T>(null, 0);
+        }
+
+        NativeBufferOwner<T> buffer = Allocate(source.Length);
+        source.CopyTo(buffer.Span);
+        return buffer;
+    }
+
     public void Dispose()
     {
-        Dispose(true);
+        DisposeUnmanaged();
         GC.SuppressFinalize(this);
     }
 
-    private void Dispose(bool disposing)
+    private void DisposeUnmanaged()
     {
-        if (_disposed)
+        T* ptr;
+        fixed (T** pPtr = &_ptr)
         {
-            return;
+            IntPtr* pIntPtr = (IntPtr*)pPtr;
+            ptr = (T*)Interlocked.Exchange(ref *pIntPtr, IntPtr.Zero);
         }
 
-        _disposed = true;
-        T* ptr = _ptr;
-        _ptr = null;
         if (ptr is not null)
         {
+            long bytes = (long)_length * sizeof(T);
             NativeMemory.Free(ptr);
+            GC.RemoveMemoryPressure(bytes);
         }
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static void ThrowObjectDisposed()
+    {
+        throw new ObjectDisposedException(nameof(NativeBufferOwner<T>));
     }
 }
