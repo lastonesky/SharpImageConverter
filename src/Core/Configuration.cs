@@ -262,26 +262,17 @@ namespace SharpImageConverter.Core
 
         private static byte[] RgbaToRgb(byte[] rgba)
         {
-            var rgb = new byte[(rgba.Length / 4) * 3];
-            for (int i = 0, j = 0; i < rgba.Length; i += 4, j += 3)
-            {
-                rgb[j + 0] = rgba[i + 0];
-                rgb[j + 1] = rgba[i + 1];
-                rgb[j + 2] = rgba[i + 2];
-            }
+            // 目标缓冲区每个字节都会被写入，跳过 new byte[] 的无谓清零
+            var rgb = GC.AllocateUninitializedArray<byte>((rgba.Length / 4) * 3);
+            SimdHelper.PackRgbaToRgb(rgba, rgb);
             return rgb;
         }
 
         private static Image<Rgba32> ConvertRgbToRgba(Image<Rgb24> rgb)
         {
-            var rgbaBuf = new byte[rgb.Width * rgb.Height * 4];
-            for (int i = 0, j = 0; j < rgb.Buffer.Length; i += 4, j += 3)
-            {
-                rgbaBuf[i + 0] = rgb.Buffer[j + 0];
-                rgbaBuf[i + 1] = rgb.Buffer[j + 1];
-                rgbaBuf[i + 2] = rgb.Buffer[j + 2];
-                rgbaBuf[i + 3] = 255;
-            }
+            int pixels = rgb.Buffer.Length / 3;
+            var rgbaBuf = GC.AllocateUninitializedArray<byte>(pixels * 4);
+            SimdHelper.ExpandRgbToRgba(rgb.Buffer, rgbaBuf);
             return new Image<Rgba32>(rgb.Width, rgb.Height, rgbaBuf, rgb.Metadata);
         }
 
@@ -349,14 +340,8 @@ namespace SharpImageConverter.Core
 
         private static byte[] GrayToRgb(byte[] gray)
         {
-            var rgb = new byte[gray.Length * 3];
-            for (int i = 0, j = 0; i < gray.Length; i++, j += 3)
-            {
-                byte v = gray[i];
-                rgb[j + 0] = v;
-                rgb[j + 1] = v;
-                rgb[j + 2] = v;
-            }
+            var rgb = GC.AllocateUninitializedArray<byte>(gray.Length * 3);
+            SimdHelper.ExpandGrayToRgb(gray, rgb);
             return rgb;
         }
     }

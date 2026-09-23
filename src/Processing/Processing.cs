@@ -1,6 +1,5 @@
 using System;
 using System.Buffers;
-using System.Numerics;
 using System.Threading.Tasks;
 using SharpImageConverter.Core;
 
@@ -62,7 +61,8 @@ namespace SharpImageConverter.Processing
             if (sw <= 0 || sh <= 0 || width <= 0 || height <= 0) return this;
             if (sw == width && sh == height) return this;
             var src = _image.Buffer;
-            var dst = new byte[width * height * 3];
+            // 目标缓冲每个字节都会被覆写，跳过 new byte[] 的无谓清零
+            var dst = GC.AllocateUninitializedArray<byte>(width * height * 3);
             float scaleX = sw <= 1 ? 0f : (float)(sw - 1) / Math.Max(1, width - 1);
             float scaleY = sh <= 1 ? 0f : (float)(sh - 1) / Math.Max(1, height - 1);
             var poolInt = ArrayPool<int>.Shared;
@@ -150,7 +150,8 @@ namespace SharpImageConverter.Processing
             int sh = _image.Height;
             if (sw <= 0 || sh <= 0 || width <= 0 || height <= 0) return this;
 
-            var dst = new byte[width * height * 3];
+            // 目标缓冲每个字节都会被覆写，跳过 new byte[] 的无谓清零
+            var dst = GC.AllocateUninitializedArray<byte>(width * height * 3);
 
             double scaleX = (double)sw / width;
             double scaleY = (double)sh / height;
@@ -248,7 +249,8 @@ namespace SharpImageConverter.Processing
         public ImageProcessingContext ResizeBicubicOptimized(int width, int height)
         {
             var src = _image.Buffer;
-            var dst = new byte[width * height * 3];
+            // 目标缓冲每个字节都会被覆写，跳过 new byte[] 的无谓清零
+            var dst = GC.AllocateUninitializedArray<byte>(width * height * 3);
             int sw = _image.Width, sh = _image.Height;
             if (sw <= 0 || sh <= 0 || width <= 0 || height <= 0)
             {
@@ -263,26 +265,26 @@ namespace SharpImageConverter.Processing
             var poolFloat = ArrayPool<float>.Shared;
             int[] xIndex = poolInt.Rent(width * 4);
             float[] xWeight = poolFloat.Rent(width * 4);
-            for (int x = 0; x < width; x++)
-            {
-                float gx = (x + 0.5f) * scaleX - 0.5f;
-                int ix = (int)MathF.Floor(gx);
-                float t = gx - ix;
-                for (int k = -1; k <= 2; k++)
-                {
-                    int idx = x * 4 + (k + 1);
-                    int sx = ix + k;
-                    if (sx < 0) sx = 0;
-                    else if (sx >= sw) sx = sw - 1;
-                    xIndex[idx] = sx;
-                    xWeight[idx] = CubicF(t - k);
-                }
-            }
-
             int[] yIndex = poolInt.Rent(height * 4);
             float[] yWeight = poolFloat.Rent(height * 4);
             try
             {
+                for (int x = 0; x < width; x++)
+                {
+                    float gx = (x + 0.5f) * scaleX - 0.5f;
+                    int ix = (int)MathF.Floor(gx);
+                    float t = gx - ix;
+                    for (int k = -1; k <= 2; k++)
+                    {
+                        int idx = x * 4 + (k + 1);
+                        int sx = ix + k;
+                        if (sx < 0) sx = 0;
+                        else if (sx >= sw) sx = sw - 1;
+                        xIndex[idx] = sx;
+                        xWeight[idx] = CubicF(t - k);
+                    }
+                }
+
                 for (int y = 0; y < height; y++)
                 {
                     float gy = (y + 0.5f) * scaleY - 0.5f;
@@ -299,8 +301,6 @@ namespace SharpImageConverter.Processing
                     }
                 }
 
-                int vecSize = Vector<float>.Count;
-
                 Parallel.For(0, height, y =>
                 {
                     int yOff = y * 4;
@@ -314,79 +314,12 @@ namespace SharpImageConverter.Processing
                     float wy3 = yWeight[yOff + 3];
 
                     int dBase = y * width * 3;
-                    Span<int> sxBuf0 = stackalloc int[4 * Vector<float>.Count];
-                    Span<float> wxBuf0 = stackalloc float[4 * Vector<float>.Count];
+                    int base0 = sy0 * sw * 3;
+                    int base1 = sy1 * sw * 3;
+                    int base2 = sy2 * sw * 3;
+                    int base3 = sy3 * sw * 3;
 
-                    int x = 0;
-                    int vecLimit = width - (width % vecSize);
-                    for (; x < vecLimit; x += vecSize)
-                    {
-                        int xOff0 = x * 4;
-
-                        for (int i = 0; i < vecSize; i++)
-                        {
-                            int xo = x + i;
-                            int xOff = xo * 4;
-                            sxBuf0[i * 4 + 0] = xIndex[xOff + 0];
-                            sxBuf0[i * 4 + 1] = xIndex[xOff + 1];
-                            sxBuf0[i * 4 + 2] = xIndex[xOff + 2];
-                            sxBuf0[i * 4 + 3] = xIndex[xOff + 3];
-                            wxBuf0[i * 4 + 0] = xWeight[xOff + 0];
-                            wxBuf0[i * 4 + 1] = xWeight[xOff + 1];
-                            wxBuf0[i * 4 + 2] = xWeight[xOff + 2];
-                            wxBuf0[i * 4 + 3] = xWeight[xOff + 3];
-                        }
-
-                        for (int c = 0; c < 3; c++)
-                        {
-                            for (int i = 0; i < vecSize; i++)
-                            {
-                                int sx0 = sxBuf0[i * 4 + 0];
-                                int sx1 = sxBuf0[i * 4 + 1];
-                                int sx2 = sxBuf0[i * 4 + 2];
-                                int sx3 = sxBuf0[i * 4 + 3];
-                                float wx0 = wxBuf0[i * 4 + 0];
-                                float wx1 = wxBuf0[i * 4 + 1];
-                                float wx2 = wxBuf0[i * 4 + 2];
-                                float wx3 = wxBuf0[i * 4 + 3];
-
-                                float row0 =
-                                    wx0 * src[(sy0 * sw + sx0) * 3 + c] +
-                                    wx1 * src[(sy0 * sw + sx1) * 3 + c] +
-                                    wx2 * src[(sy0 * sw + sx2) * 3 + c] +
-                                    wx3 * src[(sy0 * sw + sx3) * 3 + c];
-                                float row1 =
-                                    wx0 * src[(sy1 * sw + sx0) * 3 + c] +
-                                    wx1 * src[(sy1 * sw + sx1) * 3 + c] +
-                                    wx2 * src[(sy1 * sw + sx2) * 3 + c] +
-                                    wx3 * src[(sy1 * sw + sx3) * 3 + c];
-                                float row2 =
-                                    wx0 * src[(sy2 * sw + sx0) * 3 + c] +
-                                    wx1 * src[(sy2 * sw + sx1) * 3 + c] +
-                                    wx2 * src[(sy2 * sw + sx2) * 3 + c] +
-                                    wx3 * src[(sy2 * sw + sx3) * 3 + c];
-                                float row3 =
-                                    wx0 * src[(sy3 * sw + sx0) * 3 + c] +
-                                    wx1 * src[(sy3 * sw + sx1) * 3 + c] +
-                                    wx2 * src[(sy3 * sw + sx2) * 3 + c] +
-                                    wx3 * src[(sy3 * sw + sx3) * 3 + c];
-
-                                float val =
-                                    wy0 * row0 +
-                                    wy1 * row1 +
-                                    wy2 * row2 +
-                                    wy3 * row3;
-
-                                if (val < 0f) val = 0f;
-                                else if (val > 255f) val = 255f;
-
-                                int d = dBase + (x + i) * 3 + c;
-                                dst[d] = (byte)(val + 0.5f);
-                            }
-                        }
-                    }
-
-                    for (; x < width; x++)
+                    for (int x = 0; x < width; x++)
                     {
                         int xOff = x * 4;
                         int sx0 = xIndex[xOff + 0];
@@ -399,28 +332,35 @@ namespace SharpImageConverter.Processing
                         float wx3 = xWeight[xOff + 3];
                         int d = dBase + x * 3;
 
+                        // 16 个源偏移在三个通道间共享，只算一次
+                        int q0 = sx0 * 3, q1 = sx1 * 3, q2 = sx2 * 3, q3 = sx3 * 3;
+                        int p00 = base0 + q0, p01 = base0 + q1, p02 = base0 + q2, p03 = base0 + q3;
+                        int p10 = base1 + q0, p11 = base1 + q1, p12 = base1 + q2, p13 = base1 + q3;
+                        int p20 = base2 + q0, p21 = base2 + q1, p22 = base2 + q2, p23 = base2 + q3;
+                        int p30 = base3 + q0, p31 = base3 + q1, p32 = base3 + q2, p33 = base3 + q3;
+
                         for (int c = 0; c < 3; c++)
                         {
                             float row0 =
-                                wx0 * src[(sy0 * sw + sx0) * 3 + c] +
-                                wx1 * src[(sy0 * sw + sx1) * 3 + c] +
-                                wx2 * src[(sy0 * sw + sx2) * 3 + c] +
-                                wx3 * src[(sy0 * sw + sx3) * 3 + c];
+                                wx0 * src[p00 + c] +
+                                wx1 * src[p01 + c] +
+                                wx2 * src[p02 + c] +
+                                wx3 * src[p03 + c];
                             float row1 =
-                                wx0 * src[(sy1 * sw + sx0) * 3 + c] +
-                                wx1 * src[(sy1 * sw + sx1) * 3 + c] +
-                                wx2 * src[(sy1 * sw + sx2) * 3 + c] +
-                                wx3 * src[(sy1 * sw + sx3) * 3 + c];
+                                wx0 * src[p10 + c] +
+                                wx1 * src[p11 + c] +
+                                wx2 * src[p12 + c] +
+                                wx3 * src[p13 + c];
                             float row2 =
-                                wx0 * src[(sy2 * sw + sx0) * 3 + c] +
-                                wx1 * src[(sy2 * sw + sx1) * 3 + c] +
-                                wx2 * src[(sy2 * sw + sx2) * 3 + c] +
-                                wx3 * src[(sy2 * sw + sx3) * 3 + c];
+                                wx0 * src[p20 + c] +
+                                wx1 * src[p21 + c] +
+                                wx2 * src[p22 + c] +
+                                wx3 * src[p23 + c];
                             float row3 =
-                                wx0 * src[(sy3 * sw + sx0) * 3 + c] +
-                                wx1 * src[(sy3 * sw + sx1) * 3 + c] +
-                                wx2 * src[(sy3 * sw + sx2) * 3 + c] +
-                                wx3 * src[(sy3 * sw + sx3) * 3 + c];
+                                wx0 * src[p30 + c] +
+                                wx1 * src[p31 + c] +
+                                wx2 * src[p32 + c] +
+                                wx3 * src[p33 + c];
 
                             float val =
                                 wy0 * row0 +
@@ -496,33 +436,15 @@ namespace SharpImageConverter.Processing
             bool useParallel = n >= 200000 && height >= 32 && Environment.ProcessorCount > 1;
             if (useParallel)
             {
+                int rowBytes = width * 3;
                 Parallel.For(0, height, y =>
                 {
-                    int row = y * width * 3;
-                    int end = row + width * 3;
-                    for (int o = row; o < end; o += 3)
-                    {
-                        int r = buf[o + 0], g = buf[o + 1], b = buf[o + 2];
-                        int yy = (77 * r + 150 * g + 29 * b) >> 8;
-                        byte yb = (byte)yy;
-                        buf[o + 0] = yb;
-                        buf[o + 1] = yb;
-                        buf[o + 2] = yb;
-                    }
+                    SimdHelper.GrayscaleRgb24InPlace(buf.AsSpan(y * rowBytes, rowBytes));
                 });
             }
             else
             {
-                for (int i = 0; i < n; i++)
-                {
-                    int o = i * 3;
-                    int r = buf[o + 0], g = buf[o + 1], b = buf[o + 2];
-                    int y = (77 * r + 150 * g + 29 * b) >> 8;
-                    byte yy = (byte)y;
-                    buf[o + 0] = yy;
-                    buf[o + 1] = yy;
-                    buf[o + 2] = yy;
-                }
+                SimdHelper.GrayscaleRgb24InPlace(buf);
             }
             return this;
         }
