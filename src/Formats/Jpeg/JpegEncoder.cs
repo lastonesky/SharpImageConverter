@@ -6,6 +6,7 @@ using System.Diagnostics;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using SharpImageConverter.Metadata;
 using SharpImageConverter.Core;
 using SharpImageConverter.Formats.Jpeg;
@@ -1311,11 +1312,15 @@ public static class JpegEncoder
             int width = Vector<int>.Count;
             var zero = Vector<int>.Zero;
             var bias = new Vector<int>(1 << 19);
+            // 直接从缓冲区载入，避免 new Vector<int>(span) 的一次中间拷贝
+            ref int blockRef = ref MemoryMarshal.GetReference(block);
+            ref int recipRef = ref MemoryMarshal.GetReference(quantRecip.AsSpan());
             int i = 0;
             for (; i <= 64 - width; i += width)
             {
-                var coeff = new Vector<int>(block.Slice(i, width));
-                var recip = new Vector<int>(quantRecip, i);
+                nuint o = (nuint)i;
+                var coeff = Vector.LoadUnsafe(ref blockRef, o);
+                var recip = Vector.LoadUnsafe(ref recipRef, o);
                 var negativeMask = Vector.LessThan(coeff, zero);
                 var absCoeff = Vector.ConditionalSelect(negativeMask, -coeff, coeff);
                 var scaled = (absCoeff * recip + bias) >> 20;
@@ -1487,11 +1492,15 @@ public static class JpegEncoder
             int widthVec = Vector<int>.Count;
             var rounding = new Vector<int>(2);
             var offset = new Vector<int>(128);
+            // 直接从缓冲区载入，避免 new Vector<int>(span) 的一次中间拷贝
+            ref int cbAccRef = ref MemoryMarshal.GetReference(cbAcc);
+            ref int crAccRef = ref MemoryMarshal.GetReference(crAcc);
             int i = 0;
             for (; i <= 64 - widthVec; i += widthVec)
             {
-                var cbVec = new Vector<int>(cbAcc.Slice(i, widthVec));
-                var crVec = new Vector<int>(crAcc.Slice(i, widthVec));
+                nuint o = (nuint)i;
+                var cbVec = Vector.LoadUnsafe(ref cbAccRef, o);
+                var crVec = Vector.LoadUnsafe(ref crAccRef, o);
                 (((cbVec + rounding) >> 2) - offset).CopyTo(cb.Slice(i, widthVec));
                 (((crVec + rounding) >> 2) - offset).CopyTo(cr.Slice(i, widthVec));
             }

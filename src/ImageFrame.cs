@@ -604,37 +604,138 @@ public sealed class ImageFrame
                 return (src, width, height);
         }
 
-        byte[] dst = new byte[newW * newH * 3];
-        for (int y = 0; y < height; y++)
+        // 旋转结果每个字节都会被覆写，跳过 new byte[] 的无谓清零
+        byte[] dst = GC.AllocateUninitializedArray<byte>(newW * newH * 3);
+
+        // 转置类（5-8）的分块边长：源/目标各占 Tile*Tile*3 字节，32 时约 3KB，稳落 L1
+        const int Tile = 32;
+
+        // 方向分支提到循环外：原先每个像素都要走一次 switch，而且 case 4 只能逐像素拷。
+        switch (orientation)
         {
-            for (int x = 0; x < width; x++)
-            {
-                int dx, dy;
-                switch (orientation)
+            case 2:
+            case 3:
+                // 水平镜像 / 180 度：目标行 = 源行的反序（按像素粒度反转）
+                for (int y = 0; y < height; y++)
                 {
-                    case 2:
-                        dx = (width - 1 - x); dy = y; break;
-                    case 3:
-                        dx = (width - 1 - x); dy = (height - 1 - y); break;
-                    case 4:
-                        dx = x; dy = (height - 1 - y); break;
-                    case 5:
-                        dx = y; dy = x; break;
-                    case 6:
-                        dx = (height - 1 - y); dy = x; break;
-                    case 7:
-                        dx = (height - 1 - y); dy = (width - 1 - x); break;
-                    case 8:
-                        dx = y; dy = (width - 1 - x); break;
-                    default:
-                        dx = x; dy = y; break;
+                    int srcRow = (orientation == 2 ? y : height - 1 - y) * width * 3;
+                    int dstRow = y * width * 3;
+                    for (int x = 0; x < width; x++)
+                    {
+                        int srcIdx = srcRow + x * 3;
+                        int dstIdx = dstRow + (width - 1 - x) * 3;
+                        dst[dstIdx + 0] = src[srcIdx + 0];
+                        dst[dstIdx + 1] = src[srcIdx + 1];
+                        dst[dstIdx + 2] = src[srcIdx + 2];
+                    }
                 }
-                int srcIdx = (y * width + x) * 3;
-                int dstIdx = (dy * newW + dx) * 3;
-                dst[dstIdx + 0] = src[srcIdx + 0];
-                dst[dstIdx + 1] = src[srcIdx + 1];
-                dst[dstIdx + 2] = src[srcIdx + 2];
-            }
+                break;
+
+            case 4:
+                // 垂直翻转：整行原样搬，直接走向量化的块拷贝
+                for (int y = 0; y < height; y++)
+                {
+                    src.AsSpan((height - 1 - y) * width * 3, width * 3)
+                       .CopyTo(dst.AsSpan(y * width * 3, width * 3));
+                }
+                break;
+
+            // 5-8 是转置类：不加分块时目标端按列写入，跨度是整个行宽，
+            // 工作集远超缓存导致每次写入都 miss。按 Tile 走之后源/目标各自的
+            // 工作集只有 Tile*Tile*3 字节，稳定落在 L1 里。
+            case 5:
+                for (int ty = 0; ty < height; ty += Tile)
+                {
+                    int yEnd = Math.Min(ty + Tile, height);
+                    for (int tx = 0; tx < width; tx += Tile)
+                    {
+                        int xEnd = Math.Min(tx + Tile, width);
+                        for (int y = ty; y < yEnd; y++)
+                        {
+                            int srcRow = y * width * 3;
+                            for (int x = tx; x < xEnd; x++)
+                            {
+                                int srcIdx = srcRow + x * 3;
+                                int dstIdx = (x * newW + y) * 3;
+                                dst[dstIdx + 0] = src[srcIdx + 0];
+                                dst[dstIdx + 1] = src[srcIdx + 1];
+                                dst[dstIdx + 2] = src[srcIdx + 2];
+                            }
+                        }
+                    }
+                }
+                break;
+
+            case 6:
+                for (int ty = 0; ty < height; ty += Tile)
+                {
+                    int yEnd = Math.Min(ty + Tile, height);
+                    for (int tx = 0; tx < width; tx += Tile)
+                    {
+                        int xEnd = Math.Min(tx + Tile, width);
+                        for (int y = ty; y < yEnd; y++)
+                        {
+                            int srcRow = y * width * 3;
+                            int dstBase = (height - 1 - y) * 3;
+                            for (int x = tx; x < xEnd; x++)
+                            {
+                                int srcIdx = srcRow + x * 3;
+                                int dstIdx = x * newW * 3 + dstBase;
+                                dst[dstIdx + 0] = src[srcIdx + 0];
+                                dst[dstIdx + 1] = src[srcIdx + 1];
+                                dst[dstIdx + 2] = src[srcIdx + 2];
+                            }
+                        }
+                    }
+                }
+                break;
+
+            case 7:
+                for (int ty = 0; ty < height; ty += Tile)
+                {
+                    int yEnd = Math.Min(ty + Tile, height);
+                    for (int tx = 0; tx < width; tx += Tile)
+                    {
+                        int xEnd = Math.Min(tx + Tile, width);
+                        for (int y = ty; y < yEnd; y++)
+                        {
+                            int srcRow = y * width * 3;
+                            int dstBase = (height - 1 - y) * 3;
+                            for (int x = tx; x < xEnd; x++)
+                            {
+                                int srcIdx = srcRow + x * 3;
+                                int dstIdx = (width - 1 - x) * newW * 3 + dstBase;
+                                dst[dstIdx + 0] = src[srcIdx + 0];
+                                dst[dstIdx + 1] = src[srcIdx + 1];
+                                dst[dstIdx + 2] = src[srcIdx + 2];
+                            }
+                        }
+                    }
+                }
+                break;
+
+            case 8:
+                for (int ty = 0; ty < height; ty += Tile)
+                {
+                    int yEnd = Math.Min(ty + Tile, height);
+                    for (int tx = 0; tx < width; tx += Tile)
+                    {
+                        int xEnd = Math.Min(tx + Tile, width);
+                        for (int y = ty; y < yEnd; y++)
+                        {
+                            int srcRow = y * width * 3;
+                            for (int x = tx; x < xEnd; x++)
+                            {
+                                int srcIdx = srcRow + x * 3;
+                                int dstIdx = ((width - 1 - x) * newW + y) * 3;
+                                dst[dstIdx + 0] = src[srcIdx + 0];
+                                dst[dstIdx + 1] = src[srcIdx + 1];
+                                dst[dstIdx + 2] = src[srcIdx + 2];
+                            }
+                        }
+                    }
+                }
+                break;
         }
         return (dst, newW, newH);
     }
