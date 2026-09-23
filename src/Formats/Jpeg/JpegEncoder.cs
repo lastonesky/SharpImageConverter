@@ -566,10 +566,12 @@ public static class JpegEncoder
             Trace.WriteLine($"[jpeg] quality={quality} subsample={(subsample420 ? "420" : "444")}");
         }
 
-        byte[] qY = BuildQuantTable(StdLumaQuant, quality);
-        byte[] qC = BuildQuantTable(StdChromaQuant, quality);
-        int[] qYRecip = BuildQuantRecipIntDct(qY);
-        int[] qCRecip = BuildQuantRecipIntDct(qC);
+        QuantTables lumaTables = GetQuantTables(quality, luma: true);
+        QuantTables chromaTables = GetQuantTables(quality, luma: false);
+        byte[] qY = lumaTables.Table;
+        byte[] qC = chromaTables.Table;
+        int[] qYRecip = lumaTables.Recip;
+        int[] qCRecip = chromaTables.Recip;
 
         WriteMarker(stream, 0xD8);
         WriteApp0Jfif(stream);
@@ -617,8 +619,9 @@ public static class JpegEncoder
             Trace.WriteLine($"[jpeg] quality={quality} grayscale");
         }
 
-        byte[] qY = BuildQuantTable(StdLumaQuant, quality);
-        int[] qYRecip = BuildQuantRecipIntDct(qY);
+        QuantTables lumaTables = GetQuantTables(quality, luma: true);
+        byte[] qY = lumaTables.Table;
+        int[] qYRecip = lumaTables.Recip;
 
         WriteMarker(stream, 0xD8);
         WriteApp0Jfif(stream);
@@ -1390,7 +1393,8 @@ public static class JpegEncoder
         if (lastNz != 63) bw.WriteHuff(ac[0x00]);
     }
 
-    // float FDCT removed; always use integer FDCT
+    // 只有整数 FDCT 实现：浮点 FDCT 已在早期版本中移除。整数版本在 x86/ARM 上结果一致，
+    // 避免了跨平台浮点舍入差异，且与 libjpeg 的 islow 整数 FDCT 精度对齐。
 
     internal static unsafe void FillMcu420RgbToYCbCr(
         byte[] rgb,
@@ -1620,6 +1624,44 @@ public static class JpegEncoder
             code <<= 1;
         }
         return table;
+    }
+
+    /// <summary>
+    /// 量化表 + 整数 DCT 用的 reciprocal 表。两者都只由 baseTable 和 quality 决定，
+    /// 且下游只读，因此可以在多次编码之间共享同一份不可变实例。
+    /// </summary>
+    private sealed class QuantTables
+    {
+        public readonly byte[] Table;
+        public readonly int[] Recip;
+
+        public QuantTables(byte[] table, int[] recip)
+        {
+            Table = table;
+            Recip = recip;
+        }
+    }
+
+    // quality 在进入 WriteInternal / WriteInternalGray 前已由 NormalizeQuality 收敛到 [1,100]，
+    // 所以按 quality 直接索引缓存即可。惰性填充采用良性竞态：最坏情况是重复算一次同样的结果，
+    // Volatile.Write/Read 保证读到的一定是构造完整的实例。
+    private const int MaxQuality = 100;
+    private static readonly QuantTables?[] LumaQuantCache = new QuantTables?[MaxQuality + 1];
+    private static readonly QuantTables?[] ChromaQuantCache = new QuantTables?[MaxQuality + 1];
+
+    private static QuantTables GetQuantTables(int quality, bool luma)
+    {
+        QuantTables?[] cache = luma ? LumaQuantCache : ChromaQuantCache;
+        QuantTables? cached = Volatile.Read(ref cache[quality]);
+        if (cached is not null)
+        {
+            return cached;
+        }
+
+        byte[] table = BuildQuantTable(luma ? StdLumaQuant : StdChromaQuant, quality);
+        var tables = new QuantTables(table, BuildQuantRecipIntDct(table));
+        Volatile.Write(ref cache[quality], tables);
+        return tables;
     }
 
     private static byte[] BuildQuantTable(byte[] baseTable, int quality)
