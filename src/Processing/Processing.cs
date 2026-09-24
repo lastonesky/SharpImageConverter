@@ -53,12 +53,6 @@ namespace SharpImageConverter.Processing
             return ResizeArea(width, height);
         }
 
-        /// <summary>
-        /// 双线性插值缩放到指定尺寸
-        /// </summary>
-        /// <param name="width">目标宽度</param>
-        /// <param name="height">目标高度</param>
-        /// <returns>上下文自身</returns>
         // ---- ResizeBilinear SIMD 掩码 ----
         // 一次 8 字节载入可以拿到 x0 与 x1=x0+1 两个像素的完整 RGB
         // （布局 R0 G0 B0 R1 G1 B1 ? ?）。下面两组掩码把
@@ -91,6 +85,12 @@ namespace SharpImageConverter.Processing
             Vector128.Create((byte)0x80, 0x80, 0, 0x80, 0x80, 1, 0x80, 0x80, 2, 0x80, 0x80, 3, 0x80, 0x80, 0x80, 0x80),
         };
 
+        /// <summary>
+        /// 双线性插值缩放到指定尺寸
+        /// </summary>
+        /// <param name="width">目标宽度</param>
+        /// <param name="height">目标高度</param>
+        /// <returns>上下文自身</returns>
         public ImageProcessingContext ResizeBilinear(int width, int height)
         {
             int sw = _image.Width, sh = _image.Height;
