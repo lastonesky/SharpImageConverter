@@ -1,6 +1,7 @@
 using System;
 using System.Buffers;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Numerics;
 using System.Runtime.CompilerServices;
@@ -27,6 +28,27 @@ namespace SharpImageConverter.Formats.Gif
         private static readonly int[] InterlaceInc = { 8, 8, 4, 2 };
 
         private enum DecodeMode { Rgb24, Rgba32, Animation }
+
+        /// <summary>
+        /// 是否采集解码各阶段耗时并输出诊断日志，默认关闭。
+        /// 关闭时不会调用 Stopwatch，热路径无额外开销。
+        /// </summary>
+        public bool EnableDiagnostics { get; set; }
+
+        /// <summary>
+        /// 诊断日志输出委托，为 null 时回落到 <see cref="Trace"/>。
+        /// </summary>
+        public Action<string>? DiagnosticsLog { get; set; }
+
+        /// <summary>
+        /// 最近一次解码的耗时统计，未开启诊断时为 null。
+        /// </summary>
+        public GifTiming? LastTiming { get; private set; }
+
+        /// <summary>
+        /// 取当前时间戳；未开启诊断时返回 0，避免无谓的计时开销。
+        /// </summary>
+        private static long Now(GifTiming? timing) => timing is null ? 0 : Stopwatch.GetTimestamp();
 
         public GifAnimation DecodeAnimationRgb24(string path)
         {
@@ -84,18 +106,38 @@ namespace SharpImageConverter.Formats.Gif
         private void ExecuteDecode(DecodeContext ctx)
         {
             NativeBufferOwner<byte>? backBuffer = null;
+            var timing = EnableDiagnostics ? new GifTiming(GifTimingKind.Decode) : null;
+            long t0 = Now(timing);
             try
             {
-                ExecuteDecodeCore(ctx, ref backBuffer);
+                ExecuteDecodeCore(ctx, ref backBuffer, timing);
             }
             finally
             {
                 backBuffer?.Dispose();
             }
+            long t1 = Now(timing);
+
+            if (timing is not null)
+            {
+                int frames = Math.Max(1, ctx.RgbFrames?.Count ?? 1);
+                timing.TotalTicks = t1 - t0;
+                timing.FrameCount = frames;
+                timing.PixelCount *= frames;
+                timing.Label = ctx.Mode switch
+                {
+                    DecodeMode.Rgb24 => "rgb24",
+                    DecodeMode.Rgba32 => "rgba32",
+                    _ => "animation",
+                };
+                LastTiming = timing;
+                GifTiming.Emit(timing, DiagnosticsLog);
+            }
         }
 
-        private void ExecuteDecodeCore(DecodeContext ctx, ref NativeBufferOwner<byte>? backBuffer)
+        private void ExecuteDecodeCore(DecodeContext ctx, ref NativeBufferOwner<byte>? backBuffer, GifTiming? timing)
         {
+            long th0 = Now(timing);
             var stream = ctx.Stream;
             byte[] sig = new byte[6];
             ReadExact(stream, sig, 0, 6);
@@ -116,6 +158,12 @@ namespace SharpImageConverter.Formats.Gif
             int pixelCount = width * height;
             int components = ctx.Mode == DecodeMode.Rgba32 ? 4 : 3;
             byte[] canvas = new byte[pixelCount * components];
+
+            if (timing is not null)
+            {
+                timing.PixelCount = pixelCount;
+                timing.HeaderTicks = Now(timing) - th0;
+            }
 
             // 背景色填充推迟到第一帧解出索引之后：若首帧整幅覆盖且每个索引都落在调色板内、
             // 又没有透明索引，则每个像素都会被渲染覆盖，这次整画布填充是死写，可以整体跳过。
@@ -196,8 +244,11 @@ namespace SharpImageConverter.Formats.Gif
 
                     int lzwMin = stream.ReadByte();
                     byte[] indices = pool.Rent(iw * ih);
+                    long tl0 = Now(timing);
                     lzwDecoder.Decode(indices.AsSpan(0, iw * ih), iw, ih, lzwMin);
+                    long tl1 = Now(timing);
 
+                    long tb0 = Now(timing);
                     bool opaqueFullCover = !interlace && transIndex < 0 &&
                         ix == 0 && iy == 0 && iw == width && ih == height &&
                         AllIndicesInRange(indices, iw * ih, palCount);
@@ -210,15 +261,25 @@ namespace SharpImageConverter.Formats.Gif
                         }
                         canvasReady = true;
                     }
+                    long tb1 = Now(timing);
 
                     if (disposal == 3)
                     {
                         backBuffer ??= NativeBufferOwner<byte>.Allocate(canvas.Length);
                         canvas.AsSpan().CopyTo(backBuffer.Span);
                     }
+                    long tb2 = Now(timing);
 
                     RenderFrame(canvas, indices, width, height, ix, iy, iw, ih, interlace, transIndex, palette, palCount, ctx.Mode == DecodeMode.Rgba32, opaqueFullCover);
+                    long tr1 = Now(timing);
                     pool.Return(indices);
+
+                    if (timing is not null)
+                    {
+                        timing.LzwTicks += tl1 - tl0;
+                        timing.BackgroundTicks += (tb1 - tb0) + (tb2 - tb1);
+                        timing.RenderTicks += tr1 - tb2;
+                    }
 
                     if (ctx.Mode == DecodeMode.Rgba32)
                     {
@@ -237,6 +298,7 @@ namespace SharpImageConverter.Formats.Gif
                     ctx.Durations!.Add(delayCs * 10 < 10 ? 10 : delayCs * 10);
 
                     // Post-processing disposal
+                    long td0 = Now(timing);
                     if (disposal == 2) // Restore to background
                     {
                         FillRect(canvas, width, height, ix, iy, iw, ih, ctx.Mode == DecodeMode.Rgba32, hasGct ? gct[bgIndex*3] : (byte)0, hasGct ? gct[bgIndex*3+1] : (byte)0, hasGct ? gct[bgIndex*3+2] : (byte)0);
@@ -245,15 +307,21 @@ namespace SharpImageConverter.Formats.Gif
                     {
                         backBuffer.Span.CopyTo(canvas.AsSpan());
                     }
+                    long td1 = Now(timing);
+                    if (timing is not null) timing.BackgroundTicks += td1 - td0;
 
                     disposal = 0; transIndex = -1; delayCs = 0;
                     if (ctx.Mode == DecodeMode.Rgb24) return;
                 }
             }
+            long tf0 = Now(timing);
             if (!canvasReady && hasBgColor)
             {
                 FillBackground(canvas, components, bgR, bgG, bgB);
             }
+            long tf1 = Now(timing);
+            if (timing is not null) timing.BackgroundTicks += tf1 - tf0;
+
             if (ctx.RgbFrames?.Count == 0) ctx.RgbFrames.Add(new Image<Rgb24>(width, height, canvas));
         }
 

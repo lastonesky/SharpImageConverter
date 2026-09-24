@@ -1,5 +1,10 @@
 ## 未发布
 ### 改进
+- 新增 GIF 编解码耗时统计：`GifTiming` 按阶段记录 quantize / prepare / header / lzw / render / background
+  与未归入阶段的其余时间，并给出占比与吞吐（Mpx/s）。`GifEncoder` / `GifDecoder` 及其适配器新增
+  `EnableDiagnostics`、`DiagnosticsLog` 与 `LastTiming`：默认关闭，关闭时热路径不调用 Stopwatch（零开销），
+  开启后报表经 `DiagnosticsLog` 输出，未设置时回落到 `Trace`。
+  CLI 新增 `--gif-debug`（单次转换的分阶段耗时）与 `--gif-bench N`（重复 N 次取最小/中位/平均，只测量不产出文件）。
 - `SimdHelper.AddBytesInPlace` 改为真正的 SIMD：SSE2/AdvSimd 下用 128 位整字节加法（`paddb`，天然 mod 256 回绕），移除原先 Widen/Narrow 的迂回实现。
 - 新增 `SimdHelper.GrayscaleRgb24InPlace`：SSSE3 `pshufb` 三路反交错 + 16 位定点加权，每批 16 像素，`Processing.Grayscale()` 已接入。
 - 新增 `SimdHelper.ExpandGrayToRgb` / `PackRgbaToRgb` / `ExpandRgbToRgba`，替换 `Configuration` 中的逐像素格式互转，并用 `GC.AllocateUninitializedArray` 避免多余清零。
@@ -29,6 +34,11 @@
   4x 放大 537.5ms → 496.9ms（1.08x）；缩小方向受限于写带宽，基本持平（±2%）。
 - 把 `ResizeBilinear` 的定点常数（Shift / Scale / RoundingOffset）提到类级别，
   以便抽出的 `BilinearCore4` 辅助方法复用。
+
+### 工具
+- 新增 `tools/gif-compare.sh` 与 `tools/gif-timing-master.patch`：把 GIF 计时代码移植到
+  基准分支（默认 master）的临时 git 工作树上，让两个分支跑同一套 `--gif-bench` 口径，
+  用于量化优化前后的差异。补丁针对 master @ `0bbf1f9`，若该分支的 `GifDecoder` 再有改动需重新移植。
 
 ### 文档
 - 工程类文档统一收拢到 `docs/`：`PerfReport.md`、`AuditVerification.md`、`goal.md` 移入，
