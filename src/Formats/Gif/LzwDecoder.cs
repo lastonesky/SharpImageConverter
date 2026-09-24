@@ -1,6 +1,9 @@
 using System;
 using System.Buffers;
 using System.IO;
+using System.Runtime.InteropServices;
+using System.Runtime.Intrinsics;
+using System.Runtime.Intrinsics.X86;
 using SharpImageConverter.Core;
 
 namespace SharpImageConverter.Formats.Gif
@@ -11,32 +14,19 @@ namespace SharpImageConverter.Formats.Gif
         private readonly byte[] _blockBuffer = new byte[256];
         private int _blockLength;
         private int _blockIndex;
-
+        
         private int _bitBuffer;
         private int _bitCount;
 
         private readonly NativeBufferOwner<int> _prefix = NativeBufferOwner<int>.Allocate(4096);
         private readonly NativeBufferOwner<byte> _suffix = NativeBufferOwner<byte>.Allocate(4096);
+        private readonly NativeBufferOwner<byte> _pixelStack = NativeBufferOwner<byte>.Allocate(4097);
 
-        /// <summary>
-        /// 每个字典项对应串的长度。有了它就能在展开之前知道串长，
-        /// 从而把字符直接写进输出缓冲的正确位置，省掉「压栈 + 反向拷贝」这第二遍。
-        /// 根码不查此表（长度恒为 1）。
-        /// </summary>
-        private readonly NativeBufferOwner<int> _strLen = NativeBufferOwner<int>.Allocate(4096);
-
-        /// <summary>
-        /// 解码核心的工作量实测（2400x1800 照片，432 万像素）：
-        /// 码数 100.7 万、串平均长 4.29、前缀链迭代 331 万次、位补位迭代 142 万次。
-        /// 据此做过并已否决的改动（均实测变慢，勿重复尝试）：
-        /// 一次补 4 字节的位缓冲（-12%）、prefix/suffix 打包成单个 int（-5%）、
-        /// 二级跳转表一次展开两个像素（-5%）。
-        /// </summary>
         public void Decode(Span<byte> pixels, int width, int height, int dataSize)
         {
             Span<int> prefix = _prefix.Span;
             Span<byte> suffix = _suffix.Span;
-            Span<int> strLen = _strLen.Span;
+            Span<byte> pixelStack = _pixelStack.Span;
             int clearCode = 1 << dataSize;
             int endCode = clearCode + 1;
             int available = clearCode + 2;
@@ -44,6 +34,7 @@ namespace SharpImageConverter.Formats.Gif
             int codeSize = dataSize + 1;
             int codeMask = (1 << codeSize) - 1;
 
+            int top = 0;
             int pixelIndex = 0;
             int pixelCount = width * height;
 
@@ -103,87 +94,71 @@ namespace SharpImageConverter.Formats.Gif
                 // Handle end code
                 if (code == endCode) break;
 
-                // 首个码必定是根码：串长 1，且不产生新的字典项
+                // First code case
                 if (oldCode == -1)
                 {
-                    pixels[pixelIndex++] = (byte)code;
+                    pixelStack[top++] = (byte)code; // code < clearCode implies suffix is code
                     oldCode = code;
-                    continue;
-                }
-
-                // 串长：根码为 1；已在字典中则查表；code == available 时
-                // 串为 string(oldCode) 拼接上它自己的首字符
-                int codeLen;
-                if (code < clearCode) codeLen = 1;
-                else if (code < available) codeLen = strLen[code];
-                else codeLen = oldCode < clearCode ? 2 : strLen[oldCode] + 1;
-
-                int firstChar;
-                if (codeLen <= pixelCount - pixelIndex)
-                {
-                    // 常规路径：串完整落在输出缓冲内，逐字符直写，不做边界判断
-                    int pos = pixelIndex + codeLen;
-                    int walk = code;
-
-                    // 特殊情形：码尚未进字典，输出为 string(oldCode) + string(oldCode) 的首字符
-                    if (code >= available)
-                    {
-                        int fc = oldCode;
-                        while (fc >= clearCode) fc = prefix[fc];
-                        pixels[--pos] = (byte)fc;
-                        walk = oldCode;
-                    }
-
-                    while (walk >= clearCode)
-                    {
-                        pixels[--pos] = suffix[walk];
-                        walk = prefix[walk];
-                    }
-                    firstChar = walk;
-                    pixels[--pos] = (byte)firstChar;
-                    pixelIndex += codeLen;
                 }
                 else
                 {
-                    // 数据被截断：只写前 writeLen 个字符（正常 GIF 不会走到这里）
-                    int writeLen = pixelCount - pixelIndex;
-                    int idx = codeLen;
-                    int walk = code;
+                    int inCode = code;
+                    int firstChar;
+
+                    // Special case: Code is not in table yet
                     if (code >= available)
                     {
-                        int fc = oldCode;
-                        while (fc >= clearCode) fc = prefix[fc];
-                        idx--;
-                        if (idx < writeLen) pixels[pixelIndex + idx] = (byte)fc;
-                        walk = oldCode;
+                        // Output is OldString + OldString[0]
+                        int temp = oldCode;
+                        while (temp >= clearCode)
+                        {
+                            temp = prefix[temp];
+                        }
+                        firstChar = temp;
+                        pixelStack[top++] = (byte)firstChar;
+                        code = oldCode;
                     }
-                    while (walk >= clearCode)
+
+                    // Expand code into pixel stack
+                    while (code >= clearCode)
                     {
-                        idx--;
-                        if (idx < writeLen) pixels[pixelIndex + idx] = suffix[walk];
-                        walk = prefix[walk];
+                        pixelStack[top++] = suffix[code];
+                        code = prefix[code];
                     }
-                    firstChar = walk;
-                    idx--;
-                    if (idx < writeLen) pixels[pixelIndex + idx] = (byte)firstChar;
-                    pixelIndex += writeLen;
+                    firstChar = code;
+                    pixelStack[top++] = (byte)firstChar;
+
+                    // Add new code to table if possible
+                    if (available < 4096)
+                    {
+                        prefix[available] = oldCode;
+                        suffix[available] = (byte)firstChar;
+                        available++;
+                        // Increase code size when needed
+                        if ((available & codeMask) == 0 && available < 4096)
+                        {
+                            codeSize++;
+                            codeMask = (1 << codeSize) - 1;
+                        }
+                    }
+                    oldCode = inCode;
                 }
 
-                // Add new code to table if possible
-                if (available < 4096)
+                // 栈顶到栈底就是这段串的正向输出：短串直接内联回写，长串走反序向量拷贝
+                int runLength = Math.Min(top, pixelCount - pixelIndex);
+                if (runLength > 16)
                 {
-                    prefix[available] = oldCode;
-                    suffix[available] = (byte)firstChar;
-                    strLen[available] = oldCode < clearCode ? 2 : strLen[oldCode] + 1;
-                    available++;
-                    // Increase code size when needed
-                    if ((available & codeMask) == 0 && available < 4096)
+                    ReverseCopy(pixels.Slice(pixelIndex, runLength), pixelStack.Slice(top - runLength, runLength));
+                }
+                else
+                {
+                    for (int k = 0; k < runLength; k++)
                     {
-                        codeSize++;
-                        codeMask = (1 << codeSize) - 1;
+                        pixels[pixelIndex + k] = pixelStack[top - 1 - k];
                     }
                 }
-                oldCode = code;
+                pixelIndex += runLength;
+                top = 0;
             }
 
             // Flush remaining sub-blocks
@@ -215,11 +190,37 @@ namespace SharpImageConverter.Formats.Gif
             }
         }
 
+        /// <summary>
+        /// 把 src 逆序写入 dst（要求 dst.Length == src.Length，且两块内存不重叠）。
+        /// SSSE3 下用 pshufb 每 16 字节反转一次，替代逐字节回写。
+        /// </summary>
+        private static void ReverseCopy(Span<byte> dst, ReadOnlySpan<byte> src)
+        {
+            int n = dst.Length;
+            int i = 0;
+            if (Ssse3.IsSupported && n >= 16)
+            {
+                ref byte dstRef = ref MemoryMarshal.GetReference(dst);
+                ref byte srcRef = ref MemoryMarshal.GetReference(src);
+                Vector128<byte> reverse = Vector128.Create((byte)15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0);
+                int limit = n - 16;
+                for (; i <= limit; i += 16)
+                {
+                    Vector128<byte> v = Vector128.LoadUnsafe(ref srcRef, (nuint)(n - i - 16));
+                    Vector128.StoreUnsafe(Ssse3.Shuffle(v, reverse), ref dstRef, (nuint)i);
+                }
+            }
+            for (; i < n; i++)
+            {
+                dst[i] = src[n - 1 - i];
+            }
+        }
+
         public void Dispose()
         {
             _prefix.Dispose();
             _suffix.Dispose();
-            _strLen.Dispose();
+            _pixelStack.Dispose();
         }
     }
 }
