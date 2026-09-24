@@ -30,6 +30,15 @@
 - 把 `ResizeBilinear` 的定点常数（Shift / Scale / RoundingOffset）提到类级别，
   以便抽出的 `BilinearCore4` 辅助方法复用。
 
+### 文档
+- 工程类文档统一收拢到 `docs/`：`PerfReport.md`、`AuditVerification.md`、`goal.md` 移入，
+  JPEG 规范原文移入 `docs/reference/`，并新增 `docs/README.md` 作为索引。
+  `README.md` / `README.en.md` / `CHANGELOG.md` / `THIRD-PARTY-NOTICES.md` 按生态约定保留在根目录，
+  `.trae/rules/project.md` 因 IDE 按固定路径读取而保持原位。
+- `goal.md` 中的引用由失效的绝对路径（`file:///d:/...`，盘符本身已错）改为仓库内相对路径。
+- 删除根目录误留的 `gcm-diagnose.log`（Git Credential Manager 诊断输出，未被 git 跟踪，
+  内容仅含环境变量名与路径，无凭据值）。
+
 ### 测试
 - 新增 `SharpImageConverter.Tests/SimdPixelOpsTests.cs`，覆盖新增 SIMD 路径与标量实现的逐字节一致性、0..70 长度边界、mod 256 回绕语义，并显式断言本机 SSSE3 可用以免 SIMD 分支漏测。
 - 新增 `SharpImageConverter.Tests/ResizeConsistencyTests.cs`，用改动前的原样算法做参考实现，逐位校验

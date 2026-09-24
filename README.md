@@ -78,8 +78,15 @@ SharpImageConverter/
 │  ├── Program.cs
 │  └── SharpImageConverter.Cli.csproj
 ├── SharpImageConverter.Tests/   # 单元测试工程
+├── docs/                        # 工程类文档（索引见 docs/README.md）
+│  ├── PerfReport.md             # 性能问题定位与优化状态
+│  ├── AuditVerification.md      # 外部审计报告复核
+│  ├── goal.md                   # 与成熟库的差距清单
+│  └── reference/                # 规范原文等参考资料
 └── README.md / README.en.md
 ```
+
+工程类文档（性能分析、审计复核、差距清单）统一放在 `docs/`，入口见 [docs/README.md](docs/README.md)。
 
 ## 使用方式（API）
 
