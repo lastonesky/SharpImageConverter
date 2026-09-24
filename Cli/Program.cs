@@ -27,6 +27,22 @@ class Program
         // 参数解析与行为选项汇总
         var options = ParseOptions(args, inputPath);
         options.IsDirectoryInput = isDir;
+        EnableGifDiagnostics(options);
+
+        // GIF 耗时基准：只测量不转换（目录输入时该选项无效）
+        if (options.GifBench.HasValue)
+        {
+            if (isDir)
+            {
+                Console.WriteLine("⚠️ --gif-bench 仅支持单文件输入，已忽略");
+            }
+            else
+            {
+                RunGifBench(options, options.GifBench.Value);
+                return;
+            }
+        }
+
         var swTotal = Stopwatch.StartNew();
         try
         {
@@ -53,6 +69,7 @@ class Program
         Console.WriteLine("支持输出: .jpg/.jpeg/.png/.bmp/.webp/.gif");
         Console.WriteLine("操作: resize:WxH | resizebilinear:WxH | resizefit:WxH | grayscale");
         Console.WriteLine("参数: --quality N | --subsample 420/444 | --keep-metadata | --idct int/float | --stream | --jpeg-debug | --gif-frames | --gray | --dithering on/off");
+        Console.WriteLine("GIF 耗时统计: --gif-debug（分阶段耗时）| --gif-bench N（重复 N 次取最小/中位/平均，默认 5）");
         Console.WriteLine("文件夹选项: --recursive | --to bmp/png/jpg/webp | --parallel N | --skip-existing");
     }
 
@@ -70,6 +87,24 @@ class Program
             if (string.Equals(a, "--jpeg-debug", StringComparison.OrdinalIgnoreCase))
             {
                 options.JpegDebug = true;
+                continue;
+            }
+            if (string.Equals(a, "--gif-debug", StringComparison.OrdinalIgnoreCase))
+            {
+                options.GifDebug = true;
+                continue;
+            }
+            if (string.Equals(a, "--gif-bench", StringComparison.OrdinalIgnoreCase))
+            {
+                if (i + 1 < args.Length && int.TryParse(args[i + 1], out int benchCount) && benchCount > 0)
+                {
+                    options.GifBench = benchCount;
+                    i++;
+                }
+                else
+                {
+                    options.GifBench = 5;
+                }
                 continue;
             }
             if (string.Equals(a, "--dithering", StringComparison.OrdinalIgnoreCase))
@@ -224,10 +259,117 @@ class Program
             Dithering = src.Dithering,
             UseFloatIdct = src.UseFloatIdct,
             UseStreamingDecoder = src.UseStreamingDecoder,
-            Gray = src.Gray
+            Gray = src.Gray,
+            GifDebug = src.GifDebug,
+            GifBench = src.GifBench
         };
         foreach (var op in src.Operations) dst.Operations.Add(op);
         return dst;
+    }
+
+    /// <summary>
+    /// 创建 GIF 解码器，按 --gif-debug 决定是否输出分阶段耗时。
+    /// </summary>
+    static GifDecoder CreateGifDecoder(CliOptions options) => new()
+    {
+        EnableDiagnostics = options.GifDebug,
+        DiagnosticsLog = options.GifDebug ? Console.WriteLine : null,
+    };
+
+    /// <summary>
+    /// 开启 GIF 耗时统计：把带诊断开关的编解码器注册进默认配置，
+    /// 这样经 Image.Load / Image.Save 走注册表实例的路径也会输出分阶段耗时。
+    /// </summary>
+    static void EnableGifDiagnostics(CliOptions options)
+    {
+        if (!options.GifDebug) return;
+        Action<string> log = Console.WriteLine;
+        Configuration.Default.RegisterDecoder<GifFormat>(new GifDecoder { EnableDiagnostics = true, DiagnosticsLog = log });
+        Configuration.Default.RegisterDecoderRgba<GifFormat>(new GifDecoderRgbaAdapter { EnableDiagnostics = true, DiagnosticsLog = log });
+        Configuration.Default.RegisterEncoder<GifFormat>(new GifEncoderAdapter { EnableDithering = options.Dithering, EnableDiagnostics = true, DiagnosticsLog = log });
+        Configuration.Default.RegisterEncoderRgba<GifFormat>(new GifEncoderAdapterRgba { EnableDithering = options.Dithering, EnableDiagnostics = true, DiagnosticsLog = log });
+    }
+
+    /// <summary>
+    /// GIF 编解码基准：重复 N 次并给出各阶段的最小/中位/平均值，便于对比优化前后的差异。
+    /// </summary>
+    static void RunGifBench(CliOptions options, int iterations)
+    {
+        string inExt = Path.GetExtension(options.InputPath).ToLowerInvariant();
+        Console.WriteLine($"🏁 GIF 耗时基准: {Path.GetFileName(options.InputPath)}  重复 {iterations} 次  (抖动 {(options.Dithering ? "开" : "关")})");
+
+        Image<Rgb24>? rgb = null;
+
+        if (inExt == ".gif")
+        {
+            // 一次性读入内存，避免把磁盘 IO 计入解码耗时
+            byte[] bytes = File.ReadAllBytes(options.InputPath);
+            var decodeTimings = new List<GifTiming>(iterations);
+            for (int i = 0; i < iterations; i++)
+            {
+                var dec = new GifDecoder { EnableDiagnostics = true };
+                using var ms = new MemoryStream(bytes, false);
+                var frame = dec.DecodeRgb24(ms);
+                if (dec.LastTiming is not null) decodeTimings.Add(dec.LastTiming);
+                rgb ??= frame;
+            }
+            PrintBenchSummary("decode", decodeTimings);
+        }
+
+        rgb ??= LoadRgb24(options.InputPath, options.UseFloatIdct, options.UseStreamingDecoder);
+
+        var encodeTimings = new List<GifTiming>(iterations);
+        for (int i = 0; i < iterations; i++)
+        {
+            var enc = new GifEncoder { EnableDiagnostics = true, EnableDithering = options.Dithering };
+            using var ms = new MemoryStream();
+            enc.Encode(new ImageFrame(rgb.Width, rgb.Height, rgb.Buffer), ms);
+            if (enc.LastTiming is not null) encodeTimings.Add(enc.LastTiming);
+        }
+        PrintBenchSummary("encode", encodeTimings);
+    }
+
+    static void PrintBenchSummary(string kind, List<GifTiming> timings)
+    {
+        if (timings.Count == 0)
+        {
+            Console.WriteLine($"[{kind}] 无统计结果");
+            return;
+        }
+
+        int pixels = timings[0].PixelCount;
+        double medianTotal = Median(timings.Select(t => t.TotalMs));
+        string throughput = medianTotal > 0 && pixels > 0
+            ? $"  中位吞吐 {pixels / (medianTotal * 1000.0):F2} Mpx/s"
+            : string.Empty;
+        Console.WriteLine($"── [{kind}] {timings.Count} 次, {pixels} 像素{throughput}");
+
+        PrintBenchStat(timings, "total", t => t.TotalMs);
+        PrintBenchStat(timings, "prepare", t => t.PrepareMs);
+        PrintBenchStat(timings, "quantize", t => t.QuantizeMs);
+        PrintBenchStat(timings, "header", t => t.HeaderMs);
+        PrintBenchStat(timings, "lzw", t => t.LzwMs);
+        PrintBenchStat(timings, "render", t => t.RenderMs);
+        PrintBenchStat(timings, "background", t => t.BackgroundMs);
+        PrintBenchStat(timings, "other", t => t.OtherMs);
+        Console.WriteLine();
+    }
+
+    static void PrintBenchStat(List<GifTiming> timings, string name, Func<GifTiming, double> selector)
+    {
+        var values = timings.Select(selector).OrderBy(v => v).ToArray();
+        // 中位数低于 1 微秒的阶段只可能是计时噪声，不进报表
+        if (Median(values) < 0.001) return;
+        double avg = values.Average();
+        Console.WriteLine($"    {name.PadRight(11)} min={values[0],8:F3}ms  median={Median(values),8:F3}ms  avg={avg,8:F3}ms  max={values[^1],8:F3}ms");
+    }
+
+    static double Median(IEnumerable<double> values)
+    {
+        var sorted = values.OrderBy(v => v).ToArray();
+        if (sorted.Length == 0) return 0;
+        int mid = sorted.Length / 2;
+        return sorted.Length % 2 == 1 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2.0;
     }
 
     static bool Process(CliOptions options)
@@ -259,7 +401,7 @@ class Program
         string dir = Path.GetDirectoryName(baseOut) ?? ".";
         string nameNoExt = Path.GetFileNameWithoutExtension(baseOut);
         string ext = NormalizeOutputExtension(Path.GetExtension(baseOut));
-        var gifDec = new GifDecoder();
+        var gifDec = CreateGifDecoder(options);
         var frames = gifDec.DecodeAllFrames(options.InputPath);
         int digits = Math.Max(3, frames.Count.ToString().Length);
 
@@ -388,7 +530,7 @@ class Program
     static void ConvertGifToWebp(CliOptions options)
     {
         string outputPath = options.OutputPath ?? throw new InvalidOperationException("输出路径为空");
-        var gifDec = new GifDecoder();
+        var gifDec = CreateGifDecoder(options);
         GifAnimation anim;
         using (var fs = File.OpenRead(options.InputPath)) anim = gifDec.DecodeAnimationRgb24(fs);
 
@@ -414,7 +556,7 @@ class Program
     static void ProcessGifToWebpWithOps(CliOptions options)
     {
         string outputPath = options.OutputPath ?? throw new InvalidOperationException("输出路径为空");
-        var gifDec = new GifDecoder();
+        var gifDec = CreateGifDecoder(options);
         GifAnimation anim;
         using (var fs = File.OpenRead(options.InputPath)) anim = gifDec.DecodeAnimationRgb24(fs);
 
@@ -490,7 +632,12 @@ class Program
         string ext = Path.GetExtension(outputPath).ToLowerInvariant();
         if (ext == ".gif")
         {
-            var encoder = new GifEncoderAdapter { EnableDithering = options.Dithering };
+            var encoder = new GifEncoderAdapter
+            {
+                EnableDithering = options.Dithering,
+                EnableDiagnostics = options.GifDebug,
+                DiagnosticsLog = options.GifDebug ? Console.WriteLine : null,
+            };
             encoder.EncodeRgb24(outputPath, image);
             return;
         }
@@ -523,7 +670,12 @@ class Program
         string ext = Path.GetExtension(outputPath).ToLowerInvariant();
         if (ext == ".gif")
         {
-            var encoder = new GifEncoderAdapterRgba { EnableDithering = options.Dithering };
+            var encoder = new GifEncoderAdapterRgba
+            {
+                EnableDithering = options.Dithering,
+                EnableDiagnostics = options.GifDebug,
+                DiagnosticsLog = options.GifDebug ? Console.WriteLine : null,
+            };
             encoder.EncodeRgba32(outputPath, image);
             return;
         }
@@ -805,6 +957,8 @@ class Program
         public bool UseStreamingDecoder { get; set; }
         public bool Gray { get; set; }
         public bool JpegDebug { get; set; }
+        public bool GifDebug { get; set; }
+        public int? GifBench { get; set; }
         public List<Action<ImageProcessingContext>> Operations { get; } = [];
         public bool IsDirectoryInput { get; set; }
         public bool Recursive { get; set; }
