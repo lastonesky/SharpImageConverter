@@ -1,0 +1,1057 @@
+diff --git a/Cli/Program.cs b/Cli/Program.cs
+index 8b525d0..b8f0884 100644
+--- a/Cli/Program.cs
++++ b/Cli/Program.cs
+@@ -27,6 +27,22 @@ class Program
+         // 参数解析与行为选项汇总
+         var options = ParseOptions(args, inputPath);
+         options.IsDirectoryInput = isDir;
++        EnableGifDiagnostics(options);
++
++        // GIF 耗时基准：只测量不转换（目录输入时该选项无效）
++        if (options.GifBench.HasValue)
++        {
++            if (isDir)
++            {
++                Console.WriteLine("⚠️ --gif-bench 仅支持单文件输入，已忽略");
++            }
++            else
++            {
++                RunGifBench(options, options.GifBench.Value);
++                return;
++            }
++        }
++
+         var swTotal = Stopwatch.StartNew();
+         try
+         {
+@@ -53,6 +69,7 @@ class Program
+         Console.WriteLine("支持输出: .jpg/.jpeg/.png/.bmp/.webp/.gif");
+         Console.WriteLine("操作: resize:WxH | resizebilinear:WxH | resizefit:WxH | grayscale");
+         Console.WriteLine("参数: --quality N | --subsample 420/444 | --keep-metadata | --idct int/float | --stream | --jpeg-debug | --gif-frames | --gray | --dithering on/off");
++        Console.WriteLine("GIF 耗时统计: --gif-debug（分阶段耗时）| --gif-bench N（重复 N 次取最小/中位/平均，默认 5）");
+         Console.WriteLine("文件夹选项: --recursive | --to bmp/png/jpg/webp | --parallel N | --skip-existing");
+     }
+ 
+@@ -72,6 +89,24 @@ class Program
+                 options.JpegDebug = true;
+                 continue;
+             }
++            if (string.Equals(a, "--gif-debug", StringComparison.OrdinalIgnoreCase))
++            {
++                options.GifDebug = true;
++                continue;
++            }
++            if (string.Equals(a, "--gif-bench", StringComparison.OrdinalIgnoreCase))
++            {
++                if (i + 1 < args.Length && int.TryParse(args[i + 1], out int benchCount) && benchCount > 0)
++                {
++                    options.GifBench = benchCount;
++                    i++;
++                }
++                else
++                {
++                    options.GifBench = 5;
++                }
++                continue;
++            }
+             if (string.Equals(a, "--dithering", StringComparison.OrdinalIgnoreCase))
+             {
+                 if (i + 1 < args.Length)
+@@ -224,12 +259,119 @@ class Program
+             Dithering = src.Dithering,
+             UseFloatIdct = src.UseFloatIdct,
+             UseStreamingDecoder = src.UseStreamingDecoder,
+-            Gray = src.Gray
++            Gray = src.Gray,
++            GifDebug = src.GifDebug,
++            GifBench = src.GifBench
+         };
+         foreach (var op in src.Operations) dst.Operations.Add(op);
+         return dst;
+     }
+ 
++    /// <summary>
++    /// 创建 GIF 解码器，按 --gif-debug 决定是否输出分阶段耗时。
++    /// </summary>
++    static GifDecoder CreateGifDecoder(CliOptions options) => new()
++    {
++        EnableDiagnostics = options.GifDebug,
++        DiagnosticsLog = options.GifDebug ? Console.WriteLine : null,
++    };
++
++    /// <summary>
++    /// 开启 GIF 耗时统计：把带诊断开关的编解码器注册进默认配置，
++    /// 这样经 Image.Load / Image.Save 走注册表实例的路径也会输出分阶段耗时。
++    /// </summary>
++    static void EnableGifDiagnostics(CliOptions options)
++    {
++        if (!options.GifDebug) return;
++        Action<string> log = Console.WriteLine;
++        Configuration.Default.RegisterDecoder<GifFormat>(new GifDecoder { EnableDiagnostics = true, DiagnosticsLog = log });
++        Configuration.Default.RegisterDecoderRgba<GifFormat>(new GifDecoderRgbaAdapter { EnableDiagnostics = true, DiagnosticsLog = log });
++        Configuration.Default.RegisterEncoder<GifFormat>(new GifEncoderAdapter { EnableDithering = options.Dithering, EnableDiagnostics = true, DiagnosticsLog = log });
++        Configuration.Default.RegisterEncoderRgba<GifFormat>(new GifEncoderAdapterRgba { EnableDithering = options.Dithering, EnableDiagnostics = true, DiagnosticsLog = log });
++    }
++
++    /// <summary>
++    /// GIF 编解码基准：重复 N 次并给出各阶段的最小/中位/平均值，便于对比优化前后的差异。
++    /// </summary>
++    static void RunGifBench(CliOptions options, int iterations)
++    {
++        string inExt = Path.GetExtension(options.InputPath).ToLowerInvariant();
++        Console.WriteLine($"🏁 GIF 耗时基准: {Path.GetFileName(options.InputPath)}  重复 {iterations} 次  (抖动 {(options.Dithering ? "开" : "关")})");
++
++        Image<Rgb24>? rgb = null;
++
++        if (inExt == ".gif")
++        {
++            // 一次性读入内存，避免把磁盘 IO 计入解码耗时
++            byte[] bytes = File.ReadAllBytes(options.InputPath);
++            var decodeTimings = new List<GifTiming>(iterations);
++            for (int i = 0; i < iterations; i++)
++            {
++                var dec = new GifDecoder { EnableDiagnostics = true };
++                using var ms = new MemoryStream(bytes, false);
++                var frame = dec.DecodeRgb24(ms);
++                if (dec.LastTiming is not null) decodeTimings.Add(dec.LastTiming);
++                rgb ??= frame;
++            }
++            PrintBenchSummary("decode", decodeTimings);
++        }
++
++        rgb ??= LoadRgb24(options.InputPath, options.UseFloatIdct, options.UseStreamingDecoder);
++
++        var encodeTimings = new List<GifTiming>(iterations);
++        for (int i = 0; i < iterations; i++)
++        {
++            var enc = new GifEncoder { EnableDiagnostics = true, EnableDithering = options.Dithering };
++            using var ms = new MemoryStream();
++            enc.Encode(new ImageFrame(rgb.Width, rgb.Height, rgb.Buffer), ms);
++            if (enc.LastTiming is not null) encodeTimings.Add(enc.LastTiming);
++        }
++        PrintBenchSummary("encode", encodeTimings);
++    }
++
++    static void PrintBenchSummary(string kind, List<GifTiming> timings)
++    {
++        if (timings.Count == 0)
++        {
++            Console.WriteLine($"[{kind}] 无统计结果");
++            return;
++        }
++
++        int pixels = timings[0].PixelCount;
++        double medianTotal = Median(timings.Select(t => t.TotalMs));
++        string throughput = medianTotal > 0 && pixels > 0
++            ? $"  中位吞吐 {pixels / (medianTotal * 1000.0):F2} Mpx/s"
++            : string.Empty;
++        Console.WriteLine($"── [{kind}] {timings.Count} 次, {pixels} 像素{throughput}");
++
++        PrintBenchStat(timings, "total", t => t.TotalMs);
++        PrintBenchStat(timings, "prepare", t => t.PrepareMs);
++        PrintBenchStat(timings, "quantize", t => t.QuantizeMs);
++        PrintBenchStat(timings, "header", t => t.HeaderMs);
++        PrintBenchStat(timings, "lzw", t => t.LzwMs);
++        PrintBenchStat(timings, "render", t => t.RenderMs);
++        PrintBenchStat(timings, "background", t => t.BackgroundMs);
++        PrintBenchStat(timings, "other", t => t.OtherMs);
++        Console.WriteLine();
++    }
++
++    static void PrintBenchStat(List<GifTiming> timings, string name, Func<GifTiming, double> selector)
++    {
++        var values = timings.Select(selector).OrderBy(v => v).ToArray();
++        // 中位数低于 1 微秒的阶段只可能是计时噪声，不进报表
++        if (Median(values) < 0.001) return;
++        double avg = values.Average();
++        Console.WriteLine($"    {name.PadRight(11)} min={values[0],8:F3}ms  median={Median(values),8:F3}ms  avg={avg,8:F3}ms  max={values[^1],8:F3}ms");
++    }
++
++    static double Median(IEnumerable<double> values)
++    {
++        var sorted = values.OrderBy(v => v).ToArray();
++        if (sorted.Length == 0) return 0;
++        int mid = sorted.Length / 2;
++        return sorted.Length % 2 == 1 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2.0;
++    }
++
+     static bool Process(CliOptions options)
+     {
+         string inExt = Path.GetExtension(options.InputPath).ToLowerInvariant();
+@@ -259,7 +401,7 @@ class Program
+         string dir = Path.GetDirectoryName(baseOut) ?? ".";
+         string nameNoExt = Path.GetFileNameWithoutExtension(baseOut);
+         string ext = NormalizeOutputExtension(Path.GetExtension(baseOut));
+-        var gifDec = new GifDecoder();
++        var gifDec = CreateGifDecoder(options);
+         var frames = gifDec.DecodeAllFrames(options.InputPath);
+         int digits = Math.Max(3, frames.Count.ToString().Length);
+ 
+@@ -388,7 +530,7 @@ class Program
+     static void ConvertGifToWebp(CliOptions options)
+     {
+         string outputPath = options.OutputPath ?? throw new InvalidOperationException("输出路径为空");
+-        var gifDec = new GifDecoder();
++        var gifDec = CreateGifDecoder(options);
+         GifAnimation anim;
+         using (var fs = File.OpenRead(options.InputPath)) anim = gifDec.DecodeAnimationRgb24(fs);
+ 
+@@ -414,7 +556,7 @@ class Program
+     static void ProcessGifToWebpWithOps(CliOptions options)
+     {
+         string outputPath = options.OutputPath ?? throw new InvalidOperationException("输出路径为空");
+-        var gifDec = new GifDecoder();
++        var gifDec = CreateGifDecoder(options);
+         GifAnimation anim;
+         using (var fs = File.OpenRead(options.InputPath)) anim = gifDec.DecodeAnimationRgb24(fs);
+ 
+@@ -490,7 +632,12 @@ class Program
+         string ext = Path.GetExtension(outputPath).ToLowerInvariant();
+         if (ext == ".gif")
+         {
+-            var encoder = new GifEncoderAdapter { EnableDithering = options.Dithering };
++            var encoder = new GifEncoderAdapter
++            {
++                EnableDithering = options.Dithering,
++                EnableDiagnostics = options.GifDebug,
++                DiagnosticsLog = options.GifDebug ? Console.WriteLine : null,
++            };
+             encoder.EncodeRgb24(outputPath, image);
+             return;
+         }
+@@ -523,7 +670,12 @@ class Program
+         string ext = Path.GetExtension(outputPath).ToLowerInvariant();
+         if (ext == ".gif")
+         {
+-            var encoder = new GifEncoderAdapterRgba { EnableDithering = options.Dithering };
++            var encoder = new GifEncoderAdapterRgba
++            {
++                EnableDithering = options.Dithering,
++                EnableDiagnostics = options.GifDebug,
++                DiagnosticsLog = options.GifDebug ? Console.WriteLine : null,
++            };
+             encoder.EncodeRgba32(outputPath, image);
+             return;
+         }
+@@ -805,6 +957,8 @@ class Program
+         public bool UseStreamingDecoder { get; set; }
+         public bool Gray { get; set; }
+         public bool JpegDebug { get; set; }
++        public bool GifDebug { get; set; }
++        public int? GifBench { get; set; }
+         public List<Action<ImageProcessingContext>> Operations { get; } = [];
+         public bool IsDirectoryInput { get; set; }
+         public bool Recursive { get; set; }
+diff --git a/src/Formats/Gif/GifAdapter.cs b/src/Formats/Gif/GifAdapter.cs
+index a0c42c4..c8be93c 100644
+--- a/src/Formats/Gif/GifAdapter.cs
++++ b/src/Formats/Gif/GifAdapter.cs
+@@ -12,6 +12,21 @@ namespace SharpImageConverter.Formats.Gif
+     {
+         public bool EnableDithering { get; set; } = true;
+ 
++        /// <summary>
++        /// 是否采集编码各阶段耗时并输出诊断日志。
++        /// </summary>
++        public bool EnableDiagnostics { get; set; }
++
++        /// <summary>
++        /// 诊断日志输出委托，为 null 时回落到 Trace。
++        /// </summary>
++        public Action<string>? DiagnosticsLog { get; set; }
++
++        /// <summary>
++        /// 最近一次编码的耗时统计，未开启诊断时为 null。
++        /// </summary>
++        public GifTiming? LastTiming { get; private set; }
++
+         /// <summary>
+         /// 将 RGB24 图像编码为 GIF 文件
+         /// </summary>
+@@ -19,10 +34,11 @@ namespace SharpImageConverter.Formats.Gif
+         /// <param name="image">输入图像</param>
+         public void EncodeRgb24(string path, Image<Rgb24> image)
+         {
+-            var encoder = new GifEncoder { EnableDithering = EnableDithering };
++            var encoder = CreateEncoder();
+             using var fs = File.Create(path);
+             var frame = new ImageFrame(image.Width, image.Height, image.Buffer);
+             encoder.Encode(frame, fs);
++            LastTiming = encoder.LastTiming;
+         }
+ 
+         /// <summary>
+@@ -32,10 +48,18 @@ namespace SharpImageConverter.Formats.Gif
+         /// <param name="image">输入图像</param>
+         public void EncodeRgb24(Stream stream, Image<Rgb24> image)
+         {
+-            var encoder = new GifEncoder { EnableDithering = EnableDithering };
++            var encoder = CreateEncoder();
+             var frame = new ImageFrame(image.Width, image.Height, image.Buffer);
+             encoder.Encode(frame, stream);
++            LastTiming = encoder.LastTiming;
+         }
++
++        private GifEncoder CreateEncoder() => new()
++        {
++            EnableDithering = EnableDithering,
++            EnableDiagnostics = EnableDiagnostics,
++            DiagnosticsLog = DiagnosticsLog,
++        };
+     }
+ 
+     /// <summary>
+@@ -45,6 +69,21 @@ namespace SharpImageConverter.Formats.Gif
+     {
+         public bool EnableDithering { get; set; } = true;
+ 
++        /// <summary>
++        /// 是否采集编码各阶段耗时并输出诊断日志。
++        /// </summary>
++        public bool EnableDiagnostics { get; set; }
++
++        /// <summary>
++        /// 诊断日志输出委托，为 null 时回落到 Trace。
++        /// </summary>
++        public Action<string>? DiagnosticsLog { get; set; }
++
++        /// <summary>
++        /// 最近一次编码的耗时统计，未开启诊断时为 null。
++        /// </summary>
++        public GifTiming? LastTiming { get; private set; }
++
+         /// <summary>
+         /// 将 RGBA32 图像编码为 GIF 文件
+         /// </summary>
+@@ -52,9 +91,10 @@ namespace SharpImageConverter.Formats.Gif
+         /// <param name="image">输入图像</param>
+         public void EncodeRgba32(string path, Image<Rgba32> image)
+         {
+-            var encoder = new GifEncoder { EnableDithering = EnableDithering };
++            var encoder = CreateEncoder();
+             using var fs = File.Create(path);
+             encoder.EncodeRgba(image.Width, image.Height, image.Buffer, fs);
++            LastTiming = encoder.LastTiming;
+         }
+ 
+         /// <summary>
+@@ -64,9 +104,17 @@ namespace SharpImageConverter.Formats.Gif
+         /// <param name="image">输入图像</param>
+         public void EncodeRgba32(Stream stream, Image<Rgba32> image)
+         {
+-            var encoder = new GifEncoder { EnableDithering = EnableDithering };
++            var encoder = CreateEncoder();
+             encoder.EncodeRgba(image.Width, image.Height, image.Buffer, stream);
++            LastTiming = encoder.LastTiming;
+         }
++
++        private GifEncoder CreateEncoder() => new()
++        {
++            EnableDithering = EnableDithering,
++            EnableDiagnostics = EnableDiagnostics,
++            DiagnosticsLog = DiagnosticsLog,
++        };
+     }
+ 
+     /// <summary>
+@@ -74,6 +122,21 @@ namespace SharpImageConverter.Formats.Gif
+     /// </summary>
+     public sealed class GifDecoderRgbaAdapter : IImageDecoderRgba
+     {
++        /// <summary>
++        /// 是否采集解码各阶段耗时并输出诊断日志。
++        /// </summary>
++        public bool EnableDiagnostics { get; set; }
++
++        /// <summary>
++        /// 诊断日志输出委托，为 null 时回落到 Trace。
++        /// </summary>
++        public Action<string>? DiagnosticsLog { get; set; }
++
++        /// <summary>
++        /// 最近一次解码的耗时统计，未开启诊断时为 null。
++        /// </summary>
++        public GifTiming? LastTiming { get; private set; }
++
+         /// <summary>
+         /// 解码 GIF 文件为 RGBA32 图像
+         /// </summary>
+@@ -81,8 +144,10 @@ namespace SharpImageConverter.Formats.Gif
+         /// <returns>RGBA32 图像</returns>
+         public Image<Rgba32> DecodeRgba32(string path)
+         {
+-            var dec = new GifDecoder();
+-            return dec.DecodeRgba32(path);
++            var dec = CreateDecoder();
++            var image = dec.DecodeRgba32(path);
++            LastTiming = dec.LastTiming;
++            return image;
+         }
+ 
+         /// <summary>
+@@ -92,8 +157,16 @@ namespace SharpImageConverter.Formats.Gif
+         /// <returns>RGBA32 图像</returns>
+         public Image<Rgba32> DecodeRgba32(Stream stream)
+         {
+-            var dec = new GifDecoder();
+-            return dec.DecodeRgba32(stream);
++            var dec = CreateDecoder();
++            var image = dec.DecodeRgba32(stream);
++            LastTiming = dec.LastTiming;
++            return image;
+         }
++
++        private GifDecoder CreateDecoder() => new()
++        {
++            EnableDiagnostics = EnableDiagnostics,
++            DiagnosticsLog = DiagnosticsLog,
++        };
+     }
+ }
+diff --git a/src/Formats/Gif/GifDecoder.cs b/src/Formats/Gif/GifDecoder.cs
+index 4e34b0d..63237ca 100644
+--- a/src/Formats/Gif/GifDecoder.cs
++++ b/src/Formats/Gif/GifDecoder.cs
+@@ -1,6 +1,7 @@
+ using System;
+ using System.Buffers;
+ using System.Collections.Generic;
++using System.Diagnostics;
+ using System.IO;
+ using SharpImageConverter.Core;
+ 
+@@ -23,6 +24,19 @@ namespace SharpImageConverter.Formats.Gif
+ 
+         private enum DecodeMode { Rgb24, Rgba32, Animation }
+ 
++        // ---- 为跨分支对比临时移植的耗时统计（opt-gif 分支同款实现）----
++
++        /// <summary>是否采集解码各阶段耗时并输出诊断日志，默认关闭。</summary>
++        public bool EnableDiagnostics { get; set; }
++
++        /// <summary>诊断日志输出委托，为 null 时回落到 Trace。</summary>
++        public Action<string>? DiagnosticsLog { get; set; }
++
++        /// <summary>最近一次解码的耗时统计，未开启诊断时为 null。</summary>
++        public GifTiming? LastTiming { get; private set; }
++
++        private static long Now(GifTiming? timing) => timing is null ? 0 : Stopwatch.GetTimestamp();
++
+         public GifAnimation DecodeAnimationRgb24(string path)
+         {
+             using var fs = File.OpenRead(path);
+@@ -79,18 +93,38 @@ namespace SharpImageConverter.Formats.Gif
+         private void ExecuteDecode(DecodeContext ctx)
+         {
+             NativeBufferOwner<byte>? backBuffer = null;
++            var timing = EnableDiagnostics ? new GifTiming(GifTimingKind.Decode) : null;
++            long t0 = Now(timing);
+             try
+             {
+-                ExecuteDecodeCore(ctx, ref backBuffer);
++                ExecuteDecodeCore(ctx, ref backBuffer, timing);
+             }
+             finally
+             {
+                 backBuffer?.Dispose();
+             }
++            long t1 = Now(timing);
++
++            if (timing is not null)
++            {
++                int frames = Math.Max(1, ctx.RgbFrames?.Count ?? 1);
++                timing.TotalTicks = t1 - t0;
++                timing.FrameCount = frames;
++                timing.PixelCount *= frames;
++                timing.Label = ctx.Mode switch
++                {
++                    DecodeMode.Rgb24 => "rgb24",
++                    DecodeMode.Rgba32 => "rgba32",
++                    _ => "animation",
++                };
++                LastTiming = timing;
++                GifTiming.Emit(timing, DiagnosticsLog);
++            }
+         }
+ 
+-        private void ExecuteDecodeCore(DecodeContext ctx, ref NativeBufferOwner<byte>? backBuffer)
++        private void ExecuteDecodeCore(DecodeContext ctx, ref NativeBufferOwner<byte>? backBuffer, GifTiming? timing)
+         {
++            long th0 = Now(timing);
+             var stream = ctx.Stream;
+             byte[] sig = new byte[6];
+             ReadExact(stream, sig, 0, 6);
+@@ -112,6 +146,13 @@ namespace SharpImageConverter.Formats.Gif
+             int components = ctx.Mode == DecodeMode.Rgba32 ? 4 : 3;
+             byte[] canvas = new byte[pixelCount * components];
+ 
++            if (timing is not null)
++            {
++                timing.PixelCount = pixelCount;
++                timing.HeaderTicks = Now(timing) - th0;
++            }
++
++            long tb0 = Now(timing);
+             if (hasGct && bgIndex < gctColors)
+             {
+                 byte r = gct[bgIndex * 3], g = gct[bgIndex * 3 + 1], b = gct[bgIndex * 3 + 2];
+@@ -124,6 +165,8 @@ namespace SharpImageConverter.Formats.Gif
+                     for (int i = 0; i < canvas.Length; i += 3) { canvas[i] = r; canvas[i+1] = g; canvas[i+2] = b; }
+                 }
+             }
++            long tb1 = Now(timing);
++            if (timing is not null) timing.BackgroundTicks += tb1 - tb0;
+ 
+             if (ctx.Mode != DecodeMode.Rgba32)
+             {
+@@ -196,17 +239,29 @@ namespace SharpImageConverter.Formats.Gif
+ 
+                     int lzwMin = stream.ReadByte();
+                     byte[] indices = pool.Rent(iw * ih);
++                    long tl0 = Now(timing);
+                     lzwDecoder.Decode(indices.AsSpan(0, iw * ih), iw, ih, lzwMin);
++                    long tl1 = Now(timing);
+ 
++                    long tb2 = Now(timing);
+                     if (disposal == 3)
+                     {
+                         backBuffer ??= NativeBufferOwner<byte>.Allocate(canvas.Length);
+                         canvas.AsSpan().CopyTo(backBuffer.Span);
+                     }
++                    long tb3 = Now(timing);
+ 
+                     RenderFrame(canvas, indices, width, height, ix, iy, iw, ih, interlace, transIndex, palette, palCount, ctx.Mode == DecodeMode.Rgba32);
++                    long tr1 = Now(timing);
+                     pool.Return(indices);
+ 
++                    if (timing is not null)
++                    {
++                        timing.LzwTicks += tl1 - tl0;
++                        timing.BackgroundTicks += tb3 - tb2;
++                        timing.RenderTicks += tr1 - tb3;
++                    }
++
+                     if (ctx.Mode == DecodeMode.Rgba32)
+                     {
+                         ctx.RgbaFrame = new Image<Rgba32>(width, height, canvas);
+@@ -224,6 +279,7 @@ namespace SharpImageConverter.Formats.Gif
+                     ctx.Durations!.Add(delayCs * 10 < 10 ? 10 : delayCs * 10);
+ 
+                     // Post-processing disposal
++                    long td0 = Now(timing);
+                     if (disposal == 2) // Restore to background
+                     {
+                         FillRect(canvas, width, height, ix, iy, iw, ih, ctx.Mode == DecodeMode.Rgba32, hasGct ? gct[bgIndex*3] : (byte)0, hasGct ? gct[bgIndex*3+1] : (byte)0, hasGct ? gct[bgIndex*3+2] : (byte)0);
+@@ -232,6 +288,8 @@ namespace SharpImageConverter.Formats.Gif
+                     {
+                         backBuffer.Span.CopyTo(canvas.AsSpan());
+                     }
++                    long td1 = Now(timing);
++                    if (timing is not null) timing.BackgroundTicks += td1 - td0;
+ 
+                     disposal = 0; transIndex = -1; delayCs = 0;
+                     if (ctx.Mode == DecodeMode.Rgb24) return;
+diff --git a/src/Formats/Gif/GifEncoder.cs b/src/Formats/Gif/GifEncoder.cs
+index 9ac0d55..f23f3c5 100644
+--- a/src/Formats/Gif/GifEncoder.cs
++++ b/src/Formats/Gif/GifEncoder.cs
+@@ -1,5 +1,6 @@
+ using System;
+ using System.Collections.Generic;
++using System.Diagnostics;
+ using System.IO;
+ using SharpImageConverter.Core;
+ 
+@@ -17,10 +18,63 @@ public class GifEncoder
+     /// </summary>
+     public bool EnableDithering { get; set; } = true;
+ 
++    /// <summary>
++    /// 是否采集编码各阶段耗时并输出诊断日志，默认关闭。
++    /// 关闭时不会调用 Stopwatch，热路径无额外开销。
++    /// </summary>
++    public bool EnableDiagnostics { get; set; }
++
++    /// <summary>
++    /// 诊断日志输出委托，为 null 时回落到 <see cref="Trace"/>。
++    /// </summary>
++    public Action<string>? DiagnosticsLog { get; set; }
++
++    /// <summary>
++    /// 最近一次编码的耗时统计，未开启诊断时为 null。
++    /// </summary>
++    public GifTiming? LastTiming { get; private set; }
++
++    /// <summary>
++    /// 取当前时间戳；未开启诊断时返回 0，避免无谓的计时开销。
++    /// </summary>
++    private static long Now(GifTiming? timing) => timing is null ? 0 : Stopwatch.GetTimestamp();
++
++    private GifTiming? BeginTiming(int pixelCount, int frameCount)
++    {
++        return EnableDiagnostics ? new GifTiming(GifTimingKind.Encode, pixelCount, frameCount) : null;
++    }
++
++    private void FinishTiming(GifTiming? timing)
++    {
++        if (timing is null) return;
++        LastTiming = timing;
++        GifTiming.Emit(timing, DiagnosticsLog);
++    }
++
+     public void Encode(ImageFrame image, Stream stream)
+     {
++        var timing = BeginTiming(image.Width * image.Height, 1);
++        long t0 = Now(timing);
++        EncodeCore(image, stream, timing);
++        long t1 = Now(timing);
++
++        if (timing is not null)
++        {
++            timing.TotalTicks = t1 - t0;
++            timing.Label = "rgb24";
++        }
++        FinishTiming(timing);
++    }
++
++    /// <summary>
++    /// 单帧编码核心：量化 → 头与调色板 → LZW。各阶段耗时累加进 <paramref name="timing"/>。
++    /// </summary>
++    private void EncodeCore(ImageFrame image, Stream stream, GifTiming? timing)
++    {
++        long t0 = Now(timing);
+         var (palette, indices) = Quantizer.Quantize(image.Pixels, image.Width, image.Height, EnableDithering);
+-        
++        long t1 = Now(timing);
++
+         int paletteCount = palette.Length / 3;
+         int depth = GetColorDepth(paletteCount);
+         int actualTableSize = 1 << (depth + 1);
+@@ -52,18 +106,33 @@ public class GifEncoder
+         WriteShort(_headerBuf, ref ptr, image.Height);
+         _headerBuf[ptr++] = 0; // No local table
+         stream.Write(_headerBuf, 0, ptr);
++        long t2 = Now(timing);
+ 
+         // LZW
+         using var lzwEncoder = new LzwEncoder(stream);
+         lzwEncoder.Encode(indices, image.Width, image.Height, Math.Max(2, depth + 1));
++        long t3 = Now(timing);
+         stream.WriteByte(0x3B); // Trailer
++        long t4 = Now(timing);
++
++        if (timing is not null)
++        {
++            timing.QuantizeTicks += t1 - t0;
++            timing.HeaderTicks += (t2 - t1) + (t4 - t3);
++            timing.LzwTicks += t3 - t2;
++            timing.PaletteColors = paletteCount;
++        }
+     }
+ 
+     public void EncodeRgba(int width, int height, byte[] rgba, Stream stream)
+     {
++        var timing = BeginTiming(width * height, 1);
++        long t0 = Now(timing);
++
+         bool hasTransparent = false;
+         for (int i = 3; i < rgba.Length; i += 4) { if (rgba[i] < 128) { hasTransparent = true; break; } }
+-        
++        long tScanEnd = Now(timing);
++
+         if (!hasTransparent)
+         {
+             byte[] rgb = new byte[width * height * 3];
+@@ -71,12 +140,25 @@ public class GifEncoder
+             {
+                 rgb[j] = rgba[i]; rgb[j + 1] = rgba[i + 1]; rgb[j + 2] = rgba[i + 2];
+             }
+-            Encode(new ImageFrame(width, height, rgb), stream);
++            long tPrepEnd = Now(timing);
++
++            EncodeCore(new ImageFrame(width, height, rgb), stream, timing);
++            long tEnd = Now(timing);
++
++            if (timing is not null)
++            {
++                timing.PrepareTicks = tPrepEnd - t0;
++                timing.TotalTicks = tEnd - t0;
++                timing.Label = "rgba32(opaque)";
++            }
++            FinishTiming(timing);
+             return;
+         }
+ 
++        long t1 = Now(timing);
+         QuantizeRgbaWithTransparency(width, height, rgba, out var palette, out var indices, out int depth);
+-        
++        long t2 = Now(timing);
++
+         int ptr = 0;
+         WriteAscii(_headerBuf, ref ptr, "GIF89a");
+         WriteShort(_headerBuf, ref ptr, width);
+@@ -84,7 +166,7 @@ public class GifEncoder
+         _headerBuf[ptr++] = (byte)(0x80 | (0x07 << 4) | depth);
+         _headerBuf[ptr++] = 0; _headerBuf[ptr++] = 0;
+         stream.Write(_headerBuf, 0, ptr);
+-        
++
+         stream.Write(palette);
+ 
+         // GCE for transparency
+@@ -94,17 +176,32 @@ public class GifEncoder
+         _headerBuf[ptr++] = 0; _headerBuf[ptr++] = 0; // Delay
+         _headerBuf[ptr++] = 0; // Transparent index
+         _headerBuf[ptr++] = 0; // Terminator
+-        
++
+         // Image Descriptor
+         _headerBuf[ptr++] = 0x2C;
+         WriteShort(_headerBuf, ref ptr, 0); WriteShort(_headerBuf, ref ptr, 0);
+         WriteShort(_headerBuf, ref ptr, width); WriteShort(_headerBuf, ref ptr, height);
+         _headerBuf[ptr++] = 0;
+         stream.Write(_headerBuf, 0, ptr);
++        long t3 = Now(timing);
+ 
+         using var lzwEncoder = new LzwEncoder(stream);
+         lzwEncoder.Encode(indices, width, height, Math.Max(2, depth + 1));
++        long t4 = Now(timing);
+         stream.WriteByte(0x3B);
++        long t5 = Now(timing);
++
++        if (timing is not null)
++        {
++            timing.PrepareTicks = tScanEnd - t0;
++            timing.QuantizeTicks = t2 - t1;
++            timing.HeaderTicks = (t3 - t2) + (t5 - t4);
++            timing.LzwTicks = t4 - t3;
++            timing.TotalTicks = t5 - t0;
++            timing.PaletteColors = palette.Length / 3;
++            timing.Label = "rgba32(alpha)";
++        }
++        FinishTiming(timing);
+     }
+ 
+     public void EncodeAnimation(IReadOnlyList<ImageFrame> frames, IReadOnlyList<int> frameDurationsMs, int loopCount, Stream stream)
+@@ -112,6 +209,9 @@ public class GifEncoder
+         if (frames.Count == 0) return;
+         int w = frames[0].Width, h = frames[0].Height;
+ 
++        var timing = BeginTiming(w * h * frames.Count, frames.Count);
++        long t0 = Now(timing);
++
+         int ptr = 0;
+         WriteAscii(_headerBuf, ref ptr, "GIF89a");
+         WriteShort(_headerBuf, ref ptr, w); WriteShort(_headerBuf, ref ptr, h);
+@@ -120,13 +220,18 @@ public class GifEncoder
+         stream.Write(_headerBuf, 0, ptr);
+ 
+         WriteNetscapeExtension(stream, loopCount);
++        long tHeaderEnd = Now(timing);
++        if (timing is not null) timing.HeaderTicks = tHeaderEnd - t0;
++
+         using var lzwEncoder = new LzwEncoder(stream);
+ 
+         for (int i = 0; i < frames.Count; i++)
+         {
++            long tq0 = Now(timing);
+             var (pal, inds) = Quantizer.Quantize(frames[i].Pixels, w, h, EnableDithering);
++            long tq1 = Now(timing);
+             int depth = GetColorDepth(pal.Length / 3);
+-            
++
+             ptr = 0;
+             // GCE
+             _headerBuf[ptr++] = 0x21; _headerBuf[ptr++] = 0xF9; _headerBuf[ptr++] = 4;
+@@ -134,7 +239,7 @@ public class GifEncoder
+             int delay = (frameDurationsMs[i] + 5) / 10;
+             WriteShort(_headerBuf, ref ptr, Math.Clamp(delay, 0, 65535));
+             _headerBuf[ptr++] = 0; _headerBuf[ptr++] = 0;
+-            
++
+             // Image Descriptor
+             _headerBuf[ptr++] = 0x2C;
+             WriteShort(_headerBuf, ref ptr, 0); WriteShort(_headerBuf, ref ptr, 0);
+@@ -146,16 +251,37 @@ public class GifEncoder
+             stream.Write(pal);
+             int pad = (1 << (depth + 1)) * 3 - pal.Length;
+             if (pad > 0) stream.Write(new byte[pad]);
++            long tq2 = Now(timing);
+ 
+             lzwEncoder.Encode(inds, w, h, Math.Max(2, depth + 1));
++            long tq3 = Now(timing);
++
++            if (timing is not null)
++            {
++                timing.QuantizeTicks += tq1 - tq0;
++                timing.HeaderTicks += tq2 - tq1;
++                timing.LzwTicks += tq3 - tq2;
++                timing.PaletteColors = Math.Max(timing.PaletteColors, pal.Length / 3);
++            }
+         }
+         stream.WriteByte(0x3B);
++        long t1 = Now(timing);
++
++        if (timing is not null)
++        {
++            timing.TotalTicks = t1 - t0;
++            timing.Label = "animation";
++        }
++        FinishTiming(timing);
+     }
+ 
+     public void EncodeAnimationRgba(int width, int height, IReadOnlyList<byte[]> rgbaFrames, IReadOnlyList<int> frameDurationsMs, int loopCount, Stream stream)
+     {
+         if (rgbaFrames.Count == 0) return;
+ 
++        var timing = BeginTiming(width * height * rgbaFrames.Count, rgbaFrames.Count);
++        long t0 = Now(timing);
++
+         int ptr = 0;
+         WriteAscii(_headerBuf, ref ptr, "GIF89a");
+         WriteShort(_headerBuf, ref ptr, width); WriteShort(_headerBuf, ref ptr, height);
+@@ -164,12 +290,17 @@ public class GifEncoder
+         stream.Write(_headerBuf, 0, ptr);
+ 
+         WriteNetscapeExtension(stream, loopCount);
++        long tHeaderEnd = Now(timing);
++        if (timing is not null) timing.HeaderTicks = tHeaderEnd - t0;
++
+         using var lzwEncoder = new LzwEncoder(stream);
+ 
+         for (int i = 0; i < rgbaFrames.Count; i++)
+         {
++            long tq0 = Now(timing);
+             QuantizeRgbaWithTransparency(width, height, rgbaFrames[i], out var pal, out var inds, out int depth);
+-            
++            long tq1 = Now(timing);
++
+             ptr = 0;
+             // GCE
+             _headerBuf[ptr++] = 0x21; _headerBuf[ptr++] = 0xF9; _headerBuf[ptr++] = 4;
+@@ -178,7 +309,7 @@ public class GifEncoder
+             WriteShort(_headerBuf, ref ptr, Math.Clamp(delay, 0, 65535));
+             _headerBuf[ptr++] = 0; // TransIndex=0
+             _headerBuf[ptr++] = 0;
+-            
++
+             // Image Descriptor
+             _headerBuf[ptr++] = 0x2C;
+             WriteShort(_headerBuf, ref ptr, 0); WriteShort(_headerBuf, ref ptr, 0);
+@@ -187,9 +318,27 @@ public class GifEncoder
+             stream.Write(_headerBuf, 0, ptr);
+ 
+             stream.Write(pal);
++            long tq2 = Now(timing);
+             lzwEncoder.Encode(inds, width, height, Math.Max(2, depth + 1));
++            long tq3 = Now(timing);
++
++            if (timing is not null)
++            {
++                timing.QuantizeTicks += tq1 - tq0;
++                timing.HeaderTicks += tq2 - tq1;
++                timing.LzwTicks += tq3 - tq2;
++                timing.PaletteColors = Math.Max(timing.PaletteColors, pal.Length / 3);
++            }
+         }
+         stream.WriteByte(0x3B);
++        long t1 = Now(timing);
++
++        if (timing is not null)
++        {
++            timing.TotalTicks = t1 - t0;
++            timing.Label = "animation(rgba)";
++        }
++        FinishTiming(timing);
+     }
+ 
+     private static int GetColorDepth(int count)
+diff --git a/src/Formats/Gif/GifTiming.cs b/src/Formats/Gif/GifTiming.cs
+new file mode 100644
+index 0000000..9ae4349
+--- /dev/null
++++ b/src/Formats/Gif/GifTiming.cs
+@@ -0,0 +1,182 @@
++using System;
++using System.Diagnostics;
++using System.Globalization;
++using System.Text;
++
++namespace SharpImageConverter.Formats.Gif;
++
++/// <summary>
++/// 耗时统计方向：编码或解码。
++/// </summary>
++public enum GifTimingKind
++{
++    /// <summary>编码统计。</summary>
++    Encode,
++
++    /// <summary>解码统计。</summary>
++    Decode,
++}
++
++/// <summary>
++/// GIF 编解码的分阶段耗时统计。
++/// 仅在 <c>EnableDiagnostics</c> 打开时采集，未涉及的阶段保持 0 且不出现在报表中。
++/// 所有耗时以 <see cref="Stopwatch"/> 时间戳记录，避免高频调用时的委托与对象开销。
++/// </summary>
++public sealed class GifTiming
++{
++    private static readonly double TickToMs = 1000.0 / Stopwatch.Frequency;
++
++    /// <summary>
++    /// 创建一份统计实例。
++    /// </summary>
++    /// <param name="kind">编码或解码。</param>
++    /// <param name="pixelCount">像素总数（单帧为 宽×高，动画为 宽×高×帧数）。</param>
++    /// <param name="frameCount">帧数。</param>
++    public GifTiming(GifTimingKind kind, int pixelCount = 0, int frameCount = 1)
++    {
++        Kind = kind;
++        PixelCount = pixelCount;
++        FrameCount = frameCount;
++    }
++
++    /// <summary>统计方向。</summary>
++    public GifTimingKind Kind { get; }
++
++    /// <summary>附加说明，例如 rgb24 / rgba32(alpha) / animation。</summary>
++    public string? Label { get; set; }
++
++    /// <summary>像素总数。</summary>
++    public int PixelCount { get; set; }
++
++    /// <summary>帧数。</summary>
++    public int FrameCount { get; set; }
++
++    /// <summary>调色板颜色数（编码时为实际生成的颜色数）。</summary>
++    public int PaletteColors { get; set; }
++
++    /// <summary>总耗时（tick）。</summary>
++    public long TotalTicks { get; set; }
++
++    /// <summary>前置转换耗时（tick）：RGBA 拆分、透明通道扫描、索引重映射。</summary>
++    public long PrepareTicks { get; set; }
++
++    /// <summary>颜色量化耗时（tick）：直方图构建 + 中位切分 + 调色板映射 + 抖动。</summary>
++    public long QuantizeTicks { get; set; }
++
++    /// <summary>容器读写耗时（tick）：头信息、全局/局部调色板、扩展块、图像描述符与尾块。</summary>
++    public long HeaderTicks { get; set; }
++
++    /// <summary>LZW 耗时（tick）：编码为压缩，解码为解压。</summary>
++    public long LzwTicks { get; set; }
++
++    /// <summary>像素渲染耗时（tick）：解码时把索引展开为 RGB/RGBA。</summary>
++    public long RenderTicks { get; set; }
++
++    /// <summary>画布维护耗时（tick）：背景填充、索引范围校验、disposal 恢复。</summary>
++    public long BackgroundTicks { get; set; }
++
++    /// <summary>总耗时（毫秒）。</summary>
++    public double TotalMs => ToMs(TotalTicks);
++
++    /// <summary>前置转换耗时（毫秒）。</summary>
++    public double PrepareMs => ToMs(PrepareTicks);
++
++    /// <summary>颜色量化耗时（毫秒）。</summary>
++    public double QuantizeMs => ToMs(QuantizeTicks);
++
++    /// <summary>容器读写耗时（毫秒）。</summary>
++    public double HeaderMs => ToMs(HeaderTicks);
++
++    /// <summary>LZW 耗时（毫秒）。</summary>
++    public double LzwMs => ToMs(LzwTicks);
++
++    /// <summary>像素渲染耗时（毫秒）。</summary>
++    public double RenderMs => ToMs(RenderTicks);
++
++    /// <summary>画布维护耗时（毫秒）。</summary>
++    public double BackgroundMs => ToMs(BackgroundTicks);
++
++    /// <summary>未归入上述阶段的时间（毫秒），主要是解析循环、缓冲分配与文件 IO。</summary>
++    public double OtherMs
++    {
++        get
++        {
++            double accounted = PrepareMs + QuantizeMs + HeaderMs + LzwMs + RenderMs + BackgroundMs;
++            double rest = TotalMs - accounted;
++            return rest > 0 ? rest : 0;
++        }
++    }
++
++    /// <summary>吞吐率，单位百万像素/秒；总耗时为 0 时返回 0。</summary>
++    public double MegapixelsPerSecond
++    {
++        get
++        {
++            double ms = TotalMs;
++            if (ms <= 0 || PixelCount <= 0) return 0;
++            return PixelCount / (ms * 1000.0);
++        }
++    }
++
++    /// <summary>
++    /// 把时间戳差值换算为毫秒。
++    /// </summary>
++    /// <param name="ticks">时间戳差值。</param>
++    /// <returns>毫秒。</returns>
++    public static double ToMs(long ticks) => ticks * TickToMs;
++
++    /// <summary>
++    /// 生成可读的多行耗时报表：首行为总计与吞吐，随后按占比从大到小列出各阶段。
++    /// </summary>
++    /// <returns>报表字符串。</returns>
++    public string Format()
++    {
++        var sb = new StringBuilder(160);
++        sb.Append("[gif-timing] ").Append(Kind == GifTimingKind.Encode ? "encode" : "decode");
++        if (!string.IsNullOrEmpty(Label)) sb.Append('/').Append(Label);
++        sb.Append(" total=").Append(Fmt(TotalMs)).Append("ms");
++
++        double mpx = MegapixelsPerSecond;
++        if (mpx > 0) sb.Append(" (").Append(Fmt(mpx)).Append(" Mpx/s)");
++        if (PixelCount > 0) sb.Append(" pixels=").Append(PixelCount);
++        if (FrameCount > 1) sb.Append(" frames=").Append(FrameCount);
++        if (PaletteColors > 0) sb.Append(" colors=").Append(PaletteColors);
++
++        AppendPhase(sb, "prepare", "预处理", PrepareMs);
++        AppendPhase(sb, "quantize", "量化抖动", QuantizeMs);
++        AppendPhase(sb, "header", "头/调色板", HeaderMs);
++        AppendPhase(sb, "lzw", "LZW", LzwMs);
++        AppendPhase(sb, "render", "像素展开", RenderMs);
++        AppendPhase(sb, "background", "背景/校验", BackgroundMs);
++        AppendPhase(sb, "other", "其余", OtherMs);
++        return sb.ToString();
++    }
++
++    /// <summary>
++    /// 输出统计报表：优先使用调用方提供的日志委托，否则回落到 <see cref="Trace"/>。
++    /// </summary>
++    /// <param name="timing">统计实例。</param>
++    /// <param name="log">日志委托，为 null 时写入 Trace。</param>
++    public static void Emit(GifTiming timing, Action<string>? log)
++    {
++        string report = timing.Format();
++        if (log is not null) log(report);
++        else Trace.WriteLine(report);
++    }
++
++    private void AppendPhase(StringBuilder sb, string name, string description, double ms)
++    {
++        // 低于 1 微秒的阶段只可能是计时噪声，不进报表
++        if (ms < 0.001) return;
++        double pct = TotalMs > 0 ? ms * 100.0 / TotalMs : 0;
++        sb.Append("\n    ")
++          .Append(name.PadRight(11))
++          .Append(Fmt(ms).PadLeft(9))
++          .Append("ms  ")
++          .Append(Fmt(pct).PadLeft(5))
++          .Append("%  ")
++          .Append(description);
++    }
++
++    private static string Fmt(double value) => value.ToString("F3", CultureInfo.InvariantCulture);
++}

@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using SharpImageConverter.Core;
 
@@ -17,10 +18,63 @@ public class GifEncoder
     /// </summary>
     public bool EnableDithering { get; set; } = true;
 
+    /// <summary>
+    /// 是否采集编码各阶段耗时并输出诊断日志，默认关闭。
+    /// 关闭时不会调用 Stopwatch，热路径无额外开销。
+    /// </summary>
+    public bool EnableDiagnostics { get; set; }
+
+    /// <summary>
+    /// 诊断日志输出委托，为 null 时回落到 <see cref="Trace"/>。
+    /// </summary>
+    public Action<string>? DiagnosticsLog { get; set; }
+
+    /// <summary>
+    /// 最近一次编码的耗时统计，未开启诊断时为 null。
+    /// </summary>
+    public GifTiming? LastTiming { get; private set; }
+
+    /// <summary>
+    /// 取当前时间戳；未开启诊断时返回 0，避免无谓的计时开销。
+    /// </summary>
+    private static long Now(GifTiming? timing) => timing is null ? 0 : Stopwatch.GetTimestamp();
+
+    private GifTiming? BeginTiming(int pixelCount, int frameCount)
+    {
+        return EnableDiagnostics ? new GifTiming(GifTimingKind.Encode, pixelCount, frameCount) : null;
+    }
+
+    private void FinishTiming(GifTiming? timing)
+    {
+        if (timing is null) return;
+        LastTiming = timing;
+        GifTiming.Emit(timing, DiagnosticsLog);
+    }
+
     public void Encode(ImageFrame image, Stream stream)
     {
+        var timing = BeginTiming(image.Width * image.Height, 1);
+        long t0 = Now(timing);
+        EncodeCore(image, stream, timing);
+        long t1 = Now(timing);
+
+        if (timing is not null)
+        {
+            timing.TotalTicks = t1 - t0;
+            timing.Label = "rgb24";
+        }
+        FinishTiming(timing);
+    }
+
+    /// <summary>
+    /// 单帧编码核心：量化 → 头与调色板 → LZW。各阶段耗时累加进 <paramref name="timing"/>。
+    /// </summary>
+    private void EncodeCore(ImageFrame image, Stream stream, GifTiming? timing)
+    {
+        long t0 = Now(timing);
         var (palette, indices) = Quantizer.Quantize(image.Pixels, image.Width, image.Height, EnableDithering);
-        
+        long t1 = Now(timing);
+
         int paletteCount = palette.Length / 3;
         int depth = GetColorDepth(paletteCount);
         int actualTableSize = 1 << (depth + 1);
@@ -52,18 +106,33 @@ public class GifEncoder
         WriteShort(_headerBuf, ref ptr, image.Height);
         _headerBuf[ptr++] = 0; // No local table
         stream.Write(_headerBuf, 0, ptr);
+        long t2 = Now(timing);
 
         // LZW
         using var lzwEncoder = new LzwEncoder(stream);
         lzwEncoder.Encode(indices, image.Width, image.Height, Math.Max(2, depth + 1));
+        long t3 = Now(timing);
         stream.WriteByte(0x3B); // Trailer
+        long t4 = Now(timing);
+
+        if (timing is not null)
+        {
+            timing.QuantizeTicks += t1 - t0;
+            timing.HeaderTicks += (t2 - t1) + (t4 - t3);
+            timing.LzwTicks += t3 - t2;
+            timing.PaletteColors = paletteCount;
+        }
     }
 
     public void EncodeRgba(int width, int height, byte[] rgba, Stream stream)
     {
+        var timing = BeginTiming(width * height, 1);
+        long t0 = Now(timing);
+
         bool hasTransparent = false;
         for (int i = 3; i < rgba.Length; i += 4) { if (rgba[i] < 128) { hasTransparent = true; break; } }
-        
+        long tScanEnd = Now(timing);
+
         if (!hasTransparent)
         {
             byte[] rgb = new byte[width * height * 3];
@@ -71,12 +140,25 @@ public class GifEncoder
             {
                 rgb[j] = rgba[i]; rgb[j + 1] = rgba[i + 1]; rgb[j + 2] = rgba[i + 2];
             }
-            Encode(new ImageFrame(width, height, rgb), stream);
+            long tPrepEnd = Now(timing);
+
+            EncodeCore(new ImageFrame(width, height, rgb), stream, timing);
+            long tEnd = Now(timing);
+
+            if (timing is not null)
+            {
+                timing.PrepareTicks = tPrepEnd - t0;
+                timing.TotalTicks = tEnd - t0;
+                timing.Label = "rgba32(opaque)";
+            }
+            FinishTiming(timing);
             return;
         }
 
+        long t1 = Now(timing);
         QuantizeRgbaWithTransparency(width, height, rgba, out var palette, out var indices, out int depth);
-        
+        long t2 = Now(timing);
+
         int ptr = 0;
         WriteAscii(_headerBuf, ref ptr, "GIF89a");
         WriteShort(_headerBuf, ref ptr, width);
@@ -84,7 +166,7 @@ public class GifEncoder
         _headerBuf[ptr++] = (byte)(0x80 | (0x07 << 4) | depth);
         _headerBuf[ptr++] = 0; _headerBuf[ptr++] = 0;
         stream.Write(_headerBuf, 0, ptr);
-        
+
         stream.Write(palette);
 
         // GCE for transparency
@@ -94,23 +176,41 @@ public class GifEncoder
         _headerBuf[ptr++] = 0; _headerBuf[ptr++] = 0; // Delay
         _headerBuf[ptr++] = 0; // Transparent index
         _headerBuf[ptr++] = 0; // Terminator
-        
+
         // Image Descriptor
         _headerBuf[ptr++] = 0x2C;
         WriteShort(_headerBuf, ref ptr, 0); WriteShort(_headerBuf, ref ptr, 0);
         WriteShort(_headerBuf, ref ptr, width); WriteShort(_headerBuf, ref ptr, height);
         _headerBuf[ptr++] = 0;
         stream.Write(_headerBuf, 0, ptr);
+        long t3 = Now(timing);
 
         using var lzwEncoder = new LzwEncoder(stream);
         lzwEncoder.Encode(indices, width, height, Math.Max(2, depth + 1));
+        long t4 = Now(timing);
         stream.WriteByte(0x3B);
+        long t5 = Now(timing);
+
+        if (timing is not null)
+        {
+            timing.PrepareTicks = tScanEnd - t0;
+            timing.QuantizeTicks = t2 - t1;
+            timing.HeaderTicks = (t3 - t2) + (t5 - t4);
+            timing.LzwTicks = t4 - t3;
+            timing.TotalTicks = t5 - t0;
+            timing.PaletteColors = palette.Length / 3;
+            timing.Label = "rgba32(alpha)";
+        }
+        FinishTiming(timing);
     }
 
     public void EncodeAnimation(IReadOnlyList<ImageFrame> frames, IReadOnlyList<int> frameDurationsMs, int loopCount, Stream stream)
     {
         if (frames.Count == 0) return;
         int w = frames[0].Width, h = frames[0].Height;
+
+        var timing = BeginTiming(w * h * frames.Count, frames.Count);
+        long t0 = Now(timing);
 
         int ptr = 0;
         WriteAscii(_headerBuf, ref ptr, "GIF89a");
@@ -120,13 +220,18 @@ public class GifEncoder
         stream.Write(_headerBuf, 0, ptr);
 
         WriteNetscapeExtension(stream, loopCount);
+        long tHeaderEnd = Now(timing);
+        if (timing is not null) timing.HeaderTicks = tHeaderEnd - t0;
+
         using var lzwEncoder = new LzwEncoder(stream);
 
         for (int i = 0; i < frames.Count; i++)
         {
+            long tq0 = Now(timing);
             var (pal, inds) = Quantizer.Quantize(frames[i].Pixels, w, h, EnableDithering);
+            long tq1 = Now(timing);
             int depth = GetColorDepth(pal.Length / 3);
-            
+
             ptr = 0;
             // GCE
             _headerBuf[ptr++] = 0x21; _headerBuf[ptr++] = 0xF9; _headerBuf[ptr++] = 4;
@@ -134,7 +239,7 @@ public class GifEncoder
             int delay = (frameDurationsMs[i] + 5) / 10;
             WriteShort(_headerBuf, ref ptr, Math.Clamp(delay, 0, 65535));
             _headerBuf[ptr++] = 0; _headerBuf[ptr++] = 0;
-            
+
             // Image Descriptor
             _headerBuf[ptr++] = 0x2C;
             WriteShort(_headerBuf, ref ptr, 0); WriteShort(_headerBuf, ref ptr, 0);
@@ -146,15 +251,36 @@ public class GifEncoder
             stream.Write(pal);
             int pad = (1 << (depth + 1)) * 3 - pal.Length;
             if (pad > 0) stream.Write(new byte[pad]);
+            long tq2 = Now(timing);
 
             lzwEncoder.Encode(inds, w, h, Math.Max(2, depth + 1));
+            long tq3 = Now(timing);
+
+            if (timing is not null)
+            {
+                timing.QuantizeTicks += tq1 - tq0;
+                timing.HeaderTicks += tq2 - tq1;
+                timing.LzwTicks += tq3 - tq2;
+                timing.PaletteColors = Math.Max(timing.PaletteColors, pal.Length / 3);
+            }
         }
         stream.WriteByte(0x3B);
+        long t1 = Now(timing);
+
+        if (timing is not null)
+        {
+            timing.TotalTicks = t1 - t0;
+            timing.Label = "animation";
+        }
+        FinishTiming(timing);
     }
 
     public void EncodeAnimationRgba(int width, int height, IReadOnlyList<byte[]> rgbaFrames, IReadOnlyList<int> frameDurationsMs, int loopCount, Stream stream)
     {
         if (rgbaFrames.Count == 0) return;
+
+        var timing = BeginTiming(width * height * rgbaFrames.Count, rgbaFrames.Count);
+        long t0 = Now(timing);
 
         int ptr = 0;
         WriteAscii(_headerBuf, ref ptr, "GIF89a");
@@ -164,12 +290,17 @@ public class GifEncoder
         stream.Write(_headerBuf, 0, ptr);
 
         WriteNetscapeExtension(stream, loopCount);
+        long tHeaderEnd = Now(timing);
+        if (timing is not null) timing.HeaderTicks = tHeaderEnd - t0;
+
         using var lzwEncoder = new LzwEncoder(stream);
 
         for (int i = 0; i < rgbaFrames.Count; i++)
         {
+            long tq0 = Now(timing);
             QuantizeRgbaWithTransparency(width, height, rgbaFrames[i], out var pal, out var inds, out int depth);
-            
+            long tq1 = Now(timing);
+
             ptr = 0;
             // GCE
             _headerBuf[ptr++] = 0x21; _headerBuf[ptr++] = 0xF9; _headerBuf[ptr++] = 4;
@@ -178,7 +309,7 @@ public class GifEncoder
             WriteShort(_headerBuf, ref ptr, Math.Clamp(delay, 0, 65535));
             _headerBuf[ptr++] = 0; // TransIndex=0
             _headerBuf[ptr++] = 0;
-            
+
             // Image Descriptor
             _headerBuf[ptr++] = 0x2C;
             WriteShort(_headerBuf, ref ptr, 0); WriteShort(_headerBuf, ref ptr, 0);
@@ -187,9 +318,27 @@ public class GifEncoder
             stream.Write(_headerBuf, 0, ptr);
 
             stream.Write(pal);
+            long tq2 = Now(timing);
             lzwEncoder.Encode(inds, width, height, Math.Max(2, depth + 1));
+            long tq3 = Now(timing);
+
+            if (timing is not null)
+            {
+                timing.QuantizeTicks += tq1 - tq0;
+                timing.HeaderTicks += tq2 - tq1;
+                timing.LzwTicks += tq3 - tq2;
+                timing.PaletteColors = Math.Max(timing.PaletteColors, pal.Length / 3);
+            }
         }
         stream.WriteByte(0x3B);
+        long t1 = Now(timing);
+
+        if (timing is not null)
+        {
+            timing.TotalTicks = t1 - t0;
+            timing.Label = "animation(rgba)";
+        }
+        FinishTiming(timing);
     }
 
     private static int GetColorDepth(int count)
