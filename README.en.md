@@ -78,6 +78,11 @@ SharpImageConverter/
 │  ├── Program.cs
 │  └── SharpImageConverter.Cli.csproj
 ├── SharpImageConverter.Tests/   # Test project
+├── docs/                        # Engineering docs (see docs/README.md)
+│  ├── PerfReport.md             # Performance findings and optimization status
+│  ├── AuditVerification.md      # Verification of an external audit report
+│  ├── goal.md                   # Gap list vs. mature libraries
+│  └── reference/                # Specification source material
 └── README.md / README.en.md
 ```
 
