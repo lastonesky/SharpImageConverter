@@ -2,6 +2,11 @@ using System;
 using System.Buffers;
 using System.Collections.Generic;
 using System.IO;
+using System.Numerics;
+using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
+using System.Runtime.Intrinsics;
+using System.Runtime.Intrinsics.X86;
 using SharpImageConverter.Core;
 
 namespace SharpImageConverter.Formats.Gif
@@ -112,18 +117,13 @@ namespace SharpImageConverter.Formats.Gif
             int components = ctx.Mode == DecodeMode.Rgba32 ? 4 : 3;
             byte[] canvas = new byte[pixelCount * components];
 
-            if (hasGct && bgIndex < gctColors)
-            {
-                byte r = gct[bgIndex * 3], g = gct[bgIndex * 3 + 1], b = gct[bgIndex * 3 + 2];
-                if (ctx.Mode == DecodeMode.Rgba32)
-                {
-                    for (int i = 0; i < canvas.Length; i += 4) { canvas[i] = r; canvas[i+1] = g; canvas[i+2] = b; canvas[i+3] = 255; }
-                }
-                else
-                {
-                    for (int i = 0; i < canvas.Length; i += 3) { canvas[i] = r; canvas[i+1] = g; canvas[i+2] = b; }
-                }
-            }
+            // 背景色填充推迟到第一帧解出索引之后：若首帧整幅覆盖且每个索引都落在调色板内、
+            // 又没有透明索引，则每个像素都会被渲染覆盖，这次整画布填充是死写，可以整体跳过。
+            bool hasBgColor = hasGct && bgIndex < gctColors;
+            byte bgR = hasBgColor ? gct[bgIndex * 3] : (byte)0;
+            byte bgG = hasBgColor ? gct[bgIndex * 3 + 1] : (byte)0;
+            byte bgB = hasBgColor ? gct[bgIndex * 3 + 2] : (byte)0;
+            bool canvasReady = false;
 
             if (ctx.Mode != DecodeMode.Rgba32)
             {
@@ -198,13 +198,26 @@ namespace SharpImageConverter.Formats.Gif
                     byte[] indices = pool.Rent(iw * ih);
                     lzwDecoder.Decode(indices.AsSpan(0, iw * ih), iw, ih, lzwMin);
 
+                    bool opaqueFullCover = !interlace && transIndex < 0 &&
+                        ix == 0 && iy == 0 && iw == width && ih == height &&
+                        AllIndicesInRange(indices, iw * ih, palCount);
+
+                    if (!canvasReady)
+                    {
+                        if (hasBgColor && !opaqueFullCover)
+                        {
+                            FillBackground(canvas, components, bgR, bgG, bgB);
+                        }
+                        canvasReady = true;
+                    }
+
                     if (disposal == 3)
                     {
                         backBuffer ??= NativeBufferOwner<byte>.Allocate(canvas.Length);
                         canvas.AsSpan().CopyTo(backBuffer.Span);
                     }
 
-                    RenderFrame(canvas, indices, width, height, ix, iy, iw, ih, interlace, transIndex, palette, palCount, ctx.Mode == DecodeMode.Rgba32);
+                    RenderFrame(canvas, indices, width, height, ix, iy, iw, ih, interlace, transIndex, palette, palCount, ctx.Mode == DecodeMode.Rgba32, opaqueFullCover);
                     pool.Return(indices);
 
                     if (ctx.Mode == DecodeMode.Rgba32)
@@ -237,13 +250,26 @@ namespace SharpImageConverter.Formats.Gif
                     if (ctx.Mode == DecodeMode.Rgb24) return;
                 }
             }
+            if (!canvasReady && hasBgColor)
+            {
+                FillBackground(canvas, components, bgR, bgG, bgB);
+            }
             if (ctx.RgbFrames?.Count == 0) ctx.RgbFrames.Add(new Image<Rgb24>(width, height, canvas));
         }
 
-        private void RenderFrame(byte[] canvas, byte[] indices, int w, int h, int ix, int iy, int iw, int ih, bool interlace, int trans, byte[] pal, int palColors, bool rgba)
+        private void RenderFrame(byte[] canvas, byte[] indices, int w, int h, int ix, int iy, int iw, int ih, bool interlace, int trans, byte[] pal, int palColors, bool rgba, bool opaqueFullCover)
         {
             int comp = rgba ? 4 : 3;
             int stride = w * comp;
+
+            // 整幅覆盖 + 无透明 + 索引全部落在调色板内时，没有任何边界判断和散写，
+            // 走连续展开的专用路径（含 AVX2 gather 版本）。
+            if (opaqueFullCover)
+            {
+                RenderFullCanvasOpaque(canvas, indices, pal, palColors, w * h, rgba);
+                return;
+            }
+
             if (interlace)
             {
                 int idxPtr = 0;
@@ -335,6 +361,156 @@ namespace SharpImageConverter.Formats.Gif
                 }
             }
         }
+
+        /// <summary>
+        /// 用单一背景色填充整块画布：先构造 16 像素的模式块，再以指数式自我拷贝扩散到整块缓冲。
+        /// 相比逐像素写 3/4 字节，拷贝走的是向量化 memcpy，只受内存带宽限制。
+        /// </summary>
+        private static void FillBackground(byte[] canvas, int components, byte r, byte g, byte b)
+        {
+            int patternLength = 16 * components;
+            if (canvas.Length <= 0) return;
+
+            if (canvas.Length < patternLength * 2)
+            {
+                for (int i = 0; i + components <= canvas.Length; i += components)
+                {
+                    canvas[i] = r; canvas[i + 1] = g; canvas[i + 2] = b;
+                    if (components == 4) canvas[i + 3] = 255;
+                }
+                return;
+            }
+
+            Span<byte> head = canvas.AsSpan(0, patternLength);
+            for (int i = 0; i < patternLength; i += components)
+            {
+                head[i] = r; head[i + 1] = g; head[i + 2] = b;
+                if (components == 4) head[i + 3] = 255;
+            }
+
+            int filled = patternLength;
+            while (filled < canvas.Length)
+            {
+                int copyLength = Math.Min(filled, canvas.Length - filled);
+                canvas.AsSpan(0, copyLength).CopyTo(canvas.AsSpan(filled, copyLength));
+                filled += copyLength;
+            }
+        }
+
+        /// <summary>
+        /// 检查索引缓冲的全部取值是否都小于调色板颜色数（因此渲染时每个像素都会被写入）。
+        /// </summary>
+        private static bool AllIndicesInRange(byte[] indices, int count, int palColors)
+        {
+            if (palColors >= 256) return true;
+            if (count <= 0) return true;
+
+            ref byte src = ref MemoryMarshal.GetReference(indices.AsSpan());
+            int i = 0;
+            byte max = 0;
+
+            if (Vector.IsHardwareAccelerated)
+            {
+                int width = Vector<byte>.Count;
+                Vector<byte> vmax = Vector<byte>.Zero;
+                for (; i + width <= count; i += width)
+                {
+                    vmax = Vector.Max(vmax, Vector.LoadUnsafe(ref src, (nuint)i));
+                }
+                for (int lane = 0; lane < width; lane++)
+                {
+                    byte v = vmax[lane];
+                    if (v > max) max = v;
+                }
+            }
+
+            for (; i < count; i++)
+            {
+                byte v = indices[i];
+                if (v > max) max = v;
+            }
+            return max < palColors;
+        }
+
+        /// <summary>
+        /// 整画布、无透明索引的调色板展开：输出地址完全连续，无边界判断。
+        /// AVX2 路径用 gather 一次取 8 个调色板颜色，再压成 24 字节（RGB24）/ 直接 32 字节（RGBA32）。
+        /// </summary>
+        private static unsafe void RenderFullCanvasOpaque(byte[] canvas, byte[] indices, byte[] pal, int palColors, int pixelCount, bool rgba)
+        {
+            if (pixelCount <= 0) return;
+
+            // 调色板展开成 32 位色（低 3 字节为 RGB，RGBA 时第 4 字节为不透明 alpha）
+            int* palPtr = stackalloc int[256];
+            int count = Math.Min(256, palColors);
+            int alphaBits = rgba ? 255 << 24 : 0;
+            for (int i = 0; i < count; i++)
+            {
+                palPtr[i] = pal[i * 3] | (pal[i * 3 + 1] << 8) | (pal[i * 3 + 2] << 16) | alphaBits;
+            }
+            for (int i = count; i < 256; i++)
+            {
+                palPtr[i] = 0;
+            }
+
+            fixed (byte* pCanvas = canvas)
+            fixed (byte* pIndices = indices)
+            {
+                byte* dst = pCanvas;
+                byte* srcIdx = pIndices;
+                int i = 0;
+
+                if (rgba)
+                {
+                    if (Avx2.IsSupported)
+                    {
+                        for (; i + 8 <= pixelCount; i += 8)
+                        {
+                            Vector256<int> colors = Avx2.GatherVector256(palPtr, Avx2.ConvertToVector256Int32(Vector128.LoadUnsafe(ref *srcIdx, (nuint)i)), 4);
+                            Unsafe.WriteUnaligned(dst + (nuint)i * 4, colors);
+                        }
+                    }
+                    for (; i < pixelCount; i++)
+                    {
+                        Unsafe.WriteUnaligned(dst + (nuint)i * 4, palPtr[srcIdx[i]]);
+                    }
+                    return;
+                }
+
+                if (Avx2.IsSupported)
+                {
+                    // 8 像素一组：gather 出 8 个 32 位色后，每个 128 位通道压成 12 字节（共 24 字节）。
+                    // 先写 0..15（其中 12..15 是低通道的填充，会被下一次写入覆盖），再把高通道写到 12..27。
+                    for (; i + 10 <= pixelCount; i += 8)
+                    {
+                        Vector256<int> colors = Avx2.GatherVector256(palPtr, Avx2.ConvertToVector256Int32(Vector128.LoadUnsafe(ref *srcIdx, (nuint)i)), 4);
+                        Vector256<byte> packed = Avx2.Shuffle(colors.AsByte(), RgbaToRgbShuffle);
+                        Unsafe.WriteUnaligned(dst + (nuint)i * 3, packed.GetLower());
+                        Unsafe.WriteUnaligned(dst + (nuint)i * 3 + 12, packed.GetUpper());
+                    }
+                }
+
+                // 标量收尾：每像素一次 32 位写并按 3 字节步进，多出的第 4 字节由下一像素覆盖
+                for (; i < pixelCount - 1; i++)
+                {
+                    Unsafe.WriteUnaligned(dst + (nuint)i * 3, palPtr[srcIdx[i]]);
+                }
+                if (i < pixelCount)
+                {
+                    int color = palPtr[srcIdx[i]];
+                    byte* tail = dst + (nuint)i * 3;
+                    tail[0] = (byte)color;
+                    tail[1] = (byte)(color >> 8);
+                    tail[2] = (byte)(color >> 16);
+                }
+            }
+        }
+
+        // RGBA(4 像素 = 16 字节) -> RGB(4 像素 = 12 字节)，与 Core/SimdHelper 中的同名掩码一致；
+        // 256 位版本是两个通道各用一份相同掩码（vpshufb 不跨 128 位通道）。
+        private static readonly Vector256<byte> RgbaToRgbShuffle = Vector256.Create(
+            Vector128.Create((byte)0, 1, 2, 4, 5, 6, 8, 9, 10, 12, 13, 14, 0x80, 0x80, 0x80, 0x80),
+            Vector128.Create((byte)0, 1, 2, 4, 5, 6, 8, 9, 10, 12, 13, 14, 0x80, 0x80, 0x80, 0x80));
 
         private void ReadExact(Stream s, byte[] buf, int off, int len)
         {
