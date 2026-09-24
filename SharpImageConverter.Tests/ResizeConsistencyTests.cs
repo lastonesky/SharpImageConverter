@@ -160,6 +160,143 @@ namespace Jpeg2Bmp.Tests
             return dst;
         }
 
+        // ---------------- 参考实现：改动前的 ResizeBicubicOptimized ----------------
+        private static float RefCubicF(float x)
+        {
+            const float a = -0.5f;
+            x = MathF.Abs(x);
+            if (x <= 1f)
+            {
+                return (a + 2f) * x * x * x - (a + 3f) * x * x + 1f;
+            }
+            if (x < 2f)
+            {
+                return a * x * x * x - 5f * a * x * x + 8f * a * x - 4f * a;
+            }
+            return 0f;
+        }
+
+        /// <summary>
+        /// 原始标量版本。SIMD 路径必须与它逐位一致，因此这里的乘加结合顺序、
+        /// 先夹取再 +0.5 截断的顺序都不能动。
+        /// </summary>
+        private static byte[] RefBicubic(byte[] src, int sw, int sh, int width, int height)
+        {
+            var dst = new byte[width * height * 3];
+            float scaleX = (float)sw / width;
+            float scaleY = (float)sh / height;
+
+            var xIndex = new int[width * 4];
+            var xWeight = new float[width * 4];
+            var yIndex = new int[height * 4];
+            var yWeight = new float[height * 4];
+
+            for (int x = 0; x < width; x++)
+            {
+                float gx = (x + 0.5f) * scaleX - 0.5f;
+                int ix = (int)MathF.Floor(gx);
+                float t = gx - ix;
+                for (int k = -1; k <= 2; k++)
+                {
+                    int idx = x * 4 + (k + 1);
+                    int sx = ix + k;
+                    if (sx < 0) sx = 0;
+                    else if (sx >= sw) sx = sw - 1;
+                    xIndex[idx] = sx;
+                    xWeight[idx] = RefCubicF(t - k);
+                }
+            }
+
+            for (int y = 0; y < height; y++)
+            {
+                float gy = (y + 0.5f) * scaleY - 0.5f;
+                int iy = (int)MathF.Floor(gy);
+                float t = gy - iy;
+                for (int k = -1; k <= 2; k++)
+                {
+                    int idx = y * 4 + (k + 1);
+                    int sy = iy + k;
+                    if (sy < 0) sy = 0;
+                    else if (sy >= sh) sy = sh - 1;
+                    yIndex[idx] = sy;
+                    yWeight[idx] = RefCubicF(t - k);
+                }
+            }
+
+            for (int y = 0; y < height; y++)
+            {
+                int yOff = y * 4;
+                int sy0 = yIndex[yOff + 0];
+                int sy1 = yIndex[yOff + 1];
+                int sy2 = yIndex[yOff + 2];
+                int sy3 = yIndex[yOff + 3];
+                float wy0 = yWeight[yOff + 0];
+                float wy1 = yWeight[yOff + 1];
+                float wy2 = yWeight[yOff + 2];
+                float wy3 = yWeight[yOff + 3];
+
+                int dBase = y * width * 3;
+                int b0 = sy0 * sw * 3;
+                int b1 = sy1 * sw * 3;
+                int b2 = sy2 * sw * 3;
+                int b3 = sy3 * sw * 3;
+
+                for (int x = 0; x < width; x++)
+                {
+                    int xOff = x * 4;
+                    float wx0 = xWeight[xOff + 0];
+                    float wx1 = xWeight[xOff + 1];
+                    float wx2 = xWeight[xOff + 2];
+                    float wx3 = xWeight[xOff + 3];
+                    int d = dBase + x * 3;
+
+                    int q0 = xIndex[xOff + 0] * 3;
+                    int q1 = xIndex[xOff + 1] * 3;
+                    int q2 = xIndex[xOff + 2] * 3;
+                    int q3 = xIndex[xOff + 3] * 3;
+                    int p00 = b0 + q0, p01 = b0 + q1, p02 = b0 + q2, p03 = b0 + q3;
+                    int p10 = b1 + q0, p11 = b1 + q1, p12 = b1 + q2, p13 = b1 + q3;
+                    int p20 = b2 + q0, p21 = b2 + q1, p22 = b2 + q2, p23 = b2 + q3;
+                    int p30 = b3 + q0, p31 = b3 + q1, p32 = b3 + q2, p33 = b3 + q3;
+
+                    for (int c = 0; c < 3; c++)
+                    {
+                        float row0 =
+                            wx0 * src[p00 + c] +
+                            wx1 * src[p01 + c] +
+                            wx2 * src[p02 + c] +
+                            wx3 * src[p03 + c];
+                        float row1 =
+                            wx0 * src[p10 + c] +
+                            wx1 * src[p11 + c] +
+                            wx2 * src[p12 + c] +
+                            wx3 * src[p13 + c];
+                        float row2 =
+                            wx0 * src[p20 + c] +
+                            wx1 * src[p21 + c] +
+                            wx2 * src[p22 + c] +
+                            wx3 * src[p23 + c];
+                        float row3 =
+                            wx0 * src[p30 + c] +
+                            wx1 * src[p31 + c] +
+                            wx2 * src[p32 + c] +
+                            wx3 * src[p33 + c];
+
+                        float val =
+                            wy0 * row0 +
+                            wy1 * row1 +
+                            wy2 * row2 +
+                            wy3 * row3;
+
+                        if (val < 0f) val = 0f;
+                        else if (val > 255f) val = 255f;
+                        dst[d + c] = (byte)(val + 0.5f);
+                    }
+                }
+            }
+            return dst;
+        }
+
         [Fact]
         public void SimdPath_IsAvailable_OnThisMachine()
         {
@@ -255,6 +392,50 @@ namespace Jpeg2Bmp.Tests
             ImageExtensions.Mutate(img, ctx => ctx.Resize(width, height));
 
             Assert.Equal(expected, img.Buffer);
+        }
+
+        [Theory]
+        [MemberData(nameof(SizeCases))]
+        public void ResizeBicubic_MatchesReferenceExactly(int sw, int sh, int width, int height)
+        {
+            var src = MakeData(sw * sh * 3, sw * 53 + sh);
+            var expected = RefBicubic(src, sw, sh, width, height);
+
+            var img = new Image<Rgb24>(sw, sh, (byte[])src.Clone());
+            ImageExtensions.Mutate(img, ctx => ctx.ResizeBicubicOptimized(width, height));
+
+            Assert.Equal(width, img.Width);
+            Assert.Equal(height, img.Height);
+            Assert.Equal(expected, img.Buffer);
+        }
+
+        /// <summary>
+        /// 双三次的 SIMD 路径有两个必须在排查中被覆盖的边界：
+        /// 抽头夹到了最后一个源像素（这类 x 会被排除出 SIMD），以及每行最后一个输出像素（只能按 3 字节写）。
+        /// </summary>
+        [Fact]
+        public void ResizeBicubic_SweepSmallSizes_MatchesReference()
+        {
+            int[] dims = { 1, 2, 3, 4, 7, 8, 15, 16 };
+            int[] outs = { 1, 2, 3, 4, 5, 8, 16 };
+
+            foreach (int sw in dims)
+            {
+                foreach (int sh in dims)
+                {
+                    var src = MakeData(sw * sh * 3, sw * 7 + sh * 11);
+                    foreach (int dw in outs)
+                    {
+                        foreach (int dh in outs)
+                        {
+                            var expected = RefBicubic(src, sw, sh, dw, dh);
+                            var img = new Image<Rgb24>(sw, sh, (byte[])src.Clone());
+                            ImageExtensions.Mutate(img, ctx => ctx.ResizeBicubicOptimized(dw, dh));
+                            Assert.Equal(expected, img.Buffer);
+                        }
+                    }
+                }
+            }
         }
     }
 }

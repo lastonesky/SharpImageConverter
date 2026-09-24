@@ -73,9 +73,50 @@ namespace SharpImageConverter.Processing
             Vector128.Create((byte)0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 2, 0x80, 5, 0x80, 10, 0x80, 13, 0x80),
         };
 
+        /// <summary>
+        /// 水平方向 4 抽头的双三次插值：一次算出 3 个通道（放在 128 位浮点的前 3 条 lane）。
+        /// 结合顺序与标量路径完全一致：(((w0*p0) + (w1*p1)) + (w2*p2)) + (w3*p3)。
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static Vector128<float> BicubicRow(
+            ref byte srcRef,
+            int rowBase, int q0, int q1, int q2, int q3,
+            Vector128<float> w0, Vector128<float> w1, Vector128<float> w2, Vector128<float> w3)
+        {
+            var acc = Sse2.Multiply(w0, BicubicLoadRgb(ref srcRef, rowBase + q0));
+            acc = Sse2.Add(acc, Sse2.Multiply(w1, BicubicLoadRgb(ref srcRef, rowBase + q1)));
+            acc = Sse2.Add(acc, Sse2.Multiply(w2, BicubicLoadRgb(ref srcRef, rowBase + q2)));
+            return Sse2.Add(acc, Sse2.Multiply(w3, BicubicLoadRgb(ref srcRef, rowBase + q3)));
+        }
+
+        /// <summary>
+        /// 一次 4 字节载入拿到某个源像素的 R/G/B：低 3 字节是我们要的通道，
+        /// 第 4 字节是相邻像素的 R——它跟着一起算，但最后不会被写出。
+        /// 需要 offset + 4 &lt;= 源长度，由调用方把落在最后一个源像素上的抽头排除来保证。
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static Vector128<float> BicubicLoadRgb(ref byte srcRef, int offset)
+        {
+            uint packed = Unsafe.ReadUnaligned<uint>(ref Unsafe.Add(ref srcRef, offset));
+            return Sse2.ConvertToVector128Single(Sse41.ConvertToVector128Int32(Vector128.CreateScalar(packed).AsByte()));
+        }
+
+        // 把 4 个 int32 结果的低字节收成 4 个紧凑字节（第 4 个 lane 是多余读出，不参与写出）
+        private static readonly Vector128<byte> BicubicStoreMask =
+            Vector128.Create((byte)0, 4, 8, 12, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80);
+
+        // 双三次写出端的两个常量贵在重复构造，提到静态只读里：夹取上界与四舍五入偏移
+        private static readonly Vector128<float> MaxByte = Vector128.Create(255f);
+        private static readonly Vector128<float> Half = Vector128.Create(0.5f);
+
         // 4 个 int32 结果（值域 [0,255]）取其低字节，得到 4 个紧凑字节
         private static readonly Vector128<byte> BilinearExtractMask =
             Vector128.Create((byte)0, 4, 8, 12, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80);
+
+        // 双线性定点精度：权重放大 2^Shift，垂直/水平两级相乘后右移 2*Shift
+        private const int Shift = 11;
+        private const int Scale = 1 << Shift;
+        private const int RoundingOffset = 1 << (2 * Shift - 1);
 
         // 3 个通道各自的 4 字节交错成 12 字节 RGB24（4 个像素）
         private static readonly Vector128<byte>[] BilinearInterleaveMask =
@@ -84,6 +125,59 @@ namespace SharpImageConverter.Processing
             Vector128.Create((byte)0x80, 0, 0x80, 0x80, 1, 0x80, 0x80, 2, 0x80, 0x80, 3, 0x80, 0x80, 0x80, 0x80, 0x80),
             Vector128.Create((byte)0x80, 0x80, 0, 0x80, 0x80, 1, 0x80, 0x80, 2, 0x80, 0x80, 3, 0x80, 0x80, 0x80, 0x80),
         };
+
+        /// <summary>
+        /// 双线性插值的 SIMD 核心：一次算出 4 个输出像素，结果放在返回向量的低 12 字节。
+        /// 与标量路径的数值完全相同（同样的 11 位定点拆分与同样的移位顺序）。
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static Vector128<byte> BilinearCore4(
+            ref byte srcRef,
+            ref int x0Ref,
+            ref short qRef,
+            ref short rRef,
+            int row0, int row1, int x,
+            Vector128<int> wy0Vec, Vector128<int> wy1Vec, Vector128<int> roundVec)
+        {
+            // 一次 8 字节载入同时拿到同一行的 x0 与 x1=x0+1 两个像素
+            ulong a0 = Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref srcRef, row0 + Unsafe.Add(ref x0Ref, x + 0)));
+            ulong a1 = Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref srcRef, row0 + Unsafe.Add(ref x0Ref, x + 1)));
+            ulong a2 = Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref srcRef, row0 + Unsafe.Add(ref x0Ref, x + 2)));
+            ulong a3 = Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref srcRef, row0 + Unsafe.Add(ref x0Ref, x + 3)));
+            var v01 = Vector128.Create(a0, a1).AsByte();
+            var v23 = Vector128.Create(a2, a3).AsByte();
+
+            ulong b0 = Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref srcRef, row1 + Unsafe.Add(ref x0Ref, x + 0)));
+            ulong b1 = Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref srcRef, row1 + Unsafe.Add(ref x0Ref, x + 1)));
+            ulong b2 = Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref srcRef, row1 + Unsafe.Add(ref x0Ref, x + 2)));
+            ulong b3 = Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref srcRef, row1 + Unsafe.Add(ref x0Ref, x + 3)));
+            var w01 = Vector128.Create(b0, b1).AsByte();
+            var w23 = Vector128.Create(b2, b3).AsByte();
+
+            nuint qo = (nuint)(x * 2);
+            var qVec = Vector128.LoadUnsafe(ref qRef, qo);
+            var rVec = Vector128.LoadUnsafe(ref rRef, qo);
+
+            var outBytes = Vector128<byte>.Zero;
+            for (int c = 0; c < 3; c++)
+            {
+                var p0 = Sse2.Or(Ssse3.Shuffle(v01, BilinearPairMaskA[c]), Ssse3.Shuffle(v23, BilinearPairMaskB[c])).AsInt16();
+                var p1 = Sse2.Or(Ssse3.Shuffle(w01, BilinearPairMaskA[c]), Ssse3.Shuffle(w23, BilinearPairMaskB[c])).AsInt16();
+
+                // 水平：(a*q0 + b*q1) << 7 + (a*r0 + b*r1)
+                var h0 = Sse2.Add(Sse2.ShiftLeftLogical(Sse2.MultiplyAddAdjacent(p0, qVec), 7), Sse2.MultiplyAddAdjacent(p0, rVec));
+                var h1 = Sse2.Add(Sse2.ShiftLeftLogical(Sse2.MultiplyAddAdjacent(p1, qVec), 7), Sse2.MultiplyAddAdjacent(p1, rVec));
+
+                var val = Sse2.ShiftRightLogical(
+                    Sse2.Add(Sse2.Add(Sse41.MultiplyLow(h0, wy0Vec), Sse41.MultiplyLow(h1, wy1Vec)), roundVec),
+                    2 * Shift);
+
+                var chan = Ssse3.Shuffle(val.AsByte(), BilinearExtractMask);
+                outBytes = Sse2.Or(outBytes, Ssse3.Shuffle(chan, BilinearInterleaveMask[c]));
+            }
+
+            return outBytes;
+        }
 
         /// <summary>
         /// 双线性插值缩放到指定尺寸
@@ -103,11 +197,6 @@ namespace SharpImageConverter.Processing
             float scaleY = sh <= 1 ? 0f : (float)(sh - 1) / Math.Max(1, height - 1);
             var poolInt = ArrayPool<int>.Shared;
             var poolShort = ArrayPool<short>.Shared;
-
-            // Fixed point precision
-            const int Shift = 11;
-            const int Scale = 1 << Shift;
-            const int RoundingOffset = 1 << (2 * Shift - 1);
 
             int[] x0IndexArr = poolInt.Rent(width);
             int[] x1IndexArr = poolInt.Rent(width);
@@ -192,61 +281,46 @@ namespace SharpImageConverter.Processing
                     int dRow = y * width * 3;
 
                     // 每行还要保证 8 字节载入不越界；row1 >= row0，用 row1 做保守判断
-                    int limit = 0;
+                    int maxX0Off = srcLen - 8 - row1;
+                    int limit4 = 0;
+                    int limit8 = 0;
                     if (useSimd)
                     {
-                        limit = simdXEnd;
-                        int maxX0Off = srcLen - 8 - row1;
-                        while (limit > 0 && x0Index[limit - 1] > maxX0Off) limit -= 4;
+                        limit4 = simdXEnd;
+                        while (limit4 > 0 && x0Index[limit4 - 1] > maxX0Off) limit4 -= 4;
+                        // x0Index 单调不减，只要整批的末位安全，批内其余下标也一定安全
+                        limit8 = limit4 & ~7;
                     }
 
                     var wy0Vec = Vector128.Create(wy0);
                     var wy1Vec = Vector128.Create(wy1);
                     var roundVec = Vector128.Create(RoundingOffset);
 
+                    ref int x0Ref = ref MemoryMarshal.GetReference(x0IndexArr.AsSpan(0, width));
+
                     int x = 0;
-                    for (; x < limit; x += 4)
+                    // 两个 4 像素批次之间没有数据依赖，配对成 8 像素一轮可以让两条依赖链并行发射
+                    for (; x < limit8; x += 8)
                     {
-                        ulong a0 = Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref srcRef, row0 + x0Index[x + 0]));
-                        ulong a1 = Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref srcRef, row0 + x0Index[x + 1]));
-                        ulong a2 = Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref srcRef, row0 + x0Index[x + 2]));
-                        ulong a3 = Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref srcRef, row0 + x0Index[x + 3]));
-                        var v01 = Vector128.Create(a0, a1).AsByte();
-                        var v23 = Vector128.Create(a2, a3).AsByte();
+                        var o0 = BilinearCore4(ref srcRef, ref x0Ref, ref qRef, ref rRef, row0, row1, x, wy0Vec, wy1Vec, roundVec);
+                        var o1 = BilinearCore4(ref srcRef, ref x0Ref, ref qRef, ref rRef, row0, row1, x + 4, wy0Vec, wy1Vec, roundVec);
 
-                        ulong b0 = Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref srcRef, row1 + x0Index[x + 0]));
-                        ulong b1 = Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref srcRef, row1 + x0Index[x + 1]));
-                        ulong b2 = Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref srcRef, row1 + x0Index[x + 2]));
-                        ulong b3 = Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref srcRef, row1 + x0Index[x + 3]));
-                        var w01 = Vector128.Create(b0, b1).AsByte();
-                        var w23 = Vector128.Create(b2, b3).AsByte();
+                        int d0 = dRow + x * 3;
+                        // 每批 12 字节：8 字节 + 4 字节两次写入，不越界写到下一组
+                        Unsafe.WriteUnaligned(ref Unsafe.Add(ref dstRef, d0), o0.AsUInt64().GetElement(0));
+                        Unsafe.WriteUnaligned(ref Unsafe.Add(ref dstRef, d0 + 8), o0.AsUInt32().GetElement(2));
+                        int d1 = d0 + 12;
+                        Unsafe.WriteUnaligned(ref Unsafe.Add(ref dstRef, d1), o1.AsUInt64().GetElement(0));
+                        Unsafe.WriteUnaligned(ref Unsafe.Add(ref dstRef, d1 + 8), o1.AsUInt32().GetElement(2));
+                    }
 
-                        nuint qo = (nuint)(x * 2);
-                        var qVec = Vector128.LoadUnsafe(ref qRef, qo);
-                        var rVec = Vector128.LoadUnsafe(ref rRef, qo);
-
-                        var outBytes = Vector128<byte>.Zero;
-                        for (int c = 0; c < 3; c++)
-                        {
-                            var p0 = Sse2.Or(Ssse3.Shuffle(v01, BilinearPairMaskA[c]), Ssse3.Shuffle(v23, BilinearPairMaskB[c])).AsInt16();
-                            var p1 = Sse2.Or(Ssse3.Shuffle(w01, BilinearPairMaskA[c]), Ssse3.Shuffle(w23, BilinearPairMaskB[c])).AsInt16();
-
-                            // 水平：(a*q0 + b*q1) << 7 + (a*r0 + b*r1)
-                            var h0 = Sse2.Add(Sse2.ShiftLeftLogical(Sse2.MultiplyAddAdjacent(p0, qVec), 7), Sse2.MultiplyAddAdjacent(p0, rVec));
-                            var h1 = Sse2.Add(Sse2.ShiftLeftLogical(Sse2.MultiplyAddAdjacent(p1, qVec), 7), Sse2.MultiplyAddAdjacent(p1, rVec));
-
-                            var val = Sse2.ShiftRightLogical(
-                                Sse2.Add(Sse2.Add(Sse41.MultiplyLow(h0, wy0Vec), Sse41.MultiplyLow(h1, wy1Vec)), roundVec),
-                                2 * Shift);
-
-                            var chan = Ssse3.Shuffle(val.AsByte(), BilinearExtractMask);
-                            outBytes = Sse2.Or(outBytes, Ssse3.Shuffle(chan, BilinearInterleaveMask[c]));
-                        }
+                    for (; x < limit4; x += 4)
+                    {
+                        var o = BilinearCore4(ref srcRef, ref x0Ref, ref qRef, ref rRef, row0, row1, x, wy0Vec, wy1Vec, roundVec);
 
                         int d = dRow + x * 3;
-                        // 4 个像素 = 12 字节：8 字节 + 4 字节两次写入，不越界写到下一组
-                        Unsafe.WriteUnaligned(ref Unsafe.Add(ref dstRef, d), outBytes.AsUInt64().GetElement(0));
-                        Unsafe.WriteUnaligned(ref Unsafe.Add(ref dstRef, d + 8), outBytes.AsUInt32().GetElement(2));
+                        Unsafe.WriteUnaligned(ref Unsafe.Add(ref dstRef, d), o.AsUInt64().GetElement(0));
+                        Unsafe.WriteUnaligned(ref Unsafe.Add(ref dstRef, d + 8), o.AsUInt32().GetElement(2));
                     }
 
                     for (; x < width; x++)
@@ -511,8 +585,29 @@ namespace SharpImageConverter.Processing
                     }
                 }
 
+                // SIMD 路径要求抽头只落在 [0, sw-2] 上（一次读 4 字节）；
+                // xIndex[x*4+3] 是该像素的最大抽头，且随 x 单调不减，找到第一个越界位置即可。
+                // 另外最后一个输出像素只能按 3 字节写，不参与 SIMD。
+                bool useSimd = Sse2.IsSupported && Ssse3.IsSupported && Sse41.IsSupported;
+                int simdEnd = width - 1;
+                if (useSimd)
+                {
+                    for (int x = 0; x < simdEnd; x++)
+                    {
+                        if (xIndex[x * 4 + 3] > sw - 2) { simdEnd = x; break; }
+                    }
+                }
+                else
+                {
+                    simdEnd = 0;
+                }
+
                 Parallel.For(0, height, y =>
                 {
+                    // ref 局部变量不能跨 lambda 边界捕获，因此每行开始时各取一次
+                    ref byte srcRef = ref MemoryMarshal.GetReference(src.AsSpan());
+                    ref byte dstRef = ref MemoryMarshal.GetReference(dst.AsSpan());
+
                     int yOff = y * 4;
                     int sy0 = yIndex[yOff + 0];
                     int sy1 = yIndex[yOff + 1];
@@ -529,7 +624,56 @@ namespace SharpImageConverter.Processing
                     int base2 = sy2 * sw * 3;
                     int base3 = sy3 * sw * 3;
 
-                    for (int x = 0; x < width; x++)
+                    int x = 0;
+                    for (; x < simdEnd; x++)
+                    {
+                        int xOff = x * 4;
+                        int sx0 = xIndex[xOff + 0];
+                        int sx1 = xIndex[xOff + 1];
+                        int sx2 = xIndex[xOff + 2];
+                        int sx3 = xIndex[xOff + 3];
+
+                        // 16 个源偏移在三个通道间共享，只算一次
+                        int q0 = sx0 * 3, q1 = sx1 * 3, q2 = sx2 * 3, q3 = sx3 * 3;
+
+                        var w0 = Vector128.Create(xWeight[xOff + 0]);
+                        var w1 = Vector128.Create(xWeight[xOff + 1]);
+                        var w2 = Vector128.Create(xWeight[xOff + 2]);
+                        var w3 = Vector128.Create(xWeight[xOff + 3]);
+
+                        var row0 = BicubicRow(ref srcRef, base0, q0, q1, q2, q3, w0, w1, w2, w3);
+                        var row1 = BicubicRow(ref srcRef, base1, q0, q1, q2, q3, w0, w1, w2, w3);
+                        var row2 = BicubicRow(ref srcRef, base2, q0, q1, q2, q3, w0, w1, w2, w3);
+                        var row3 = BicubicRow(ref srcRef, base3, q0, q1, q2, q3, w0, w1, w2, w3);
+
+                        // 垂直方向同样是 (((wy0*row0) + (wy1*row1)) + ...) 的结合顺序
+                        var val = Sse2.Multiply(Vector128.Create(wy0), row0);
+                        val = Sse2.Add(val, Sse2.Multiply(Vector128.Create(wy1), row1));
+                        val = Sse2.Add(val, Sse2.Multiply(Vector128.Create(wy2), row2));
+                        val = Sse2.Add(val, Sse2.Multiply(Vector128.Create(wy3), row3));
+
+                        // 先夹到 [0,255] 再 +0.5 截断——顺序必须和标量一致，否则边界取值会差 1
+                        val = Sse2.Min(Sse2.Max(val, Vector128<float>.Zero), MaxByte);
+                        // 必须用截断转换：标量路径是 (byte)(val + 0.5f)，协处理器语义等同于 cvtt。
+                        // 若误用 cvtps2dq（最近取整）会整体偏 1，且 255.5 会取整成 256，取低字节时又绕回 0。
+                        Vector128<int> iv = Sse2.ConvertToVector128Int32WithTruncation(Sse2.Add(val, Half));
+                        var packed = Ssse3.Shuffle(iv.AsByte(), BicubicStoreMask);
+
+                        int d = dBase + x * 3;
+                        if (x + 1 < width)
+                        {
+                            // 写成 4 字节会顺带覆盖下一个像素的 R，那个像素随后会自己覆写回来
+                            Unsafe.WriteUnaligned(ref Unsafe.Add(ref dstRef, d), packed.AsUInt32().GetElement(0));
+                        }
+                        else
+                        {
+                            dst[d + 0] = (byte)iv.GetElement(0);
+                            dst[d + 1] = (byte)iv.GetElement(1);
+                            dst[d + 2] = (byte)iv.GetElement(2);
+                        }
+                    }
+
+                    for (; x < width; x++)
                     {
                         int xOff = x * 4;
                         int sx0 = xIndex[xOff + 0];
