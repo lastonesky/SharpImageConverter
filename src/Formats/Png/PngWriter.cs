@@ -2,6 +2,7 @@ using System;
 using System.Buffers;
 using System.IO;
 using System.Numerics;
+using System.Runtime.InteropServices;
 using SharpImageConverter.Core;
 using SharpImageConverter.Metadata;
 
@@ -246,23 +247,26 @@ public static class PngWriter
     private static void ApplyUpFilterSimd(ReadOnlySpan<byte> current, ReadOnlySpan<byte> prevRow, Span<byte> destination)
     {
         int length = current.Length;
-        ReadOnlySpan<byte> prevSpan = prevRow;
-        Span<byte> destSpan = destination;
         int i = 0;
         if (Vector.IsHardwareAccelerated && length >= Vector<byte>.Count)
         {
+            // 直接按元素偏移载入/回写，避免每步 Slice(i) 的重复边界检查。
+            // Up 滤波是回绕减法（与 PNG 规范一致），不能用带饱和的减法。
             int simdCount = Vector<byte>.Count;
+            ref byte curRef = ref MemoryMarshal.GetReference(current);
+            ref byte prevRef = ref MemoryMarshal.GetReference(prevRow);
+            ref byte dstRef = ref MemoryMarshal.GetReference(destination);
             for (; i <= length - simdCount; i += simdCount)
             {
-                var curVec = new Vector<byte>(current.Slice(i));
-                var prevVec = new Vector<byte>(prevSpan.Slice(i));
-                var result = Vector.Subtract(curVec, prevVec);
-                result.CopyTo(destSpan.Slice(i));
+                var diff = Vector.Subtract(
+                    Vector.LoadUnsafe(ref curRef, (nuint)i),
+                    Vector.LoadUnsafe(ref prevRef, (nuint)i));
+                diff.StoreUnsafe(ref dstRef, (nuint)i);
             }
         }
         for (; i < length; i++)
         {
-            destSpan[i] = (byte)(current[i] - prevSpan[i]);
+            destination[i] = (byte)(current[i] - prevRow[i]);
         }
     }
     private static byte[] ToBigEndian(uint val)
