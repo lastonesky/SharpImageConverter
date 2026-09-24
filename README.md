@@ -197,6 +197,8 @@ dotnet run -- <输入文件或文件夹路径> [输出文件或文件夹路径] 
   - `--jpeg-debug`：打印 JPEG 编码配置与耗时信息。
 - GIF/灰度相关：
   - `--gif-frames`：GIF 拆帧导出。
+  - `--gif-debug`：打印 GIF 编解码的分阶段耗时（量化、LZW、像素展开等）与吞吐（Mpx/s）。
+  - `--gif-bench N`：对 GIF 编解码重复 N 次（默认 5）并输出各阶段的最小/中位/平均耗时，用于对比优化前后的差异；该选项只做测量、不产出文件。
   - `--gray`：输出阶段按灰度保存（BMP/PNG/WebP/JPEG 路径生效）。
   - `--dithering on|off`：GIF 编码抖动开关（默认 on）。
 - 目录批处理参数：

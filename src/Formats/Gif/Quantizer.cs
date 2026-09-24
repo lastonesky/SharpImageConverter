@@ -15,6 +15,8 @@ public sealed class Quantizer : IDisposable
     private const int SIZE = 33; // 2^5 + 1
     private const int MaxColors = 256;
     private const int HistogramVolume = SIZE * SIZE * SIZE;
+    /// <summary>误差按 1/16 缩放：除以 16 与乘 0.0625f 在同一浮点语义下结果完全一致。</summary>
+    private const float InvSixteen = 0.0625f;
 
     private readonly long[] _vwt;
     private readonly long[] _vmr;
@@ -312,53 +314,81 @@ public sealed class Quantizer : IDisposable
     {
         byte[] indices = new byte[width * height];
         int errorBufferLength = (width + 2) * 3;
-        float[] currentRowError = ArrayPool<float>.Shared.Rent(errorBufferLength);
-        float[] nextRowError = ArrayPool<float>.Shared.Rent(errorBufferLength);
+        float[] rowErrorIn = ArrayPool<float>.Shared.Rent(errorBufferLength);
+        float[] rowErrorOut = ArrayPool<float>.Shared.Rent(errorBufferLength);
         try
         {
-            Array.Clear(currentRowError, 0, errorBufferLength);
-            Array.Clear(nextRowError, 0, errorBufferLength);
+            Array.Clear(rowErrorIn, 0, errorBufferLength);
 
+            // 误差扩散改写为滚动寄存器形式，去掉每像素 12 次内存读改写：
+            //   - 同行左邻扩散（原 currentRowError[x+1] 上的 7/16 项）用寄存器携带，
+            //     读取时再叠加到上一行留在该槽位的误差上；
+            //   - 下一行三个槽位（x / x+1 / x+2）的累加用三个滚动寄存器，
+            //     第 x 槽在像素 x 处理完集齐 1/16、5/16、3/16 三份贡献后一次性写出。
+            // 加法的操作数与先后顺序与逐像素版一致，浮点结果逐位相同。
             for (int y = 0; y < height; y++)
             {
                 int rowOffset = y * width * 3;
+                int indexOffset = y * width;
+
+                float carryR = 0, carryG = 0, carryB = 0;
+                float next0R = 0, next0G = 0, next0B = 0;
+                float next1R = 0, next1G = 0, next1B = 0;
+                float next2R = 0, next2G = 0, next2B = 0;
+
                 for (int x = 0; x < width; x++)
                 {
                     int pxOff = rowOffset + x * 3;
-                    int errorIndex = (x + 1) * 3;
-                    float r = Math.Clamp(pixels[pxOff] + currentRowError[errorIndex], 0, 255);
-                    float g = Math.Clamp(pixels[pxOff + 1] + currentRowError[errorIndex + 1], 0, 255);
-                    float b = Math.Clamp(pixels[pxOff + 2] + currentRowError[errorIndex + 2], 0, 255);
+                    // 槽位 x+1 上仍是上一行扩散过来的误差，本行左邻的 7/16 叠加在其上
+                    int inOff = (x + 1) * 3;
+                    float leftR = rowErrorIn[inOff] + carryR;
+                    float leftG = rowErrorIn[inOff + 1] + carryG;
+                    float leftB = rowErrorIn[inOff + 2] + carryB;
+                    float r = Math.Clamp(pixels[pxOff] + leftR, 0, 255);
+                    float g = Math.Clamp(pixels[pxOff + 1] + leftG, 0, 255);
+                    float b = Math.Clamp(pixels[pxOff + 2] + leftB, 0, 255);
                     int bestIndex = lut[(((int)r >> 3) + 1) * SIZE * SIZE + (((int)g >> 3) + 1) * SIZE + (((int)b >> 3) + 1)];
-                    indices[y * width + x] = (byte)bestIndex;
+                    indices[indexOffset + x] = (byte)bestIndex;
                     int palOff = bestIndex * 3;
-                    float er = (r - palette[palOff]) / 16f;
-                    float eg = (g - palette[palOff + 1]) / 16f;
-                    float eb = (b - palette[palOff + 2]) / 16f;
-                    int rightErrorIndex = (x + 2) * 3;
-                    currentRowError[rightErrorIndex] += er * 7;
-                    currentRowError[rightErrorIndex + 1] += eg * 7;
-                    currentRowError[rightErrorIndex + 2] += eb * 7;
-                    int downLeftErrorIndex = x * 3;
-                    nextRowError[downLeftErrorIndex] += er * 3;
-                    nextRowError[downLeftErrorIndex + 1] += eg * 3;
-                    nextRowError[downLeftErrorIndex + 2] += eb * 3;
-                    nextRowError[errorIndex] += er * 5;
-                    nextRowError[errorIndex + 1] += eg * 5;
-                    nextRowError[errorIndex + 2] += eb * 5;
-                    nextRowError[rightErrorIndex] += er;
-                    nextRowError[rightErrorIndex + 1] += eg;
-                    nextRowError[rightErrorIndex + 2] += eb;
+                    float er = (r - palette[palOff]) * InvSixteen;
+                    float eg = (g - palette[palOff + 1]) * InvSixteen;
+                    float eb = (b - palette[palOff + 2]) * InvSixteen;
+
+                    int outOff = x * 3;
+                    rowErrorOut[outOff] = next0R + er * 3;
+                    rowErrorOut[outOff + 1] = next0G + eg * 3;
+                    rowErrorOut[outOff + 2] = next0B + eb * 3;
+
+                    carryR = er * 7;
+                    carryG = eg * 7;
+                    carryB = eb * 7;
+                    next0R = next1R + er * 5;
+                    next0G = next1G + eg * 5;
+                    next0B = next1B + eb * 5;
+                    next1R = next2R + er;
+                    next1G = next2G + eg;
+                    next1B = next2B + eb;
+                    next2R = 0;
+                    next2G = 0;
+                    next2B = 0;
                 }
 
-                (currentRowError, nextRowError) = (nextRowError, currentRowError);
-                Array.Clear(nextRowError, 0, errorBufferLength);
+                // 末两槽（width / width+1）不再收到 3/16 与 5/16 项
+                int tailOff = width * 3;
+                rowErrorOut[tailOff] = next0R;
+                rowErrorOut[tailOff + 1] = next0G;
+                rowErrorOut[tailOff + 2] = next0B;
+                rowErrorOut[tailOff + 3] = next1R;
+                rowErrorOut[tailOff + 4] = next1G;
+                rowErrorOut[tailOff + 5] = next1B;
+
+                (rowErrorIn, rowErrorOut) = (rowErrorOut, rowErrorIn);
             }
         }
         finally
         {
-            ArrayPool<float>.Shared.Return(currentRowError);
-            ArrayPool<float>.Shared.Return(nextRowError);
+            ArrayPool<float>.Shared.Return(rowErrorIn);
+            ArrayPool<float>.Shared.Return(rowErrorOut);
         }
         return indices;
     }

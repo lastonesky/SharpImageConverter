@@ -1,6 +1,9 @@
 using System;
 using System.Buffers;
 using System.IO;
+using System.Runtime.InteropServices;
+using System.Runtime.Intrinsics;
+using System.Runtime.Intrinsics.X86;
 using SharpImageConverter.Core;
 
 namespace SharpImageConverter.Formats.Gif
@@ -47,60 +50,58 @@ namespace SharpImageConverter.Formats.Gif
 
             while (pixelIndex < pixelCount)
             {
-                if (top == 0)
+                // Fill bit buffer with enough bits
+                while (_bitCount < codeSize)
                 {
-                    // Fill bit buffer with enough bits
-                    while (_bitCount < codeSize)
+                    if (_blockIndex >= _blockLength)
                     {
-                        if (_blockIndex >= _blockLength)
+                        int len = _stream.ReadByte();
+                        if (len <= 0)
                         {
-                            int len = _stream.ReadByte();
-                            if (len <= 0) 
-                            {
-                                // Unexpected end of data, but let's break and return what we have
-                                return; 
-                            }
-                            _blockLength = len;
-                            int read = 0;
-                            while (read < len)
-                            {
-                                int n = _stream.Read(_blockBuffer.AsSpan(read, len - read));
-                                if (n == 0) throw new EndOfStreamException("Unexpected end of stream in GIF data block");
-                                read += n;
-                            }
-                            _blockIndex = 0;
+                            // Unexpected end of data, but let's break and return what we have
+                            return;
                         }
-
-                        _bitBuffer |= (_blockBuffer[_blockIndex++] & 0xFF) << _bitCount;
-                        _bitCount += 8;
+                        _blockLength = len;
+                        int read = 0;
+                        while (read < len)
+                        {
+                            int n = _stream.Read(_blockBuffer.AsSpan(read, len - read));
+                            if (n == 0) throw new EndOfStreamException("Unexpected end of stream in GIF data block");
+                            read += n;
+                        }
+                        _blockIndex = 0;
                     }
 
-                    // Extract code
-                    int code = _bitBuffer & codeMask;
-                    _bitBuffer >>= codeSize;
-                    _bitCount -= codeSize;
+                    _bitBuffer |= (_blockBuffer[_blockIndex++] & 0xFF) << _bitCount;
+                    _bitCount += 8;
+                }
 
-                    // Handle clear code
-                    if (code == clearCode)
-                    {
-                        codeSize = dataSize + 1;
-                        codeMask = (1 << codeSize) - 1;
-                        available = clearCode + 2;
-                        oldCode = -1;
-                        continue;
-                    }
+                // Extract code
+                int code = _bitBuffer & codeMask;
+                _bitBuffer >>= codeSize;
+                _bitCount -= codeSize;
 
-                    // Handle end code
-                    if (code == endCode) break;
+                // Handle clear code
+                if (code == clearCode)
+                {
+                    codeSize = dataSize + 1;
+                    codeMask = (1 << codeSize) - 1;
+                    available = clearCode + 2;
+                    oldCode = -1;
+                    continue;
+                }
 
-                    // First code case
-                    if (oldCode == -1)
-                    {
-                        pixelStack[top++] = (byte)code; // code < clearCode implies suffix is code
-                        oldCode = code;
-                        continue;
-                    }
+                // Handle end code
+                if (code == endCode) break;
 
+                // First code case
+                if (oldCode == -1)
+                {
+                    pixelStack[top++] = (byte)code; // code < clearCode implies suffix is code
+                    oldCode = code;
+                }
+                else
+                {
                     int inCode = code;
                     int firstChar;
 
@@ -143,9 +144,21 @@ namespace SharpImageConverter.Formats.Gif
                     oldCode = inCode;
                 }
 
-                // Pop stack and write pixel
-                top--;
-                pixels[pixelIndex++] = pixelStack[top];
+                // 栈顶到栈底就是这段串的正向输出：短串直接内联回写，长串走反序向量拷贝
+                int runLength = Math.Min(top, pixelCount - pixelIndex);
+                if (runLength > 16)
+                {
+                    ReverseCopy(pixels.Slice(pixelIndex, runLength), pixelStack.Slice(top - runLength, runLength));
+                }
+                else
+                {
+                    for (int k = 0; k < runLength; k++)
+                    {
+                        pixels[pixelIndex + k] = pixelStack[top - 1 - k];
+                    }
+                }
+                pixelIndex += runLength;
+                top = 0;
             }
 
             // Flush remaining sub-blocks
@@ -174,6 +187,32 @@ namespace SharpImageConverter.Formats.Gif
                         ArrayPool<byte>.Shared.Return(skipBuffer);
                     }
                  }
+            }
+        }
+
+        /// <summary>
+        /// 把 src 逆序写入 dst（要求 dst.Length == src.Length，且两块内存不重叠）。
+        /// SSSE3 下用 pshufb 每 16 字节反转一次，替代逐字节回写。
+        /// </summary>
+        private static void ReverseCopy(Span<byte> dst, ReadOnlySpan<byte> src)
+        {
+            int n = dst.Length;
+            int i = 0;
+            if (Ssse3.IsSupported && n >= 16)
+            {
+                ref byte dstRef = ref MemoryMarshal.GetReference(dst);
+                ref byte srcRef = ref MemoryMarshal.GetReference(src);
+                Vector128<byte> reverse = Vector128.Create((byte)15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0);
+                int limit = n - 16;
+                for (; i <= limit; i += 16)
+                {
+                    Vector128<byte> v = Vector128.LoadUnsafe(ref srcRef, (nuint)(n - i - 16));
+                    Vector128.StoreUnsafe(Ssse3.Shuffle(v, reverse), ref dstRef, (nuint)i);
+                }
+            }
+            for (; i < n; i++)
+            {
+                dst[i] = src[n - 1 - i];
             }
         }
 

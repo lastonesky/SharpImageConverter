@@ -193,6 +193,8 @@ Special cases:
 - `--keep-metadata` : When recompressing JPEG, try to preserve basic EXIF/ICC metadata
 - `--jpeg-debug` : Enable JPEG decoding debug output
 - `--gif-frames` : Export animated GIF frames as individual images for inspection/debugging
+- `--gif-debug` : Print per-phase GIF encode/decode timings (quantize, LZW, pixel expand, ...) and throughput (Mpx/s)
+- `--gif-bench N` : Repeat GIF encode/decode N times (default 5) and report min/median/avg per phase, for comparing before/after optimizations; measurement only, writes no file
 - `--gray` : Force grayscale output (applies to JPEG/PNG/BMP/WebP)
 - `--stream` : Use streaming decode for JPEG to reduce memory usage; other formats fall back to normal decode
 - `--idct int|float` : Choose JPEG IDCT implementation (integer/float), applies to JPEG decoding only

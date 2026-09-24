@@ -13,16 +13,32 @@ namespace SharpImageConverter.Formats.Gif
         public bool EnableDithering { get; set; } = true;
 
         /// <summary>
+        /// 是否采集编码各阶段耗时并输出诊断日志。
+        /// </summary>
+        public bool EnableDiagnostics { get; set; }
+
+        /// <summary>
+        /// 诊断日志输出委托，为 null 时回落到 Trace。
+        /// </summary>
+        public Action<string>? DiagnosticsLog { get; set; }
+
+        /// <summary>
+        /// 最近一次编码的耗时统计，未开启诊断时为 null。
+        /// </summary>
+        public GifTiming? LastTiming { get; private set; }
+
+        /// <summary>
         /// 将 RGB24 图像编码为 GIF 文件
         /// </summary>
         /// <param name="path">输出路径</param>
         /// <param name="image">输入图像</param>
         public void EncodeRgb24(string path, Image<Rgb24> image)
         {
-            var encoder = new GifEncoder { EnableDithering = EnableDithering };
+            var encoder = CreateEncoder();
             using var fs = File.Create(path);
             var frame = new ImageFrame(image.Width, image.Height, image.Buffer);
             encoder.Encode(frame, fs);
+            LastTiming = encoder.LastTiming;
         }
 
         /// <summary>
@@ -32,10 +48,18 @@ namespace SharpImageConverter.Formats.Gif
         /// <param name="image">输入图像</param>
         public void EncodeRgb24(Stream stream, Image<Rgb24> image)
         {
-            var encoder = new GifEncoder { EnableDithering = EnableDithering };
+            var encoder = CreateEncoder();
             var frame = new ImageFrame(image.Width, image.Height, image.Buffer);
             encoder.Encode(frame, stream);
+            LastTiming = encoder.LastTiming;
         }
+
+        private GifEncoder CreateEncoder() => new()
+        {
+            EnableDithering = EnableDithering,
+            EnableDiagnostics = EnableDiagnostics,
+            DiagnosticsLog = DiagnosticsLog,
+        };
     }
 
     /// <summary>
@@ -46,15 +70,31 @@ namespace SharpImageConverter.Formats.Gif
         public bool EnableDithering { get; set; } = true;
 
         /// <summary>
+        /// 是否采集编码各阶段耗时并输出诊断日志。
+        /// </summary>
+        public bool EnableDiagnostics { get; set; }
+
+        /// <summary>
+        /// 诊断日志输出委托，为 null 时回落到 Trace。
+        /// </summary>
+        public Action<string>? DiagnosticsLog { get; set; }
+
+        /// <summary>
+        /// 最近一次编码的耗时统计，未开启诊断时为 null。
+        /// </summary>
+        public GifTiming? LastTiming { get; private set; }
+
+        /// <summary>
         /// 将 RGBA32 图像编码为 GIF 文件
         /// </summary>
         /// <param name="path">输出路径</param>
         /// <param name="image">输入图像</param>
         public void EncodeRgba32(string path, Image<Rgba32> image)
         {
-            var encoder = new GifEncoder { EnableDithering = EnableDithering };
+            var encoder = CreateEncoder();
             using var fs = File.Create(path);
             encoder.EncodeRgba(image.Width, image.Height, image.Buffer, fs);
+            LastTiming = encoder.LastTiming;
         }
 
         /// <summary>
@@ -64,9 +104,17 @@ namespace SharpImageConverter.Formats.Gif
         /// <param name="image">输入图像</param>
         public void EncodeRgba32(Stream stream, Image<Rgba32> image)
         {
-            var encoder = new GifEncoder { EnableDithering = EnableDithering };
+            var encoder = CreateEncoder();
             encoder.EncodeRgba(image.Width, image.Height, image.Buffer, stream);
+            LastTiming = encoder.LastTiming;
         }
+
+        private GifEncoder CreateEncoder() => new()
+        {
+            EnableDithering = EnableDithering,
+            EnableDiagnostics = EnableDiagnostics,
+            DiagnosticsLog = DiagnosticsLog,
+        };
     }
 
     /// <summary>
@@ -75,14 +123,31 @@ namespace SharpImageConverter.Formats.Gif
     public sealed class GifDecoderRgbaAdapter : IImageDecoderRgba
     {
         /// <summary>
+        /// 是否采集解码各阶段耗时并输出诊断日志。
+        /// </summary>
+        public bool EnableDiagnostics { get; set; }
+
+        /// <summary>
+        /// 诊断日志输出委托，为 null 时回落到 Trace。
+        /// </summary>
+        public Action<string>? DiagnosticsLog { get; set; }
+
+        /// <summary>
+        /// 最近一次解码的耗时统计，未开启诊断时为 null。
+        /// </summary>
+        public GifTiming? LastTiming { get; private set; }
+
+        /// <summary>
         /// 解码 GIF 文件为 RGBA32 图像
         /// </summary>
         /// <param name="path">文件路径</param>
         /// <returns>RGBA32 图像</returns>
         public Image<Rgba32> DecodeRgba32(string path)
         {
-            var dec = new GifDecoder();
-            return dec.DecodeRgba32(path);
+            var dec = CreateDecoder();
+            var image = dec.DecodeRgba32(path);
+            LastTiming = dec.LastTiming;
+            return image;
         }
 
         /// <summary>
@@ -92,8 +157,16 @@ namespace SharpImageConverter.Formats.Gif
         /// <returns>RGBA32 图像</returns>
         public Image<Rgba32> DecodeRgba32(Stream stream)
         {
-            var dec = new GifDecoder();
-            return dec.DecodeRgba32(stream);
+            var dec = CreateDecoder();
+            var image = dec.DecodeRgba32(stream);
+            LastTiming = dec.LastTiming;
+            return image;
         }
+
+        private GifDecoder CreateDecoder() => new()
+        {
+            EnableDiagnostics = EnableDiagnostics,
+            DiagnosticsLog = DiagnosticsLog,
+        };
     }
 }
