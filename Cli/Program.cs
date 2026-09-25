@@ -70,6 +70,8 @@ class Program
         Console.WriteLine("操作: resize:WxH | resizebilinear:WxH | resizefit:WxH | grayscale");
         Console.WriteLine("参数: --quality N | --subsample 420/444 | --keep-metadata | --idct int/float | --stream | --jpeg-debug | --gif-frames | --gray | --dithering on/off");
         Console.WriteLine("GIF 耗时统计: --gif-debug（分阶段耗时）| --gif-bench N（重复 N 次取最小/中位/平均，默认 5）");
+        Console.WriteLine("GIF 量化器: --gif-quantizer octree(默认,八叉树+Bayer) | wu/legacy(原 Wu+Floyd–Steinberg)");
+        Console.WriteLine("GIF 抖动幅度: --gif-dither N (默认 8 = 一个量化步长; 调大会放大颗粒与缩放摩尔纹)");
         Console.WriteLine("文件夹选项: --recursive | --to bmp/png/jpg/webp | --parallel N | --skip-existing");
     }
 
@@ -104,6 +106,24 @@ class Program
                 else
                 {
                     options.GifBench = 5;
+                }
+                continue;
+            }
+            if (string.Equals(a, "--gif-quantizer", StringComparison.OrdinalIgnoreCase))
+            {
+                if (i + 1 < args.Length)
+                {
+                    options.GifQuantizer = args[i + 1].Trim().ToLowerInvariant();
+                    i++;
+                }
+                continue;
+            }
+            if (string.Equals(a, "--gif-dither", StringComparison.OrdinalIgnoreCase))
+            {
+                if (i + 1 < args.Length && int.TryParse(args[i + 1], out int ds) && ds >= 0)
+                {
+                    options.GifDitherStrength = ds;
+                    i++;
                 }
                 continue;
             }
@@ -261,7 +281,9 @@ class Program
             UseStreamingDecoder = src.UseStreamingDecoder,
             Gray = src.Gray,
             GifDebug = src.GifDebug,
-            GifBench = src.GifBench
+            GifBench = src.GifBench,
+            GifQuantizer = src.GifQuantizer,
+            GifDitherStrength = src.GifDitherStrength
         };
         foreach (var op in src.Operations) dst.Operations.Add(op);
         return dst;
@@ -286,9 +308,21 @@ class Program
         Action<string> log = Console.WriteLine;
         Configuration.Default.RegisterDecoder<GifFormat>(new GifDecoder { EnableDiagnostics = true, DiagnosticsLog = log });
         Configuration.Default.RegisterDecoderRgba<GifFormat>(new GifDecoderRgbaAdapter { EnableDiagnostics = true, DiagnosticsLog = log });
-        Configuration.Default.RegisterEncoder<GifFormat>(new GifEncoderAdapter { EnableDithering = options.Dithering, EnableDiagnostics = true, DiagnosticsLog = log });
-        Configuration.Default.RegisterEncoderRgba<GifFormat>(new GifEncoderAdapterRgba { EnableDithering = options.Dithering, EnableDiagnostics = true, DiagnosticsLog = log });
+        Configuration.Default.RegisterEncoder<GifFormat>(new GifEncoderAdapter { EnableDithering = options.Dithering, QuantizerKind = ParseGifQuantizer(options.GifQuantizer), DitherStrength = options.GifDitherStrength, EnableDiagnostics = true, DiagnosticsLog = log });
+        Configuration.Default.RegisterEncoderRgba<GifFormat>(new GifEncoderAdapterRgba { EnableDithering = options.Dithering, QuantizerKind = ParseGifQuantizer(options.GifQuantizer), DitherStrength = options.GifDitherStrength, EnableDiagnostics = true, DiagnosticsLog = log });
     }
+
+    /// <summary>
+    /// 将 CLI 字符串映射为量化器枚举：wu/legacy/floyd/fs 走原 Wu + Floyd–Steinberg；
+    /// 其余（含 octree/空）走默认八叉树 + Bayer。
+    /// </summary>
+    static GifQuantizerKind ParseGifQuantizer(string? v) =>
+        string.Equals(v, "wu", StringComparison.OrdinalIgnoreCase)
+        || string.Equals(v, "legacy", StringComparison.OrdinalIgnoreCase)
+        || string.Equals(v, "floyd", StringComparison.OrdinalIgnoreCase)
+        || string.Equals(v, "fs", StringComparison.OrdinalIgnoreCase)
+            ? GifQuantizerKind.WuFloydSteinberg
+            : GifQuantizerKind.OctreeBayer;
 
     /// <summary>
     /// GIF 编解码基准：重复 N 次并给出各阶段的最小/中位/平均值，便于对比优化前后的差异。
@@ -321,7 +355,7 @@ class Program
         var encodeTimings = new List<GifTiming>(iterations);
         for (int i = 0; i < iterations; i++)
         {
-            var enc = new GifEncoder { EnableDiagnostics = true, EnableDithering = options.Dithering };
+            var enc = new GifEncoder { EnableDiagnostics = true, EnableDithering = options.Dithering, QuantizerKind = ParseGifQuantizer(options.GifQuantizer), DitherStrength = options.GifDitherStrength };
             using var ms = new MemoryStream();
             enc.Encode(new ImageFrame(rgb.Width, rgb.Height, rgb.Buffer), ms);
             if (enc.LastTiming is not null) encodeTimings.Add(enc.LastTiming);
@@ -635,6 +669,8 @@ class Program
             var encoder = new GifEncoderAdapter
             {
                 EnableDithering = options.Dithering,
+                QuantizerKind = ParseGifQuantizer(options.GifQuantizer),
+                DitherStrength = options.GifDitherStrength,
                 EnableDiagnostics = options.GifDebug,
                 DiagnosticsLog = options.GifDebug ? Console.WriteLine : null,
             };
@@ -673,6 +709,8 @@ class Program
             var encoder = new GifEncoderAdapterRgba
             {
                 EnableDithering = options.Dithering,
+                QuantizerKind = ParseGifQuantizer(options.GifQuantizer),
+                DitherStrength = options.GifDitherStrength,
                 EnableDiagnostics = options.GifDebug,
                 DiagnosticsLog = options.GifDebug ? Console.WriteLine : null,
             };
@@ -959,6 +997,8 @@ class Program
         public bool JpegDebug { get; set; }
         public bool GifDebug { get; set; }
         public int? GifBench { get; set; }
+        public string? GifQuantizer { get; set; } // "octree"(默认) | "wu"/"legacy"/"fs" 切回原实现
+        public int GifDitherStrength { get; set; } = 8; // Bayer 抖动幅度，仅 octree 生效
         public List<Action<ImageProcessingContext>> Operations { get; } = [];
         public bool IsDirectoryInput { get; set; }
         public bool Recursive { get; set; }

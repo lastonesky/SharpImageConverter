@@ -18,6 +18,16 @@ public sealed class Quantizer : IDisposable
     /// <summary>误差按 1/16 缩放：除以 16 与乘 0.0625f 在同一浮点语义下结果完全一致。</summary>
     private const float InvSixteen = 0.0625f;
 
+    /// <summary>
+    /// 低于该像素数时直方图走单线程：并行的固定开销（每个 worker 从 ArrayPool 租借并清零
+    /// 5 个 35,937 元直方图，再把它们全量串行合并回主直方图）超过并行本身省下的扫描时间。
+    /// 该开销随线程数增长，所以阈值也随核数抬高 —— 实测（--gif-bench 15 取中位数）
+    /// 交叉点：4 核约 0.5 MP、8 核约 1.05 MP、24 核约 1.6 MP。
+    /// 小图收益显著：512×512 −41%、800×600 −28%、1280×720 −17%（24 核）。
+    /// </summary>
+    private static readonly int HistogramParallelPixelThreshold =
+        60_000 * Environment.ProcessorCount + 300_000;
+
     private readonly long[] _vwt;
     private readonly long[] _vmr;
     private readonly long[] _vmg;
@@ -74,7 +84,7 @@ public sealed class Quantizer : IDisposable
 
     private unsafe (byte[] Palette, byte[] Indices) QuantizeInternalPtr(byte* pixels, int pixelLength, int width, int height, bool enableDithering)
     {
-        BuildHistogramParallel(pixels, pixelLength);
+        BuildHistogram(pixels, pixelLength);
         CalculateMoments();
 
         Box[] cube = new Box[MaxColors];
@@ -135,6 +145,37 @@ public sealed class Quantizer : IDisposable
             indices = ApplyMappingOnly(pixels, pixelLength, width, height, mappingLut);
         }
         return (palette, indices);
+    }
+
+    private unsafe void BuildHistogram(byte* pixels, int pixelLength)
+    {
+        // 小图：单线程直接累加进主直方图，省掉每线程的租借/清零与全量合并。
+        if (pixelLength / 3 < HistogramParallelPixelThreshold)
+        {
+            Array.Clear(_vwt, 0, HistogramVolume);
+            Array.Clear(_vmr, 0, HistogramVolume);
+            Array.Clear(_vmg, 0, HistogramVolume);
+            Array.Clear(_vmb, 0, HistogramVolume);
+            Array.Clear(_m2, 0, HistogramVolume);
+
+            int len = pixelLength / 3;
+            for (int i = 0; i < len; i++)
+            {
+                int baseIdx = i * 3;
+                int r = pixels[baseIdx];
+                int g = pixels[baseIdx + 1];
+                int b = pixels[baseIdx + 2];
+                int idx = (((r >> 3) + 1) * SIZE * SIZE) + (((g >> 3) + 1) * SIZE) + ((b >> 3) + 1);
+                _vwt[idx]++;
+                _vmr[idx] += r;
+                _vmg[idx] += g;
+                _vmb[idx] += b;
+                _m2[idx] += (double)r * r + (double)g * g + (double)b * b;
+            }
+            return;
+        }
+
+        BuildHistogramParallel(pixels, pixelLength);
     }
 
     private unsafe void BuildHistogramParallel(byte* pixels, int pixelLength)

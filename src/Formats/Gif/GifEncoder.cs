@@ -7,6 +7,17 @@ using SharpImageConverter.Core;
 namespace SharpImageConverter.Formats.Gif;
 
 /// <summary>
+/// GIF 编码使用的量化/抖动方案。
+/// </summary>
+public enum GifQuantizerKind
+{
+    /// <summary>八叉树量化 + Bayer 有序抖动（默认，速度更快，输出与原实现不同）。</summary>
+    OctreeBayer = 0,
+    /// <summary>Wu 量化 + Floyd–Steinberg 误差扩散（原实现，输出逐字节稳定）。</summary>
+    WuFloydSteinberg = 1,
+}
+
+/// <summary>
 /// GIF 编码器，支持 RGB24 与 RGBA32 编码（含量化与 LZW 压缩）
 /// </summary>
 public class GifEncoder
@@ -17,6 +28,18 @@ public class GifEncoder
     /// 是否开启 Floyd-Steinberg 抖动，默认开启。
     /// </summary>
     public bool EnableDithering { get; set; } = true;
+
+    /// <summary>
+    /// 量化/抖动方案。默认 <see cref="GifQuantizerKind.OctreeBayer"/>（八叉树 + Bayer 有序抖动，更快）；
+    /// 设回 <see cref="GifQuantizerKind.WuFloydSteinberg"/> 可复用原 Wu + Floyd–Steinberg 实现。
+    /// </summary>
+    public GifQuantizerKind QuantizerKind { get; set; } = GifQuantizerKind.OctreeBayer;
+
+    /// <summary>
+    /// Bayer 有序抖动幅度（仅 <see cref="GifQuantizerKind.OctreeBayer"/> 生效），默认 8 = 一个量化步长。
+    /// 调大会显著放大颗粒与缩放摩尔纹，详见 <see cref="OctreeQuantizer.DitherStrength"/>。
+    /// </summary>
+    public int DitherStrength { get; set; } = 8;
 
     /// <summary>
     /// 是否采集编码各阶段耗时并输出诊断日志，默认关闭。
@@ -72,7 +95,7 @@ public class GifEncoder
     private void EncodeCore(ImageFrame image, Stream stream, GifTiming? timing)
     {
         long t0 = Now(timing);
-        var (palette, indices) = Quantizer.Quantize(image.Pixels, image.Width, image.Height, EnableDithering);
+        var (palette, indices) = QuantizePixels(image.Pixels, image.Width, image.Height);
         long t1 = Now(timing);
 
         int paletteCount = palette.Length / 3;
@@ -228,7 +251,7 @@ public class GifEncoder
         for (int i = 0; i < frames.Count; i++)
         {
             long tq0 = Now(timing);
-            var (pal, inds) = Quantizer.Quantize(frames[i].Pixels, w, h, EnableDithering);
+            var (pal, inds) = QuantizePixels(frames[i].Pixels, w, h);
             long tq1 = Now(timing);
             int depth = GetColorDepth(pal.Length / 3);
 
@@ -341,6 +364,17 @@ public class GifEncoder
         FinishTiming(timing);
     }
 
+    /// <summary>
+    /// 按 <see cref="QuantizerKind"/> 选择量化器，对 RGB24 像素生成调色板与索引。
+    /// 新方案（八叉树 + Bayer）为默认；原 Wu + Floyd–Steinberg 保留作可切换项。
+    /// </summary>
+    private (byte[] Palette, byte[] Indices) QuantizePixels(ReadOnlySpan<byte> pixels, int width, int height)
+    {
+        return QuantizerKind == GifQuantizerKind.WuFloydSteinberg
+            ? Quantizer.Quantize(pixels, width, height, EnableDithering)
+            : OctreeQuantizer.Quantize(pixels, width, height, EnableDithering, DitherStrength);
+    }
+
     private static int GetColorDepth(int count)
     {
         int depth = 0;
@@ -390,7 +424,7 @@ public class GifEncoder
             }
         }
 
-        var (pal, indsOpaque) = Quantizer.Quantize(opaque, width, height, EnableDithering);
+        var (pal, indsOpaque) = QuantizePixels(opaque, width, height);
         int palCount = pal.Length / 3;
         depth = GetColorDepth(palCount + 1);
         int actualSize = 1 << (depth + 1);
