@@ -13,6 +13,16 @@ namespace SharpImageConverter.Formats.Gif
         public bool EnableDithering { get; set; } = true;
 
         /// <summary>
+        /// 量化/抖动方案；默认八叉树 + Bayer（更快）。设回 WuFloydSteinberg 复用原实现。
+        /// </summary>
+        public GifQuantizerKind QuantizerKind { get; set; } = GifQuantizerKind.OctreeBayer;
+
+        /// <summary>
+        /// Bayer 抖动幅度（默认 8）。调大会放大颗粒与缩放摩尔纹。
+        /// </summary>
+        public int DitherStrength { get; set; } = 8;
+
+        /// <summary>
         /// 是否采集编码各阶段耗时并输出诊断日志。
         /// </summary>
         public bool EnableDiagnostics { get; set; }
@@ -57,6 +67,8 @@ namespace SharpImageConverter.Formats.Gif
         private GifEncoder CreateEncoder() => new()
         {
             EnableDithering = EnableDithering,
+            QuantizerKind = QuantizerKind,
+            DitherStrength = DitherStrength,
             EnableDiagnostics = EnableDiagnostics,
             DiagnosticsLog = DiagnosticsLog,
         };
@@ -68,6 +80,16 @@ namespace SharpImageConverter.Formats.Gif
     public sealed class GifEncoderAdapterRgba : IImageEncoderRgba
     {
         public bool EnableDithering { get; set; } = true;
+
+        /// <summary>
+        /// 量化/抖动方案；默认八叉树 + Bayer（更快）。设回 WuFloydSteinberg 复用原实现。
+        /// </summary>
+        public GifQuantizerKind QuantizerKind { get; set; } = GifQuantizerKind.OctreeBayer;
+
+        /// <summary>
+        /// Bayer 抖动幅度（默认 8）。调大会放大颗粒与缩放摩尔纹。
+        /// </summary>
+        public int DitherStrength { get; set; } = 8;
 
         /// <summary>
         /// 是否采集编码各阶段耗时并输出诊断日志。
@@ -112,6 +134,8 @@ namespace SharpImageConverter.Formats.Gif
         private GifEncoder CreateEncoder() => new()
         {
             EnableDithering = EnableDithering,
+            QuantizerKind = QuantizerKind,
+            DitherStrength = DitherStrength,
             EnableDiagnostics = EnableDiagnostics,
             DiagnosticsLog = DiagnosticsLog,
         };
