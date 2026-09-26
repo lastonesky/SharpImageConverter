@@ -1,5 +1,6 @@
 using SharpImageConverter.Metadata;
 using System.Buffers;
+using System.Diagnostics;
 using System.Runtime.Intrinsics.X86;
 
 namespace SharpImageConverter.Formats.Jpeg;
@@ -357,6 +358,7 @@ internal sealed class JpegFrameState
 
     public void DecodeScan(in ScanHeader scan, ref JpegBitReader reader)
     {
+        long probeStart = JpegPerfProbe.Enabled ? Stopwatch.GetTimestamp() : 0;
         bool interleaved = scan.Components.Length > 1;
 
         var scanComponents = new ComponentState[scan.Components.Length];
@@ -454,6 +456,11 @@ internal sealed class JpegFrameState
                     }
                 }
             }
+        }
+
+        if (JpegPerfProbe.Enabled)
+        {
+            JpegPerfProbe.Add(JpegPerfProbe.Entropy, Stopwatch.GetTimestamp() - probeStart);
         }
     }
 
@@ -749,6 +756,7 @@ internal sealed class JpegFrameState
 
     public JpegImage ReconstructImage()
     {
+        long probeStart = JpegPerfProbe.Enabled ? Stopwatch.GetTimestamp() : 0;
         int width = frame.Width;
         int height = frame.Height;
         int bitsPerSample = frame.Precision;
@@ -774,8 +782,13 @@ internal sealed class JpegFrameState
 
             if (colorSpace == JpegColorSpace.Gray && components.Length == 1)
             {
+                long pxStart = JpegPerfProbe.Enabled ? Stopwatch.GetTimestamp() : 0;
                 output = new byte[checked(width * height)];
                 handled = JpegDecoder.TryReconstructGrayDirect(frame, components[0], quantTables, useFloatingPointIdct, output);
+                if (JpegPerfProbe.Enabled)
+                {
+                    JpegPerfProbe.Add(JpegPerfProbe.IdctColor, Stopwatch.GetTimestamp() - pxStart);
+                }
                 if (!handled)
                 {
                     output = null;
@@ -784,8 +797,13 @@ internal sealed class JpegFrameState
 
             if (!handled && colorSpace == JpegColorSpace.Rgb && channelCount == 3)
             {
+                long pxStart = JpegPerfProbe.Enabled ? Stopwatch.GetTimestamp() : 0;
                 output = new byte[checked(width * height * 3)];
                 handled = JpegDecoder.TryReconstructRgbDirect(frame, components, quantTables, componentOrder, useFloatingPointIdct, output);
+                if (JpegPerfProbe.Enabled)
+                {
+                    JpegPerfProbe.Add(JpegPerfProbe.IdctColor, Stopwatch.GetTimestamp() - pxStart);
+                }
                 if (!handled)
                 {
                     output = null;
@@ -795,8 +813,13 @@ internal sealed class JpegFrameState
             if (!handled && colorSpace == JpegColorSpace.YCbCr && !useFloatingPointIdct && Sse2.IsSupported)
             {
                 output = new byte[checked(width * height * channelCount)];
+                long pxStart = JpegPerfProbe.Enabled ? Stopwatch.GetTimestamp() : 0;
                 if (JpegDecoder.TryDecodeInterleavedYCbCrSimd(components, output, width, height, fullWidth, fullHeight, componentOrder, quantTables, useFloatingPointIdct, frame))
                 {
+                    if (JpegPerfProbe.Enabled)
+                    {
+                        JpegPerfProbe.Add(JpegPerfProbe.IdctColor, Stopwatch.GetTimestamp() - pxStart);
+                    }
                     byte[]? iccProfileSimd = iccCollector?.GetProfile();
                     var colorInfoSimd = new JpegColorInfo(colorSpace, hasAdobe, adobeTransform, iccProfileSimd);
                     // SIMD path produces RGB24
@@ -806,10 +829,15 @@ internal sealed class JpegFrameState
                     jpegImg.Metadata.IccProfile = iccProfileSimd;
                     return jpegImg;
                 }
+                if (JpegPerfProbe.Enabled)
+                {
+                    JpegPerfProbe.Add(JpegPerfProbe.IdctColor, Stopwatch.GetTimestamp() - pxStart);
+                }
             }
 
             if (!handled)
             {
+                long pxStart = JpegPerfProbe.Enabled ? Stopwatch.GetTimestamp() : 0;
                 for (int i = 0; i < components.Length; i++)
                 {
                     ComponentState c = components[i];
@@ -828,10 +856,18 @@ internal sealed class JpegFrameState
 
                 output ??= new byte[checked(width * height * channelCount)];
                 JpegDecoder.InterleaveComponents(planes, planeStrides, planeWidths, planeHeights, fullWidth, fullHeight, width, height, componentOrder, output);
+                if (JpegPerfProbe.Enabled)
+                {
+                    JpegPerfProbe.Add(JpegPerfProbe.IdctColor, Stopwatch.GetTimestamp() - pxStart);
+                }
             }
         }
         finally
         {
+            if (JpegPerfProbe.Enabled)
+            {
+                JpegPerfProbe.Add(JpegPerfProbe.Reconstruct, Stopwatch.GetTimestamp() - probeStart);
+            }
             for (int i = 0; i < planes.Length; i++)
             {
                 byte[]? plane = planes[i];

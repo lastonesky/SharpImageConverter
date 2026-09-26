@@ -112,6 +112,7 @@ public static partial class JpegDecoder
 
         public JpegImage Decode()
         {
+            JpegPerfProbe.Begin();
             try
             {
                 ReadMarkerExpected(JpegMarker.SOI);
@@ -173,6 +174,7 @@ public static partial class JpegDecoder
             }
             finally
             {
+                JpegPerfProbe.End(JpegPerfProbe.DecodeTotal);
                 state.DisposeResources();
             }
         }

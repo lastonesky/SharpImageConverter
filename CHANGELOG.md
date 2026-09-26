@@ -6,6 +6,60 @@
   单阶段提速但端到端未达标的同样按无效处理。
 
 ### 改进
+- **JPEG 解码重建（IDCT + YCbCr→RGB）按 MCU 行并行。**
+  `TryDecodeInterleavedYCbCrSimd` 的 `my` 行循环改为 `Parallel.For`：每个 MCU 行只写
+  `output` 的 `[my*blockH, (my+1)*blockH)` 行区间、互不相交，系数缓冲在熵解码结束后只读，
+  量化表共享只读，SIMD 重建内部全是 `static readonly` 常量 ⇒ 线程安全无需同步。
+  门控 `60_000 × ProcessorCount + 300_000` 像素（与量化映射同式），小图保持单线程。
+  `examples/progressive.jpg`(143 MP) `--jpeg-bench 7` 中位数：
+  | 阶段 | 优化前 | 优化后 | 提升 |
+  |---|---|---|---|
+  | decode total | 440.5 ms | **223~229 ms** | **−49%** |
+  | reconstruct | 255.1 ms | **37.5~45.7 ms** | **−82~85%** |
+  | entropy（同进程对照组，未改动） | 176.8 ms | 176.8 ms | 0% |
+  8 个基线产物（含 143MP 解码/回编码、CMYK/RGB、灰度、q85+444 参数组）**逐字节一致**，152 单测通过。
+- **JPEG 编码流水线批大小 `McuBatchSize` 16 → 64。**
+  队列容量按「批」计（`clamp(ProcessorCount,2,16)` 批），批=16 时在途 MCU 仅 256 个，
+  下游频繁饿等，35K 次入队的信号量唤醒延迟累计可观；批 ≥64 后流水线加深，
+  produce-wait 61.8 → ~10ms、huffman-wait 90 → ~21ms。
+  同二进制 `SIC_JPEG_BATCH` env 交错 A/B（3 轮，encode total 中位数）：
+  批 16 → 292/283/301 ms，批 64 → 204/207 ms，批 128 → 198/203 ms，批 256 → 199 ms
+  ——**64 起进入平台（−30%）**，256 因在途工作集变大回落，64 与 128 无显著差异，
+  按在途内存（两队列满载 ≈19MB vs ≈38MB）取 64。批大小不影响产物
+  （Huffman 按每 MCU 全局 `Sequence` 排序，与分批无关），8 基线产物逐字节一致、152 单测通过。
+  小图不受影响：`5_star_base.jpg` 编码 11.5 → 11.4 ms（噪声内）。
+- **实测否决：produce（RGB→YCbCr 取样）按行带多生产者并行。**
+  `Parallel.ForEach` 多点直接入队：编码 total 303 → 921 ms（dop=∞）/572 ms（dop=4），
+  并行度越高越慢、交叉点在单线程。原因：① 多生产者争抢 16 批容量的 sampleQueue 形成波状停顿；
+  ② 乱序入队使 Huffman 从 `== expected` 直写快路径退到 pending ring 冷读
+  （huffman-busy 218 → 296/397 ms，143MB 系数冷读）。结论已写入 `ProduceRgbSamples` 上方注释；
+  若将来重做，正确方向是「并行填充 + 单点按序派发」。
+- **`--jpeg-debug` 诊断输出接通控制台。** `JpegEncoder` 的诊断一直写 `Trace.WriteLine`，
+  但 CLI 从未注册监听器，输出全部丢失；现在 `--jpeg-debug` 时注册 `ConsoleTraceListener`，
+  可看到 `[jpeg-timing] total=… FillMcu420=…`（色彩转换占比）。新增 `--jpeg-bench N`
+  分阶段基准与 `SIC_JPEG_STAGE_TIMING=1` 分阶段探针（produce/dct/huffman 及其 wait 槽位、
+  解码 entropy/reconstruct/idct-color），测量方法与 `--gif-bench` 对齐。
+- **PNG 解码反滤波重构：按滤波器类型分派专用函数，Paeth 用代数化简，并复用已有 SIMD 色彩转换。**
+  旧实现把整行先 `CopyTo` 进目标缓冲、再原地改，且逐字节在循环里做 `switch`——
+  真实 PNG（libpng/PIL 自适应滤波）里 Paeth 通常占 90% 以上行，逐字节分支同时破坏分支预测与指令缓存。
+  新实现：① 一次分派到 `UnfilterSub/Up/Average/Paeth`，从 `src` 直读、写 `dst`，省掉一遍整行拷贝
+  （左邻 a 取自 dst、上邻 b 与左上邻 c 取自 prev，三者都不在 src，故语义安全）；
+  ② 首 `bpp` 字节单独处理，热循环内不再有 `i >= bpp` 判断；
+  ③ Paeth 用代数化简——展开后 `p-a = b-c`、`p-b = a-c`、`p-c = (b-c)+(a-c)`，`p` 本身无需计算，
+  且 `pa`/`pb` 可并行求值，依赖链缩短一层。另注：首 bpp 字节的 a、c 均为 0，
+  此时 Paeth **退化为 Up**，直接按 Up 处理。
+  ④ `UnfilterRgba8ToRgbDirect` / `UnfilterRgb8ToRgbaDirect` 里手写的逐像素标量搬运
+  改为复用 `SimdHelper.PackRgbaToRgb` / `ExpandRgbToRgba`（SSSE3 `pshufb`）。
+  同一份二进制内用 `SIC_PNG_LEGACY_UNFILTER=1` env 探针交错 A/B，7 轮取中位数：
+  | 输入 | 优化前 | 优化后 | 提升 |
+  |---|---|---|---|
+  | 4000×3000 RGBA（Paeth 占 97% 行） | 194.65 ms | 161.14 ms | **−17.2%** |
+  | 2000×1500 RGB | 70.52 ms | 45.40 ms | **−35.6%** |
+  | 640×480 RGB | 9.31 ms | 6.31 ms | **−32.2%** |
+  | `Amish-Noka-Dresser.png`（几乎无滤波行） | 3.94 ms | 3.88 ms | −1.5% |
+  最后一行是预期内的零收益：该图滤波器几乎全为 None，反滤波本就不做事。
+  正确性：19 张语料（含 Adam7 隔行、调色板、灰度+Alpha、16 位灰度、1×1/5×3/37×11 奇宽）
+  RGB 与 RGBA 解码产物**逐字节一致**，并与 Pillow 逐一对齐；152 个单元测试通过。
 - **LZW 编码器字典查找改为两级（过滤缓存 + 散列表），并把槽位从 64 位压到 32 位。**
   编码循环是「算散列 → 载入槽位 → 比较 → 更新 `ent`」的串行依赖链，每像素一次，既不能向量化
   也不能软件流水；二级表 256 KB 必然落在 L2 上，那次加载的十余周期延迟就是整条链的主体。

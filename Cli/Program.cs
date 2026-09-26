@@ -28,6 +28,11 @@ class Program
         var options = ParseOptions(args, inputPath);
         options.IsDirectoryInput = isDir;
         EnableGifDiagnostics(options);
+        // JPEG 诊断走 Trace.WriteLine，默认无监听器时输出全部丢失，这里补一个控制台监听器
+        if (options.JpegDebug)
+        {
+            Trace.Listeners.Add(new ConsoleTraceListener());
+        }
 
         // GIF 耗时基准：只测量不转换（目录输入时该选项无效）
         if (options.GifBench.HasValue)
@@ -39,6 +44,20 @@ class Program
             else
             {
                 RunGifBench(options, options.GifBench.Value);
+                return;
+            }
+        }
+
+        // JPEG 耗时基准：只测量不转换（目录输入时该选项无效）
+        if (options.JpegBench.HasValue)
+        {
+            if (isDir)
+            {
+                Console.WriteLine("⚠️ --jpeg-bench 仅支持单文件输入，已忽略");
+            }
+            else
+            {
+                RunJpegBench(options, options.JpegBench.Value);
                 return;
             }
         }
@@ -70,6 +89,7 @@ class Program
         Console.WriteLine("操作: resize:WxH | resizebilinear:WxH | resizefit:WxH | grayscale");
         Console.WriteLine("参数: --quality N | --subsample 420/444 | --keep-metadata | --idct int/float | --stream | --jpeg-debug | --gif-frames | --gray | --dithering on/off");
         Console.WriteLine("GIF 耗时统计: --gif-debug（分阶段耗时）| --gif-bench N（重复 N 次取最小/中位/平均，默认 5）");
+        Console.WriteLine("JPEG 耗时统计: --jpeg-bench N（重复 N 次；配合环境变量 SIC_JPEG_STAGE_TIMING=1 输出分阶段耗时）");
         Console.WriteLine("GIF 量化器: --gif-quantizer octree(默认,八叉树+Bayer) | wu/legacy(原 Wu+Floyd–Steinberg)");
         Console.WriteLine("GIF 抖动幅度: --gif-dither N (默认 8 = 一个量化步长; 调大会放大颗粒与缩放摩尔纹)");
         Console.WriteLine("文件夹选项: --recursive | --to bmp/png/jpg/webp | --parallel N | --skip-existing");
@@ -106,6 +126,19 @@ class Program
                 else
                 {
                     options.GifBench = 5;
+                }
+                continue;
+            }
+            if (string.Equals(a, "--jpeg-bench", StringComparison.OrdinalIgnoreCase))
+            {
+                if (i + 1 < args.Length && int.TryParse(args[i + 1], out int jpegBenchCount) && jpegBenchCount > 0)
+                {
+                    options.JpegBench = jpegBenchCount;
+                    i++;
+                }
+                else
+                {
+                    options.JpegBench = 5;
                 }
                 continue;
             }
@@ -404,6 +437,124 @@ class Program
         if (sorted.Length == 0) return 0;
         int mid = sorted.Length / 2;
         return sorted.Length % 2 == 1 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2.0;
+    }
+
+    /// <summary>
+    /// JPEG 编解码基准：重复 N 次，输出总耗时 min/中位/avg/max。
+    /// 设置环境变量 SIC_JPEG_STAGE_TIMING=1 时同时输出分阶段耗时：
+    /// 编码侧 produce（RGB→YCbCr 色彩转换）、dct（FDCT+量化）、huffman（熵编码）及各自阻塞等待；
+    /// 解码侧 entropy（熵解码）、reconstruct（重建）及其中的 idct-color（IDCT+上采样+YCbCr→RGB）。
+    /// </summary>
+    static void RunJpegBench(CliOptions options, int iterations)
+    {
+        string inExt = Path.GetExtension(options.InputPath).ToLowerInvariant();
+        int quality = options.JpegQuality ?? 75;
+        bool subsample420 = options.Subsample420 ?? true;
+        Console.WriteLine($"🏁 JPEG 耗时基准: {Path.GetFileName(options.InputPath)}  重复 {iterations} 次  quality={quality} subsample={(subsample420 ? "420" : "444")}");
+        if (!JpegPerfProbe.Enabled)
+        {
+            Console.WriteLine("（未开启分阶段计时：设置环境变量 SIC_JPEG_STAGE_TIMING=1 可查看各阶段占比）");
+        }
+
+        if (inExt is ".jpg" or ".jpeg")
+        {
+            // 一次性读入内存，避免把磁盘 IO 计入解码耗时
+            byte[] jpegBytes = File.ReadAllBytes(options.InputPath);
+            var runs = new List<double[]>();
+            var totals = new List<double>();
+            for (int i = 0; i < iterations; i++)
+            {
+                CollectGarbage();
+                var sw = Stopwatch.StartNew();
+                var img = JpegDecoder.Decode(jpegBytes, options.UseFloatIdct);
+                sw.Stop();
+                totals.Add(sw.Elapsed.TotalMilliseconds);
+                runs.Add(JpegPerfProbe.TakeLastRun());
+                GC.KeepAlive(img);
+            }
+            PrintJpegBenchSummary("decode", runs, totals, dctWorkers: 0);
+        }
+
+        Image<Rgb24> rgb = LoadRgb24(options.InputPath, options.UseFloatIdct, options.UseStreamingDecoder);
+        var encoderOptions = new JpegEncoderOptions(quality, subsample420, keepMetadata: false, enableDiagnostics: false);
+        var encRuns = new List<double[]>();
+        var encTotals = new List<double>();
+        byte[]? firstOutput = null;
+        bool outputsMatch = true;
+        for (int i = 0; i < iterations; i++)
+        {
+            CollectGarbage();
+            using var ms = new MemoryStream();
+            var sw = Stopwatch.StartNew();
+            JpegEncoder.Write(ms, rgb.Width, rgb.Height, rgb.Buffer, encoderOptions);
+            sw.Stop();
+            encTotals.Add(sw.Elapsed.TotalMilliseconds);
+            encRuns.Add(JpegPerfProbe.TakeLastRun());
+            byte[] bytes = ms.ToArray();
+            if (firstOutput is null)
+            {
+                firstOutput = bytes;
+            }
+            else if (!bytes.AsSpan().SequenceEqual(firstOutput))
+            {
+                outputsMatch = false;
+            }
+        }
+        PrintJpegBenchSummary("encode", encRuns, encTotals, JpegPerfProbe.LastDctWorkers);
+        Console.WriteLine(outputsMatch ? "编码产物一致性: 各轮逐字节一致 ✅" : "编码产物一致性: 各轮不一致 ❌");
+        Console.WriteLine();
+    }
+
+    static void CollectGarbage()
+    {
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
+        GC.Collect();
+    }
+
+    static void PrintJpegBenchSummary(string kind, List<double[]> runs, List<double> totals, int dctWorkers)
+    {
+        Console.WriteLine($"── [{kind}] {runs.Count} 次");
+        PrintStat("total", totals);
+
+        bool hasStages = runs.Count > 0 && runs[0].Length > 0;
+        if (hasStages)
+        {
+            for (int s = 0; s < runs[0].Length; s++)
+            {
+                if (s == JpegPerfProbe.EncodeTotal || s == JpegPerfProbe.DecodeTotal)
+                {
+                    continue; // 与上面的 total 同义，避免重复
+                }
+
+                PrintStat(JpegPerfProbe.StageNames[s], runs.Select(r => r[s]).ToList());
+            }
+
+            if (kind == "encode")
+            {
+                PrintStat("produce-busy", Derive(runs, JpegPerfProbe.Produce, JpegPerfProbe.ProduceWait, (a, b) => a - b));
+                PrintStat("dct-busy(sum)", Derive(runs, JpegPerfProbe.DctWall, JpegPerfProbe.DctWait, (a, b) => a - b));
+                PrintStat("huffman-busy", Derive(runs, JpegPerfProbe.Huffman, JpegPerfProbe.HuffmanWait, (a, b) => a - b));
+                if (dctWorkers > 1)
+                {
+                    PrintStat("dct/worker", runs.Select(r => r[JpegPerfProbe.DctWall] / dctWorkers).ToList());
+                }
+            }
+        }
+
+        Console.WriteLine();
+    }
+
+    static List<double> Derive(List<double[]> runs, int stageA, int stageB, Func<double, double, double> op)
+        => runs.Select(r => op(r[stageA], r[stageB])).ToList();
+
+    static void PrintStat(string name, IList<double> values)
+    {
+        if (values.Count == 0) return;
+        var sorted = values.OrderBy(v => v).ToArray();
+        // 阶段中位低于 0.01 ms 的只可能是计时噪声，不进报表
+        if (Median(sorted) < 0.01) return;
+        Console.WriteLine($"    {name.PadRight(15)} min={sorted[0],9:F3}ms  median={Median(sorted),9:F3}ms  avg={sorted.Average(),9:F3}ms  max={sorted[^1],9:F3}ms");
     }
 
     static bool Process(CliOptions options)
@@ -997,6 +1148,7 @@ class Program
         public bool JpegDebug { get; set; }
         public bool GifDebug { get; set; }
         public int? GifBench { get; set; }
+        public int? JpegBench { get; set; }
         public string? GifQuantizer { get; set; } // "octree"(默认) | "wu"/"legacy"/"fs" 切回原实现
         public int GifDitherStrength { get; set; } = 8; // Bayer 抖动幅度，仅 octree 生效
         public List<Action<ImageProcessingContext>> Operations { get; } = [];

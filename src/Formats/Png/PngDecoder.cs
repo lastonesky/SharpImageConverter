@@ -3,6 +3,11 @@ using System.Collections.Generic;
 using System.Buffers;
 using System.IO;
 using System.Numerics;
+using System.Runtime.CompilerServices;
+using System.Runtime.Intrinsics;
+using System.Runtime.Intrinsics.Arm;
+using System.Runtime.Intrinsics.X86;
+using System.Runtime.InteropServices;
 using System.Text;
 using SharpImageConverter.Core;
 using SharpImageConverter.Metadata;
@@ -733,12 +738,12 @@ public class PngDecoder
         for (int y = 0; y < h; y++)
         {
             byte filterType = rawData[rawIdx++];
-            rawData.Slice(rawIdx, stride).CopyTo(cur.Span.Slice(0, stride));
+            ReadOnlySpan<byte> srcSpan = rawData.Slice(rawIdx, stride);
             rawIdx += stride;
 
             Span<byte> curSpan = cur.Span.Slice(0, stride);
             ReadOnlySpan<byte> prevSpan = prev.Span.Slice(0, stride);
-            UnfilterScanline(filterType, curSpan, prevSpan, bpp);
+            UnfilterScanline(filterType, srcSpan, curSpan, prevSpan, bpp);
 
             curSpan.CopyTo(recon.AsSpan(reconIdx, stride));
             reconIdx += stride;
@@ -761,12 +766,12 @@ public class PngDecoder
         for (int y = 0; y < h; y++)
         {
             byte filterType = rawData[rawIdx++];
-            rawData.Slice(rawIdx, stride).CopyTo(cur.Span.Slice(0, stride));
+            ReadOnlySpan<byte> srcSpan = rawData.Slice(rawIdx, stride);
             rawIdx += stride;
 
             Span<byte> curSpan = cur.Span.Slice(0, stride);
             ReadOnlySpan<byte> prevSpan = prev.Span.Slice(0, stride);
-            UnfilterScanline(filterType, curSpan, prevSpan, bpp);
+            UnfilterScanline(filterType, srcSpan, curSpan, prevSpan, bpp);
             curSpan.CopyTo(output.AsSpan(y * stride, stride));
             (cur, prev) = (prev, cur);
         }
@@ -787,12 +792,12 @@ public class PngDecoder
         for (int y = 0; y < h; y++)
         {
             byte filterType = rawData[rawIdx++];
-            rawData.Slice(rawIdx, stride).CopyTo(cur.Span.Slice(0, stride));
+            ReadOnlySpan<byte> srcSpan = rawData.Slice(rawIdx, stride);
             rawIdx += stride;
 
             Span<byte> curSpan = cur.Span.Slice(0, stride);
             ReadOnlySpan<byte> prevSpan = prev.Span.Slice(0, stride);
-            UnfilterScanline(filterType, curSpan, prevSpan, bpp);
+            UnfilterScanline(filterType, srcSpan, curSpan, prevSpan, bpp);
             curSpan.CopyTo(output.AsSpan(y * stride, stride));
             (cur, prev) = (prev, cur);
         }
@@ -813,23 +818,16 @@ public class PngDecoder
         for (int y = 0; y < h; y++)
         {
             byte filterType = rawData[rawIdx++];
-            rawData.Slice(rawIdx, stride).CopyTo(cur.Span.Slice(0, stride));
+            ReadOnlySpan<byte> srcSpan = rawData.Slice(rawIdx, stride);
             rawIdx += stride;
 
             Span<byte> curSpan = cur.Span.Slice(0, stride);
             ReadOnlySpan<byte> prevSpan = prev.Span.Slice(0, stride);
-            UnfilterScanline(filterType, curSpan, prevSpan, bpp);
+            UnfilterScanline(filterType, srcSpan, curSpan, prevSpan, bpp);
 
-            Span<byte> dst = output.AsSpan(y * w * 3, w * 3);
-            int src = 0;
-            int dstIndex = 0;
-            for (int x = 0; x < w; x++)
-            {
-                dst[dstIndex++] = curSpan[src++];
-                dst[dstIndex++] = curSpan[src++];
-                dst[dstIndex++] = curSpan[src++];
-                src++;
-            }
+            // RGBA -> RGB 走 SimdHelper 的 SSSE3 pshufb 版本（每批 4 像素：读 16 字节写 12 字节），
+            // 替换原来逐像素的三次搬运标量循环
+            SimdHelper.PackRgbaToRgb(curSpan.Slice(0, w * 4), output.AsSpan(y * w * 3, w * 3));
             (cur, prev) = (prev, cur);
         }
 
@@ -849,82 +847,210 @@ public class PngDecoder
         for (int y = 0; y < h; y++)
         {
             byte filterType = rawData[rawIdx++];
-            rawData.Slice(rawIdx, stride).CopyTo(cur.Span.Slice(0, stride));
+            ReadOnlySpan<byte> srcSpan = rawData.Slice(rawIdx, stride);
             rawIdx += stride;
 
             Span<byte> curSpan = cur.Span.Slice(0, stride);
             ReadOnlySpan<byte> prevSpan = prev.Span.Slice(0, stride);
-            UnfilterScanline(filterType, curSpan, prevSpan, bpp);
+            UnfilterScanline(filterType, srcSpan, curSpan, prevSpan, bpp);
 
-            Span<byte> dst = output.AsSpan(y * w * 4, w * 4);
-            int src = 0;
-            int dstIndex = 0;
-            for (int x = 0; x < w; x++)
-            {
-                dst[dstIndex++] = curSpan[src++];
-                dst[dstIndex++] = curSpan[src++];
-                dst[dstIndex++] = curSpan[src++];
-                dst[dstIndex++] = 255;
-            }
+            // RGB -> RGBA（alpha 置 255）同样复用 SimdHelper 的 SSSE3 版本
+            SimdHelper.ExpandRgbToRgba(curSpan.Slice(0, w * 3), output.AsSpan(y * w * 4, w * 4));
             (cur, prev) = (prev, cur);
         }
 
         return output;
     }
 
-    private static void UnfilterScanline(byte filterType, Span<byte> curSpan, ReadOnlySpan<byte> prevSpan, int bpp)
+    /// <summary>
+    /// 对一行做反滤波：从 <paramref name="src"/>（原始行，不含滤波器字节）读，
+    /// 把重建结果写入 <paramref name="dst"/>，<paramref name="prev"/> 是上一行的重建结果。
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// 按滤波器类型一次性分派到专用函数，而不是在逐字节循环里做 switch ——
+    /// 真实 PNG（libpng/PIL 的自适应滤波）里 Paeth 通常占 90% 以上的行，
+    /// 逐字节分支会同时破坏分支预测和指令缓存。
+    /// </para>
+    /// <para>
+    /// 读 src、写 dst 而不是「先拷贝到 dst 再原地改」，省掉一遍整行拷贝。
+    /// 这一点对 <see cref="UnfilterSub"/> 之外的所有滤波器都成立：左邻 a 取自 dst，
+    /// 上邻 b、左上邻 c 取自 prev，三者都不是 src。
+    /// </para>
+    /// </remarks>
+    private static void UnfilterScanline(byte filterType, ReadOnlySpan<byte> src, Span<byte> dst, ReadOnlySpan<byte> prev, int bpp)
     {
-        if (filterType == 0)
+        switch (filterType)
         {
-            return;
+            case 0:
+                src.CopyTo(dst);
+                return;
+            case 1:
+                UnfilterSub(src, dst, bpp);
+                return;
+            case 2:
+                UnfilterUp(src, prev, dst);
+                return;
+            case 3:
+                UnfilterAverage(src, dst, prev, bpp);
+                return;
+            case 4:
+                UnfilterPaeth(src, dst, prev, bpp);
+                return;
+            default:
+                // 规范只定义 0..4。保持与旧实现一致的行为：无法识别时原样输出。
+                src.CopyTo(dst);
+                return;
+        }
+    }
+
+    /// <summary>Sub：dst[i] = src[i] + dst[i-bpp]（左邻，首 bpp 字节的左邻为 0）。</summary>
+    private static void UnfilterSub(ReadOnlySpan<byte> src, Span<byte> dst, int bpp)
+    {
+        int len = src.Length;
+        if (len == 0) return;
+        ref byte s = ref MemoryMarshal.GetReference(src);
+        ref byte d = ref MemoryMarshal.GetReference(dst);
+
+        int head = Math.Min(bpp, len);
+        for (int i = 0; i < head; i++)
+        {
+            Unsafe.Add(ref d, i) = Unsafe.Add(ref s, i);
         }
 
-        if (filterType == 2)
+        for (int i = bpp; i < len; i++)
         {
-            SimdHelper.AddBytesInPlace(curSpan, prevSpan);
-            return;
+            Unsafe.Add(ref d, i) = (byte)(Unsafe.Add(ref s, i) + Unsafe.Add(ref d, i - bpp));
         }
+    }
 
-        for (int i = 0; i < curSpan.Length; i++)
+    /// <summary>Up：dst[i] = src[i] + prev[i]，逐字节回绕加法，可整块并行。</summary>
+    private static void UnfilterUp(ReadOnlySpan<byte> src, ReadOnlySpan<byte> prev, Span<byte> dst)
+    {
+        int len = src.Length;
+        if (len == 0) return;
+        ref byte s = ref MemoryMarshal.GetReference(src);
+        ref byte p = ref MemoryMarshal.GetReference(prev);
+        ref byte d = ref MemoryMarshal.GetReference(dst);
+
+        int i = 0;
+        if (Sse2.IsSupported)
         {
-            byte x = curSpan[i];
-            byte a = (i >= bpp) ? curSpan[i - bpp] : (byte)0;
-            byte b = prevSpan[i];
-            byte c = (i >= bpp) ? prevSpan[i - bpp] : (byte)0;
-
-            switch (filterType)
+            int limit = len - Vector128<byte>.Count;
+            for (; i <= limit; i += Vector128<byte>.Count)
             {
-                case 1:
-                    x += a;
-                    break;
-                case 3:
-                    x += (byte)((a + b) / 2);
-                    break;
-                case 4:
-                    x += PaethPredictor(a, b, c);
-                    break;
+                nuint o = (nuint)i;
+                Vector128.StoreUnsafe(
+                    Sse2.Add(Vector128.LoadUnsafe(ref s, o), Vector128.LoadUnsafe(ref p, o)),
+                    ref d, o);
             }
+        }
+        else if (AdvSimd.IsSupported)
+        {
+            int limit = len - Vector128<byte>.Count;
+            for (; i <= limit; i += Vector128<byte>.Count)
+            {
+                nuint o = (nuint)i;
+                Vector128.StoreUnsafe(
+                    AdvSimd.Add(Vector128.LoadUnsafe(ref s, o), Vector128.LoadUnsafe(ref p, o)),
+                    ref d, o);
+            }
+        }
+        else if (Vector.IsHardwareAccelerated && len >= Vector<byte>.Count)
+        {
+            int simd = Vector<byte>.Count;
+            for (; i <= len - simd; i += simd)
+            {
+                nuint o = (nuint)i;
+                Vector.StoreUnsafe(
+                    Vector.Add(Vector.LoadUnsafe(ref s, o), Vector.LoadUnsafe(ref p, o)),
+                    ref d, o);
+            }
+        }
 
-            curSpan[i] = x;
+        for (; i < len; i++)
+        {
+            Unsafe.Add(ref d, i) = (byte)(Unsafe.Add(ref s, i) + Unsafe.Add(ref p, i));
         }
     }
 
-    private static void ApplyUpFilterDecodeSimd(byte[] curRow, byte[] prevRow, int length)
+    /// <summary>Average：dst[i] = src[i] + ((dst[i-bpp] + prev[i]) &gt;&gt; 1)（截断，非四舍五入）。</summary>
+    private static void UnfilterAverage(ReadOnlySpan<byte> src, Span<byte> dst, ReadOnlySpan<byte> prev, int bpp)
     {
-        SimdHelper.AddBytesInPlace(curRow.AsSpan(0, length), prevRow.AsSpan(0, length));
+        int len = src.Length;
+        if (len == 0) return;
+        ref byte s = ref MemoryMarshal.GetReference(src);
+        ref byte p = ref MemoryMarshal.GetReference(prev);
+        ref byte d = ref MemoryMarshal.GetReference(dst);
+
+        // 首 bpp 字节左邻 a = 0：(0 + prev[i]) / 2 = prev[i] >> 1
+        int head = Math.Min(bpp, len);
+        for (int i = 0; i < head; i++)
+        {
+            Unsafe.Add(ref d, i) = (byte)(Unsafe.Add(ref s, i) + (Unsafe.Add(ref p, i) >> 1));
+        }
+
+        for (int i = bpp; i < len; i++)
+        {
+            int a = Unsafe.Add(ref d, i - bpp);
+            int b = Unsafe.Add(ref p, i);
+            Unsafe.Add(ref d, i) = (byte)(Unsafe.Add(ref s, i) + ((a + b) >> 1));
+        }
     }
 
-    private static byte PaethPredictor(byte a, byte b, byte c)
+    /// <summary>
+    /// Paeth：dst[i] = src[i] + Paeth(a, b, c)，其中 a = dst[i-bpp]、b = prev[i]、c = prev[i-bpp]。
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// 预测量的选择按「代数化简后的三个差值」比较，不再先算 p = a+b-c 再各减一次。
+    /// 展开后：<c>p-a = b-c</c>、<c>p-b = a-c</c>、<c>p-c = (b-c)+(a-c)</c>，
+    /// 于是 p 本身根本不需要计算，且 pa 与 pb 可以并行求值，依赖链从「先 p 再三减」缩短一层。
+    /// 值的范围：a,b,c ∈ [0,255] ⇒ pa,pb ∈ [-255,255]、pc ∈ [-510,510]，int 下不会溢出。
+    /// </para>
+    /// <para>
+    /// 首 bpp 字节的 a 与 c 均为 0，此时 pa = b、pb = 0、pc = b。
+    /// b &gt; 0 时 pb 严格最小 ⇒ 预测 b；b == 0 时三者全为 0，预测 a = 0 = b。
+    /// 两种情形都等于 prev[i]，即<b>Paeth 的首 bpp 字节退化为 Up</b>，可以直接按 Up 处理。
+    /// </para>
+    /// <para>
+    /// 这条循环是<b>真串行</b>：a 取自本行已重建的前一个字节，且 Paeth 的三路比较是非线性的，
+    /// 因此既不能用「移位+加」的对数步前缀和，也不能靠 SIMD 跨像素并行。
+    /// 唯一能并行的是 bpp 条互不相干的链（每个字节位置一条），交给乱序执行去发掘。
+    /// </para>
+    /// </remarks>
+    private static void UnfilterPaeth(ReadOnlySpan<byte> src, Span<byte> dst, ReadOnlySpan<byte> prev, int bpp)
     {
-        int p = a + b - c;
-        int pa = Math.Abs(p - a);
-        int pb = Math.Abs(p - b);
-        int pc = Math.Abs(p - c);
+        int len = src.Length;
+        if (len == 0) return;
+        ref byte s = ref MemoryMarshal.GetReference(src);
+        ref byte p = ref MemoryMarshal.GetReference(prev);
+        ref byte d = ref MemoryMarshal.GetReference(dst);
 
-        if (pa <= pb && pa <= pc) return a;
-        else if (pb <= pc) return b;
-        else return c;
+        int head = Math.Min(bpp, len);
+        for (int i = 0; i < head; i++)
+        {
+            Unsafe.Add(ref d, i) = (byte)(Unsafe.Add(ref s, i) + Unsafe.Add(ref p, i));
+        }
+
+        for (int i = bpp; i < len; i++)
+        {
+            int a = Unsafe.Add(ref d, i - bpp);
+            int b = Unsafe.Add(ref p, i);
+            int c = Unsafe.Add(ref p, i - bpp);
+
+            int pa = b - c;
+            int pb = a - c;
+            int pc = pa + pb;
+            if (pa < 0) pa = -pa;
+            if (pb < 0) pb = -pb;
+            if (pc < 0) pc = -pc;
+
+            int pred = (pa <= pb && pa <= pc) ? a : (pb <= pc ? b : c);
+            Unsafe.Add(ref d, i) = (byte)(Unsafe.Add(ref s, i) + pred);
+        }
     }
+
 
     private void ExpandPassToImage(byte[] decodedPass, byte[] finalImage, int pass, int w, int h, int sx, int sy, int dx, int dy)
     {
