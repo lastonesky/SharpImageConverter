@@ -35,6 +35,13 @@ public sealed class OctreeQuantizer
         60_000 * Environment.ProcessorCount + 300_000;
 
     /// <summary>
+    /// 低于该像素数时映射阶段走单线程：并行有固定调度开销，且多核争抢内存带宽，
+    /// 小图上并行反而更慢。与直方图同尺度门控。
+    /// </summary>
+    private static readonly int MapParallelPixelThreshold =
+        60_000 * Environment.ProcessorCount + 300_000;
+
+    /// <summary>
     /// Bayer 4×4 有序抖动矩阵，归一化到 [-0.5, 0.5) 区间使用。
     /// </summary>
     private static readonly byte[,] Bayer4 =
@@ -157,9 +164,8 @@ public sealed class OctreeQuantizer
         // 预计算每个 5-bit 立方对应的调色板索引（供逐像素 O(1) 查表）
         BuildMapLut();
 
-        byte[] indices = enableDithering
-            ? MapWithBayer(pixels, width, height)
-            : MapDirect(pixels, width, height);
+        byte[] indices = new byte[width * height];
+        MapPixels(pixels, width, height, enableDithering, indices);
 
         return (palette, indices);
     }
@@ -495,53 +501,151 @@ public sealed class OctreeQuantizer
         }
         return _nodes[node].NearestLeafIndex;
     }
-
     private static int CubeIndex(int r, int g, int b) => ((r >> 3) << 10) | ((g >> 3) << 5) | (b >> 3);
 
-    private unsafe byte[] MapDirect(byte* pixels, int width, int height)
+    /// <summary>
+    /// 映射阶段入口：抖动走 Bayer 4×4，不抖动直接降到 5-bit 立方；两条路径都按行区间切片。
+    /// <para>
+    /// 映射逐像素独立、无跨像素依赖链，因此可以按行并行。但每线程有固定调度开销，
+    /// 且多核会争抢内存带宽（本阶段读 3 字节/像素、写 1 字节/像素），小图上并行反而更慢，
+    /// 故按与直方图同尺度的像素数门控。
+    /// </para>
+    /// </summary>
+    private unsafe void MapPixels(byte* pixels, int width, int height, bool enableDithering, byte[] indices)
     {
-        byte[] indices = new byte[width * height];
-        int len = width * height;
-        for (int i = 0; i < len; i++)
+        bool simd = Ssse3.IsSupported && Sse2.IsSupported;
+        bool parallel = Environment.ProcessorCount > 1
+            && (long)width * height >= MapParallelPixelThreshold;
+
+        byte[]? d5 = enableDithering && !simd ? BuildDither5Table() : null;
+
+        if (!parallel)
         {
-            int o = i * 3;
-            indices[i] = _mapLut[CubeIndex(pixels[o], pixels[o + 1], pixels[o + 2])];
+            if (enableDithering)
+            {
+                if (simd) MapWithBayerSimd(pixels, width, 0, height, indices);
+                else MapWithBayerScalar(d5!, pixels, width, 0, height, indices);
+            }
+            else if (simd) MapDirectSimd(pixels, width, 0, height, indices);
+            else MapDirectScalar(pixels, width, 0, height, indices);
+            return;
         }
-        return indices;
+
+        int bands = Environment.ProcessorCount;
+        int rows = (height + bands - 1) / bands;
+        IntPtr pix = (IntPtr)pixels;
+        byte[] d5c = d5!;
+        Parallel.For(0, bands, b =>
+        {
+            int y0 = b * rows;
+            int y1 = Math.Min(y0 + rows, height);
+            if (y0 >= y1) return;
+            unsafe
+            {
+                byte* p = (byte*)pix;
+                if (enableDithering)
+                {
+                    if (simd) MapWithBayerSimd(p, width, y0, y1, indices);
+                    else MapWithBayerScalar(d5c, p, width, y0, y1, indices);
+                }
+                else if (simd) MapDirectSimd(p, width, y0, y1, indices);
+                else MapDirectScalar(p, width, y0, y1, indices);
+            }
+        });
     }
 
-    private unsafe byte[] MapWithBayer(byte* pixels, int width, int height)
+    /// <summary>
+    /// 不抖动路径的标量版：像素直接降到 5-bit 立方再查 <see cref="_mapLut"/>。
+    /// </summary>
+    private unsafe void MapDirectScalar(byte* pixels, int width, int yStart, int yEnd, byte[] indices)
     {
-        byte[] indices = new byte[width * height];
-        if (Ssse3.IsSupported && Sse2.IsSupported)
-            return MapWithBayerSimd(pixels, width, height, indices);
-        return MapWithBayerScalar(pixels, width, height, indices);
+        int o = yStart * width * 3;
+        for (int y = yStart; y < yEnd; y++)
+        {
+            int rowBase = y * width;
+            for (int x = 0; x < width; x++)
+            {
+                indices[rowBase + x] = _mapLut[CubeIndex(pixels[o], pixels[o + 1], pixels[o + 2])];
+                o += 3;
+            }
+        }
+    }
+
+    /// <summary>
+    /// 不抖动路径的 SSSE3 版：一次 16 像素（48 字节）。<c>pshufb</c> 解交织出 R/G/B 三个平面，
+    /// 16 位通道内 <c>psrlw 3</c> 得到 5-bit 分量（输入是 0-255 的字节，无需饱和处理），
+    /// 合成 16 个 cube 下标后仍用标量查 <see cref="_mapLut"/>——
+    /// 字节表 + 15 位下标的 gather 在 AVX2 下没有可用的向量指令（见 docs/PerfReport.md）。
+    /// <para>
+    /// 与 <see cref="MapWithBayerSimd"/> 结构完全一致，只少了偏移表与 pminsw/pmaxsw，便于对照维护。
+    /// </para>
+    /// </summary>
+    private unsafe void MapDirectSimd(byte* pixels, int width, int yStart, int yEnd, byte[] indices)
+    {
+        Vector128<byte> zero = Vector128<byte>.Zero;
+        ushort* buf = stackalloc ushort[16];
+
+        int w16 = width & ~15;
+        int o = yStart * width * 3;
+        for (int y = yStart; y < yEnd; y++)
+        {
+            int rowBase = y * width;
+            int x = 0;
+            for (; x < w16; x += 16)
+            {
+                var v0 = Sse2.LoadVector128(pixels + o);
+                var v1 = Sse2.LoadVector128(pixels + o + 16);
+                var v2 = Sse2.LoadVector128(pixels + o + 32);
+                var R = Sse2.Or(Sse2.Or(Ssse3.Shuffle(v0, ShufR0), Ssse3.Shuffle(v1, ShufR1)), Ssse3.Shuffle(v2, ShufR2));
+                var G = Sse2.Or(Sse2.Or(Ssse3.Shuffle(v0, ShufG0), Ssse3.Shuffle(v1, ShufG1)), Ssse3.Shuffle(v2, ShufG2));
+                var B = Sse2.Or(Sse2.Or(Ssse3.Shuffle(v0, ShufB0), Ssse3.Shuffle(v1, ShufB1)), Ssse3.Shuffle(v2, ShufB2));
+
+                var rl = Sse2.ShiftRightLogical(Sse2.UnpackLow(R, zero).AsInt16(), 3);
+                var rh = Sse2.ShiftRightLogical(Sse2.UnpackHigh(R, zero).AsInt16(), 3);
+                var gl = Sse2.ShiftRightLogical(Sse2.UnpackLow(G, zero).AsInt16(), 3);
+                var gh = Sse2.ShiftRightLogical(Sse2.UnpackHigh(G, zero).AsInt16(), 3);
+                var bl = Sse2.ShiftRightLogical(Sse2.UnpackLow(B, zero).AsInt16(), 3);
+                var bh = Sse2.ShiftRightLogical(Sse2.UnpackHigh(B, zero).AsInt16(), 3);
+
+                var clo = Sse2.Or(Sse2.Or(Sse2.ShiftLeftLogical(rl, 10), Sse2.ShiftLeftLogical(gl, 5)), bl);
+                var chi = Sse2.Or(Sse2.Or(Sse2.ShiftLeftLogical(rh, 10), Sse2.ShiftLeftLogical(gh, 5)), bh);
+                Sse2.Store((byte*)buf, clo.AsByte());
+                Sse2.Store((byte*)(buf + 8), chi.AsByte());
+
+                for (int j = 0; j < 16; j++) indices[rowBase + x + j] = _mapLut[buf[j]];
+                o += 48;
+            }
+            for (; x < width; x++)
+            {
+                indices[rowBase + x] = _mapLut[CubeIndex(pixels[o], pixels[o + 1], pixels[o + 2])];
+                o += 3;
+            }
+        }
     }
 
     /// <summary>
     /// 标量回退路径（无 SSSE3 时使用）。把「浮点偏移 + clamp + (int)截断 + &gt;&gt;3」
     /// 预计算成 16 相位 × 256 项的一张 5-bit 表，逐像素只做 3 次查表 + 移位 + 1 次 LUT 查表。
     /// <para>
-    /// 与原先的浮点写法逐位等价：t*strength = 3k-22.5（k 为 Bayer 矩阵值、strength=48），
-    /// 故 (int)clamp(v + t*48, 0, 255) ≡ clamp(v + 3k - 23, 0, 255)。实测产物 md5 一致。
-    /// 相对浮点版：143 MP 图 map 阶段 553 → 215 ms（quantize 中位）。
+    /// 与原先的浮点写法逐位等价：t*strength = strength*(2k-15)/32，因 v 为整数时
+    /// floor(v + x) = v + floor(x)，故 (int)clamp(v + t*strength, 0, 255)
+    /// ≡ clamp(v + floor(strength*(2k-15)/32), 0, 255)。实测产物 md5 一致。
     /// </para>
     /// </summary>
-    private unsafe byte[] MapWithBayerScalar(byte* pixels, int width, int height, byte[] indices)
+    private unsafe void MapWithBayerScalar(byte[] d5, byte* pixels, int width, int yStart, int yEnd, byte[] indices)
     {
-        byte[] d5 = BuildDither5Table();
         Span<int> pbase = stackalloc int[16];
         for (int ym = 0; ym < 4; ym++)
             for (int xm = 0; xm < 4; xm++)
                 pbase[ym * 4 + xm] = Bayer4[ym, xm] * 256;
 
         int w4 = width & ~3;
-        for (int y = 0; y < height; y++)
+        int o = yStart * width * 3;
+        for (int y = yStart; y < yEnd; y++)
         {
             int rowBase = y * width;
             int y4 = (y & 3) * 4;
             int b0 = pbase[y4], b1 = pbase[y4 + 1], b2 = pbase[y4 + 2], b3 = pbase[y4 + 3];
-            int o = rowBase * 3;
             int x = 0;
             for (; x < w4; x += 4)
             {
@@ -558,13 +662,12 @@ public sealed class OctreeQuantizer
                 o += 3;
             }
         }
-        return indices;
     }
 
     /// <summary>
     /// 第 k 个 Bayer 相位对应的整数偏移。浮点原式为 (int)clamp(v + t*strength, 0, 255)，
     /// t = (k-7.5)/16；因 v 为整数，floor(v + x) = v + floor(x)，故等价于
-    /// clamp(v + floor(strength*(2k-15)/32), 0, 255)。strength=48 时即 3k-23。
+    /// clamp(v + floor(strength*(2k-15)/32), 0, 255)。默认 strength=8 时即 (2k-15)/4 下取整。
     /// </summary>
     private int DitherOffset(int k) => (int)Math.Floor(DitherStrength * (2 * k - 15) / 32.0);
 
@@ -602,15 +705,13 @@ public sealed class OctreeQuantizer
     /// <summary>
     /// SSSE3 路径：一次处理 16 像素（48 字节）。pshufb 解交织出 R/G/B 三个平面，
     /// 在 16 位通道内做「加偏移 + pminsw/pmaxsw 饱和 + psrlw 3」得到 5-bit 分量，
-    /// 合成 16 个 cube 下标后仍用标量查 <see cref="_mapLut"/>——
-    /// 字节表 + 15 位下标的 gather 在 AVX2 下没有可用的向量指令（见 docs/PerfReport.md）。
+    /// 合成 16 个 cube 下标后仍用标量查 <see cref="_mapLut"/>。
     /// <para>
     /// Bayer 抖动逐像素独立、无跨像素依赖链，因此这里是吞吐受限而非依赖链受限，
     /// SIMD 有效；这与 Floyd–Steinberg（串行误差扩散链）的结论相反。
-    /// 相对标量整数版：143 MP 图 quantize 中位 215 → 111 ms。
     /// </para>
     /// </summary>
-    private unsafe byte[] MapWithBayerSimd(byte* pixels, int width, int height, byte[] indices)
+    private unsafe void MapWithBayerSimd(byte* pixels, int width, int yStart, int yEnd, byte[] indices)
     {
         var offTab = new short[4][];
         for (int ym = 0; ym < 4; ym++)
@@ -625,10 +726,10 @@ public sealed class OctreeQuantizer
         ushort* buf = stackalloc ushort[16];
 
         int w16 = width & ~15;
-        for (int y = 0; y < height; y++)
+        int o = yStart * width * 3;
+        for (int y = yStart; y < yEnd; y++)
         {
             int rowBase = y * width;
-            int o = rowBase * 3;
             fixed (short* op = offTab[y & 3])
             {
                 Vector128<short> offLo = Sse2.LoadVector128(op);
@@ -669,6 +770,5 @@ public sealed class OctreeQuantizer
                 }
             }
         }
-        return indices;
     }
 }
