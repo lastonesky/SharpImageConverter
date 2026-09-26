@@ -34,7 +34,16 @@ public readonly struct JpegEncoderOptions
 /// </summary>
 public static class JpegEncoder
 {
-    private const int McuBatchSize = 16;
+    /// <summary>
+    /// 单批 MCU 数。实测（143MP，同二进制 SIC_JPEG_BATCH 交错 A/B，encode total 中位数）：
+    /// 16 → 292/283/301ms，64 → 204/207ms，128 → 198/203ms，256 → 199ms。
+    /// 16 太小：队列容量按「批」计（clamp(ProcessorCount,2,16) 批），批小则在途 MCU 少
+    /// （16批×16MCU=256 个），下游频繁饿等，35K 次入队的信号量唤醒延迟累计 ~110ms。
+    /// 64 起进入平台期（64≈128，噪声内），256 因在途工作集变大略回落；
+    /// 取 64 以控制在途内存（两队列满载 ≈19MB，128 则 ≈38MB）。
+    /// 批大小不影响产物：Huffman 按每 MCU 的全局 Sequence 排序，与分批无关。
+    /// </summary>
+    private const int McuBatchSize = 64;
     private static readonly byte[] IccProfileSignature =
     [
         (byte)'I',(byte)'C',(byte)'C',(byte)'_',(byte)'P',(byte)'R',(byte)'O',(byte)'F',(byte)'I',(byte)'L',(byte)'E',0x00
@@ -205,16 +214,29 @@ public static class JpegEncoder
         private readonly SemaphoreSlim _slots;
         private readonly object _gate = new();
 
-        public PipeQueue(int capacity)
+        // 分阶段计时（JpegPerfProbe）：入队/出队各记到哪个槽位。
+        // sample 队列：生产者入队等待记 produce-wait，DCT 取样等待记 dct-wait；
+        // dct 队列：DCT 入队等待记 dct-wait，Huffman 取批等待记 huffman-wait。
+        private readonly int _enqueueWaitStage;
+        private readonly int _dequeueWaitStage;
+
+        public PipeQueue(int capacity, int enqueueWaitStage, int dequeueWaitStage)
         {
             _buffer = new T?[capacity];
             _items = new SemaphoreSlim(0, capacity);
             _slots = new SemaphoreSlim(capacity, capacity);
+            _enqueueWaitStage = enqueueWaitStage;
+            _dequeueWaitStage = dequeueWaitStage;
         }
 
         public void Enqueue(T? item, CancellationToken token)
         {
+            long waitStart = JpegPerfProbe.Enabled ? Stopwatch.GetTimestamp() : 0;
             _slots.Wait(token);
+            if (JpegPerfProbe.Enabled)
+            {
+                JpegPerfProbe.Add(_enqueueWaitStage, Stopwatch.GetTimestamp() - waitStart);
+            }
             lock (_gate)
             {
                 _buffer[_tail] = item;
@@ -225,7 +247,12 @@ public static class JpegEncoder
 
         public T? Dequeue(CancellationToken token)
         {
+            long waitStart = JpegPerfProbe.Enabled ? Stopwatch.GetTimestamp() : 0;
             _items.Wait(token);
+            if (JpegPerfProbe.Enabled)
+            {
+                JpegPerfProbe.Add(_dequeueWaitStage, Stopwatch.GetTimestamp() - waitStart);
+            }
             T? item;
             lock (_gate)
             {
@@ -666,9 +693,11 @@ public static class JpegEncoder
         EncodeMetrics? metrics)
     {
         int capacity = Math.Clamp(Environment.ProcessorCount, 2, 16);
-        var sampleQueue = new PipeQueue<McuBatch>(capacity);
-        var dctQueue = new PipeQueue<McuBatch>(capacity);
+        var sampleQueue = new PipeQueue<McuBatch>(capacity, JpegPerfProbe.ProduceWait, JpegPerfProbe.DctWait);
+        var dctQueue = new PipeQueue<McuBatch>(capacity, JpegPerfProbe.DctWait, JpegPerfProbe.HuffmanWait);
         int dctWorkers = Math.Clamp(Environment.ProcessorCount - 1, 1, 8);
+        JpegPerfProbe.Begin();
+        JpegPerfProbe.SetDctWorkers(dctWorkers);
 
         using var cts = new CancellationTokenSource();
         CancellationToken token = cts.Token;
@@ -683,6 +712,7 @@ public static class JpegEncoder
 
         Task.WaitAll(dctTasks);
         Task.WaitAll(t1, t4);
+        JpegPerfProbe.End(JpegPerfProbe.EncodeTotal);
     }
 
     private static void EncodeGrayPipeline(
@@ -695,9 +725,11 @@ public static class JpegEncoder
         HuffCode[] acY)
     {
         int capacity = Math.Clamp(Environment.ProcessorCount, 2, 16);
-        var sampleQueue = new PipeQueue<McuBatch>(capacity);
-        var dctQueue = new PipeQueue<McuBatch>(capacity);
+        var sampleQueue = new PipeQueue<McuBatch>(capacity, JpegPerfProbe.ProduceWait, JpegPerfProbe.DctWait);
+        var dctQueue = new PipeQueue<McuBatch>(capacity, JpegPerfProbe.DctWait, JpegPerfProbe.HuffmanWait);
         int dctWorkers = Math.Clamp(Environment.ProcessorCount - 1, 1, 8);
+        JpegPerfProbe.Begin();
+        JpegPerfProbe.SetDctWorkers(dctWorkers);
 
         using var cts = new CancellationTokenSource();
         CancellationToken token = cts.Token;
@@ -712,6 +744,7 @@ public static class JpegEncoder
 
         Task.WaitAll(dctTasks);
         Task.WaitAll(t1, t4);
+        JpegPerfProbe.End(JpegPerfProbe.EncodeTotal);
     }
 
     private static void RunStage(Action action, CancellationTokenSource cts)
@@ -730,6 +763,15 @@ public static class JpegEncoder
         }
     }
 
+    // 实测否决（2026-09-26，143MP progressive.jpg --jpeg-bench 7 中位数）：
+    // 「produce 按 MCU 行带 Parallel.ForEach 并行」编码 total 303 → 921ms（dop=∞）、
+    // 572ms（dop=4）——并行度越高越慢，交叉点在单线程。原因：① 多生产者争抢
+    // sampleQueue 的信号量 + 队列仅 16 批，形成波状停顿，Huffman 饿等 279ms；
+    // ② 乱序入队使 Huffman 从「== expected 直写快路径」退到 pending ring 冷读
+    //   （huffman-busy 218 → 296/397ms，143MB 系数冷读）。
+    // 上界测算：即使 produce 全免费，total 也只到 ~250ms（−17%），协调成本已超收益。
+    // Sequence 保持全局光栅序号的写法与验证（8 产物 md5 一致）均已就绪，若将来
+    // 要重做，正确方向是「并行填充 + 单点按序派发」，而不是多点直接入队。
     private static void ProduceRgbSamples(
         PipeQueue<McuBatch> output,
         byte[] rgb24,
@@ -741,6 +783,7 @@ public static class JpegEncoder
         CancellationToken token,
         EncodeMetrics? metrics)
     {
+        long probeStart = JpegPerfProbe.Enabled ? Stopwatch.GetTimestamp() : 0;
         int sequence = 0;
         McuBatch? batch = null;
         try
@@ -846,6 +889,13 @@ public static class JpegEncoder
             }
             throw;
         }
+        finally
+        {
+            if (JpegPerfProbe.Enabled)
+            {
+                JpegPerfProbe.Add(JpegPerfProbe.Produce, Stopwatch.GetTimestamp() - probeStart);
+            }
+        }
     }
 
     private static void ProduceGraySamples(
@@ -857,6 +907,7 @@ public static class JpegEncoder
         int batchSize,
         CancellationToken token)
     {
+        long probeStart = JpegPerfProbe.Enabled ? Stopwatch.GetTimestamp() : 0;
         int blocksX = (width + 7) / 8;
         int blocksY = (height + 7) / 8;
         int sequence = 0;
@@ -907,6 +958,13 @@ public static class JpegEncoder
             }
             throw;
         }
+        finally
+        {
+            if (JpegPerfProbe.Enabled)
+            {
+                JpegPerfProbe.Add(JpegPerfProbe.Produce, Stopwatch.GetTimestamp() - probeStart);
+            }
+        }
     }
 
     private static void ProcessDct(
@@ -916,41 +974,52 @@ public static class JpegEncoder
         int[] qCRecip,
         CancellationToken token)
     {
-        for (; ; )
+        long probeStart = JpegPerfProbe.Enabled ? Stopwatch.GetTimestamp() : 0;
+        try
         {
-            var batch = input.Dequeue(token);
-            if (batch == null)
+            for (; ; )
             {
-                output.Enqueue(null, token);
-                break;
-            }
+                var batch = input.Dequeue(token);
+                if (batch == null)
+                {
+                    output.Enqueue(null, token);
+                    break;
+                }
 
-            for (int m = 0; m < batch.Count; m++)
+                for (int m = 0; m < batch.Count; m++)
+                {
+                    ref SampledMcuRef mcu = ref batch.Items[m];
+                    try
+                    {
+                        ulong packed = 0;
+                        for (int i = 0; i < mcu.BlockCount; i++)
+                        {
+                            int[] q = mcu.Order![i] == 0 ? qYRecip : qCRecip;
+                            int lastNz = DctQuantizeInPlace(mcu.GetBlockSpan(i), q);
+                            packed |= (ulong)lastNz << (i * 6);
+                        }
+                        mcu.LastNzPacked = packed;
+                    }
+                    catch
+                    {
+                        for (int j = m; j < batch.Count; j++)
+                        {
+                            batch.Items[j].Free();
+                        }
+                        ReturnMcuBatch(batch);
+                        throw;
+                    }
+                }
+
+                output.Enqueue(batch, token);
+            }
+        }
+        finally
+        {
+            if (JpegPerfProbe.Enabled)
             {
-                ref SampledMcuRef mcu = ref batch.Items[m];
-                try
-                {
-                    ulong packed = 0;
-                    for (int i = 0; i < mcu.BlockCount; i++)
-                    {
-                        int[] q = mcu.Order![i] == 0 ? qYRecip : qCRecip;
-                        int lastNz = DctQuantizeInPlace(mcu.GetBlockSpan(i), q);
-                        packed |= (ulong)lastNz << (i * 6);
-                    }
-                    mcu.LastNzPacked = packed;
-                }
-                catch
-                {
-                    for (int j = m; j < batch.Count; j++)
-                    {
-                        batch.Items[j].Free();
-                    }
-                    ReturnMcuBatch(batch);
-                    throw;
-                }
+                JpegPerfProbe.Add(JpegPerfProbe.DctWall, Stopwatch.GetTimestamp() - probeStart);
             }
-
-            output.Enqueue(batch, token);
         }
     }
 
@@ -960,34 +1029,45 @@ public static class JpegEncoder
         int[] qYRecip,
         CancellationToken token)
     {
-        for (; ; )
+        long probeStart = JpegPerfProbe.Enabled ? Stopwatch.GetTimestamp() : 0;
+        try
         {
-            var batch = input.Dequeue(token);
-            if (batch == null)
+            for (; ; )
             {
-                output.Enqueue(null, token);
-                break;
-            }
-
-            for (int m = 0; m < batch.Count; m++)
-            {
-                ref SampledMcuRef mcu = ref batch.Items[m];
-                try
+                var batch = input.Dequeue(token);
+                if (batch == null)
                 {
-                    mcu.LastNzPacked = (ulong)DctQuantizeInPlace(mcu.GetBlockSpan(0), qYRecip);
+                    output.Enqueue(null, token);
+                    break;
                 }
-                catch
+
+                for (int m = 0; m < batch.Count; m++)
                 {
-                    for (int j = m; j < batch.Count; j++)
+                    ref SampledMcuRef mcu = ref batch.Items[m];
+                    try
                     {
-                        batch.Items[j].Free();
+                        mcu.LastNzPacked = (ulong)DctQuantizeInPlace(mcu.GetBlockSpan(0), qYRecip);
                     }
-                    ReturnMcuBatch(batch);
-                    throw;
+                    catch
+                    {
+                        for (int j = m; j < batch.Count; j++)
+                        {
+                            batch.Items[j].Free();
+                        }
+                        ReturnMcuBatch(batch);
+                        throw;
+                    }
                 }
-            }
 
-            output.Enqueue(batch, token);
+                output.Enqueue(batch, token);
+            }
+        }
+        finally
+        {
+            if (JpegPerfProbe.Enabled)
+            {
+                JpegPerfProbe.Add(JpegPerfProbe.DctWall, Stopwatch.GetTimestamp() - probeStart);
+            }
         }
     }
 
@@ -1117,6 +1197,7 @@ public static class JpegEncoder
         int prevCrdc = 0;
         int expected = 0;
         int completed = 0;
+        long probeStart = JpegPerfProbe.Enabled ? Stopwatch.GetTimestamp() : 0;
         RentPendingState(256, out var pendingItems, out var pendingSequences, out int pendingCapacity, out int pendingMask);
 
         try
@@ -1196,6 +1277,10 @@ public static class JpegEncoder
         }
         finally
         {
+            if (JpegPerfProbe.Enabled)
+            {
+                JpegPerfProbe.Add(JpegPerfProbe.Huffman, Stopwatch.GetTimestamp() - probeStart);
+            }
             ReturnPendingState(pendingItems, pendingSequences, pendingCapacity);
         }
     }
@@ -1211,6 +1296,7 @@ public static class JpegEncoder
         int prevYdc = 0;
         int expected = 0;
         int completed = 0;
+        long probeStart = JpegPerfProbe.Enabled ? Stopwatch.GetTimestamp() : 0;
         RentPendingState(256, out var pendingItems, out var pendingSequences, out int pendingCapacity, out int pendingMask);
 
         try
@@ -1290,6 +1376,10 @@ public static class JpegEncoder
         }
         finally
         {
+            if (JpegPerfProbe.Enabled)
+            {
+                JpegPerfProbe.Add(JpegPerfProbe.Huffman, Stopwatch.GetTimestamp() - probeStart);
+            }
             ReturnPendingState(pendingItems, pendingSequences, pendingCapacity);
         }
     }

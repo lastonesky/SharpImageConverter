@@ -276,3 +276,109 @@ quantize **60.8 → 23.3 ms**（抖动 ~54 → ~18.5 ms）。
 - 之前记录的「下一步要瞄准量化的直方图构建与调色板查找」这条判断可以作废：
   两者合计只占编码 4.3 ms / 5.5%，真正的 73% 在抖动，而抖动受串行链限制。
 
+## PNG / JPEG / BMP 侧：已覆盖项与实测否决项（2026-09-26）
+
+对照优化模式库逐项核对后的结论。列出被否决的方向，避免以后重复尝试。
+
+### 1. PNG 解码反滤波：已优化（见 CHANGELOG）
+
+改动前逐字节 `switch` + 「先整行 `CopyTo` 再原地改」。改为按滤波器类型一次分派 +
+从 `src` 直读直写 `dst` + Paeth 代数化简 + 复用 SIMD 色彩转换。
+4000×3000 RGBA −17.2%、2000×1500 RGB −35.6%、640×480 RGB −32.2%（同一二进制 env 探针 A/B，7 轮中位数）。
+
+**Paeth 不可向量化**：左邻 `a` 取自本行已重建的前一个字节，三路比较是非线性的，
+既不能走「移位+加」的对数步前缀和，也不能跨像素并行。唯一可并行的是 `bpp` 条互不相干的链，
+交给乱序执行去发掘即可。
+
+### 2. PNG 编码：瓶颈是 deflate，换滤波器反而更慢（实测否决）
+
+143 MP 图编码 2106 ms，而 JPEG 编码同图只要 303 ms。拆解：BMP 编码做同等量级的
+行处理（SIMD RGB→BGR + 418 MB 写出）只要 132 ms ⇒ PNG 编码里 **deflate 约占 94%**，
+滤波阶段不是瓶颈。
+
+试图用「换更好的滤波器降低熵、让 deflate 更快更小」的思路，实测否决
+（3000×2250 RGB，Python zlib level 6，与 .NET `CompressionLevel.Optimal` 同一后端）：
+
+| 滤波器 | deflate 耗时 | 输出体积 |
+|---|---|---|
+| None | **280 ms** | 7.99 MB |
+| **Up（当前实现）** | **521 ms** | 5.00 MB |
+| Sub | 620 ms | 4.87 MB |
+| Paeth | 690 ms | 4.69 MB |
+| Average | 702 ms | 4.61 MB |
+
+结论：**Up 是速度/体积的最优折中**。换 Paeth 慢 32%、只小 6%；自适应滤波（五行都试一遍再挑）
+只会更慢。要做只能把压缩级别暴露成选项（速度↔体积的显式权衡），那不是纯提速。
+
+### 3. Adler32：不在热路径（否决）
+
+`Adler32` 是逐字节串行链（`s2` 依赖 `s1`），看起来是理想的 SIMD 目标，
+但 PNG 解码全程走的是**无校验的 `Stream` 重载**，根本不调用它——
+动手前先确认调用点，否则会优化一条没人走的路径。
+
+### 4. 已覆盖、无需再动的部分
+
+- **CRC32**：已有 SIMD 实现（`Crc32.cs`）。
+- **BMP**：行填充 + RGB→BGR 已 SSSE3 `pshufb` 向量化，并有分级行缓冲（stackalloc / ArrayPool）。
+- **JPEG 编码**：FDCT 与量化已融合（避免对 64 个系数的二次遍历）；
+  Huffman code 与幅值位合并为一次位写入；分阶段 `Task.Run` 流水。143 MP 编码 303 ms。
+- **JPEG 解码**：已有 `HuffmanDecodingTable`（LUT）、`FastIDCT` 与 SIMD 重建流水线。
+- **GIF**：两级字典查找、八叉树量化、Bayer 抖动均已优化（见上文各节）。
+
+### 5. 附带发现（非本次改动引入）
+
+16 位灰度 PNG 降位到 8 位时，本库取大端样本的**高字节**（等价 `v >> 8`），是标准做法；
+Pillow 的 `convert('RGB')` 对 `I;16` 是**截断到 255**，故二者在 16 位灰度图上结果不同。
+对比基准时不要直接拿 Pillow 当 16 位的 ground truth。
+
+## JPEG 编解码分阶段优化（2026-09-26）
+
+### 工具链（本轮新增）
+
+- `SIC_JPEG_STAGE_TIMING=1` 打开 `JpegPerfProbe` 分阶段探针；`--jpeg-bench N` 重复 N 次
+  给出 min/median/avg/max（与 `--gif-bench` 对齐）。槽位：编码 produce/huffman/dct-wall 及
+  各自 wait、派生 busy；解码 entropy/reconstruct/idct-color。
+- `--jpeg-debug` 接通 `ConsoleTraceListener`（此前 `Trace.WriteLine` 无监听器，输出全丢），
+  可看 `[jpeg-timing] … FillMcu420=…`——色彩转换在编码 total 中占 **64.5%**（310/481ms，含 metrics 开销）。
+- 基线产物固化在 `/tmp/jpegbench/`（8 个 md5）。注意其中两个的生成参数是
+  `--quality 85 --subsample 444`（`enc_5_star_base.jpg`、`enc_Amish-Noka-Dresser.jpg`），其余默认；
+  输入↔输出映射见 CHANGELOG。改动后必须全部逐字节复现。
+
+### 基线分阶段（progressive.jpg 143 MP，median）
+
+| 阶段 | 编码 | 解码 |
+|---|---|---|
+| total | 331 ms（后同日复测 303） | 440.5 ms |
+| 单线程关键阶段 | produce 302.7（busy 241）/ huffman 330.7（busy 218） | entropy 176.8 / reconstruct 255.1 |
+| 并行阶段 | dct-wall 2646 ms ÷ 8 worker（busy sum 303 ⇒ 每 worker ~38 ms，占空比 11%） | idct-color 231.5（单线程） |
+
+**封死性上界**：FDCT+量化并行且不在关键路径，免费也拿不到 1% ⇒ 编码侧动 FDCT/量化
+无意义；解码 reconstruct 占 58% 且单线程 ⇒ 上界 40%+；编码被 produce（色彩转换）与
+huffman（熵编码）双重单线程约束 ⇒ 只有动其中之一才有端到端收益。
+
+### 已保留（均过 7% 门槛，8 产物 md5 一致 + 152 单测）
+
+1. **解码重建按 MCU 行并行**：decode total 440.5 → 223~229 ms（**−49%**），
+   reconstruct 255 → 37.5~45.7（−82~85%）；entropy 同进程对照 176.8 → 176.8（0%），排除环境漂移。
+2. **`McuBatchSize` 16 → 64**：同二进制 `SIC_JPEG_BATCH` 交错 A/B 3 轮
+   （encode total 中位）批 16 → 292/283/301，批 64 → 204/207 ⇒ **−30%**。
+   64≈128（噪声内）、256 回落，按在途内存取 64。机理：队列容量按批计，批 16 时在途仅
+   256 个 MCU，produce-wait 61.8/huffman-wait 90 全是饿等；加深批后两个 wait 掉到 ~10/~21 ms。
+
+### 实测否决（勿重复尝试）
+
+- **produce 按行带多生产者并行**：total 303 → 921 ms（dop=∞）→ 572 ms（dop=4），
+  并行度越高越慢。① 多生产者争抢 16 批容量队列 → 波状停顿；② 乱序入队让 Huffman 走
+  pending ring 冷读（busy 218 → 296/397）。交叉点在单线程。详见 `ProduceRgbSamples` 注释。
+  将来若重做：**并行填充 + 单点按序派发**（保持单生产者入队、按序出队），不是多点直接入队。
+- **加大批到 256**：在途工作集变大，199 ms 反而略差于 64/128（~190-204）。
+
+### 剩余瓶颈与机会评估
+
+- **解码**：entropy 现在占 77%（177/229）。逐位变长位流 + 依赖链，与 GIF LZW 解码同构
+  （SIMD 已证伪），单 scan 内不可并行；progressive 需全扫描完成才能重建，无法与 reconstruct 重叠。
+  重启标记（RST）分段并行只对带 RST 的 baseline 图有效，语料未见 ⇒ 暂不动。
+- **编码**：produce（fill ~190-240，已 SSSE3，AVX2 对 3 字节像素去交错无干净方案——
+  libjpeg-turbo 的 AVX2 也不做色彩转换）与 huffman busy（LUT 已覆盖）是两个 ~200ms 级地板；
+  单动任何一个，端到端上界 ≈ −25~30%，两者都动才有 −50%。FDCT/量化维持「封死」结论。
+

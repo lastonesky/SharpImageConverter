@@ -107,6 +107,30 @@ public static partial class JpegDecoder
         ushort[] cbQuant = quantTables[cbComp.QuantTableId].Table;
         ushort[] crQuant = quantTables[crComp.QuantTableId].Table;
 
+        // 按 MCU 行并行：每个 my 只写 output 的 [my*blockH, (my+1)*blockH) 行区间，互不相交；
+        // 系数缓冲在熵解码结束后只读，量化表共享只读 ⇒ 线程安全。
+        // 门控与量化映射阶段同式（交叉点 4 核 0.54 MP / 8 核 0.78 MP / 24 核 1.74 MP），
+        // 小图保持单线程避免 Parallel.For 固定开销吃掉收益。
+        int parallelThreshold = 60_000 * Environment.ProcessorCount + 300_000;
+        if ((long)width * height >= parallelThreshold && mcuY >= 2)
+        {
+            Parallel.For(0, mcuY, my =>
+            {
+                for (int mx = 0; mx < mcuX; mx++)
+                {
+                    if (is444)
+                    {
+                        DecodeMcu444Simd(mx, my, yComp, cbComp, crComp, yQuant, cbQuant, crQuant, output, width, height);
+                    }
+                    else
+                    {
+                        DecodeMcu420Simd(mx, my, yComp, cbComp, crComp, yQuant, cbQuant, crQuant, output, width, height);
+                    }
+                }
+            });
+            return true;
+        }
+
         for (int my = 0; my < mcuY; my++)
         {
             for (int mx = 0; mx < mcuX; mx++)
