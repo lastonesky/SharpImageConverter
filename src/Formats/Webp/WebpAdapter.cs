@@ -62,12 +62,8 @@ namespace SharpImageConverter.Formats.Webp
         {
             var rgba = WebpStreamDecoder.DecodeRgbaFromStream(stream, out int width, out int height);
             var rgb = new byte[width * height * 3];
-            for (int i = 0, j = 0; i < rgba.Length; i += 4, j += 3)
-            {
-                rgb[j + 0] = rgba[i + 0];
-                rgb[j + 1] = rgba[i + 1];
-                rgb[j + 2] = rgba[i + 2];
-            }
+            // 复用已有的 SSSE3 打包实现（原为逐像素标量循环）
+            SimdHelper.PackRgbaToRgb(rgba, rgb);
             return new Image<Rgb24>(width, height, rgb);
         }
     }
@@ -216,13 +212,8 @@ namespace SharpImageConverter.Formats.Webp
                 if (frame.Width != width || frame.Height != height) throw new ArgumentException("所有帧必须具有相同的宽高");
 
                 var rgba = new byte[width * height * 4];
-                for (int i = 0, j = 0; j < frame.Buffer.Length; i += 4, j += 3)
-                {
-                    rgba[i + 0] = frame.Buffer[j + 0];
-                    rgba[i + 1] = frame.Buffer[j + 1];
-                    rgba[i + 2] = frame.Buffer[j + 2];
-                    rgba[i + 3] = 255;
-                }
+                // 复用已有的 SSSE3 展开实现（原为逐像素标量循环）
+                SimdHelper.ExpandRgbToRgba(frame.Buffer, rgba);
                 rgbaFrames[fi] = rgba;
 
                 int d = frameDurationsMs[fi];

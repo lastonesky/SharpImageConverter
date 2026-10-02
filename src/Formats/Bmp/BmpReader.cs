@@ -123,7 +123,8 @@ public static class BmpReader
         height = Math.Abs(rawHeight);
 
         long rowBits = (long)width * bpp;
-        long rowStrideLong = ((rowBits + 31L) / 32L) * 4L;
+        // 行字节数按 4 字节对齐：位运算替代除法/乘法（(bits+31)/32*4 == ((bits+31)>>5)<<2）
+        long rowStrideLong = ((rowBits + 31L) >> 5) << 2;
         if (rowStrideLong <= 0 || rowStrideLong > int.MaxValue) throw new InvalidDataException("BMP row stride is invalid");
         int rowStride = (int)rowStrideLong;
 

@@ -45,7 +45,8 @@ public static class BmpWriter
         int expectedGrayLength = checked(width * height);
         if (gray.Length != expectedGrayLength) throw new ArgumentException("Gray buffer length does not match dimensions.", nameof(gray));
 
-        int rowStride = checked(((width + 3) / 4) * 4);
+        // 行字节数按 4 字节对齐：& ~3 替代 (n+3)/4*4
+        int rowStride = checked((width + 3) & ~3);
         int imageSize = checked(rowStride * height);
         int paletteSize = 256 * 4;
         int fileSize = checked(FileHeaderSize + InfoHeaderSize + paletteSize + imageSize);
@@ -174,7 +175,8 @@ public static class BmpWriter
         int expectedRgbLength = checked(srcRowSize * height);
         if (rgb.Length != expectedRgbLength) throw new ArgumentException("RGB buffer length does not match dimensions.", nameof(rgb));
 
-        int rowStride = checked(((srcRowSize + 3) / 4) * 4);
+        // 行字节数按 4 字节对齐：& ~3 替代 (n+3)/4*4
+        int rowStride = checked((srcRowSize + 3) & ~3);
         int imageSize = checked(rowStride * height);
         int fileSize = checked(FileHeaderSize + InfoHeaderSize + imageSize);
 

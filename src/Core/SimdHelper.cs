@@ -27,8 +27,23 @@ internal static class SimdHelper
 
         int i = 0;
 
+        // 分派阶梯从最宽到最窄：Sse2.IsSupported 在 x64 上恒为真，
+        // 若排在 Vector<T> 之前会把 AVX2/AVX-512 宽档变成永不可达的死代码。
+        int vectorWidth = Vector.IsHardwareAccelerated ? Vector<byte>.Count : 0;
+
+        if (vectorWidth > Vector128<byte>.Count && length >= vectorWidth)
+        {
+            int simd = vectorWidth;
+            for (; i <= length - simd; i += simd)
+            {
+                nuint o = (nuint)i;
+                var a = Vector.LoadUnsafe(ref dstRef, o);
+                var b = Vector.LoadUnsafe(ref srcRef, o);
+                Vector.StoreUnsafe(a + b, ref dstRef, o);
+            }
+        }
         // 首选 128 位整字节加法：一条 paddb 处理 16 字节，天然回绕。
-        if (Sse2.IsSupported)
+        else if (Sse2.IsSupported)
         {
             int limit = length - Vector128<byte>.Count;
             for (; i <= limit; i += Vector128<byte>.Count)
@@ -50,9 +65,9 @@ internal static class SimdHelper
                 Vector128.StoreUnsafe(AdvSimd.Add(a, b), ref dstRef, o);
             }
         }
-        else if (Vector.IsHardwareAccelerated && length >= Vector<byte>.Count)
+        else if (vectorWidth > 0 && length >= vectorWidth)
         {
-            int simd = Vector<byte>.Count;
+            int simd = vectorWidth;
             for (; i <= length - simd; i += simd)
             {
                 nuint o = (nuint)i;
@@ -234,15 +249,26 @@ internal static class SimdHelper
             {
                 ref byte src = ref MemoryMarshal.GetReference(rgba);
                 ref byte dst = ref MemoryMarshal.GetReference(rgb);
-                for (int b = 0; b < blocks; b++)
+
+                // 除最后一块外都直接写满 16 字节：高 4 字节是 shuffle 掩码置零的垃圾，
+                // 但它们仍然落在本缓冲区内，且会被下一块的真实数据覆盖，
+                // 因此用一次 16 字节存储替代原先"取 3 个标量再写 3 次"的做法。
+                int fullBlocks = blocks - 1;
+                for (int b = 0; b < fullBlocks; b++)
                 {
                     Vector128<byte> v = Vector128.LoadUnsafe(ref src, (nuint)(b * 16));
-                    Vector128<byte> packed = Ssse3.Shuffle(v, RgbaToRgbShuffle);
-                    int o = b * 12;
-                    Unsafe.WriteUnaligned(ref Unsafe.Add(ref dst, o), packed.AsUInt32().GetElement(0));
-                    Unsafe.WriteUnaligned(ref Unsafe.Add(ref dst, o + 4), packed.AsUInt32().GetElement(1));
-                    Unsafe.WriteUnaligned(ref Unsafe.Add(ref dst, o + 8), packed.AsUInt32().GetElement(2));
+                    Vector128.StoreUnsafe(Ssse3.Shuffle(v, RgbaToRgbShuffle), ref dst, (nuint)(b * 12));
                 }
+
+                // 最后一块没有"下一块"来覆盖尾部，只能写真实的 12 字节：
+                // 拆成 8 字节 + 4 字节两次存储（仍是 2 次，而非原先逐元素 3 次）。
+                int last = fullBlocks;
+                Vector128<byte> lastV = Vector128.LoadUnsafe(ref src, (nuint)(last * 16));
+                Vector128<byte> lastPacked = Ssse3.Shuffle(lastV, RgbaToRgbShuffle);
+                int o = last * 12;
+                Unsafe.WriteUnaligned(ref Unsafe.Add(ref dst, o), lastPacked.AsUInt64().GetElement(0));
+                Unsafe.WriteUnaligned(ref Unsafe.Add(ref dst, o + 8), lastPacked.AsUInt32().GetElement(2));
+
                 p = blocks * 4;
             }
         }

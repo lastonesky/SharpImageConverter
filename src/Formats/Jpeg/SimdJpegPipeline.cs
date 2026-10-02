@@ -13,25 +13,46 @@ internal static class SimdJpegPipeline
     private const int Pass2Shift = ConstBits + Pass1Bits + 3;
 
     // LLM algorithm constants (scaled by 1 << ConstBits)
-    private static readonly int Fix_0_298631336 = 2446;
-    private static readonly int Fix_0_390180644 = 3196;
-    private static readonly int Fix_0_541196100 = 4433;
-    private static readonly int Fix_0_765366865 = 6270;
-    private static readonly int Fix_0_899976223 = 7373;
-    private static readonly int Fix_1_175875602 = 9633;
-    private static readonly int Fix_1_501321110 = 12299;
-    private static readonly int Fix_1_847759065 = 15137;
-    private static readonly int Fix_1_961570560 = 16069;
-    private static readonly int Fix_2_053119869 = 16819;
-    private static readonly int Fix_2_562915447 = 20995;
-    private static readonly int Fix_3_072711026 = 25172;
+    // 用 const 而非 static readonly：const 参与编译期折叠，且与 FastIDCT.cs 的常量声明保持一致。
+    private const int Fix_0_298631336 = 2446;
+    private const int Fix_0_390180644 = 3196;
+    private const int Fix_0_541196100 = 4433;
+    private const int Fix_0_765366865 = 6270;
+    private const int Fix_0_899976223 = 7373;
+    private const int Fix_1_175875602 = 9633;
+    private const int Fix_1_501321110 = 12299;
+    private const int Fix_1_847759065 = 15137;
+    private const int Fix_1_961570560 = 16069;
+    private const int Fix_2_053119869 = 16819;
+    private const int Fix_2_562915447 = 20995;
+    private const int Fix_3_072711026 = 25172;
 
     // YCbCr to RGB constants (fixed-point 16 bits)
     private const int ColorShift = 16;
-    private static readonly int Fix_1_402 = 91881;
-    private static readonly int Fix_0_34414 = 22554;
-    private static readonly int Fix_0_71414 = 46802;
-    private static readonly int Fix_1_772 = 116130;
+    private const int Fix_1_402 = 91881;
+    private const int Fix_0_34414 = 22554;
+    private const int Fix_0_71414 = 46802;
+    private const int Fix_1_772 = 116130;
+
+    // 每块 / 每行都要用到的向量常量：提升到静态字段，避免在内联热路径里反复广播。
+    private static readonly Vector128<int> HalfPass1 = Vector128.Create(1 << (Pass1Shift - 1));
+    private static readonly Vector128<int> HalfPass2 = Vector128.Create(1 << (Pass2Shift - 1));
+    private static readonly Vector128<short> Bias128 = Vector128.Create((short)128);
+
+    // ---- RGB24 交错掩码 ----
+    // 输入 rg = [R0 G0 R1 G1 R2 G2 R3 G3 R4 G4 R5 G5 R6 G6 R7 G7]（UnpackLow(r, g) 的结果）
+    // 输入 b  = [B0 B1 B2 B3 B4 B5 B6 B7 0 0 0 0 0 0 0 0]
+    // 目标    = R0 G0 B0 R1 G1 B1 ... R7 G7 B7 （24 字节）
+    // out0（输出字节 0..15）：像素 0..4 完整 + 像素 5 的 R
+    private static readonly Vector128<byte> RgbInterleaveLowFromRg = Vector128.Create(
+        (byte)0, 1, 0x80, 2, 3, 0x80, 4, 5, 0x80, 6, 7, 0x80, 8, 9, 0x80, 10);
+    private static readonly Vector128<byte> RgbInterleaveLowFromB = Vector128.Create(
+        (byte)0x80, 0x80, 0, 0x80, 0x80, 1, 0x80, 0x80, 2, 0x80, 0x80, 3, 0x80, 0x80, 4, 0x80);
+    // out1（输出字节 16..23）：像素 5 的 G/B + 像素 6..7 完整；高 8 字节不用（写 8 字节）
+    private static readonly Vector128<byte> RgbInterleaveHighFromRg = Vector128.Create(
+        (byte)11, 0x80, 12, 13, 0x80, 14, 15, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80);
+    private static readonly Vector128<byte> RgbInterleaveHighFromB = Vector128.Create(
+        (byte)0x80, 5, 0x80, 0x80, 6, 0x80, 0x80, 7, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80);
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static void Idct8ElementsSIMD2Pass(ref Vector128<short> v0, ref Vector128<short> v1, ref Vector128<short> v2, ref Vector128<short> v3,
@@ -159,15 +180,6 @@ internal static class SimdJpegPipeline
         v7 = Sse2.UnpackHigh(q3.AsInt64(), q7.AsInt64()).AsInt16();
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static void StoreRowSse2(Vector128<short> v, Span<byte> dest, int y, int stride)
-    {
-        Vector128<short> bias = Vector128.Create((short)128);
-        v = (v + bias);
-        Vector128<byte> b = Sse2.PackUnsignedSaturate(v, v);
-        Unsafe.WriteUnaligned(ref dest[y * stride], b.GetLower());
-    }
-
     // --- Full-link vectorized methods ---
 
     internal struct Block8x8Vectors
@@ -188,7 +200,6 @@ internal static class SimdJpegPipeline
 
         // 在最外层只获取一次核心指针，消除后续所有 Slice 损耗
         byte* pDestBase = (byte*)Unsafe.AsPointer(ref MemoryMarshal.GetReference(dest));
-        //ConvertRowYCbCrToRgb(yL, cbL, crL, pRowDest);
         ConvertRowYCbCrToRgb(y.V0, cb.V0, cr.V0, pDestBase + 0 * stride);
         ConvertRowYCbCrToRgb(y.V1, cb.V1, cr.V1, pDestBase + 1 * stride);
         ConvertRowYCbCrToRgb(y.V2, cb.V2, cr.V2, pDestBase + 2 * stride);
@@ -268,14 +279,12 @@ internal static class SimdJpegPipeline
             Vector128<short> v5 = Vector128.Load(cPtr + 40) * Vector128.Load(sqPtr + 40);
             Vector128<short> v6 = Vector128.Load(cPtr + 48) * Vector128.Load(sqPtr + 48);
             Vector128<short> v7 = Vector128.Load(cPtr + 56) * Vector128.Load(sqPtr + 56);
-            Vector128<int> half = Vector128.Create(1 << (Pass1Shift - 1));
             // Pass 1: IDCT on columns
-            Idct8ElementsSIMD2Pass(ref v0, ref v1, ref v2, ref v3, ref v4, ref v5, ref v6, ref v7, Pass1Shift, half);
+            Idct8ElementsSIMD2Pass(ref v0, ref v1, ref v2, ref v3, ref v4, ref v5, ref v6, ref v7, Pass1Shift, HalfPass1);
             // Transpose to make rows vertical
             Transpose8x8Sse2(ref v0, ref v1, ref v2, ref v3, ref v4, ref v5, ref v6, ref v7);
             // Pass 2: IDCT on original rows
-            half = Vector128.Create(1 << (Pass2Shift - 1));
-            Idct8ElementsSIMD2Pass(ref v0, ref v1, ref v2, ref v3, ref v4, ref v5, ref v6, ref v7, Pass2Shift, half);
+            Idct8ElementsSIMD2Pass(ref v0, ref v1, ref v2, ref v3, ref v4, ref v5, ref v6, ref v7, Pass2Shift, HalfPass2);
             // Transpose back to row-major
             Transpose8x8Sse2(ref v0, ref v1, ref v2, ref v3, ref v4, ref v5, ref v6, ref v7);
 
@@ -285,8 +294,7 @@ internal static class SimdJpegPipeline
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private unsafe static void ConvertRowYCbCrToRgb(Vector128<short> y, Vector128<short> cb, Vector128<short> cr, byte* pDest)
     {
-        Vector128<short> bias128 = Vector128.Create((short)128);
-        y = (y + bias128);
+        y = (y + Bias128);
 
         Vector128<int> yl = Vector128.WidenLower(y);
         Vector128<int> yh = Vector128.WidenUpper(y);
@@ -303,49 +311,48 @@ internal static class SimdJpegPipeline
         Vector128<byte> g = Sse2.PackUnsignedSaturate(Sse2.PackSignedSaturate(gl, gh), Vector128<short>.Zero);
         Vector128<byte> b = Sse2.PackUnsignedSaturate(Sse2.PackSignedSaturate(bl, bh), Vector128<short>.Zero);
 
-        // 2. 使用正确的转换函数：使用 .As<short>() 或 .AsInt16()
-        // 我们可以利用 UnpackLow 将 R、G、B 分量交错配对
-        Vector128<byte> rgLow = Sse2.UnpackLow(r, g); // R0 G0 R1 G1 R2 G2 R3 G3 R4 G4 ...
-        
-        // 3. 提取交错后的 64 位数据 (前 4 个像素的 RG)
-        // 修正语法：使用 .AsInt64() 转换为长整型向量
-        ulong rg0 = (ulong)rgLow.AsInt64().GetElement(0); 
-        ulong rg1 = (ulong)rgLow.AsInt64().GetElement(1); // 后 4 个像素的 RG
-
-        // 提取 B 分量的 64 位数据
-        ulong bData = (ulong)b.AsInt64().GetElement(0); // B0 B1 B2 B3 B4 B5 B6 B7
-
-        // 4. 精准且无循环的分批拼装写入 (24 字节)
-        // 像素 0 & 1
-        *(ushort*)(pDest + 0)  = (ushort)rg0;          // R0 G0
-        *(pDest + 2)           = (byte)bData;          // B0
-        *(ushort*)(pDest + 3)  = (ushort)(rg0 >> 16);   // R1 G1
-        *(pDest + 5)           = (byte)(bData >> 8);   // B1
-
-        // 像素 2 & 3
-        *(ushort*)(pDest + 6)  = (ushort)(rg0 >> 32);   // R2 G2
-        *(pDest + 8)           = (byte)(bData >> 16);  // B2
-        *(ushort*)(pDest + 9)  = (ushort)(rg0 >> 48);   // R3 G3
-        *(pDest + 11)          = (byte)(bData >> 24);  // B3
-
-        // 像素 4 & 5
-        *(ushort*)(pDest + 12) = (ushort)rg1;          // R4 G4
-        *(pDest + 14)          = (byte)(bData >> 32);  // B4
-        *(ushort*)(pDest + 15) = (ushort)(rg1 >> 16);  // R5 G5
-        *(pDest + 17)          = (byte)(bData >> 40);  // B5
-
-        // 像素 6 & 7
-        *(ushort*)(pDest + 18) = (ushort)(rg1 >> 32);  // R6 G6
-        *(pDest + 20)          = (byte)(bData >> 48);  // B6
-        *(ushort*)(pDest + 21) = (ushort)(rg1 >> 48);  // R7 G7
-        *(pDest + 23)          = (byte)(bData >> 56);  // B7
+        InterleaveRgb24(r, g, b, pDest);
     }
 
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private unsafe static void ConvertRowYCbCrToRgb(Vector128<short> y, Vector128<short> cb, Vector128<short> cr, Span<byte> dest)
+    /// <summary>
+    /// 把三个"低 8 lane 各装 8 个分量"的字节向量交织成 RGB24，写出 24 字节。
+    /// <para>
+    /// 抽成独立方法是刻意的：交织是纯粹的字节置换，与色彩转换无关，
+    /// 独立后可以让测试直接对拍置换结果（见 <c>SimdPixelOpsTests</c>）。
+    /// </para>
+    /// </summary>
+    internal static unsafe void InterleaveRgb24(Vector128<byte> r, Vector128<byte> g, Vector128<byte> b, byte* pDest)
     {
-        byte* pDest = (byte*)Unsafe.AsPointer(ref MemoryMarshal.GetReference(dest));
-        ConvertRowYCbCrToRgb(y, cb, cr, pDest);
+        // 1. UnpackLow 把 R/G 交错成 [R0 G0 R1 G1 ... R7 G7]（16 字节，正好一个向量）
+        Vector128<byte> rg = Sse2.UnpackLow(r, g);
+
+        // 2. RGB24 交错**全程留在向量域**：两次 pshufb 分别从 rg 与 b 里挑字节，
+        //    掩码中 0x80 的位置由 pshufb 置零，故两组结果可直接按位或合并。
+        //    out0 覆盖输出字节 0..15（像素 0..4 完整 + 像素 5 的 R），
+        //    out1 覆盖输出字节 16..23（像素 5 的 G/B + 像素 6..7 完整）。
+        //    此前这里是 3 次 GetElement 拆成 ulong、再 12 次标量字节/ushort 写入。
+        Vector128<byte> out0 = Sse2.Or(Ssse3.Shuffle(rg, RgbInterleaveLowFromRg),
+                                       Ssse3.Shuffle(b, RgbInterleaveLowFromB));
+        Vector128<byte> out1 = Sse2.Or(Ssse3.Shuffle(rg, RgbInterleaveHighFromRg),
+                                       Ssse3.Shuffle(b, RgbInterleaveHighFromB));
+
+        // 3. 两次存储写满 24 字节（调用方保证一行至少可写 8 像素 = 24 字节）
+        out0.StoreUnsafe(ref *pDest);
+        Unsafe.WriteUnaligned(pDest + 16, out1.AsUInt64().GetElement(0));
+    }
+
+    /// <summary><see cref="InterleaveRgb24(Vector128{byte}, Vector128{byte}, Vector128{byte}, byte*)"/> 的安全重载，供测试直接对拍。</summary>
+    internal static void InterleaveRgb24(Vector128<byte> r, Vector128<byte> g, Vector128<byte> b, Span<byte> dest)
+    {
+        Vector128<byte> rg = Sse2.UnpackLow(r, g);
+        Vector128<byte> out0 = Sse2.Or(Ssse3.Shuffle(rg, RgbInterleaveLowFromRg),
+                                       Ssse3.Shuffle(b, RgbInterleaveLowFromB));
+        Vector128<byte> out1 = Sse2.Or(Ssse3.Shuffle(rg, RgbInterleaveHighFromRg),
+                                       Ssse3.Shuffle(b, RgbInterleaveHighFromB));
+
+        ref byte d = ref MemoryMarshal.GetReference(dest);
+        out0.StoreUnsafe(ref d);
+        Unsafe.WriteUnaligned(ref Unsafe.Add(ref d, 16), out1.AsUInt64().GetElement(0));
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]

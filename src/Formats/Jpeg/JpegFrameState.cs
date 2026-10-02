@@ -1,7 +1,7 @@
 using SharpImageConverter.Metadata;
 using System.Buffers;
 using System.Diagnostics;
-using System.Runtime.Intrinsics.X86;
+using System.Runtime.Intrinsics.X86; // JpegFrameState.cs:812 的融合 SIMD 路径门控使用 Sse2.IsSupported
 
 namespace SharpImageConverter.Formats.Jpeg;
 
