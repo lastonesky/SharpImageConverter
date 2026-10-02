@@ -120,3 +120,8 @@ examples/
 .trae/
 .workbuddy/
 .github/
+
+# A/B performance harness working data (corpus, per-run CSVs, built binaries)
+.perf/
+tools/perf/SicBench/bin/
+tools/perf/SicBench/obj/
