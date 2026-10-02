@@ -8,6 +8,7 @@
 | [PerfReport.md](PerfReport.md) | 性能问题定位与优化建议清单。逐条记录各热点（JPEG 解码/重建/色彩转换、PNG 解压、GIF 多帧、处理管线、EXIF 旋转）的发现与处置结论 | 多数条目已标记【已完成】/【问题确认不存在】 |
 | [AuditVerification.md](AuditVerification.md) | 对外部「内存管理 / SIMD 利用率 / SIMD 有效率 / 死代码」审计报告的逐条取证复核，含修复项与实测数据 | 持续更新 |
 | [goal.md](goal.md) | 与同类成熟库对比后的差距清单（编码覆盖、并发验证、流式与内存策略、测试语料、发布稳定性、许可合规） | 长期跟踪 |
+| [VnniResizeFindings.md](VnniResizeFindings.md) | AVX-VNNI 在 Resize 上落地的实验、实测（质量/速度）与「为何更慢、何种方式可能更快」的结论；代码已撤销 | 【实验完成，代码已撤销】 |
 | [reference/](reference/) | 规范原文等参考资料（如 JPEG File Interchange Format 规范） | 只读存档 |
 
 ## 根目录文档

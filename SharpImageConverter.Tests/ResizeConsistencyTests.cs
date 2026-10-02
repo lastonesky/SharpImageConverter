@@ -12,6 +12,16 @@ namespace Jpeg2Bmp.Tests
     /// </summary>
     public class ResizeConsistencyTests
     {
+        /// <summary>
+        /// 这里的参考实现复刻的是浮点路径，且断言逐字节相等。
+        /// VNNI 量化路径存在 ±1 的量化差，一旦默认路由把它选中，这些用例会失败并误导排查方向，
+        /// 因此显式关掉。当前用例尺寸都很小（阈值 0.25MP/2MP 本就不会命中），钉住只是防止以后调节目。
+        /// </summary>
+        public ResizeConsistencyTests()
+        {
+            ImageProcessingContext.UseQuantizedVnni = false;
+        }
+
         private static byte[] MakeData(int length, int seed)
         {
             var data = new byte[length];
