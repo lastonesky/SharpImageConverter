@@ -904,13 +904,115 @@ public class PngDecoder
         }
     }
 
+    /// <summary>
+    /// Sub 滤波的块内前缀和（向量化）。
+    /// <para>
+    /// Sub 沿扫描线是一条"步长 bpp"的加法链：dst[i] = src[i] + dst[i-bpp]。
+    /// 链内串行，但 <b>bpp 条链之间完全独立</b>，所以并行维度是"链"而不是"链内相邻元素"。
+    /// 做法与前缀和的对数步算法一致：反复做 <c>s += s &lt;&lt; m</c>，m 依次取 bpp、2·bpp、4·bpp…，
+    /// 第 k 步后每个元素已累加 2^k 个前驱。只要 2^k ≥ 链长即可收敛。
+    /// 链长 = ceil(16 / bpp)，故各 bpp 所需步数：1→4 步、2→3 步、3→3 步、4→2 步、5~8→2/1 步。
+    /// </para>
+    /// <para>
+    /// 由于前缀和是线性算子，块间进位可以直接加在起点上一起参与累加，
+    /// 不需要单独做"复制进位到各链"的额外步骤。
+    /// </para>
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static Vector128<byte> SubPrefixSum(Vector128<byte> s, int bpp)
+    {
+        // 注意：pslldq 的移位量必须是编译期常量，因此按 bpp 逐个展开，不能用循环变量。
+        switch (bpp)
+        {
+            case 1:
+                s = Sse2.Add(s, Sse2.ShiftLeftLogical128BitLane(s, 1));
+                s = Sse2.Add(s, Sse2.ShiftLeftLogical128BitLane(s, 2));
+                s = Sse2.Add(s, Sse2.ShiftLeftLogical128BitLane(s, 4));
+                s = Sse2.Add(s, Sse2.ShiftLeftLogical128BitLane(s, 8));
+                return s;
+            case 2:
+                s = Sse2.Add(s, Sse2.ShiftLeftLogical128BitLane(s, 2));
+                s = Sse2.Add(s, Sse2.ShiftLeftLogical128BitLane(s, 4));
+                s = Sse2.Add(s, Sse2.ShiftLeftLogical128BitLane(s, 8));
+                return s;
+            case 3:
+                s = Sse2.Add(s, Sse2.ShiftLeftLogical128BitLane(s, 3));
+                s = Sse2.Add(s, Sse2.ShiftLeftLogical128BitLane(s, 6));
+                s = Sse2.Add(s, Sse2.ShiftLeftLogical128BitLane(s, 12));
+                return s;
+            case 4:
+                s = Sse2.Add(s, Sse2.ShiftLeftLogical128BitLane(s, 4));
+                s = Sse2.Add(s, Sse2.ShiftLeftLogical128BitLane(s, 8));
+                return s;
+            case 5:
+                s = Sse2.Add(s, Sse2.ShiftLeftLogical128BitLane(s, 5));
+                s = Sse2.Add(s, Sse2.ShiftLeftLogical128BitLane(s, 10));
+                return s;
+            case 6:
+                s = Sse2.Add(s, Sse2.ShiftLeftLogical128BitLane(s, 6));
+                s = Sse2.Add(s, Sse2.ShiftLeftLogical128BitLane(s, 12));
+                return s;
+            case 7:
+                s = Sse2.Add(s, Sse2.ShiftLeftLogical128BitLane(s, 7));
+                s = Sse2.Add(s, Sse2.ShiftLeftLogical128BitLane(s, 14));
+                return s;
+            default: // bpp == 8，链长 2，一步即可
+                return Sse2.Add(s, Sse2.ShiftLeftLogical128BitLane(s, 8));
+        }
+    }
+
+    /// <summary>
+    /// 取出上一块结果的最后 bpp 字节作为下一块各链的进位（psrldq，移位量同样必须是常量）。
+    /// 结果中只有 [0, bpp) 是有效进位，其余字节为 0——正好符合"进位只加在链首"的要求。
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static Vector128<byte> SubCarry(Vector128<byte> prev, int bpp)
+    {
+        switch (bpp)
+        {
+            case 1: return Sse2.ShiftRightLogical128BitLane(prev, 15);
+            case 2: return Sse2.ShiftRightLogical128BitLane(prev, 14);
+            case 3: return Sse2.ShiftRightLogical128BitLane(prev, 13);
+            case 4: return Sse2.ShiftRightLogical128BitLane(prev, 12);
+            case 5: return Sse2.ShiftRightLogical128BitLane(prev, 11);
+            case 6: return Sse2.ShiftRightLogical128BitLane(prev, 10);
+            case 7: return Sse2.ShiftRightLogical128BitLane(prev, 9);
+            default: return Sse2.ShiftRightLogical128BitLane(prev, 8);
+        }
+    }
+
     /// <summary>Sub：dst[i] = src[i] + dst[i-bpp]（左邻，首 bpp 字节的左邻为 0）。</summary>
-    private static void UnfilterSub(ReadOnlySpan<byte> src, Span<byte> dst, int bpp)
+    /// <remarks>internal 是为了让测试能直接对拍 SIMD 与标量两条路径。</remarks>
+    internal static void UnfilterSub(ReadOnlySpan<byte> src, Span<byte> dst, int bpp)
     {
         int len = src.Length;
         if (len == 0) return;
         ref byte s = ref MemoryMarshal.GetReference(src);
         ref byte d = ref MemoryMarshal.GetReference(dst);
+
+        // 向量化路径：一次 16 字节（覆盖 bpp 条链的 16/bpp 个元素）。
+        // 首块进位为零向量，因此"首 bpp 字节左邻为 0"的边界条件天然满足，无需单独处理行首。
+        if (Sse2.IsSupported && len >= Vector128<byte>.Count && bpp >= 1 && bpp <= 8)
+        {
+            Vector128<byte> prev = Vector128<byte>.Zero;
+            int i = 0;
+            int limit = len - Vector128<byte>.Count;
+            for (; i <= limit; i += Vector128<byte>.Count)
+            {
+                nuint o = (nuint)i;
+                Vector128<byte> v = Vector128.LoadUnsafe(ref s, o);
+                Vector128<byte> r = SubPrefixSum(Sse2.Add(v, SubCarry(prev, bpp)), bpp);
+                r.StoreUnsafe(ref d, o);
+                prev = r;
+            }
+
+            // 尾部不足 16 字节：此时 i >= 16 > bpp，dst[i-bpp] 必然已由向量段写出
+            for (; i < len; i++)
+            {
+                Unsafe.Add(ref d, i) = (byte)(Unsafe.Add(ref s, i) + Unsafe.Add(ref d, i - bpp));
+            }
+            return;
+        }
 
         int head = Math.Min(bpp, len);
         for (int i = 0; i < head; i++)
@@ -934,7 +1036,22 @@ public class PngDecoder
         ref byte d = ref MemoryMarshal.GetReference(dst);
 
         int i = 0;
-        if (Sse2.IsSupported)
+        // 分派阶梯必须**从最宽到最窄**：Sse2.IsSupported 在 x64 上恒为真，
+        // 若把它排在 Vector<T> 之前，宽档（AVX2 下 32 字节 / AVX-512 下 64 字节）将永远不可达。
+        int vectorWidth = Vector.IsHardwareAccelerated ? Vector<byte>.Count : 0;
+
+        if (vectorWidth > Vector128<byte>.Count && len >= vectorWidth)
+        {
+            int simd = vectorWidth;
+            for (; i <= len - simd; i += simd)
+            {
+                nuint o = (nuint)i;
+                Vector.StoreUnsafe(
+                    Vector.Add(Vector.LoadUnsafe(ref s, o), Vector.LoadUnsafe(ref p, o)),
+                    ref d, o);
+            }
+        }
+        else if (Sse2.IsSupported)
         {
             int limit = len - Vector128<byte>.Count;
             for (; i <= limit; i += Vector128<byte>.Count)
@@ -956,9 +1073,9 @@ public class PngDecoder
                     ref d, o);
             }
         }
-        else if (Vector.IsHardwareAccelerated && len >= Vector<byte>.Count)
+        else if (vectorWidth > 0 && len >= vectorWidth)
         {
-            int simd = Vector<byte>.Count;
+            int simd = vectorWidth;
             for (; i <= len - simd; i += simd)
             {
                 nuint o = (nuint)i;

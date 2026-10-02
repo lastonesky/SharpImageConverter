@@ -1384,6 +1384,19 @@ public static class JpegEncoder
         }
     }
 
+    /// <summary>
+    /// FDCT + 量化。分派说明（原先两档用的是**不同的门控谓词**，已统一）：
+    /// <list type="bullet">
+    /// <item>档 1：<see cref="SimdJpegEncodePipeline.FdctSupported"/>（SSE2）→ FDCT 与量化融合，一趟完成。</item>
+    /// <item>档 2：<c>Vector.IsHardwareAccelerated</c> → 标量 FDCT + <c>Vector&lt;int&gt;</c> 量化。</item>
+    /// <item>档 3：纯标量 <see cref="QuantizeNearest"/>，仅在没有硬件向量化时兜底。</item>
+    /// </list>
+    /// 注意两档向量化的"宽度倒挂"是**故意**的：档 1 虽只有 128 位，但它把 FDCT 也一起向量化了，
+    /// 档 2 的 <c>Vector&lt;int&gt;</c> 可能更宽（AVX2 下 256 位）却只覆盖量化这一步；
+    /// 因此宽度不是唯一判据，FDCT 是否进向量域才更重要——不要因为"档 2 更宽"就调换顺序。
+    /// 原来档 2 还额外要求 <c>Sse2 || AdvSimd</c>，这与 <c>Vector.IsHardwareAccelerated</c> 语义重叠且
+    /// 会误导读者以为这里依赖具体 ISA；<c>Vector&lt;T&gt;</c> 本身已经是可移植抽象，故删除。
+    /// </summary>
     private static int DctQuantizeInPlace(Span<int> block, int[] quantRecip)
     {
         if (SimdJpegEncodePipeline.FdctSupported)
@@ -1395,9 +1408,7 @@ public static class JpegEncoder
 
         FDCT8x8IntInPlace(block);
 
-        if (Vector.IsHardwareAccelerated
-            && (System.Runtime.Intrinsics.X86.Sse2.IsSupported || System.Runtime.Intrinsics.Arm.AdvSimd.IsSupported)
-            && Vector<int>.Count >= 4)
+        if (Vector.IsHardwareAccelerated && Vector<int>.Count >= 4)
         {
             int width = Vector<int>.Count;
             var zero = Vector<int>.Zero;

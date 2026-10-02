@@ -532,7 +532,9 @@ namespace SharpImageConverter.Formats.Gif
                 {
                     if (Avx2.IsSupported)
                     {
-                        for (; i + 8 <= pixelCount; i += 8)
+                        // 索引载入用的是 Vector128.LoadUnsafe，**一次读 16 字节**，
+                        // 因此循环上界必须保证剩余 16 个索引字节，而不是只保证 8 个像素。
+                        for (; i + 16 <= pixelCount; i += 8)
                         {
                             Vector256<int> colors = Avx2.GatherVector256(palPtr, Avx2.ConvertToVector256Int32(Vector128.LoadUnsafe(ref *srcIdx, (nuint)i)), 4);
                             Unsafe.WriteUnaligned(dst + (nuint)i * 4, colors);
@@ -549,7 +551,11 @@ namespace SharpImageConverter.Formats.Gif
                 {
                     // 8 像素一组：gather 出 8 个 32 位色后，每个 128 位通道压成 12 字节（共 24 字节）。
                     // 先写 0..15（其中 12..15 是低通道的填充，会被下一次写入覆盖），再把高通道写到 12..27。
-                    for (; i + 10 <= pixelCount; i += 8)
+                    //
+                    // 上界取 16 而不是 10：写侧确实只需要 i+10 <= pixelCount（3i+28 <= 3·pixelCount），
+                    // 但**读侧** Vector128.LoadUnsafe 是一次读 16 字节索引，必须保证剩余 16 字节。
+                    // 取两者中更严的一个，否则会越界读 indices（过去只是靠 ArrayPool.Rent 的富余字节兜住）。
+                    for (; i + 16 <= pixelCount; i += 8)
                     {
                         Vector256<int> colors = Avx2.GatherVector256(palPtr, Avx2.ConvertToVector256Int32(Vector128.LoadUnsafe(ref *srcIdx, (nuint)i)), 4);
                         Vector256<byte> packed = Avx2.Shuffle(colors.AsByte(), RgbaToRgbShuffle);

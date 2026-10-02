@@ -176,7 +176,12 @@ public sealed class JpegImage
 
         if (PixelFormat == JpegPixelFormat.Cmyk32)
         {
-            bool invert = ColorInfo.HasAdobeTransform || !ColorInfo.HasAdobeTransform;
+            // 原写法 `HasAdobeTransform || !HasAdobeTransform` 是**恒真的重言式**，
+            // 容易被误读成笔误（也可能被"顺手修正"成 HasAdobeTransform 而改变输出）。
+            // 这里显式写成常量：当前策略是"CMYK/YCCK 一律按反相存储处理"。
+            // 理由：有 Adobe APP14 时反相是规范行为；没有 APP14 时是否反相取决于编码器，
+            // 本库沿用"一律反相"。若要改成按 HasAdobeTransform 分支，必须先用真实样本建立 golden。
+            bool invert = true;
             bool accurate = CmykConversionMode == JpegCmykConversionMode.Accurate;
             if (useParallel)
             {
@@ -234,7 +239,12 @@ public sealed class JpegImage
 
         if (PixelFormat == JpegPixelFormat.Ycck32)
         {
-            bool invert = ColorInfo.HasAdobeTransform || !ColorInfo.HasAdobeTransform;
+            // 原写法 `HasAdobeTransform || !HasAdobeTransform` 是**恒真的重言式**，
+            // 容易被误读成笔误（也可能被"顺手修正"成 HasAdobeTransform 而改变输出）。
+            // 这里显式写成常量：当前策略是"CMYK/YCCK 一律按反相存储处理"。
+            // 理由：有 Adobe APP14 时反相是规范行为；没有 APP14 时是否反相取决于编码器，
+            // 本库沿用"一律反相"。若要改成按 HasAdobeTransform 分支，必须先用真实样本建立 golden。
+            bool invert = true;
             bool accurate = CmykConversionMode == JpegCmykConversionMode.Accurate;
             if (useParallel)
             {
@@ -476,7 +486,12 @@ public sealed class JpegImage
             int si = 0;
             // Adobe CMYK is typically inverted (255-C, 255-M, 255-Y, 255-K)
             // If no Adobe APP14, it might still be inverted depending on the encoder
-            bool invert = ColorInfo.HasAdobeTransform || !ColorInfo.HasAdobeTransform; // Common for 4-comp
+            // 原写法 `HasAdobeTransform || !HasAdobeTransform` 是**恒真的重言式**，
+            // 容易被误读成笔误（也可能被"顺手修正"成 HasAdobeTransform 而改变输出）。
+            // 这里显式写成常量：当前策略是"CMYK/YCCK 一律按反相存储处理"。
+            // 理由：有 Adobe APP14 时反相是规范行为；没有 APP14 时是否反相取决于编码器，
+            // 本库沿用"一律反相"。若要改成按 HasAdobeTransform 分支，必须先用真实样本建立 golden。
+            bool invert = true; // Common for 4-comp
             bool accurate = CmykConversionMode == JpegCmykConversionMode.Accurate;
             for (int i = 0; i < count; i++)
             {
@@ -508,7 +523,12 @@ public sealed class JpegImage
             ReadOnlySpan<byte> src = pixelData.AsSpan(0, checked(count * 4));
             int si = 0;
             // Adobe YCCK is also typically inverted for the K channel or all channels
-            bool invert = ColorInfo.HasAdobeTransform || !ColorInfo.HasAdobeTransform;
+            // 原写法 `HasAdobeTransform || !HasAdobeTransform` 是**恒真的重言式**，
+            // 容易被误读成笔误（也可能被"顺手修正"成 HasAdobeTransform 而改变输出）。
+            // 这里显式写成常量：当前策略是"CMYK/YCCK 一律按反相存储处理"。
+            // 理由：有 Adobe APP14 时反相是规范行为；没有 APP14 时是否反相取决于编码器，
+            // 本库沿用"一律反相"。若要改成按 HasAdobeTransform 分支，必须先用真实样本建立 golden。
+            bool invert = true;
             bool accurate = CmykConversionMode == JpegCmykConversionMode.Accurate;
             for (int i = 0; i < count; i++)
             {

@@ -809,6 +809,13 @@ namespace SharpImageConverter.Processing
         private const int BicubicRound = 1 << (2 * BicubicWShift - 1);
         private const int BicubicMaxSum = 255 * BicubicWScale * BicubicWScale;
 
+        // 上面三个 int 常量的向量广播版本：原先在每个核心里现场 Vector.Create，
+        // 与同文件 :130-131 的 MaxByte/Half 静态只读写法不一致。提升后 JIT 可直接引用常量池。
+        private static readonly Vector256<int> BicubicMaxSum256 = Vector256.Create(BicubicMaxSum);
+        private static readonly Vector256<int> BicubicRound256 = Vector256.Create(BicubicRound);
+        private static readonly Vector128<int> BicubicMaxSum128 = Vector128.Create(BicubicMaxSum);
+        private static readonly Vector128<int> BicubicRound128 = Vector128.Create(BicubicRound);
+
         // 双三次核函数（与浮点路径同定义，供 VNNI 量化路径与标量回退共用）
         private static float CubicF(float x)
         {
@@ -1048,8 +1055,8 @@ namespace SharpImageConverter.Processing
             // [Ra,Rb,Ga,Gb,Ba,Bb,0,0] -> [R,R,G,G,B,B,0,0]（vpshufd 交换相邻 dword 后相加）
             var t = Avx2.Add(val, Avx2.Shuffle(val, 0xB1));
             t = Avx2.Max(t, Vector256<int>.Zero);
-            t = Avx2.Min(t, Vector256.Create(BicubicMaxSum));
-            var shifted = Avx2.ShiftRightLogical(Avx2.Add(t, Vector256.Create(BicubicRound)), 2 * BicubicWShift);
+            t = Avx2.Min(t, BicubicMaxSum256);
+            var shifted = Avx2.ShiftRightLogical(Avx2.Add(t, BicubicRound256), 2 * BicubicWShift);
             // 跨通道取 dword 0/2/4 到低 128 位 [R,G,B,?]，再用现有 128 位掩码抽低字节
             var rgb = Avx2.PermuteVar8x32(shifted, BicubicPickRgbIdx);
             return Ssse3.Shuffle(rgb.GetLower().AsByte(), BicubicStoreMask);
@@ -1166,8 +1173,8 @@ namespace SharpImageConverter.Processing
             val = Sse2.Add(val, Sse41.MultiplyLow(r3, wvy3));
 
             val = Sse41.Max(val, Vector128<int>.Zero);
-            val = Sse41.Min(val, Vector128.Create(BicubicMaxSum));
-            var shifted = Sse2.ShiftRightLogical(Sse2.Add(val, Vector128.Create(BicubicRound)), 2 * BicubicWShift);
+            val = Sse41.Min(val, BicubicMaxSum128);
+            var shifted = Sse2.ShiftRightLogical(Sse2.Add(val, BicubicRound128), 2 * BicubicWShift);
             return Ssse3.Shuffle(shifted.AsByte(), BicubicStoreMask);
         }
 
@@ -1216,8 +1223,8 @@ namespace SharpImageConverter.Processing
             val = Avx2.Add(val, Avx2.MultiplyLow(h3, wvy3));
 
             val = Avx2.Max(val, Vector256<int>.Zero);
-            val = Avx2.Min(val, Vector256.Create(BicubicMaxSum));
-            var shifted = Avx2.ShiftRightLogical(Avx2.Add(val, Vector256.Create(BicubicRound)), 2 * BicubicWShift);
+            val = Avx2.Min(val, BicubicMaxSum256);
+            var shifted = Avx2.ShiftRightLogical(Avx2.Add(val, BicubicRound256), 2 * BicubicWShift);
 
             // 收成 2 像素：Avx2.Shuffle 按 128 位通道独立，不能跨通道 gather，
             // 故分别对低 128（像素 x）与高 128（像素 x+1）做 128 位 shuffle 取出 R/G/B，再合成连续 6 字节。

@@ -76,13 +76,27 @@ public static class Crc32
 }
 public static class Crc32Optimized
 {
-    private static readonly uint[][] Tables; // 8x256 的大表
+    // slice-by-8 的表展开成**扁平**一维数组：原先的 uint[8][256] 每次查表都要做两级
+    // 指针跳转（先取子数组引用、再取元素），8 次查表 = 8 次潜在的非连续访存。
+    // 扁平化后 8 张表在同一块连续内存里（8KB），只剩一次基址 + 常量偏移。
+    private static readonly uint[] Tables = new uint[8 * 256];
+
+    // 各 slice 表在扁平数组中的起始偏移（编译期常量，可直接折叠进地址计算）
+    private const int T0 = 0 * 256;
+    private const int T1 = 1 * 256;
+    private const int T2 = 2 * 256;
+    private const int T3 = 3 * 256;
+    private const int T4 = 4 * 256;
+    private const int T5 = 5 * 256;
+    private const int T6 = 6 * 256;
+    private const int T7 = 7 * 256;
+
+    // 字节序判断提到静态字段：BitConverter.IsLittleEndian 虽是 JIT 常量，
+    // 但放在每 8 字节调用一次的内联读取路径里，仍会阻碍该方法的进一步内联与优化。
+    private static readonly bool IsLittleEndian = BitConverter.IsLittleEndian;
 
     static Crc32Optimized()
     {
-        Tables = new uint[8][];
-        for (int i = 0; i < 8; i++) Tables[i] = new uint[256];
-
         uint poly = 0xedb88320;
         // 生成第一张表 (同标准表)
         for (uint i = 0; i < 256; i++)
@@ -90,16 +104,16 @@ public static class Crc32Optimized
             uint crc = i;
             for (int j = 0; j < 8; j++)
                 crc = (crc & 1) == 1 ? (crc >> 1) ^ poly : crc >> 1;
-            Tables[0][i] = crc;
+            Tables[T0 + i] = crc;
         }
 
         // 基于第一张表生成后续 7 张表
-        for (int i = 0; i < 256; i++)
+        for (uint i = 0; i < 256; i++)
         {
             for (int j = 1; j < 8; j++)
             {
-                uint prev = Tables[j - 1][i];
-                Tables[j][i] = (prev >> 8) ^ Tables[0][prev & 0xFF];
+                uint prev = Tables[(j - 1) * 256 + i];
+                Tables[j * 256 + i] = (prev >> 8) ^ Tables[T0 + (prev & 0xFF)];
             }
         }
     }
@@ -108,31 +122,32 @@ public static class Crc32Optimized
     {
         uint c = ~crc;
         int i = 0;
+        int length = data.Length;
         ref byte dataRef = ref MemoryMarshal.GetReference(data);
+        ref uint tableRef = ref MemoryMarshal.GetArrayDataReference(Tables);
 
         // --- 核心优化：一次处理 8 字节 ---
-        while (data.Length - i >= 8)
+        while (length - i >= 8)
         {
             // 读取两个 32 位整数（按 little-endian 解释字节序）
-            // 通过 ReadUInt32LittleEndian 保证跨平台一致性
             uint one = ReadUInt32LittleEndian(ref Unsafe.Add(ref dataRef, i)) ^ c;
             uint two = ReadUInt32LittleEndian(ref Unsafe.Add(ref dataRef, i + 4));
 
-            c = Tables[7][one & 0xFF] ^
-                Tables[6][(one >> 8) & 0xFF] ^
-                Tables[5][(one >> 16) & 0xFF] ^
-                Tables[4][one >> 24] ^
-                Tables[3][two & 0xFF] ^
-                Tables[2][(two >> 8) & 0xFF] ^
-                Tables[1][(two >> 16) & 0xFF] ^
-                Tables[0][two >> 24];
+            c = Unsafe.Add(ref tableRef, T7 + (int)(one & 0xFF)) ^
+                Unsafe.Add(ref tableRef, T6 + (int)((one >> 8) & 0xFF)) ^
+                Unsafe.Add(ref tableRef, T5 + (int)((one >> 16) & 0xFF)) ^
+                Unsafe.Add(ref tableRef, T4 + (int)(one >> 24)) ^
+                Unsafe.Add(ref tableRef, T3 + (int)(two & 0xFF)) ^
+                Unsafe.Add(ref tableRef, T2 + (int)((two >> 8) & 0xFF)) ^
+                Unsafe.Add(ref tableRef, T1 + (int)((two >> 16) & 0xFF)) ^
+                Unsafe.Add(ref tableRef, T0 + (int)(two >> 24));
             i += 8;
         }
 
         // 处理剩余的字节 (少于 8 字节的部分)
-        while (i < data.Length)
+        while (i < length)
         {
-            c = (c >> 8) ^ Tables[0][(byte)(c ^ Unsafe.Add(ref dataRef, i++))];
+            c = (c >> 8) ^ Unsafe.Add(ref tableRef, T0 + (byte)(c ^ Unsafe.Add(ref dataRef, i++)));
         }
 
         return ~c;
@@ -142,7 +157,7 @@ public static class Crc32Optimized
     private static uint ReadUInt32LittleEndian(ref byte src)
     {
         uint value = Unsafe.ReadUnaligned<uint>(ref src);
-        if (!BitConverter.IsLittleEndian)
+        if (!IsLittleEndian)
         {
             value = BinaryPrimitives.ReverseEndianness(value);
         }

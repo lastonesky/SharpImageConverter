@@ -29,6 +29,30 @@ internal static class SimdJpegEncodePipeline
     private const int Fix_2_562915447 = 20995;
     private const int Fix_3_072711026 = 25172;
 
+    // ---- FDCT 常量的向量广播 ----
+    // Fdct8Core32Pass 每块被调用 4 次（2 个 pass × lo/hi），若常量在核心内现场 Create，
+    // 每块将产生 ~88 次 vpbroadcastd。这里统一提升为静态只读向量，与 QuantBias / C2 / CConst128
+    // 保持同一策略，也让 JIT 无需依赖循环不变式外提即可直接引用常量池。
+    private static readonly Vector128<int> VFix_0_298631336 = Vector128.Create(Fix_0_298631336);
+    private static readonly Vector128<int> VFix_0_390180644 = Vector128.Create(Fix_0_390180644);
+    private static readonly Vector128<int> VFix_0_541196100 = Vector128.Create(Fix_0_541196100);
+    private static readonly Vector128<int> VFix_0_765366865 = Vector128.Create(Fix_0_765366865);
+    private static readonly Vector128<int> VFix_0_899976223 = Vector128.Create(Fix_0_899976223);
+    private static readonly Vector128<int> VFix_1_175875602 = Vector128.Create(Fix_1_175875602);
+    private static readonly Vector128<int> VFix_1_501321110 = Vector128.Create(Fix_1_501321110);
+    private static readonly Vector128<int> VFix_1_847759065 = Vector128.Create(Fix_1_847759065);
+    private static readonly Vector128<int> VFix_1_961570560 = Vector128.Create(Fix_1_961570560);
+    private static readonly Vector128<int> VFix_2_053119869 = Vector128.Create(Fix_2_053119869);
+    private static readonly Vector128<int> VFix_2_562915447 = Vector128.Create(Fix_2_562915447);
+    private static readonly Vector128<int> VFix_3_072711026 = Vector128.Create(Fix_3_072711026);
+
+    // 取负版本：避免在热路径里对常量向量再执行一次运行时取负（psubd）。
+    private static readonly Vector128<int> VFix_Neg_0_899976223 = Vector128.Create(-Fix_0_899976223);
+    private static readonly Vector128<int> VFix_Neg_1_847759065 = Vector128.Create(-Fix_1_847759065);
+    private static readonly Vector128<int> VFix_Neg_1_961570560 = Vector128.Create(-Fix_1_961570560);
+    private static readonly Vector128<int> VFix_Neg_0_390180644 = Vector128.Create(-Fix_0_390180644);
+    private static readonly Vector128<int> VFix_Neg_2_562915447 = Vector128.Create(-Fix_2_562915447);
+
     // ---- 色彩转换常量 ----
     // 采用 16 位定点：pmaddwd 一次算一对 R/G，pmullw 算 B 分量。
     private static readonly Vector128<short> CoeffY = Vector128.Create((short)77, (short)150, (short)77, (short)150, (short)77, (short)150, (short)77, (short)150);
@@ -69,7 +93,15 @@ internal static class SimdJpegEncodePipeline
 
     private static readonly Vector128<int> QuantBias = Vector128.Create(1 << 19);
 
-    /// <summary>就地完成 8x8 整数 FDCT，输入/输出均为行主序的 64 个 int（调用方保证值域在 short 内）。</summary>
+    /// <summary>
+    /// 就地完成 8x8 整数 FDCT，输入/输出均为行主序的 64 个 int（调用方保证值域在 short 内）。
+    /// <para>
+    /// 生产路径不使用本方法（编码一律走 <see cref="ForwardDctQuantize8x8"/> 的融合版）；
+    /// 本方法保留的目的只有一个：让 <c>JpegEncoderSimdTests</c> 能在"不带量化"的前提下
+    /// 直接对比 SIMD FDCT 与标量 FDCT 的逐系数一致性。因此它与融合版共用
+    /// <see cref="FdctTransform"/>，不存在需要双份维护的变换逻辑。
+    /// </para>
+    /// </summary>
     internal static void ForwardDct8x8(Span<int> block)
     {
         Vector128<short> v0 = LoadRow(block, 0);
@@ -226,7 +258,7 @@ internal static class SimdJpegEncodePipeline
         Vector128<int> tmp11 = tmp1 + tmp2;
         Vector128<int> tmp12 = tmp1 - tmp2;
 
-        Vector128<int> z1 = (tmp12 + tmp13) * Vector128.Create(Fix_0_541196100);
+        Vector128<int> z1 = (tmp12 + tmp13) * VFix_0_541196100;
 
         Vector128<int> o0;
         Vector128<int> o4;
@@ -240,23 +272,23 @@ internal static class SimdJpegEncodePipeline
             o0 = Descale(tmp10 + tmp11, Pass1Bits);
             o4 = Descale(tmp10 - tmp11, Pass1Bits);
         }
-        Vector128<int> o2 = Descale(z1 + tmp13 * Vector128.Create(Fix_0_765366865), oddShift);
-        Vector128<int> o6 = Descale(z1 + tmp12 * Vector128.Create(-Fix_1_847759065), oddShift);
+        Vector128<int> o2 = Descale(z1 + tmp13 * VFix_0_765366865, oddShift);
+        Vector128<int> o6 = Descale(z1 + tmp12 * VFix_Neg_1_847759065, oddShift);
 
         Vector128<int> z11 = tmp4 + tmp7;
         Vector128<int> z12 = tmp5 + tmp6;
         Vector128<int> z13 = tmp4 + tmp6;
         Vector128<int> z14 = tmp5 + tmp7;
-        Vector128<int> z15 = (z13 + z14) * Vector128.Create(Fix_1_175875602);
+        Vector128<int> z15 = (z13 + z14) * VFix_1_175875602;
 
-        Vector128<int> m4 = tmp4 * Vector128.Create(Fix_0_298631336);
-        Vector128<int> m5 = tmp5 * Vector128.Create(Fix_2_053119869);
-        Vector128<int> m6 = tmp6 * Vector128.Create(Fix_3_072711026);
-        Vector128<int> m7 = tmp7 * Vector128.Create(Fix_1_501321110);
-        Vector128<int> s11 = z11 * Vector128.Create(-Fix_0_899976223);
-        Vector128<int> s12 = z12 * Vector128.Create(-Fix_2_562915447);
-        Vector128<int> s13 = z13 * Vector128.Create(-Fix_1_961570560) + z15;
-        Vector128<int> s14 = z14 * Vector128.Create(-Fix_0_390180644) + z15;
+        Vector128<int> m4 = tmp4 * VFix_0_298631336;
+        Vector128<int> m5 = tmp5 * VFix_2_053119869;
+        Vector128<int> m6 = tmp6 * VFix_3_072711026;
+        Vector128<int> m7 = tmp7 * VFix_1_501321110;
+        Vector128<int> s11 = z11 * VFix_Neg_0_899976223;
+        Vector128<int> s12 = z12 * VFix_Neg_2_562915447;
+        Vector128<int> s13 = z13 * VFix_Neg_1_961570560 + z15;
+        Vector128<int> s14 = z14 * VFix_Neg_0_390180644 + z15;
 
         v7 = Descale(m4 + s11 + s13, oddShift);
         v5 = Descale(m5 + s12 + s14, oddShift);

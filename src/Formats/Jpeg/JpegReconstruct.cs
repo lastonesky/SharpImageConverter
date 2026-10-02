@@ -86,7 +86,9 @@ public static partial class JpegDecoder
 
     internal static bool TryDecodeInterleavedYCbCrSimd(ComponentState[] components, byte[] output, int width, int height, int fullWidth, int fullHeight, int[] componentOrder, QuantizationTable[] quantTables, bool useFloatingPointIdct, FrameHeader frame)
     {
-        if (!Sse2.IsSupported || useFloatingPointIdct) return false;
+        // 交织阶段 ConvertRowYCbCrToRgb 用 pshufb 完成 RGB24 交错，因此需要 SSSE3；
+        // 其余部分（IDCT 蝶形、转置、打包）只需要 SSE2。
+        if (!Sse2.IsSupported || !Ssse3.IsSupported || useFloatingPointIdct) return false;
         if (componentOrder.Length != 3) return false;
         int yIdx = componentOrder[0];
         int cbIdx = componentOrder[1];
