@@ -1,0 +1,28 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <LangVersion>13.0</LangVersion>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>SicBench</AssemblyName>
+    <RootNamespace>SicBench</RootNamespace>
+    <RootNamespace>SicBench</RootNamespace>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <IsPackable>false</IsPackable>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <NoWarn>$(NoWarn);CS1591</NoWarn>
+    <!-- keep both sides identical: workstation, non-concurrent GC -->
+    <ServerGarbageCollection>false</ServerGarbageCollection>
+    <ConcurrentGarbageCollection>false</ConcurrentGarbageCollection>
+    <TieredPGO>true</TieredPGO>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- SicProject lets the runner point at either the current src/ or a baseline worktree -->
+    <ProjectReference Include="$(SicProject)" Condition="'$(SicProject)' != ''" />
+    <ProjectReference Include="$([MSBuild]::NormalizePath('$(MSBuildThisFileDirectory)', '..', '..', '..', 'src', 'SharpImageConverter.csproj'))" Condition="'$(SicProject)' == ''" />
+  </ItemGroup>
+
+</Project>
