@@ -572,6 +572,21 @@ public sealed class OctreeQuantizer
     }
 
     /// <summary>
+    /// 把 <paramref name="idx"/> 里从 <paramref name="baseIndex"/> 起的 8 个 LUT 下标查出的字节
+    /// 拼成一个 ulong（字节 j 放在位段 8j..8j+7）：手写完全展开、两两成树（依赖深度 3）、
+    /// 裸指针查表无边界检查。供写出侧两条向量 store 各拼一个 ulong（共 16 字节）。
+    /// </summary>
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    private static unsafe ulong Pack8(byte* lut, ushort* idx, int baseIndex)
+    {
+        ulong a0 = lut[idx[baseIndex]] | ((ulong)lut[idx[baseIndex + 1]] << 8);
+        ulong a1 = ((ulong)lut[idx[baseIndex + 2]] << 16) | ((ulong)lut[idx[baseIndex + 3]] << 24);
+        ulong a2 = ((ulong)lut[idx[baseIndex + 4]] << 32) | ((ulong)lut[idx[baseIndex + 5]] << 40);
+        ulong a3 = ((ulong)lut[idx[baseIndex + 6]] << 48) | ((ulong)lut[idx[baseIndex + 7]] << 56);
+        return (a0 | a1) | (a2 | a3);
+    }
+
+    /// <summary>
     /// 不抖动路径的 SSSE3 版：一次 16 像素（48 字节）。<c>pshufb</c> 解交织出 R/G/B 三个平面，
     /// 16 位通道内 <c>psrlw 3</c> 得到 5-bit 分量（输入是 0-255 的字节，无需饱和处理），
     /// 合成 16 个 cube 下标后仍用标量查 <see cref="_mapLut"/>——
@@ -587,38 +602,49 @@ public sealed class OctreeQuantizer
 
         int w16 = width & ~15;
         int o = yStart * width * 3;
-        for (int y = yStart; y < yEnd; y++)
+        fixed (byte* ip = indices)
+        fixed (byte* lut = _mapLut)
         {
-            int rowBase = y * width;
-            int x = 0;
-            for (; x < w16; x += 16)
+            for (int y = yStart; y < yEnd; y++)
             {
-                var v0 = Sse2.LoadVector128(pixels + o);
-                var v1 = Sse2.LoadVector128(pixels + o + 16);
-                var v2 = Sse2.LoadVector128(pixels + o + 32);
-                var R = Sse2.Or(Sse2.Or(Ssse3.Shuffle(v0, ShufR0), Ssse3.Shuffle(v1, ShufR1)), Ssse3.Shuffle(v2, ShufR2));
-                var G = Sse2.Or(Sse2.Or(Ssse3.Shuffle(v0, ShufG0), Ssse3.Shuffle(v1, ShufG1)), Ssse3.Shuffle(v2, ShufG2));
-                var B = Sse2.Or(Sse2.Or(Ssse3.Shuffle(v0, ShufB0), Ssse3.Shuffle(v1, ShufB1)), Ssse3.Shuffle(v2, ShufB2));
+                int rowBase = y * width;
+                int x = 0;
+                for (; x < w16; x += 16)
+                {
+                    var v0 = Sse2.LoadVector128(pixels + o);
+                    var v1 = Sse2.LoadVector128(pixels + o + 16);
+                    var v2 = Sse2.LoadVector128(pixels + o + 32);
+                    var R = Sse2.Or(Sse2.Or(Ssse3.Shuffle(v0, ShufR0), Ssse3.Shuffle(v1, ShufR1)), Ssse3.Shuffle(v2, ShufR2));
+                    var G = Sse2.Or(Sse2.Or(Ssse3.Shuffle(v0, ShufG0), Ssse3.Shuffle(v1, ShufG1)), Ssse3.Shuffle(v2, ShufG2));
+                    var B = Sse2.Or(Sse2.Or(Ssse3.Shuffle(v0, ShufB0), Ssse3.Shuffle(v1, ShufB1)), Ssse3.Shuffle(v2, ShufB2));
 
-                var rl = Sse2.ShiftRightLogical(Sse2.UnpackLow(R, zero).AsInt16(), 3);
-                var rh = Sse2.ShiftRightLogical(Sse2.UnpackHigh(R, zero).AsInt16(), 3);
-                var gl = Sse2.ShiftRightLogical(Sse2.UnpackLow(G, zero).AsInt16(), 3);
-                var gh = Sse2.ShiftRightLogical(Sse2.UnpackHigh(G, zero).AsInt16(), 3);
-                var bl = Sse2.ShiftRightLogical(Sse2.UnpackLow(B, zero).AsInt16(), 3);
-                var bh = Sse2.ShiftRightLogical(Sse2.UnpackHigh(B, zero).AsInt16(), 3);
+                    var rl = Sse2.ShiftRightLogical(Sse2.UnpackLow(R, zero).AsInt16(), 3);
+                    var rh = Sse2.ShiftRightLogical(Sse2.UnpackHigh(R, zero).AsInt16(), 3);
+                    var gl = Sse2.ShiftRightLogical(Sse2.UnpackLow(G, zero).AsInt16(), 3);
+                    var gh = Sse2.ShiftRightLogical(Sse2.UnpackHigh(G, zero).AsInt16(), 3);
+                    var bl = Sse2.ShiftRightLogical(Sse2.UnpackLow(B, zero).AsInt16(), 3);
+                    var bh = Sse2.ShiftRightLogical(Sse2.UnpackHigh(B, zero).AsInt16(), 3);
 
-                var clo = Sse2.Or(Sse2.Or(Sse2.ShiftLeftLogical(rl, 10), Sse2.ShiftLeftLogical(gl, 5)), bl);
-                var chi = Sse2.Or(Sse2.Or(Sse2.ShiftLeftLogical(rh, 10), Sse2.ShiftLeftLogical(gh, 5)), bh);
-                Sse2.Store((byte*)buf, clo.AsByte());
-                Sse2.Store((byte*)(buf + 8), chi.AsByte());
+                    var clo = Sse2.Or(Sse2.Or(Sse2.ShiftLeftLogical(rl, 10), Sse2.ShiftLeftLogical(gl, 5)), bl);
+                    var chi = Sse2.Or(Sse2.Or(Sse2.ShiftLeftLogical(rh, 10), Sse2.ShiftLeftLogical(gh, 5)), bh);
+                    Sse2.Store((byte*)buf, clo.AsByte());
+                    Sse2.Store((byte*)(buf + 8), chi.AsByte());
 
-                for (int j = 0; j < 16; j++) indices[rowBase + x + j] = _mapLut[buf[j]];
-                o += 48;
-            }
-            for (; x < width; x++)
-            {
-                indices[rowBase + x] = _mapLut[CubeIndex(pixels[o], pixels[o + 1], pixels[o + 2])];
-                o += 3;
+                    // 16 个 LUT 结果标量域拼两个 ulong、一条 16 字节向量 store 写出
+                    //（消掉 16 次单字节散写 + 各自的边界检查），查表走 fixed 裸指针。
+                    // 2026-10-03 四臂同二进制 A/B 实测（143MP，10 轮×N=5）：
+                    // map 段 10.52→9.67ms（池化中位 −8.1%，配对 −10.5%，10/10 轮胜），
+                    // 过「修改部分 ≥7%」门槛；产物 md5 与原实现逐字节一致。
+                    // 拆解：仅展开写出 −7.1%、仅去 LUT 边界检查 −1.0%、组合 −8.1%。
+                    // 教训：A3-a 若写成 4 迭代小循环只有 −1.5%，完全展开才拿到收益。
+                    Sse2.Store(ip + rowBase + x, Vector128.Create(Pack8(lut, buf, 0), Pack8(lut, buf, 8)).AsByte());
+                    o += 48;
+                }
+                for (; x < width; x++)
+                {
+                    indices[rowBase + x] = _mapLut[CubeIndex(pixels[o], pixels[o + 1], pixels[o + 2])];
+                    o += 3;
+                }
             }
         }
     }
@@ -727,46 +753,55 @@ public sealed class OctreeQuantizer
 
         int w16 = width & ~15;
         int o = yStart * width * 3;
-        for (int y = yStart; y < yEnd; y++)
+        fixed (byte* ip = indices)
+        fixed (byte* lut = _mapLut)
         {
-            int rowBase = y * width;
-            fixed (short* op = offTab[y & 3])
+            for (int y = yStart; y < yEnd; y++)
             {
-                Vector128<short> offLo = Sse2.LoadVector128(op);
-                Vector128<short> offHi = Sse2.LoadVector128(op + 8);
-                int x = 0;
-                for (; x < w16; x += 16)
+                int rowBase = y * width;
+                fixed (short* op = offTab[y & 3])
                 {
-                    var v0 = Sse2.LoadVector128(pixels + o);
-                    var v1 = Sse2.LoadVector128(pixels + o + 16);
-                    var v2 = Sse2.LoadVector128(pixels + o + 32);
-                    var R = Sse2.Or(Sse2.Or(Ssse3.Shuffle(v0, ShufR0), Ssse3.Shuffle(v1, ShufR1)), Ssse3.Shuffle(v2, ShufR2));
-                    var G = Sse2.Or(Sse2.Or(Ssse3.Shuffle(v0, ShufG0), Ssse3.Shuffle(v1, ShufG1)), Ssse3.Shuffle(v2, ShufG2));
-                    var B = Sse2.Or(Sse2.Or(Ssse3.Shuffle(v0, ShufB0), Ssse3.Shuffle(v1, ShufB1)), Ssse3.Shuffle(v2, ShufB2));
+                    Vector128<short> offLo = Sse2.LoadVector128(op);
+                    Vector128<short> offHi = Sse2.LoadVector128(op + 8);
+                    int x = 0;
+                    for (; x < w16; x += 16)
+                    {
+                        var v0 = Sse2.LoadVector128(pixels + o);
+                        var v1 = Sse2.LoadVector128(pixels + o + 16);
+                        var v2 = Sse2.LoadVector128(pixels + o + 32);
+                        var R = Sse2.Or(Sse2.Or(Ssse3.Shuffle(v0, ShufR0), Ssse3.Shuffle(v1, ShufR1)), Ssse3.Shuffle(v2, ShufR2));
+                        var G = Sse2.Or(Sse2.Or(Ssse3.Shuffle(v0, ShufG0), Ssse3.Shuffle(v1, ShufG1)), Ssse3.Shuffle(v2, ShufG2));
+                        var B = Sse2.Or(Sse2.Or(Ssse3.Shuffle(v0, ShufB0), Ssse3.Shuffle(v1, ShufB1)), Ssse3.Shuffle(v2, ShufB2));
 
-                    var rl = Sse2.ShiftRightLogical(Sse2.Max(Sse2.Min(Sse2.Add(Sse2.UnpackLow(R, zero).AsInt16(), offLo), c255), c0), 3);
-                    var rh = Sse2.ShiftRightLogical(Sse2.Max(Sse2.Min(Sse2.Add(Sse2.UnpackHigh(R, zero).AsInt16(), offHi), c255), c0), 3);
-                    var gl = Sse2.ShiftRightLogical(Sse2.Max(Sse2.Min(Sse2.Add(Sse2.UnpackLow(G, zero).AsInt16(), offLo), c255), c0), 3);
-                    var gh = Sse2.ShiftRightLogical(Sse2.Max(Sse2.Min(Sse2.Add(Sse2.UnpackHigh(G, zero).AsInt16(), offHi), c255), c0), 3);
-                    var bl = Sse2.ShiftRightLogical(Sse2.Max(Sse2.Min(Sse2.Add(Sse2.UnpackLow(B, zero).AsInt16(), offLo), c255), c0), 3);
-                    var bh = Sse2.ShiftRightLogical(Sse2.Max(Sse2.Min(Sse2.Add(Sse2.UnpackHigh(B, zero).AsInt16(), offHi), c255), c0), 3);
+                        var rl = Sse2.ShiftRightLogical(Sse2.Max(Sse2.Min(Sse2.Add(Sse2.UnpackLow(R, zero).AsInt16(), offLo), c255), c0), 3);
+                        var rh = Sse2.ShiftRightLogical(Sse2.Max(Sse2.Min(Sse2.Add(Sse2.UnpackHigh(R, zero).AsInt16(), offHi), c255), c0), 3);
+                        var gl = Sse2.ShiftRightLogical(Sse2.Max(Sse2.Min(Sse2.Add(Sse2.UnpackLow(G, zero).AsInt16(), offLo), c255), c0), 3);
+                        var gh = Sse2.ShiftRightLogical(Sse2.Max(Sse2.Min(Sse2.Add(Sse2.UnpackHigh(G, zero).AsInt16(), offHi), c255), c0), 3);
+                        var bl = Sse2.ShiftRightLogical(Sse2.Max(Sse2.Min(Sse2.Add(Sse2.UnpackLow(B, zero).AsInt16(), offLo), c255), c0), 3);
+                        var bh = Sse2.ShiftRightLogical(Sse2.Max(Sse2.Min(Sse2.Add(Sse2.UnpackHigh(B, zero).AsInt16(), offHi), c255), c0), 3);
 
-                    var clo = Sse2.Or(Sse2.Or(Sse2.ShiftLeftLogical(rl, 10), Sse2.ShiftLeftLogical(gl, 5)), bl);
-                    var chi = Sse2.Or(Sse2.Or(Sse2.ShiftLeftLogical(rh, 10), Sse2.ShiftLeftLogical(gh, 5)), bh);
-                    Sse2.Store((byte*)buf, clo.AsByte());
-                    Sse2.Store((byte*)(buf + 8), chi.AsByte());
+                        var clo = Sse2.Or(Sse2.Or(Sse2.ShiftLeftLogical(rl, 10), Sse2.ShiftLeftLogical(gl, 5)), bl);
+                        var chi = Sse2.Or(Sse2.Or(Sse2.ShiftLeftLogical(rh, 10), Sse2.ShiftLeftLogical(gh, 5)), bh);
+                        Sse2.Store((byte*)buf, clo.AsByte());
+                        Sse2.Store((byte*)(buf + 8), chi.AsByte());
 
-                    for (int j = 0; j < 16; j++) indices[rowBase + x + j] = _mapLut[buf[j]];
-                    o += 48;
-                }
-                for (; x < width; x++)
-                {
-                    int off = DitherOffset(Bayer4[y & 3, x & 3]);
-                    int r = Math.Clamp(pixels[o] + off, 0, 255) >> 3;
-                    int g = Math.Clamp(pixels[o + 1] + off, 0, 255) >> 3;
-                    int b = Math.Clamp(pixels[o + 2] + off, 0, 255) >> 3;
-                    indices[rowBase + x] = _mapLut[(r << 10) | (g << 5) | b];
-                    o += 3;
+                        // 与 MapDirectSimd 同一手法：16 个 LUT 结果拼两个 ulong、一条 16 字节
+                        // 向量 store 写出（消掉 16 次单字节散写 + 各自的边界检查），
+                        // 查表走 fixed 裸指针。2026-10-03 四臂同二进制 A/B：
+                        // map 段 10.52→9.67ms（池化中位 −8.1%，10/10 轮胜），
+                        // 过「修改部分 ≥7%」门槛，产物 md5 逐字节一致。
+                        Sse2.Store(ip + rowBase + x, Vector128.Create(Pack8(lut, buf, 0), Pack8(lut, buf, 8)).AsByte());
+                        o += 48;
+                    }
+                    for (; x < width; x++)
+                    {
+                        int off = DitherOffset(Bayer4[y & 3, x & 3]);
+                        int r = Math.Clamp(pixels[o] + off, 0, 255) >> 3;
+                        int g = Math.Clamp(pixels[o + 1] + off, 0, 255) >> 3;
+                        int b = Math.Clamp(pixels[o + 2] + off, 0, 255) >> 3;
+                        indices[rowBase + x] = _mapLut[(r << 10) | (g << 5) | b];
+                        o += 3;
+                    }
                 }
             }
         }
