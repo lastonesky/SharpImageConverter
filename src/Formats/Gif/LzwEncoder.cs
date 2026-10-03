@@ -66,6 +66,35 @@ namespace SharpImageConverter.Formats.Gif;
 /// 清零缓存不是原因（消融实验显示只占 1.9%），是低命中率下「多一次加载 + 比较」白付了。
 /// </para>
 /// <para>
+/// <b>输出端：64bit bit pack writer（2026-10-03 实测保留）。</b>
+/// 位先累积进 64 位累加器，超过 52 位才按组吐出 6~8 个整字节（入口不变量 ≤52，
+/// 加上最多 12 位不溢出 64），子块还剩 ≥8 字节时一条无对齐 8 字节 store 落包，
+/// 替代基线每个码字「逐字节 shift + 写包 + 块界检查」的固定开销（见 <see cref="Output"/>）。
+/// 归因对照（探针跳过全部位打包/写出、只留码宽状态机）：位打包+写出占 LZW 阶段约 12.7%
+/// （143 MP：422 → 368 ms）；宽写口把这段自身提速约 21%，LZW 阶段 422.1 → 410.6 ms
+/// （−2.7%，10 轮交错 × <c>--gif-bench 5</c> 池化中位，9/10 轮胜），端到端 total −2.9%。
+/// 产物与逐字节路径逐字节一致（progressive/5_star/car 三图 md5 验证）。
+/// </para>
+/// <para>
+/// <b>实测否决：输入经 64KB 暂存缓冲分块喂入（架构图 Input → 64KB buffer 一级）。</b>
+/// 上界分析：输入是顺序读、已被硬件预取覆盖，暂存只会多付一次全量 memcpy；
+/// 实测 LZW 422 → 440 ms（+4.2%，10/10 轮更慢）。勿再试。
+/// 本轮另一教训：消费位必须<b>右移</b>出累加器（基线 <c>&gt;&gt;=</c> 语义）——
+/// 用「保留低 r 位」的掩码会把尾巴留在 [n*8, n*8+r) 却留下已消费的低位，
+/// 产物坏在第一次 spill 的末尾字节（首差出现在 LZW 数据第 6 字节）。
+/// </para>
+/// <para>
+/// <b>实测否决：64KB 批写缓冲（把 91725 次 256B 子块 Write 合并为 357 次 64KB Write）。</b>
+/// 归因探针（跳过子块 stream.Write）显示子块写出上界仅 4.75 ms ≈ LZW 阶段的 1.2%
+/// （10 轮交错 × <c>--gif-bench 5</c> 配对中位，8/10 轮）——这 4.75 ms 是
+/// 「调用开销 + memcpy + MemoryStream 扩容」的总和，批写只能回收第一项。
+/// 独立微基准（同 23.4 MB 字节量，91725×256B vs 357×64KB，10 轮交错配对）
+/// 实测可回收量 <b>−0.05 ms（胜负 5/10，即零）</b>：.NET 的小 Write 本身
+/// 就是 memcpy 进内部缓冲，每包调用开销已被摊薄，合批不省任何东西，
+/// 反而多付一次「子块拼进批缓冲」的全量 memcpy。
+/// 上界封死，勿再试（连实现都不用做——微基准先于实现给出了否决）。
+/// </para>
+/// <para>
 /// 两张表都超过 LOH 阈值，因此从 ArrayPool 租用，避免动画逐帧分配触发大对象 GC。
 /// </para>
 /// </remarks>
@@ -223,24 +252,72 @@ public class LzwEncoder(Stream stream) : IDisposable
         _curMaxCode = (1 << _codeSize) - 1;
     }
 
+    /// <summary>
+    /// 码字打包输出 = 架构图「64bit bit pack writer」一级。
+    /// 位先累积进 64 位累加器，超过 52 位才按组吐出（入口不变量 ≤52，加最多 12 位不溢出 64），
+    /// 而不是基线的「每码字逐字节 shift + 写包 + 块界检查」。
+    /// <b>实测（2026-10-03）</b>：归因对照显示位打包+写出占 LZW 阶段约 12.7%
+    /// （143 MP：422 → 368 ms），本实现把这段自身提速约 21%，
+    /// LZW 阶段 422.1 → 410.6 ms（−2.7%，10 轮交错 × --gif-bench 5 池化中位，9/10 轮胜），
+    /// 产物逐字节一致（progressive/5_star/car 三图 md5）。
+    /// </summary>
     private void Output(int code)
     {
         _curAccum |= (long)code << _curBits;
         _curBits += _codeSize;
-
-        while (_curBits >= 8)
-        {
-            _packet[++_packetSize] = (byte)(_curAccum & 0xFF);
-            _curAccum >>= 8;
-            _curBits -= 8;
-            if (_packetSize >= MAX_BLOCK_SIZE) FlushPacket();
-        }
+        if (_curBits > 52) SpillBits();
 
         if (_nextCode > _curMaxCode && _codeSize < 12)
         {
             _codeSize++;
             _curMaxCode = (1 << _codeSize) - 1;
         }
+    }
+
+    /// <summary>
+    /// 把 <see cref="_curAccum"/> 里的整字节（<c>_curBits &gt;&gt; 3</c> 个，6~8 个）写进当前子块，
+    /// 保留不足 8 位的尾巴，并把已消费的位右移出累加器。
+    /// 快路径用一条无对齐 8 字节 store 代替逐字节循环（教训同 OctreeQuantizer 的 A3-a：
+    /// 小循环的 inc/cmp/jl 控制开销会吃掉 store 合并的收益，必须一次写出）。
+    /// </summary>
+    private void SpillBits()
+    {
+        int n = _curBits >> 3;      // 待写出的整字节数（6~8）
+        _curBits &= 7;              // 不足 8 位的尾巴留在累加器
+
+        if (_packetSize <= MAX_BLOCK_SIZE - 8)
+        {
+            // 快路径：子块还剩 ≥8 字节，一条 store 写出全部整字节（小端序，LSB 先出，与逐字节同序）。
+            // store 会把高 (8-n) 个零字节一并写到 _packetSize 之后：恒有 _curBits ≤ 64，
+            // 越界的高字节为 0；它们不会被 FlushPacket 发出（只发 _packetSize 以内），
+            // 且后续字节严格按序写入，必然先覆盖这些位置。
+            Unsafe.WriteUnaligned(ref _packet[_packetSize + 1], (ulong)_curAccum);
+            _packetSize += n;
+            // 已消费的整字节必须右移出去、让尾巴落到低位（基线 >>= 语义）；
+            // 不能用「保留低 r 位」的掩码——尾巴在 [n*8, n*8+r)，掩码会留下已消费的低位、丢掉尾巴。
+            // n==8 时 64 位右移是 UB，直接清零（此时尾巴为 0）。
+            _curAccum = n == 8 ? 0 : (long)((ulong)_curAccum >> (n * 8));
+        }
+        else
+        {
+            // 慢路径：子块尾部只剩 1~7 字节，逐字节填满 255 落块后写剩余（每 255 字节至多一次）
+            int take = MAX_BLOCK_SIZE - _packetSize;
+            if (take > n) take = n;
+            ulong a = (ulong)_curAccum;
+            int pos = _packetSize;
+            for (int k = 0; k < take; k++) { _packet[++pos] = (byte)a; a >>= 8; }
+            _packetSize = pos;
+            if (take < n)
+            {
+                FlushPacket(); // 当前子块填满 255，先落地再写剩余（≤8 字节，新块必然装得下）
+                pos = 0;
+                for (int k = take; k < n; k++) { _packet[++pos] = (byte)a; a >>= 8; }
+                _packetSize = pos;
+            }
+            _curAccum = (long)a;
+        }
+
+        if (_packetSize >= MAX_BLOCK_SIZE) FlushPacket();
     }
 
     private void FlushBits()
