@@ -15,18 +15,27 @@ namespace SharpImageConverter;
 
 public readonly struct JpegEncoderOptions
 {
-    public JpegEncoderOptions(int quality = 75, bool subsample420 = true, bool keepMetadata = true, bool enableDiagnostics = false)
+    public JpegEncoderOptions(int quality = 75, bool subsample420 = true, bool keepMetadata = true, bool enableDiagnostics = false, bool optimizeHuffman = false)
     {
         Quality = quality;
         Subsample420 = subsample420;
         KeepMetadata = keepMetadata;
         EnableDiagnostics = enableDiagnostics;
+        OptimizeHuffman = optimizeHuffman;
     }
 
     public int Quality { get; }
     public bool Subsample420 { get; }
     public bool KeepMetadata { get; }
     public bool EnableDiagnostics { get; }
+
+    /// <summary>
+    /// 按图像统计生成最优 Huffman 表（两遍编码：先统计符号分布，再据此编码）。
+    /// 标准表是固定的 Annex K 表，与实际符号分布不匹配；对大片平坦区域的图像
+    /// （扫描件、截图、大留白照片）空块开销占比极高，优化后体积可降 20%~40%。
+    /// 代价是需要多跑一遍编码管线（约 +60%~90% 编码耗时）。
+    /// </summary>
+    public bool OptimizeHuffman { get; }
 }
 
 /// <summary>
@@ -461,13 +470,13 @@ public static class JpegEncoder
     public static void Write(Stream stream, int width, int height, byte[] rgb24, JpegEncoderOptions options)
     {
         ValidateRgb24Input(stream, width, height, rgb24);
-        WriteInternal(stream, width, height, rgb24, NormalizeQuality(options.Quality), options.Subsample420, null, options.KeepMetadata, options.EnableDiagnostics);
+        WriteInternal(stream, width, height, rgb24, NormalizeQuality(options.Quality), options.Subsample420, null, options.KeepMetadata, options.EnableDiagnostics, options.OptimizeHuffman);
     }
 
     public static void Write(Stream stream, int width, int height, byte[] rgb24, JpegEncoderOptions options, ImageMetadata? metadata)
     {
         ValidateRgb24Input(stream, width, height, rgb24);
-        WriteInternal(stream, width, height, rgb24, NormalizeQuality(options.Quality), options.Subsample420, metadata, options.KeepMetadata, options.EnableDiagnostics);
+        WriteInternal(stream, width, height, rgb24, NormalizeQuality(options.Quality), options.Subsample420, metadata, options.KeepMetadata, options.EnableDiagnostics, options.OptimizeHuffman);
     }
 
     public static void WriteGray8(string path, int width, int height, byte[] gray8, int quality = 75)
@@ -584,7 +593,7 @@ public static class JpegEncoder
         }
     }
 
-    private static void WriteInternal(Stream stream, int width, int height, byte[] rgb24, int quality, bool subsample420, ImageMetadata? metadata, bool keepMetadata, bool enableDiagnostics)
+    private static void WriteInternal(Stream stream, int width, int height, byte[] rgb24, int quality, bool subsample420, ImageMetadata? metadata, bool keepMetadata, bool enableDiagnostics, bool optimizeHuffman = false)
     {
         long totalStartTicks = Stopwatch.GetTimestamp();
         EncodeMetrics? metrics = enableDiagnostics ? new EncodeMetrics() : null;
@@ -601,6 +610,29 @@ public static class JpegEncoder
         int[] qYRecip = lumaTables.Recip;
         int[] qCRecip = chromaTables.Recip;
 
+        // Huffman 表：默认用标准 Annex K 表；开启优化时先统计真实符号分布再生成最优表。
+        byte[] dcYCounts = DcLumaCounts, acYCounts = AcLumaCounts, dcCCounts = DcChromaCounts, acCCounts = AcChromaCounts;
+        byte[] dcYSymbols = DcLumaSymbols, acYSymbols = AcLumaSymbols, dcCSymbols = DcChromaSymbols, acCSymbols = AcChromaSymbols;
+        HuffCode[] dcY = DcYHuffTable, acY = AcYHuffTable, dcC = DcCHuffTable, acC = AcCHuffTable;
+
+        if (optimizeHuffman)
+        {
+            long optStart = enableDiagnostics ? Stopwatch.GetTimestamp() : 0;
+            HuffmanHistograms hist = CollectHuffmanHistograms(width, height, rgb24, subsample420, qYRecip, qCRecip);
+            (dcYCounts, dcYSymbols) = BuildOptimalHuffmanTable(hist.DcY);
+            (acYCounts, acYSymbols) = BuildOptimalHuffmanTable(hist.AcY);
+            (dcCCounts, dcCSymbols) = BuildOptimalHuffmanTable(hist.DcC);
+            (acCCounts, acCSymbols) = BuildOptimalHuffmanTable(hist.AcC);
+            dcY = BuildHuffTable(dcYCounts, dcYSymbols);
+            acY = BuildHuffTable(acYCounts, acYSymbols);
+            dcC = BuildHuffTable(dcCCounts, dcCSymbols);
+            acC = BuildHuffTable(acCCounts, acCSymbols);
+            if (enableDiagnostics)
+            {
+                Trace.WriteLine($"[jpeg-timing] huffman-optimize={(Stopwatch.GetTimestamp() - optStart) * 1000.0 / Stopwatch.Frequency:F3}ms");
+            }
+        }
+
         WriteMarker(stream, 0xD8);
         WriteApp0Jfif(stream);
         if (keepMetadata && metadata != null)
@@ -610,14 +642,14 @@ public static class JpegEncoder
         WriteDqt(stream, 0, qY);
         WriteDqt(stream, 1, qC);
         WriteSof0(stream, width, height, subsample420);
-        WriteDht(stream, 0, 0, DcLumaCounts, DcLumaSymbols);
-        WriteDht(stream, 1, 0, AcLumaCounts, AcLumaSymbols);
-        WriteDht(stream, 0, 1, DcChromaCounts, DcChromaSymbols);
-        WriteDht(stream, 1, 1, AcChromaCounts, AcChromaSymbols);
+        WriteDht(stream, 0, 0, dcYCounts, dcYSymbols);
+        WriteDht(stream, 1, 0, acYCounts, acYSymbols);
+        WriteDht(stream, 0, 1, dcCCounts, dcCSymbols);
+        WriteDht(stream, 1, 1, acCCounts, acCSymbols);
         WriteSos(stream);
 
         using var bw = new JpegBitWriter(stream);
-        EncodeRgbPipeline(bw, width, height, rgb24, subsample420, qYRecip, qCRecip, DcYHuffTable, AcYHuffTable, DcCHuffTable, AcCHuffTable, metrics);
+        EncodeRgbPipeline(bw, width, height, rgb24, subsample420, qYRecip, qCRecip, dcY, acY, dcC, acC, metrics);
         bw.FlushFinal();
         WriteMarker(stream, 0xD9);
 
@@ -1283,6 +1315,428 @@ public static class JpegEncoder
             }
             ReturnPendingState(pendingItems, pendingSequences, pendingCapacity);
         }
+    }
+
+    /// <summary>
+    /// Huffman 符号直方图（DC-Y / AC-Y / DC-C / AC-C），用于生成按图优化的 Huffman 表。
+    /// AC 符号上限 256，符号总量在大图上可达数亿，用 long 计数避免溢出。
+    /// </summary>
+    private sealed class HuffmanHistograms
+    {
+        public readonly long[] DcY = new long[256];
+        public readonly long[] AcY = new long[256];
+        public readonly long[] DcC = new long[256];
+        public readonly long[] AcC = new long[256];
+    }
+
+    /// <summary>
+    /// 跑一遍「生产 → DCT 量化」管线，但只统计 Huffman 符号分布、不产出任何字节。
+    /// 与正式编码走完全相同的采样与量化路径，保证统计到的符号序列与第二遍一致。
+    /// </summary>
+    private static HuffmanHistograms CollectHuffmanHistograms(
+        int width,
+        int height,
+        byte[] rgb24,
+        bool subsample420,
+        int[] qYRecip,
+        int[] qCRecip)
+    {
+        var hist = new HuffmanHistograms();
+        int capacity = Math.Clamp(Environment.ProcessorCount, 2, 16);
+        var sampleQueue = new PipeQueue<McuBatch>(capacity, JpegPerfProbe.ProduceWait, JpegPerfProbe.DctWait);
+        var dctQueue = new PipeQueue<McuBatch>(capacity, JpegPerfProbe.DctWait, JpegPerfProbe.HuffmanWait);
+        int dctWorkers = Math.Clamp(Environment.ProcessorCount - 1, 1, 8);
+        JpegPerfProbe.Begin();
+        JpegPerfProbe.SetDctWorkers(dctWorkers);
+
+        using var cts = new CancellationTokenSource();
+        CancellationToken token = cts.Token;
+
+        var t1 = Task.Run(() => RunStage(() => ProduceRgbSamples(sampleQueue, rgb24, width, height, subsample420, dctWorkers, McuBatchSize, token, null), cts), token);
+        Task[] dctTasks = new Task[dctWorkers];
+        for (int i = 0; i < dctWorkers; i++)
+        {
+            dctTasks[i] = Task.Run(() => RunStage(() => ProcessDct(sampleQueue, dctQueue, qYRecip, qCRecip, token), cts), token);
+        }
+        var t4 = Task.Run(() => RunStage(() => ProcessHuffmanCount(dctQueue, dctWorkers, hist, token), cts), token);
+
+        Task.WaitAll(dctTasks);
+        Task.WaitAll(t1, t4);
+        JpegPerfProbe.End(JpegPerfProbe.EncodeTotal);
+        return hist;
+    }
+
+    /// <summary>统计版 MCU 写出：与 <see cref="WriteMcuHuffman"/> 完全同构，只记符号不写位。</summary>
+    private static void CountMcuHuffman(
+        ref SampledMcuRef mcu,
+        HuffmanHistograms hist,
+        ref int prevYdc,
+        ref int prevCbdc,
+        ref int prevCrdc)
+    {
+        for (int i = 0; i < mcu.BlockCount; i++)
+        {
+            int lastNz = (int)((mcu.LastNzPacked >> (i * 6)) & 0x3F);
+            byte comp = mcu.Order![i];
+            if (comp == 0)
+            {
+                HuffmanCountBlock(mcu.GetBlockSpan(i), lastNz, ref prevYdc, hist.DcY, hist.AcY);
+            }
+            else if (comp == 1)
+            {
+                HuffmanCountBlock(mcu.GetBlockSpan(i), lastNz, ref prevCbdc, hist.DcC, hist.AcC);
+            }
+            else
+            {
+                HuffmanCountBlock(mcu.GetBlockSpan(i), lastNz, ref prevCrdc, hist.DcC, hist.AcC);
+            }
+        }
+    }
+
+    /// <summary>统计版块编码：符号推导逻辑与 <see cref="HuffmanWriteBlock"/> 必须逐行一致。</summary>
+    private static void HuffmanCountBlock(Span<int> block, int lastNz, ref int prevDc, long[] dcHist, long[] acHist)
+    {
+        int dcCoeff = block[0];
+        int diff = dcCoeff - prevDc;
+        prevDc = dcCoeff;
+
+        dcHist[MagnitudeCategory(diff)]++;
+
+        if (lastNz == 0)
+        {
+            acHist[0x00]++;
+            return;
+        }
+
+        int run = 0;
+        for (int k = 1; k <= lastNz; k++)
+        {
+            int idx = JpegConstants.ZigZag[k];
+            int v = block[idx];
+            if (v == 0)
+            {
+                run++;
+                continue;
+            }
+
+            while (run >= 16)
+            {
+                acHist[0xF0]++;
+                run -= 16;
+            }
+
+            acHist[(run << 4) | MagnitudeCategory(v)]++;
+            run = 0;
+        }
+
+        if (lastNz != 63) acHist[0x00]++;
+    }
+
+    /// <summary>
+    /// 统计版 Huffman 阶段：与 <see cref="ProcessHuffmanOrdered"/> 相同的乱序重排逻辑，
+    /// 只是把「写位」换成「记符号」。DC 预测依赖全局顺序，重排不可省。
+    /// </summary>
+    private static void ProcessHuffmanCount(
+        PipeQueue<McuBatch> input,
+        int completionCount,
+        HuffmanHistograms hist,
+        CancellationToken token)
+    {
+        int prevYdc = 0;
+        int prevCbdc = 0;
+        int prevCrdc = 0;
+        int expected = 0;
+        int completed = 0;
+        RentPendingState(256, out var pendingItems, out var pendingSequences, out int pendingCapacity, out int pendingMask);
+
+        try
+        {
+            while (completed < completionCount)
+            {
+                var batch = input.Dequeue(token);
+                if (batch == null)
+                {
+                    completed++;
+                    continue;
+                }
+
+                try
+                {
+                    for (int i = 0; i < batch.Count; i++)
+                    {
+                        ref SampledMcuRef mcu = ref batch.Items[i];
+                        if (mcu.Sequence == expected)
+                        {
+                            CountMcuHuffman(ref mcu, hist, ref prevYdc, ref prevCbdc, ref prevCrdc);
+                            mcu.Free();
+                            expected++;
+
+                            while (true)
+                            {
+                                int expectedIndex = expected & pendingMask;
+                                if (pendingSequences[expectedIndex] != expected)
+                                {
+                                    break;
+                                }
+
+                                ref SampledMcuRef pending = ref pendingItems[expectedIndex];
+                                pendingSequences[expectedIndex] = -1;
+                                CountMcuHuffman(ref pending, hist, ref prevYdc, ref prevCbdc, ref prevCrdc);
+                                pending.Free();
+                                expected++;
+                            }
+                        }
+                        else
+                        {
+                            EnsurePendingCapacity(ref pendingItems, ref pendingSequences, ref pendingCapacity, ref pendingMask, mcu.Sequence);
+                            int index = mcu.Sequence & pendingMask;
+                            while (pendingSequences[index] != -1 && pendingSequences[index] != mcu.Sequence)
+                            {
+                                index = (index + 1) & pendingMask;
+                            }
+                            pendingItems[index] = mcu;
+                            pendingSequences[index] = mcu.Sequence;
+                            mcu = default;
+                        }
+                    }
+                }
+                finally
+                {
+                    for (int i = 0; i < batch.Count; i++)
+                    {
+                        batch.Items[i].Free();
+                    }
+                    ReturnMcuBatch(batch);
+                }
+            }
+
+            while (true)
+            {
+                int index = expected & pendingMask;
+                if (pendingSequences[index] != expected)
+                {
+                    break;
+                }
+                ref SampledMcuRef pending = ref pendingItems[index];
+                pendingSequences[index] = -1;
+                CountMcuHuffman(ref pending, hist, ref prevYdc, ref prevCbdc, ref prevCrdc);
+                pending.Free();
+                expected++;
+            }
+        }
+        finally
+        {
+            ReturnPendingState(pendingItems, pendingSequences, pendingCapacity);
+        }
+    }
+
+    /// <summary>
+    /// 由符号频率生成最优 Huffman 表（码长不超过 16 位）。
+    /// 返回 DHT 的 16 个 bit 计数与按（码长，符号值）排序的符号表，两者与
+    /// <see cref="BuildHuffTable"/> 配套使用。实现要点：
+    /// ① 只有一个非零符号时强制码长 1（JPEG 不允许 0 长表；也不引入虚拟符号占位，
+    ///    避免 bits 计数与符号数不一致导致严格解码器拒读）；
+    /// ② 建树前先把总频率缩放到 1000 以内，从根上保证码长 ≤ 15。
+    /// </summary>
+    internal static (byte[] Counts, byte[] Symbols) BuildOptimalHuffmanTable(long[] freq)
+    {
+        int nonzero = 0;
+        int only = -1;
+        for (int i = 0; i < 256; i++)
+        {
+            if (freq[i] > 0)
+            {
+                nonzero++;
+                only = i;
+            }
+        }
+
+        var counts = new byte[16];
+        if (nonzero == 0)
+        {
+            // 理论上不会发生（每个块至少有 EOB 或 DC 符号），兜底成单符号 0 表
+            counts[0] = 1;
+            return (counts, new byte[] { 0x00 });
+        }
+        if (nonzero == 1)
+        {
+            counts[0] = 1;
+            return (counts, new byte[] { (byte)only });
+        }
+
+        var f = new long[nonzero];
+        var sym = new int[nonzero];
+        int m = nonzero;
+        int k = 0;
+        for (int i = 0; i < 256; i++)
+        {
+            if (freq[i] > 0)
+            {
+                f[k] = freq[i];
+                sym[k] = i;
+                k++;
+            }
+        }
+
+        // 频率缩放：Huffman 树深度的上界由「最深处叶子的权和 ≥ Fib(d+2)」给出
+        // （Fib(17)=1597），把总频率缩到 500 以内（后面可能整体 ×2）可保证码长 ≤ 14，
+        // 从而完全避开「事后限长调整只改计数、不改各符号码长」的一致性陷阱。
+        // (+1)>>1 保证非零频率不会缩成 0。
+        long sum = 0;
+        for (int i = 0; i < f.Length; i++) sum += f[i];
+        while (sum > 500)
+        {
+            sum = 0;
+            for (int i = 0; i < f.Length; i++)
+            {
+                f[i] = (f[i] + 1) >> 1;
+                sum += f[i];
+            }
+        }
+
+        // 关键：libjpeg 规定任何码长的末码不得为全 1（no code is allowed to be all
+        // ones，否则被 GDI+/libjpeg 系解码器以 "Bogus Huffman table definition" 拒绝）。
+        // 满树的最深组恰好贴满时末码必为全 1（等频 3 符号的 bits=[1,2] 无论如何扰动都是它）。
+        // 与 libjpeg 的 freq[256] 同思路：加入一个频率为 1 的虚拟叶子占据「最深组的最后一个
+        // 码位」（全 1 位），组装时把该码位挖掉——真实符号的末码必然非全 1，且仍是合法前缀码。
+        // 前提：虚拟叶子必须是全局唯一最小频率，才能保证它落在最深组；
+        // 同深度内符号按值排序，虚拟值 256 > 任何真实值，天然排在该组最后。
+        long fmin = long.MaxValue;
+        for (int i = 0; i < m; i++)
+        {
+            if (f[i] < fmin) fmin = f[i];
+        }
+        if (fmin <= 1)
+        {
+            for (int i = 0; i < m; i++) f[i] <<= 1; // 保序放大，使真实频率全部 ≥ 2
+        }
+
+        var f2 = new long[m + 1];
+        var sym2 = new int[m + 1];
+        Array.Copy(f, f2, m);
+        Array.Copy(sym, sym2, m);
+        f2[m] = 1;   // 虚拟叶子
+        sym2[m] = 256;
+
+        var counts2 = BuildTreeAndAssemble(f2, sym2, m + 1, counts, out var symbolsAll);
+
+        // 虚拟符号值 256 最大，且深度全表最深 → 必在 symbolsAll 末位、其组为最深非零组。
+        // 去掉它：该组码数 -1（挖掉全 1 码位），符号表不含它。
+        var symbols = new byte[symbolsAll.Length - 1];
+        Array.Copy(symbolsAll, symbols, symbols.Length);
+        for (int l = 16; l >= 1; l--)
+        {
+            if (counts2[l - 1] > 0)
+            {
+                counts2[l - 1]--;
+                break;
+            }
+        }
+
+        return (counts2, symbols);
+    }
+
+    /// <summary>显式树建 Huffman 并组装 DHT 的 counts/symbols。节点 0..m-1 是叶子（含虚拟）。</summary>
+    private static byte[] BuildTreeAndAssemble(long[] f, int[] sym, int m, byte[] counts, out byte[] symbols)
+    {
+        // 每轮线性扫最小两个活跃节点（O(m²)，m≤256）
+        int nodes = 2 * m - 1;
+        var nodeFreq = new long[nodes];
+        var nodeLeft = new int[nodes];
+        var nodeRight = new int[nodes];
+        var merged = new bool[nodes];
+        Array.Copy(f, nodeFreq, m);
+        for (int i = 0; i < m; i++)
+        {
+            nodeLeft[i] = -1;
+            nodeRight[i] = -1;
+        }
+
+        int next = m;
+        int root = m - 1;
+        for (int merge = 0; merge < m - 1; merge++)
+        {
+            int a = -1, b = -1;
+            for (int i = 0; i < next; i++)
+            {
+                if (merged[i]) continue;
+                if (a < 0 || nodeFreq[i] < nodeFreq[a])
+                {
+                    b = a;
+                    a = i;
+                }
+                else if (b < 0 || nodeFreq[i] < nodeFreq[b])
+                {
+                    b = i;
+                }
+            }
+
+            nodeFreq[next] = nodeFreq[a] + nodeFreq[b];
+            nodeLeft[next] = a;
+            nodeRight[next] = b;
+            merged[a] = true;
+            merged[b] = true;
+            root = next;
+            next++;
+        }
+
+        // 从根 BFS 求每个叶子的码长
+        var depth = new int[nodes];
+        var stack = new int[nodes];
+        int sp = 0;
+        stack[sp++] = root;
+        var codesize = new int[m];
+        while (sp > 0)
+        {
+            int n2 = stack[--sp];
+            int l = nodeLeft[n2], r = nodeRight[n2];
+            if (l < 0)
+            {
+                codesize[n2] = Math.Max(depth[n2], 1);
+                continue;
+            }
+            depth[l] = depth[n2] + 1;
+            depth[r] = depth[n2] + 1;
+            stack[sp++] = l;
+            stack[sp++] = r;
+        }
+
+        var bits = new int[17];
+        for (int i = 0; i < m; i++) bits[Math.Min(codesize[i], 16)]++;
+
+        int total = 0;
+        for (int i = 1; i <= 16; i++) total += bits[i];
+
+        symbols = new byte[total];
+        int p = 0;
+        for (int l = 1; l <= 16; l++)
+        {
+            counts[l - 1] = (byte)bits[l];
+            for (int s = 0; s < m; s++)
+            {
+                if (codesize[s] == l) symbols[p++] = (byte)sym[s];
+            }
+        }
+
+        return counts;
+    }
+
+    /// <summary>
+    /// 按 libjpeg（jdhuff.c/jchuff.c Figure C.2）的规则验证前缀码：
+    /// 逐码长累加码空间，每个码长组结束时已用码数必须严格小于 2^长度——
+    /// 等价于「任何码长的末码不得为全 1」。GDI+/libjpeg 系解码器会拒绝违反此规则的表。
+    /// </summary>
+    internal static bool IsLegalPrefixCode(byte[] counts)
+    {
+        long code = 0;
+        for (int l = 1; l <= 16; l++)
+        {
+            code += counts[l - 1];
+            if (code > (1L << l)) return false;
+            if (code >= (1L << l)) return false; // 末码为全 1
+            code <<= 1;
+        }
+        return true;
     }
 
     private static void ProcessHuffmanGrayOrdered(

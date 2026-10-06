@@ -20,6 +20,7 @@
 - Huffman 解码、反量化、整数 IDCT、YCbCr 转 RGB
 - 支持 EXIF Orientation 自动旋转/翻转
 - 支持将中间 RGB 图像编码输出为基线 JPEG（Baseline，quality 可调）
+- 可选按图优化的 Huffman 表（`OptimizeHuffman`）：两遍编码，平坦内容多的图可再省 20%~40%
 - 支持常见采样因子（如 4:4:4/4:2:2/4:2:0），色度上采样使用最近邻回采样
 
 ### PNG 支持
@@ -58,6 +59,15 @@
 ### 中间格式
 - 引入 `ImageFrame` 作为格式转换的中间数据结构（当前为 `Rgb24`）
 - 统一加载为 RGB，再根据输出扩展名选择编码器写回
+
+### 智能有损压缩（TinyPNG 式）
+- 一行 API / 一条命令把 JPG、PNG、GIF、WebP、BMP 压到「肉眼几乎无差别」的最小体积，输出格式与输入一致
+- 画质由**感知度量**（4×4 块平均 PSNR）把关：先抖动再评估，因此能容忍 dithering 颗粒、却拦得住真正的画质劣化
+- PNG：量化到 ≤256 色调色板（每像素 1 字节）+ Floyd–Steinberg 抖动；颜色数按画质下限二分搜索；不达标时自动回退无损真彩色重写
+- JPEG / WebP：二分搜索「刚好达标」的最低编码质量，JPEG 默认 4:2:0，色度高频丰富时自动退回 4:4:4
+- GIF：跨帧共享全局调色板并降色，动画同样支持（带透明通道的动画除外）
+- BMP 无法压缩，统一转为 PNG 输出
+- 详见 [docs/Optimize.md](docs/Optimize.md)
 
 ## What's New / 更新亮点
 
@@ -164,6 +174,32 @@ new ImageFrame(image.Width, image.Height, image.Buffer).SaveAsPng(output);
 // new SharpImageConverter.Formats.PngEncoderAdapter().EncodeRgb24(output, image);
 ```
 
+- 智能有损压缩（TinyPNG 式，保持原格式）：
+
+```csharp
+using SharpImageConverter.Compression;
+
+// 一行搞定：输出 <原名>.min.<原扩展名>
+var result = ImageOptimizer.Optimize("photo.png");
+Console.WriteLine(result); 
+// photo.png: 845.4 KB → 450.6 KB（省 46.7%）| PNG 调色板 256 色 + 抖动 | PSNR 36.57dB / 感知 48.51dB
+
+// 指定输出路径与画质档位
+ImageOptimizer.Optimize("photo.jpg", "photo.small.jpg", OptimizeOptions.Aggressive);
+
+// 精细控制
+var options = new OptimizeOptions
+{
+    TargetQuality = 92,        // 目标画质 0-100，越高越保守
+    MaxColors = 128,           // PNG/GIF 调色板上限
+    EnableDithering = true,
+    StripMetadata = true,      // 丢弃 EXIF，保留 ICC
+    MinSavingRatio = 0.05,     // 至少省 5% 才采用，否则保留原图
+};
+var r = ImageOptimizer.Optimize("banner.gif", "banner.min.gif", options);
+Console.WriteLine($"{r.SavedRatio:P1} / {r.Quality.PerceptualPsnr:F2} dB");
+```
+
 ## 命令行工具 (CLI)
 
 位于 `Cli/` 目录下，提供便捷的格式转换与简单处理功能。
@@ -206,6 +242,13 @@ dotnet run -- <输入文件或文件夹路径> [输出文件或文件夹路径] 
   - `--to ext` / `--to=ext`（同义：`--out-ext`）：指定输出后缀（bmp/png/jpg/jpeg/webp）。
   - `--parallel N`：并行度（目录模式；WebP 输出强制串行）。
   - `--skip-existing`：目标文件存在时跳过。
+- 智能压缩参数（配合 `--optimize`）：
+  - `--opt-quality N`：目标画质 0-100（默认 88）。95≈保守、88≈均衡、75≈激进。
+  - `--max-colors N`：PNG/GIF 调色板颜色上限（默认 256）。
+  - `--no-dither`：关闭 Floyd–Steinberg 抖动（体积更小，但渐变容易出色带）。
+  - `--min-saving N`：至少省 N%（如 `--min-saving 10`）才采用，否则保留原图。
+  - `--opt-verbose`：打印每个候选方案的体积与画质，便于调参。
+  - `--keep-metadata`：保留元数据（默认丢弃 EXIF、保留 ICC）。
 
 ### 文件夹批量转换
 - 递归：`--recursive`（遍历子目录）
@@ -238,6 +281,24 @@ dotnet run -- d:\images d:\out --to bmp --parallel 8
 
 # 批量：跳过已存在文件
 dotnet run -- d:\images d:\out --skip-existing
+
+# 智能压缩：输出 photo.min.png
+dotnet run -- photo.png --optimize
+
+# 智能压缩：指定输出路径 + 激进档 + 打印候选过程
+dotnet run -- photo.jpg photo.small.jpg --optimize --opt-quality 75 --opt-verbose
+
+# 智能压缩：整站图片批量压（指定输出目录，保持文件名与目录结构）
+dotnet run -- d:\site d:\site-min --optimize --recursive --parallel 8
+```
+
+### 智能压缩输出示例
+
+```text
+✅ photo.png: 845.4 KB → 450.6 KB（省 46.7%）| PNG 调色板 256 色 + 抖动 | PSNR 36.57dB / 感知 48.51dB
+✅ photo100.jpg: 352.3 KB → 76.1 KB（省 78.4%）| JPEG 质量 87（4:4:4） | PSNR 40.00dB / 感知 45.43dB
+✅ photo.gif: 380.3 KB → 299.9 KB（省 21.1%）| GIF 调色板 64 色 + 抖动 | PSNR 33.97dB / 感知 45.49dB
+➖ photo.jpg: 无收益，保留原图（78.2 KB）
 ```
 
 ## 许可证

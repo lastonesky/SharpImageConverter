@@ -365,6 +365,119 @@ public class GifEncoder
     }
 
     /// <summary>
+    /// 用「已有的调色板 + 索引」直写 GIF，跳过编码器内部的二次量化。
+    /// 智能压缩在外部完成量化与本轮画质评估后走这条路，避免量化两次导致质量不可控。
+    /// </summary>
+    /// <param name="width">宽度</param>
+    /// <param name="height">高度</param>
+    /// <param name="paletteRgb">调色板 RGB，长度 3*颜色数（≤768）</param>
+    /// <param name="indexFrames">每帧的调色板索引，长度均为 width*height</param>
+    /// <param name="frameDurationsMs">每帧时长（毫秒），单帧时可传 null</param>
+    /// <param name="loopCount">循环次数，0 表示无限循环</param>
+    /// <param name="stream">输出流</param>
+    /// <param name="transparentIndex">透明色索引，-1 表示无透明</param>
+    public void EncodeIndexed(
+        int width,
+        int height,
+        byte[] paletteRgb,
+        IReadOnlyList<byte[]> indexFrames,
+        IReadOnlyList<int>? frameDurationsMs,
+        int loopCount,
+        Stream stream,
+        int transparentIndex = -1)
+    {
+        ArgumentNullException.ThrowIfNull(paletteRgb);
+        ArgumentNullException.ThrowIfNull(indexFrames);
+        if (indexFrames.Count == 0) return;
+        if (paletteRgb.Length == 0 || paletteRgb.Length % 3 != 0 || paletteRgb.Length > 768)
+        {
+            throw new ArgumentException("调色板长度必须是 3 的倍数且不超过 768 字节", nameof(paletteRgb));
+        }
+
+        var timing = BeginTiming(width * height * indexFrames.Count, indexFrames.Count);
+        long t0 = Now(timing);
+
+        int palCount = paletteRgb.Length / 3;
+        int depth = GetColorDepth(palCount);
+        int tableSize = 1 << (depth + 1);
+        byte[] palette = paletteRgb.Length == tableSize * 3 ? paletteRgb : PadPalette(paletteRgb, tableSize);
+        bool animated = indexFrames.Count > 1;
+
+        int ptr = 0;
+        WriteAscii(_headerBuf, ref ptr, "GIF89a");
+        WriteShort(_headerBuf, ref ptr, width);
+        WriteShort(_headerBuf, ref ptr, height);
+        _headerBuf[ptr++] = (byte)(0x80 | (0x07 << 4) | depth); // 全局色表
+        _headerBuf[ptr++] = 0;
+        _headerBuf[ptr++] = 0;
+        stream.Write(_headerBuf, 0, ptr);
+        stream.Write(palette);
+
+        if (animated) WriteNetscapeExtension(stream, loopCount);
+        long tHeaderEnd = Now(timing);
+        if (timing is not null) timing.HeaderTicks = tHeaderEnd - t0;
+
+        using var lzw = new LzwEncoder(stream);
+        int minCodeSize = Math.Max(2, depth + 1);
+        for (int i = 0; i < indexFrames.Count; i++)
+        {
+            int delayCs = 0;
+            if (animated && frameDurationsMs != null && i < frameDurationsMs.Count)
+            {
+                delayCs = Math.Clamp((frameDurationsMs[i] + 5) / 10, 0, 65535);
+            }
+            // 有透明色时用 disposal=2（恢复背景），与既有 rgba 动画路径保持一致
+            int disposal = transparentIndex >= 0 && animated ? 2 : 0;
+            WriteFrameHeader(stream, width, height, transparentIndex, delayCs, disposal);
+
+            long tl0 = Now(timing);
+            lzw.Encode(indexFrames[i], width, height, minCodeSize);
+            long tl1 = Now(timing);
+            if (timing is not null) timing.LzwTicks += tl1 - tl0;
+        }
+
+        stream.WriteByte(0x3B);
+        long t1 = Now(timing);
+        if (timing is not null)
+        {
+            timing.TotalTicks = t1 - t0;
+            timing.PaletteColors = palCount;
+            timing.Label = animated ? "indexed(animation)" : "indexed";
+        }
+        FinishTiming(timing);
+    }
+
+    private void WriteFrameHeader(Stream stream, int width, int height, int transparentIndex, int delayCs, int disposal)
+    {
+        int ptr = 0;
+        if (transparentIndex >= 0 || delayCs > 0 || disposal != 0)
+        {
+            _headerBuf[ptr++] = 0x21;
+            _headerBuf[ptr++] = 0xF9;
+            _headerBuf[ptr++] = 4;
+            _headerBuf[ptr++] = (byte)(((disposal & 0x07) << 2) | (transparentIndex >= 0 ? 1 : 0));
+            WriteShort(_headerBuf, ref ptr, delayCs);
+            _headerBuf[ptr++] = (byte)(transparentIndex >= 0 ? transparentIndex : 0);
+            _headerBuf[ptr++] = 0;
+        }
+
+        _headerBuf[ptr++] = 0x2C;
+        WriteShort(_headerBuf, ref ptr, 0);
+        WriteShort(_headerBuf, ref ptr, 0);
+        WriteShort(_headerBuf, ref ptr, width);
+        WriteShort(_headerBuf, ref ptr, height);
+        _headerBuf[ptr++] = 0; // 无局部色表
+        stream.Write(_headerBuf, 0, ptr);
+    }
+
+    private static byte[] PadPalette(byte[] paletteRgb, int tableSize)
+    {
+        var padded = new byte[tableSize * 3];
+        Buffer.BlockCopy(paletteRgb, 0, padded, 0, paletteRgb.Length);
+        return padded;
+    }
+
+    /// <summary>
     /// 按 <see cref="QuantizerKind"/> 选择量化器，对 RGB24 像素生成调色板与索引。
     /// 新方案（八叉树 + Bayer）为默认；原 Wu + Floyd–Steinberg 保留作可切换项。
     /// </summary>
