@@ -172,11 +172,17 @@ public static class ZlibHelper
         return result;
     }
 
-    public static void CompressRaw(Action<Stream> writeRaw, Stream output)
+    /// <summary>
+    /// 以 zlib 容器封装原始数据流。
+    /// </summary>
+    /// <param name="writeRaw">写入未压缩数据的回调</param>
+    /// <param name="output">输出流</param>
+    /// <param name="level">Deflate 压缩级别，默认 <see cref="CompressionLevel.Optimal"/></param>
+    public static void CompressRaw(Action<Stream> writeRaw, Stream output, CompressionLevel level = CompressionLevel.Optimal)
     {
         output.WriteByte(0x78);
         output.WriteByte(0x9C);
-        var ds = new DeflateStream(output, CompressionLevel.Optimal, true);
+        var ds = new DeflateStream(output, level, true);
         var ads = new Adler32Stream(ds);
         try
         {

@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using SharpImageConverter.Compression;
 using SharpImageConverter.Core;
 using SharpImageConverter.Processing;
 using SharpImageConverter.Formats.Gif;
@@ -65,6 +66,14 @@ class Program
         var swTotal = Stopwatch.StartNew();
         try
         {
+            if (options.Optimize)
+            {
+                RunOptimize(options, isDir);
+                swTotal.Stop();
+                Console.WriteLine($"⏱️ 总耗时: {swTotal.ElapsedMilliseconds} ms");
+                return;
+            }
+
             bool wroteFile = isDir ? ProcessDirectory(options) : Process(options);
             swTotal.Stop();
             if (wroteFile)
@@ -93,6 +102,116 @@ class Program
         Console.WriteLine("GIF 量化器: --gif-quantizer octree(默认,八叉树+Bayer) | wu/legacy(原 Wu+Floyd–Steinberg)");
         Console.WriteLine("GIF 抖动幅度: --gif-dither N (默认 8 = 一个量化步长; 调大会放大颗粒与缩放摩尔纹)");
         Console.WriteLine("文件夹选项: --recursive | --to bmp/png/jpg/webp | --parallel N | --skip-existing");
+        Console.WriteLine("智能压缩: --optimize [--opt-quality N] [--max-colors N] [--no-dither] [--opt-verbose] [--min-saving 百分比]");
+        Console.WriteLine("  说明: 在画质基本不变的前提下把 JPG/PNG/GIF/WEBP/BMP 压到最小，默认输出 <原名>.min.<原扩展名>");
+    }
+
+    /// <summary>
+    /// 智能压缩模式：保持原格式输出体积最小的版本。
+    /// </summary>
+    static void RunOptimize(CliOptions options, bool isDir)
+    {
+        var opt = BuildOptimizeOptions(options);
+
+        if (!isDir)
+        {
+            string output = options.OutputPath ?? ImageOptimizer.BuildOutputPath(options.InputPath);
+            var result = ImageOptimizer.Optimize(options.InputPath, output, opt);
+            PrintOptimizeResult(result);
+            options.OutputPath = output;
+            return;
+        }
+
+        string inputDir = options.InputPath;
+        string outDir = options.OutputPath ?? inputDir;
+        if (!Directory.Exists(outDir)) Directory.CreateDirectory(outDir);
+        var searchOption = options.Recursive ? SearchOption.AllDirectories : SearchOption.TopDirectoryOnly;
+        var exts = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { ".jpg", ".jpeg", ".png", ".bmp", ".webp", ".gif" };
+        var files = Directory.EnumerateFiles(inputDir, "*.*", searchOption).Where(f => exts.Contains(Path.GetExtension(f))).ToList();
+        int parallel = options.Parallelism.HasValue && options.Parallelism.Value > 0 ? options.Parallelism.Value : Environment.ProcessorCount;
+        long savedTotal = 0, beforeTotal = 0, afterTotal = 0;
+        int kept = 0;
+
+        Parallel.ForEach(files, new ParallelOptions { MaxDegreeOfParallelism = parallel }, file =>
+        {
+            try
+            {
+                string rel = Path.GetRelativePath(inputDir, file);
+                string targetDir = options.OutputPath != null
+                    ? Path.Combine(outDir, Path.GetDirectoryName(rel) ?? ".")
+                    : Path.GetDirectoryName(file) ?? ".";
+                Directory.CreateDirectory(targetDir);
+                string nameNoExt = Path.GetFileNameWithoutExtension(file);
+                string ext = Path.GetExtension(file);
+                // 指定输出目录时保持原文件名，否则在原目录生成 .min 副本
+                string target = Path.Combine(targetDir, options.OutputPath != null ? nameNoExt + ext : nameNoExt + ".min" + ext);
+                if (options.SkipExisting && File.Exists(target)) return;
+
+                var result = ImageOptimizer.Optimize(file, target, opt);
+                lock (files)
+                {
+                    beforeTotal += result.OriginalSize;
+                    afterTotal += result.OptimizedSize;
+                    savedTotal += result.SavedBytes;
+                    if (result.KeptOriginal) kept++;
+                }
+                PrintOptimizeResult(result);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"❌ {Path.GetFileName(file)}: {ex.GetType().Name}: {ex.Message}");
+            }
+        });
+
+        double ratio = beforeTotal > 0 ? (double)savedTotal / beforeTotal : 0;
+        Console.WriteLine($"✅ 智能压缩完成: {files.Count} 个文件，{FormatSize(beforeTotal)} → {FormatSize(afterTotal)}（省 {ratio:P1}）{(kept > 0 ? $"，{kept} 个无收益已保留原图" : "")}");
+        options.OutputPath = outDir;
+    }
+
+    /// <summary>
+    /// 把 CLI 选项映射为 <see cref="OptimizeOptions"/>。
+    /// </summary>
+    static OptimizeOptions BuildOptimizeOptions(CliOptions options)
+    {
+        var opt = new OptimizeOptions
+        {
+            StripMetadata = !options.KeepMetadata,
+            EnableDithering = options.Dithering && !options.NoDither,
+            Log = options.OptimizeVerbose ? Console.WriteLine : null,
+        };
+        if (options.OptimizeQuality.HasValue) opt.TargetQuality = options.OptimizeQuality.Value;
+        if (options.MaxColors.HasValue) opt.MaxColors = options.MaxColors.Value;
+        if (options.MinSaving.HasValue) opt.MinSavingRatio = options.MinSaving.Value / 100.0;
+        if (options.JpegQuality.HasValue) opt.JpegQuality = options.JpegQuality.Value;
+        return OptimizeOptions.Normalize(opt);
+    }
+
+    /// <summary>
+    /// 打印单个文件的压缩结果。
+    /// </summary>
+    static void PrintOptimizeResult(OptimizationResult result)
+    {
+        if (result.Reason != null)
+        {
+            Console.WriteLine($"⚠️ {Path.GetFileName(result.InputPath)}: 未压缩（{result.Reason}）");
+            return;
+        }
+        if (result.KeptOriginal)
+        {
+            Console.WriteLine($"➖ {Path.GetFileName(result.InputPath)}: 无收益，保留原图（{FormatSize(result.OriginalSize)}）");
+            return;
+        }
+        Console.WriteLine($"✅ {Path.GetFileName(result.InputPath)}: {FormatSize(result.OriginalSize)} → {FormatSize(result.OptimizedSize)}（省 {result.SavedRatio:P1}）| {result.Method} | {result.Quality}");
+    }
+
+    /// <summary>
+    /// 人类可读的体积表示。
+    /// </summary>
+    static string FormatSize(long bytes)
+    {
+        if (bytes < 1024) return $"{bytes} B";
+        if (bytes < 1024 * 1024) return $"{bytes / 1024.0:0.0} KB";
+        return $"{bytes / (1024.0 * 1024.0):0.00} MB";
     }
 
     static CliOptions ParseOptions(string[] args, string inputPath)
@@ -169,6 +288,36 @@ class Program
                     else if (v is "off" or "false" or "0") options.Dithering = false;
                     i++;
                 }
+                continue;
+            }
+            if (string.Equals(a, "--optimize", StringComparison.OrdinalIgnoreCase))
+            {
+                options.Optimize = true;
+                continue;
+            }
+            if (string.Equals(a, "--opt-verbose", StringComparison.OrdinalIgnoreCase))
+            {
+                options.OptimizeVerbose = true;
+                continue;
+            }
+            if (string.Equals(a, "--no-dither", StringComparison.OrdinalIgnoreCase))
+            {
+                options.NoDither = true;
+                continue;
+            }
+            if (TryParseNamedInt(args, ref i, "--opt-quality", out int? optQuality))
+            {
+                options.OptimizeQuality = optQuality;
+                continue;
+            }
+            if (TryParseNamedInt(args, ref i, "--max-colors", out int? maxColors))
+            {
+                options.MaxColors = maxColors;
+                continue;
+            }
+            if (TryParseNamedInt(args, ref i, "--min-saving", out int? minSaving))
+            {
+                options.MinSaving = minSaving;
                 continue;
             }
             if (string.Equals(a, "--gray", StringComparison.OrdinalIgnoreCase))
@@ -251,6 +400,31 @@ class Program
         return options;
     }
 
+    /// <summary>
+    /// 解析 "--name N" 或 "--name=N" 形式的整数选项，返回是否命中。
+    /// </summary>
+    static bool TryParseNamedInt(string[] args, ref int i, string name, out int? value)
+    {
+        value = null;
+        string a = args[i];
+        if (a.StartsWith(name + "=", StringComparison.OrdinalIgnoreCase))
+        {
+            string raw = a[(name.Length + 1)..].Trim();
+            if (int.TryParse(raw, out int parsed)) value = parsed;
+            return true;
+        }
+        if (string.Equals(a, name, StringComparison.OrdinalIgnoreCase))
+        {
+            if (i + 1 < args.Length && int.TryParse(args[i + 1], out int parsed))
+            {
+                value = parsed;
+                i++;
+            }
+            return true;
+        }
+        return false;
+    }
+
     static bool ProcessDirectory(CliOptions options)
     {
         string inputDir = options.InputPath;
@@ -316,7 +490,13 @@ class Program
             GifDebug = src.GifDebug,
             GifBench = src.GifBench,
             GifQuantizer = src.GifQuantizer,
-            GifDitherStrength = src.GifDitherStrength
+            GifDitherStrength = src.GifDitherStrength,
+            Optimize = src.Optimize,
+            OptimizeQuality = src.OptimizeQuality,
+            MaxColors = src.MaxColors,
+            NoDither = src.NoDither,
+            OptimizeVerbose = src.OptimizeVerbose,
+            MinSaving = src.MinSaving,
         };
         foreach (var op in src.Operations) dst.Operations.Add(op);
         return dst;
@@ -1157,5 +1337,11 @@ class Program
         public string? OutputExtension { get; set; }
         public int? Parallelism { get; set; }
         public bool SkipExisting { get; set; }
+        public bool Optimize { get; set; }
+        public int? OptimizeQuality { get; set; }
+        public int? MaxColors { get; set; }
+        public bool NoDither { get; set; }
+        public bool OptimizeVerbose { get; set; }
+        public int? MinSaving { get; set; }
     }
 }

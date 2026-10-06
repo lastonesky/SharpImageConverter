@@ -59,6 +59,15 @@ This library was originally created to address several practical issues we encou
 - `ImageFrame` as the intermediate structure for format conversion (currently `Rgb24`)
 - Always load as RGB, then encode according to output extension
 
+### Smart Lossy Compression (TinyPNG-style)
+- One API call / one flag shrinks JPG, PNG, GIF, WebP and BMP to the smallest size that still looks identical, keeping the original format
+- Quality is guarded by a **perceptual metric** (PSNR after 4×4 block averaging): it tolerates dithering grain but still catches real degradation
+- PNG: quantize to a ≤256-color palette (1 byte per pixel) + Floyd–Steinberg dithering; the color count is binary-searched against the quality bar, with a lossless truecolor rewrite as fallback
+- JPEG/WebP: binary-search the lowest encoding quality that still meets the bar; JPEG defaults to 4:2:0 and falls back to 4:4:4 when chroma detail demands it
+- GIF: share one global palette across frames and reduce colors; animations supported (except transparent ones)
+- BMP cannot be compressed, so it is converted to PNG
+- See [docs/Optimize.md](docs/Optimize.md)
+
 ## What's New
 
 - See [CHANGELOG](CHANGELOG.md) for recent updates.
@@ -163,6 +172,32 @@ new ImageFrame(image.Width, image.Height, image.Buffer).SaveAsPng(output);
 // new SharpImageConverter.Formats.PngEncoderAdapter().EncodeRgb24(output, image);
 ```
 
+- Smart lossy compression (TinyPNG-style, keeps the original format):
+
+```csharp
+using SharpImageConverter.Compression;
+
+// One-liner: writes "<name>.min.<ext>"
+var result = ImageOptimizer.Optimize("photo.png");
+Console.WriteLine(result);
+// photo.png: 845.4 KB → 450.6 KB（省 46.7%）| PNG 调色板 256 色 + 抖动 | PSNR 36.57dB / 感知 48.51dB
+
+// Explicit output path and preset
+ImageOptimizer.Optimize("photo.jpg", "photo.small.jpg", OptimizeOptions.Aggressive);
+
+// Fine-grained control
+var options = new OptimizeOptions
+{
+    TargetQuality = 92,     // 0-100, higher = more conservative
+    MaxColors = 128,        // PNG/GIF palette cap
+    EnableDithering = true,
+    StripMetadata = true,   // drop EXIF, keep ICC
+    MinSavingRatio = 0.05,  // keep the original unless it saves at least 5%
+};
+var r = ImageOptimizer.Optimize("banner.gif", "banner.min.gif", options);
+Console.WriteLine($"{r.SavedRatio:P1} / {r.Quality.PerceptualPsnr:F2} dB");
+```
+
 ## Command Line Interface (CLI)
 
 Located in the `Cli/` directory, providing convenient format conversion and simple processing capabilities.
@@ -199,6 +234,14 @@ Special cases:
 - `--stream` : Use streaming decode for JPEG to reduce memory usage; other formats fall back to normal decode
 - `--idct int|float` : Choose JPEG IDCT implementation (integer/float), applies to JPEG decoding only
 
+### Smart Compression Options (with `--optimize`)
+- `--opt-quality N` : target quality 0-100 (default 88). 95 ≈ conservative, 88 ≈ balanced, 75 ≈ aggressive
+- `--max-colors N` : PNG/GIF palette size cap (default 256)
+- `--no-dither` : disable Floyd–Steinberg dithering (smaller, but gradients may band)
+- `--min-saving N` : only accept the result if it saves at least N%
+- `--opt-verbose` : print size and quality of every candidate
+- `--keep-metadata` : keep metadata (by default EXIF is dropped, ICC is preserved)
+
 ### Folder Batch Conversion
 - Recursion: `--recursive` (traverse subdirectories)
 - Output format: `--to bmp|png|jpg|webp` or `--out-ext .bmp|.png|.jpg|.webp`
@@ -229,6 +272,15 @@ dotnet run -- d:\images d:\out --to bmp --parallel 8
 
 # Batch: skip existing files
 dotnet run -- d:\images d:\out --skip-existing
+
+# Smart compression: writes photo.min.png
+dotnet run -- photo.png --optimize
+
+# Smart compression: explicit output, aggressive preset, verbose candidates
+dotnet run -- photo.jpg photo.small.jpg --optimize --opt-quality 75 --opt-verbose
+
+# Smart compression: whole site
+dotnet run -- d:\site d:\site-min --optimize --recursive --parallel 8
 ```
 
 ## License
