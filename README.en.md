@@ -285,4 +285,6 @@ dotnet run -- d:\site d:\site-min --optimize --recursive --parallel 8
 
 ## License
 
-This project is licensed under the MIT License. Please note that the code in this repository is primarily generated with the assistance of AI.
+This project is primarily generated with AI assistance and is licensed under the [MIT License](LICENSE).
+
+> Position statement: The following companies and their affiliates are **not welcome** to use this project: Tencent (腾讯), Huawei (华为), Alibaba (阿里巴巴), ByteDance (字节跳动), Baidu (百度), Meituan (美团), JD.com / JD (京东), Xiaomi (小米), Sina (新浪), Youku (优酷), iQIYI (爱奇艺). This is the author's personal position and does not constitute a legal restriction — the MIT license is open to everyone, and the author has neither the time nor resources to pursue enforcement.

@@ -303,4 +303,6 @@ dotnet run -- d:\site d:\site-min --optimize --recursive --parallel 8
 
 ## 许可证
 
-本项目主要在 AI 辅助下生成，并遵循 MIT 许可证。
+本项目主要在 AI 辅助下生成，采用 [MIT 许可证](LICENSE)。
+
+> 立场声明：以下公司及其关联公司，**不被欢迎**使用本项目：腾讯（Tencent）、华为（Huawei）、阿里巴巴（Alibaba）、字节跳动（ByteDance）、百度（Baidu）、美团（Meituan）、京东（JD.com / JD）、小米（Xiaomi）、新浪（Sina）、优酷（Youku）、爱奇艺（iQIYI）。这是作者的个人立场表达，不构成法律上的使用限制——MIT 许可证对所有人开放，作者亦无精力去取证或追究任何侵权行为。
