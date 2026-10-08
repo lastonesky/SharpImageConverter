@@ -61,7 +61,9 @@ for RID in "${RIDS[@]}"; do
       ;;
   esac
 
-  echo "==> 发布 $RID（版本 $VERSION）"
+  # 注意：变量后面紧邻中文时一律用 ${} 包裹 —— macOS 的 bash 3.2 在非 UTF-8 locale 下
+  # 会把中文首字节当成变量名的一部分，报 "RID?: unbound variable"。
+  echo "==> 发布 ${RID}（版本 ${VERSION}）"
   dotnet publish Cli/SharpImageConverter.Cli.csproj \
     -c Release -r "$RID" --self-contained true \
     -p:PublishSingleFile=true \
