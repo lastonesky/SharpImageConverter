@@ -1,4 +1,21 @@
 ## 未发布
+### 工具
+- 新增 `tools/build-cli.sh`：构建 CLI 的单文件自包含可执行文件（含原生 WebP 库，使用者无需安装 .NET），
+  支持 win-x64 / linux-x64 / osx-arm64，产物落在 `.artifacts/release/` 并生成 `SHA256SUMS.txt`。
+  脚本放 `tools/` 根目录而非 `tools/release/`：`.gitignore` 的 `[Rr]elease/` 会匹配任意层级的 release 目录。
+  非 Windows 平台的 `tar.gz` 需显式写入可执行位（Windows 文件系统不保存该位）。
+
+### 文档
+- 新增 `docs/Release.md`：固化发版口径（版本号 → tag → GitHub Release → 资产清单 → NuGet 自动发布触发），
+  含逐步执行清单、回报格式与本机验证手段（win 直接跑、linux 走 WSL）；`docs/README.md` 索引同步更新，
+  `README.md` 的 CLI 章节补充预编译版本的下载入口。
+
+### 修复
+- 原生库选择由「宿主 OS」改为「按 RID」（`src/SharpImageConverter.csproj` 的 `_SicNativeRid`）：
+  此前在 Windows 上发布 linux-x64 会把 Windows 的 `libwebp.dll` 拷进 Linux 产物（反向同理）。
+  未指定 `RuntimeIdentifier` 时行为不变（仍按宿主 OS），因此本机开发/测试/AOT 无影响。
+- `Cli/SharpImageConverter.Cli.csproj` 不再重复拷贝 `../src/runtimes/**`：原先会把其他平台的原生库
+  （linux `.so` / osx `.dylib`）一并带进发布目录，并被单文件 exe 的原生库清单引用（产物已实测可跑）。
 
 ## 1.0.0（相对 v0.2.8）
 ### 规则

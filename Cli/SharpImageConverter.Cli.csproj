@@ -12,9 +12,7 @@
   <ItemGroup>
     <ProjectReference Include="..\\src\\SharpImageConverter.csproj" />
   </ItemGroup>
-  <ItemGroup>
-    <None Include="..\\src\\runtimes\\**\\*.*">
-      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-    </None>
-  </ItemGroup>
+  <!-- 原生 WebP 库由 src 项目按 RID（未指定 RID 时按宿主 OS）拷贝到输出根目录，
+       见 src/SharpImageConverter.csproj 的 _SicNativeRid。此处不再重复拷贝 runtimes/**，
+       否则会把其他平台的原生库塞进发布目录。 -->
 </Project>
