@@ -1,0 +1,136 @@
+name: release
+
+# 推送 v* tag → 全自动：三平台构建 CLI 资产（原生平台构建 + 冒烟测试）→ 打包 → 创建/更新 GitHub Release。
+# 手动触发 → 只接受一个「已存在的 tag」，构建结果写入 **草稿** Release（试跑/补发用，不会公开发布）。
+#
+# NuGet 包由 nuget-publish.yml 走 OIDC trusted publishing 推送，与本工作流互不依赖（同一次 tag、同一份源码）。
+# 发布口径见 docs/Release.md。
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "已存在的 tag（如 v1.0.1）"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  cli:
+    name: CLI ${{ matrix.rid }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # 每个平台都在**原生** runner 上构建：原生库按宿主 OS 选择即可正确，也才能做冒烟测试。
+        include:
+          - os: windows-latest
+            rid: win-x64
+          - os: ubuntu-latest
+            rid: linux-x64
+          - os: macos-latest
+            rid: osx-arm64
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: refs/tags/${{ inputs.tag || github.ref_name }}
+
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: 构建 ${{ matrix.rid }}
+        shell: bash
+        run: bash tools/build-cli.sh ${{ matrix.rid }}
+
+      - name: 冒烟测试（含原生 WebP 往返）
+        shell: bash
+        env:
+          RID: ${{ matrix.rid }}
+        run: |
+          set -euo pipefail
+          work=.artifacts/smoke
+          rm -rf "$work"; mkdir -p "$work"
+          if [ "$RID" = "win-x64" ]; then
+            bin=$(ls .artifacts/release/*-"$RID".exe)
+          else
+            tar xzf .artifacts/release/*-"$RID".tar.gz -C "$work"
+            bin=$work/SharpImageConverter.Cli
+            if [ "$RUNNER_OS" = "macOS" ]; then
+              # 未签名的 arm64 二进制会被系统直接杀掉，先做 ad-hoc 签名
+              codesign --force --sign - "$bin"
+            fi
+          fi
+          "$bin" examples/car.png "$work/a.webp"          # 编码：走原生 libwebp
+          "$bin" "$work/a.webp" "$work/b.png"             # 解码：走原生 libwebpdecoder
+          "$bin" examples/car.png "$work/c.jpg" --quality 85
+          for f in a.webp b.png c.jpg; do
+            if [ ! -s "$work/$f" ]; then
+              echo "::error::冒烟测试失败：$f 为空"
+              exit 1
+            fi
+          done
+          echo "冒烟测试通过："; ls -l "$work"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cli-${{ matrix.rid }}
+          path: .artifacts/release/SharpImageConverter.Cli-*
+          if-no-files-found: error
+
+  release:
+    name: 创建 / 更新 Release
+    needs: cli
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: refs/tags/${{ inputs.tag || github.ref_name }}
+
+      - uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: "10.0.x"
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: cli-*
+          merge-multiple: true
+          path: .artifacts/release
+
+      - name: 打包 NuGet（nupkg + snupkg）
+        run: dotnet pack src/SharpImageConverter.csproj -c Release -o .artifacts/release
+
+      - name: 生成 SHA256SUMS.txt
+        run: |
+          set -euo pipefail
+          cd .artifacts/release
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: 创建 / 更新 GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            echo "Release $TAG 已存在，覆盖上传资产"
+            gh release upload "$TAG" .artifacts/release/* --clobber --repo "$REPO"
+          else
+            # 手动触发一律先建草稿；tag 推送才直接公开发布
+            if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+              gh release create "$TAG" .artifacts/release/* \
+                --repo "$REPO" --title "$TAG" --verify-tag --generate-notes --draft
+            else
+              gh release create "$TAG" .artifacts/release/* \
+                --repo "$REPO" --title "$TAG" --verify-tag --generate-notes
+            fi
+          fi

@@ -1,6 +1,8 @@
 # Shell 脚本一律 LF：Windows 上 core.autocrlf=true 时不会被改写成 CRLF，
 # 否则 bash 会因行尾的 \r 报 "command not found" / "syntax error"。
 *.sh text eol=lf
+tools/*.sh text eol=lf
+*.yml text eol=lf
 
 # 其余文件交给 git 自动判断
 * text=auto
