@@ -57,7 +57,8 @@
 6. **Windows 文件系统不保存 Linux 可执行位**：打包 linux/osx 的 `tar.gz` 必须显式写入模式，否则用户解压后 `Permission denied`（`tools/build-cli.sh` 里用 GNU tar 的 `--mode`；macOS 的 BSD tar 不需要）。CI 在原生 Linux/macOS runner 上构建，天然没有这个问题。
 7. **原生 WebP 库按 RID 选择**：`src/SharpImageConverter.csproj` 的 `_SicNativeRid` 决定拷贝哪套原生库。指定 `RuntimeIdentifier` 时以 RID 为准（跨平台发布不会混入宿主平台的原生库）；未指定时按宿主 OS。CLI 项目不再重复拷贝 `runtimes/**`。
 8. **未签名的 arm64 二进制在 macOS 上会被直接杀掉**：冒烟测试里先做 `codesign --force --sign -` 再运行。
-9. **macOS arm64 runner 不可靠**：排队 15 分钟后会被 GitHub 直接取消。所以 osx-arm64 的**发布产物**走 Intel 交叉构建（必得），arm64 实机验证只作为可选手动步骤。
+9. **macOS 不可交叉构建、也不能用单文件**：webp dylib 带构建机 `@rpath` + 版本化依赖名，必须在 macOS 上用 `install_name_tool` 补 `@loader_path` 并 ad-hoc 签名，所以 osx-arm64 必须在 arm64 macOS runner 上构建、且产物是目录式。直接用 `-r osx-arm64` 在 Windows/Linux 上发布只会拷到宿主平台的原生库（实测：拿到的 `libwebp.dll`）。
+10. **macOS arm64 runner 不要用 `macos-latest`**：`macos-latest`=macos-26 arm64，实测排队超时被取消；用 `macos-15`（同为 arm64）。
 
 ## 五、自动化：`.github/workflows/release.yml`
 
@@ -66,17 +67,23 @@
 | 推送 `v*` tag | 构建三平台 CLI → 冒烟测试 → 打包 → **创建并公开发布** Release、上传资产 |
 | 手动 `workflow_dispatch`（输入一个已存在的 tag） | 同上，但创建的是**草稿** Release（试跑/补发用，不会公开） |
 
-矩阵（win/linux 在**原生** runner 上构建，这样原生库按宿主 OS 选择即可正确，也才能真跑冒烟测试）：
+矩阵（三个平台都在**原生** runner 上构建：win/linux 的原生库按宿主 OS 选择即可正确，osx-arm64 还必须在 macOS 上修 `@rpath` 并签名）：
 
-| RID | runner | 冒烟测试 |
-|---|---|---|
-| win-x64 | `windows-latest` | 实机：`PNG→WebP→PNG` + `PNG→JPEG` |
-| linux-x64 | `ubuntu-latest` | 实机：同上 |
-| osx-arm64 | `macos-15-intel`（交叉构建） | 静态校验（`file` 确认 arm64 + 原生库为 arm64） |
+| RID | runner | 产物形态 | 冒烟测试 |
+|---|---|---|---|
+| win-x64 | `windows-latest` | 单文件 `.exe` | 实机：`PNG→WebP→PNG` + `PNG→JPEG` |
+| linux-x64 | `ubuntu-latest` | 单文件（`tar.gz` 内含单个可执行文件） | 实机：同上 |
+| osx-arm64 | `macos-15`（arm64） | 目录式（`tar.gz` 内含同名目录） | 实机：同上 |
 
-**为什么 osx-arm64 走 Intel 交叉构建**：GitHub 的 macOS arm64 runner 容量紧张，实测排队 15 分钟后被直接取消（`The job was not acquired by Runner of type hosted even after multiple attempts`），不能当作发版的可靠前置。交叉构建能保证产出，且 `_SicNativeRid` 会正确地选 `runtimes/osx-arm64/native/*.dylib`（已确认这些库本身就是 arm64）。
+**osx-arm64 为什么是目录式而不是单文件**：仓库里的 webp dylib 带着构建机的 `@rpath`
+（`/Users/lastonesky/Project/libwebp/build`）与版本化依赖名（`@rpath/libsharpyuv.0.dylib`），
+在别的机器上依赖解析不了。修它必须用 macOS 上的 `install_name_tool`（补 `@loader_path` rpath、
+按依赖名提供副本）并对每个 dylib 做 ad-hoc 签名，而这些改动发生在 `dotnet publish` **之后**,
+无法再打进单文件包 —— 所以 macOS 改为目录式发布（原生库散落在可执行文件旁）。
 
-**需要 arm64 实机验证时**：发版后手动 dispatch 一次，工作流会额外跑一个 `osx-arm64 实机冒烟（可选）` 任务（`macos-15`，`continue-on-error: true`）——拿到 runner 就实机验证，拿不到也不影响发布。
+**runner 选择**：`macos-latest`（= macos-26 arm64）实测常排队 15 分钟后被 GitHub 直接取消
+（`The job was not acquired by Runner of type hosted`）；`macos-15` 同样也是 arm64，实测秒级拿到。
+若哪天真遇到排队被取消，重跑一次 workflow_dispatch 即可。
 
 手动触发命令（草稿 Release）：
 
@@ -92,32 +99,51 @@ gh workflow run release.yml --repo lastonesky/SharpImageConverter --ref master -
 | `SharpImageConverter.X.Y.Z.snupkg` | 同上（符号包） |
 | `SharpImageConverter.Cli-X.Y.Z-win-x64.exe` | 单文件自包含（原生库内嵌，运行时自解压），**无需安装 .NET** |
 | `SharpImageConverter.Cli-X.Y.Z-linux-x64.tar.gz` | 同上 |
-| `SharpImageConverter.Cli-X.Y.Z-osx-arm64.tar.gz` | 同上；由 Intel runner 交叉构建，CI 只做架构/原生库静态校验（若要 arm64 实机验证，发版后手动 dispatch 一次） |
+| `SharpImageConverter.Cli-X.Y.Z-osx-arm64.tar.gz` | 目录式发布（tar 内含同名目录，解压后跑目录里的 `SharpImageConverter.Cli`）；用 `macos-15`(arm64) 原生构建，已在实机冒烟测试通过 |
 | `SHA256SUMS.txt` | 覆盖以上全部资产 |
 
 本机构建 CLI 资产用同名脚本（版本号自动取自 csproj，产物落在被 gitignore 的 `.artifacts/release/`）：
 
 ```bash
 tools/build-cli.sh win-x64                       # 默认
-tools/build-cli.sh win-x64 linux-x64 osx-arm64   # 多平台，需在对应平台上各自构建
+tools/build-cli.sh win-x64 linux-x64             # 多平台
+tools/build-cli.sh osx-arm64                     # 必须在 macOS 上跑（否则脚本直接报错退出）
 ```
 
-发布参数：`-c Release -r <rid> --self-contained true -p:PublishSingleFile=true
+发布参数：win/linux 用 `-c Release -r <rid> --self-contained true -p:PublishSingleFile=true
 -p:IncludeNativeLibrariesForSelfExtract=true -p:EnableCompressionInSingleFile=true
--p:DebugType=none -p:GenerateDocumentationFile=false`。
+-p:DebugType=none -p:GenerateDocumentationFile=false`；macOS 用 `-p:PublishSingleFile=false`，
+外加 dylib 的 `install_name_tool` 修复与 ad-hoc 签名（详见脚本注释）。
 
-## 七、回报格式
+## 七、发布前验证
+
+CI 工作流对**三个平台都做实机冒烟测试**（同一份 `examples/car.png` 跑 `PNG→WebP`、`WebP→PNG`、`PNG→JPEG`，三个输出都必须非空），目的就是证明原生 libwebp 在该平台能真正加载。
+
+| RID | 验证方式 | 本机可行性 |
+|---|---|---|
+| win-x64 | 直接跑一次往返 | ✅ |
+| linux-x64 | WSL 里解包后跑同一套往返（`wsl.exe -e bash -lc '...'`） | ✅ |
+| osx-arm64 | 只能靠 CI 的 `macos-15`（arm64）runner 实机跑 | ❌ 本机（Windows）无法验证 |
+
+本地自测（win/linux）：
+
+```bash
+bash tools/build-cli.sh win-x64
+# 解包后跑 examples/car.png → a.webp → b.png，三个文件都要非空
+```
+
+## 八、回报格式
 
 每次发版我会回：
 
 - tag 与指向的 commit（两个远端各一行 `git ls-remote` 证据）
-- 两个工作流（`nuget-publish` / `release`）的运行链接与结论，以及每个平台的冒烟测试是否通过
+- 两个工作流（`nuget-publish` / `release`）的运行链接与结论，以及**每个平台的实机冒烟测试是否通过**（含 macOS Mach-O 架构确认）
 - GitHub Release URL + 资产清单（含大小、状态）
 - `SHA256SUMS.txt` 内容
 - nuget.org 版本页链接
 - 已知残留风险
 
-## 八、版本号规范
+## 九、版本号规范
 
 - 正式版：`<Version>X.Y.Z</Version>` + tag `vX.Y.Z`
 - 预发布：`<Version>X.Y.Z-preview.N</Version>` + tag `vX.Y.Z-preview.N`（历史沿用过 `0.1.4-preview`、`0.2.8` 这类写法；tag 带 `v`，版本号不带）
