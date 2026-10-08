@@ -1,21 +1,26 @@
 #!/usr/bin/env bash
-# 构建 CLI 的单文件自包含可执行文件（作为 GitHub Release 资产）。
+# 构建 CLI 的发布资产（用于 GitHub Release）。
 #
 # 用法：
 #   tools/build-cli.sh [rid ...]     # 默认 win-x64
 #   例如：tools/build-cli.sh win-x64 linux-x64 osx-arm64
 #
 # 产物（.artifacts/release/，已被 .gitignore 忽略）：
-#   SharpImageConverter.Cli-<version>-win-x64.exe
-#   SharpImageConverter.Cli-<version>-<rid>.tar.gz     （linux / osx）
+#   SharpImageConverter.Cli-<version>-win-x64.exe        单文件自包含
+#   SharpImageConverter.Cli-<version>-linux-x64.tar.gz   单文件自包含（tar 内含单个可执行文件）
+#   SharpImageConverter.Cli-<version>-osx-arm64.tar.gz   目录式（tar 内含同名目录）
 #   SHA256SUMS.txt
 #
-# 说明：
-# - 单文件 + 自包含（含 libwebp 等原生库，运行时自解压），使用者无需安装 .NET。
-# - 版本号取自 src/SharpImageConverter.csproj 的 <Version>，因此必须先改版本号再执行本脚本。
-# - 需在本机或 CI 的**对应平台**上构建（win 上建 win-x64、macOS 上建 osx-arm64），
-#   这样原生库按宿主 OS 也能正确选择；CI 侧对应 .github/workflows/release.yml。
-# - 脚本放 tools/ 根目录而非 tools/release/：.gitignore 的 `[Rr]elease/` 会匹配任意层级的 release 目录。
+# 两个平台差异的原因：
+# - win / linux：单文件 + 自包含（含原生 libwebp，运行时自解压），使用者无需安装 .NET。
+# - macOS：仓库里的 webp dylib 带着构建机的 @rpath（/Users/lastonesky/Project/libwebp/build）
+#   与版本化依赖名（@rpath/libsharpyuv.0.dylib 等），别的机器上解析不了依赖。修复必须用
+#   macOS 的 install_name_tool 在发布目录里改，因此 macOS 走**目录式**发布（原生库散落在
+#   可执行文件旁），并在构建机上补 @loader_path rpath、按依赖名提供副本、再做 ad-hoc 签名。
+#   ⇒ osx-arm64 必须在 macOS 上构建（CI 用 macos-15）。
+#
+# 版本号取自 src/SharpImageConverter.csproj 的 <Version>，因此必须先改版本号再执行本脚本。
+# CI 侧对应 .github/workflows/release.yml。
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -45,6 +50,27 @@ sha256() {
   fi
 }
 
+# 修好 macOS 原生库的依赖解析（见文件头说明）
+fix_macos_native_libs() {
+  local dir="$1"
+  cd "$dir"
+  local f
+  for f in libwebp.dylib libwebpdecoder.dylib libwebpmux.dylib libwebpdemux.dylib libsharpyuv.dylib; do
+    [ -f "$f" ] || continue
+    install_name_tool -add_rpath @loader_path "$f" 2>/dev/null || true
+  done
+  # 依赖声明用的是版本化名字（@rpath/libwebp.7.dylib 等），按这些名字提供副本
+  cp -f libwebp.dylib        libwebp.7.dylib
+  cp -f libsharpyuv.dylib    libsharpyuv.0.dylib
+  cp -f libwebpdecoder.dylib libwebpdecoder.3.dylib
+  cp -f libwebpmux.dylib     libwebpmux.3.dylib
+  cp -f libwebpdemux.dylib   libwebpdemux.2.dylib
+  # arm64 上所有可执行代码都必须有签名（ad-hoc 即可），否则 dlopen 会失败
+  for f in ./*.dylib; do codesign --force --sign - "$f" >/dev/null 2>&1 || true; done
+  codesign --force --sign - ./SharpImageConverter.Cli >/dev/null 2>&1 || true
+  cd - >/dev/null
+}
+
 STAGE="$ROOT/.artifacts/release/.stage"
 OUT="$ROOT/.artifacts/release"
 rm -rf "$STAGE"
@@ -61,31 +87,44 @@ for RID in "${RIDS[@]}"; do
       ;;
   esac
 
-  # 注意：变量后面紧邻中文时一律用 ${} 包裹 —— macOS 的 bash 3.2 在非 UTF-8 locale 下
-  # 会把中文首字节当成变量名的一部分，报 "RID?: unbound variable"。
-  echo "==> 发布 ${RID}（版本 ${VERSION}）"
-  dotnet publish Cli/SharpImageConverter.Cli.csproj \
-    -c Release -r "$RID" --self-contained true \
-    -p:PublishSingleFile=true \
-    -p:IncludeNativeLibrariesForSelfExtract=true \
-    -p:EnableCompressionInSingleFile=true \
-    -p:DebugType=none \
-    -p:GenerateDocumentationFile=false \
-    -o "$STAGE/$RID" >/dev/null
-
-  BIN="$STAGE/$RID/SharpImageConverter.Cli$EXT"
-  if [ ! -f "$BIN" ]; then
-    echo "错误：未找到产物 $BIN" >&2
+  if [ "$RID" = "osx-arm64" ] && [ "$(uname -s)" != "Darwin" ]; then
+    echo "错误：osx-arm64 必须在 macOS 上构建（原生库依赖需要用 install_name_tool 修复）" >&2
     exit 1
   fi
 
+  # 注意：变量后面紧邻中文时一律用 ${} 包裹 —— macOS 的 bash 3.2 在非 UTF-8 locale 下
+  # 会把中文首字节当成变量名的一部分，报 "RID?: unbound variable"。
+  echo "==> 发布 ${RID}（版本 ${VERSION}）"
   NAME="SharpImageConverter.Cli-$VERSION-$RID"
-  if [ "$EXT" = ".exe" ]; then
-    cp "$BIN" "$OUT/$NAME.exe"
+
+  if [ "$RID" = "osx-arm64" ]; then
+    dotnet publish Cli/SharpImageConverter.Cli.csproj \
+      -c Release -r "$RID" --self-contained true \
+      -p:PublishSingleFile=false \
+      -p:DebugType=none \
+      -p:GenerateDocumentationFile=false \
+      -o "$STAGE/$NAME" >/dev/null
+    fix_macos_native_libs "$STAGE/$NAME"
+    # shellcheck disable=SC2086
+    tar $TAR_EXTRA -czf "$OUT/$NAME.tar.gz" -C "$STAGE" "$NAME"
   else
-    # shellcheck disable=SC2086  # TAR_EXTRA 需要按空格拆成多个参数
-    tar $TAR_EXTRA -czf "$OUT/$NAME.tar.gz" -C "$STAGE/$RID" "SharpImageConverter.Cli"
+    dotnet publish Cli/SharpImageConverter.Cli.csproj \
+      -c Release -r "$RID" --self-contained true \
+      -p:PublishSingleFile=true \
+      -p:IncludeNativeLibrariesForSelfExtract=true \
+      -p:EnableCompressionInSingleFile=true \
+      -p:DebugType=none \
+      -p:GenerateDocumentationFile=false \
+      -o "$STAGE/$RID" >/dev/null
+
+    BIN="$STAGE/$RID/SharpImageConverter.Cli$EXT"
+    if [ ! -f "$BIN" ]; then
+      echo "错误：未找到产物 $BIN" >&2
+      exit 1
+    fi
+    cp "$BIN" "$OUT/$NAME$EXT"
   fi
+
   echo "    -> $(ls -1 "$OUT/$NAME"* | tr '\n' ' ')"
 done
 
