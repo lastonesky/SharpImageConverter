@@ -1,8 +1,7 @@
 name: release
 
-# 推送 v* tag → 全自动：三平台构建 CLI 资产 → 打包 → 创建/更新 GitHub Release。
-# 手动触发 → 只接受一个「已存在的 tag」，构建结果写入 **草稿** Release（试跑/补发用，不会公开发布）；
-#          同时会额外尝试 macOS arm64 实机冒烟测试。
+# 推送 v* tag → 全自动：三平台构建 CLI 资产（各自实机冒烟）→ 打包 → 创建/更新 GitHub Release。
+# 手动触发 → 只接受一个「已存在的 tag」，且只写 **草稿** Release（试跑/补发不会公开发布）。
 #
 # NuGet 包由 nuget-publish.yml 走 OIDC trusted publishing 推送，与本工作流互不依赖（同一次 tag、同一份源码）。
 # 发布口径见 docs/Release.md。
@@ -30,20 +29,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # win / linux 在原生 runner 上构建并实机冒烟。
-        # osx-arm64 用 Intel runner 交叉构建：GitHub 的 macOS arm64 runner 容量紧张，
-        # 排队 15 分钟后会被直接取消（"job was not acquired by Runner"），无法作为发版的可靠前置。
-        # 交叉构建产物由下面的 osx-arm64-native-smoke（手动触发时）做实机验证。
+        # 三个平台都在原生 runner 上构建：win/linux 的原生库按宿主 OS 选择即可正确，
+        # osx-arm64 还必须用 install_name_tool 修 @rpath 并做 ad-hoc 签名（见 tools/build-cli.sh）。
         include:
           - os: windows-latest
             rid: win-x64
-            smoke: run
           - os: ubuntu-latest
             rid: linux-x64
-            smoke: run
-          - os: macos-15-intel
+          # 用 macos-15（arm64）而不是 macos-latest：macos-26 的 arm64 池常排队超时被取消
+          - os: macos-15
             rid: osx-arm64
-            smoke: static
     steps:
       - uses: actions/checkout@v5
         with:
@@ -58,7 +53,6 @@ jobs:
         run: bash tools/build-cli.sh ${{ matrix.rid }}
 
       - name: 冒烟测试（实机：PNG→WebP→PNG + JPEG）
-        if: matrix.smoke == 'run'
         shell: bash
         env:
           RID: ${{ matrix.rid }}
@@ -70,8 +64,19 @@ jobs:
             bin=$(ls .artifacts/release/*-"$RID".exe)
           else
             tar xzf .artifacts/release/*-"$RID".tar.gz -C "$work"
-            bin=$work/SharpImageConverter.Cli
+            bin=$(find "$work" -type f -name 'SharpImageConverter.Cli' | head -1)
+            chmod +x "$bin"
           fi
+          [ -n "$bin" ] || { echo "::error::未找到可执行文件"; exit 1; }
+          file "$bin"
+
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            # macOS 走目录式发布：确认修好的 @rpath 依赖副本确实在二进制旁边
+            d=$(dirname "$bin")
+            ls "$d" | grep -q 'libwebp\.7\.dylib' || { echo "::error::缺少 libwebp.7.dylib"; exit 1; }
+            ls "$d" | grep -q 'libsharpyuv\.0\.dylib' || { echo "::error::缺少 libsharpyuv.0.dylib"; exit 1; }
+          fi
+
           "$bin" examples/car.png "$work/a.webp"          # 编码：走原生 libwebp
           "$bin" "$work/a.webp" "$work/b.png"             # 解码：走原生 libwebpdecoder
           "$bin" examples/car.png "$work/c.jpg" --quality 85
@@ -81,61 +86,13 @@ jobs:
               exit 1
             fi
           done
-          echo "冒烟测试通过："; ls -l "$work"
-
-      - name: 静态校验（交叉构建：架构与原生库）
-        if: matrix.smoke == 'static'
-        shell: bash
-        env:
-          RID: ${{ matrix.rid }}
-        run: |
-          set -euo pipefail
-          work=.artifacts/smoke
-          rm -rf "$work"; mkdir -p "$work"
-          tar xzf .artifacts/release/*-"$RID".tar.gz -C "$work"
-          bin=$work/SharpImageConverter.Cli
-          file "$bin"
-          file "$bin" | grep -q 'arm64' || { echo "::error::产物不是 arm64：$(file "$bin")"; exit 1; }
-          # 交叉构建无法实机运行，至少确认原生库确实是 arm64 且被打进了 tar
-          echo "仓库内 osx-arm64 原生库架构："
-          file src/runtimes/osx-arm64/native/*.dylib | sed 's/^.*native\///'
-          file src/runtimes/osx-arm64/native/*.dylib | grep -q 'arm64' || { echo "::error::原生库不是 arm64"; exit 1; }
+          echo "冒烟测试通过："; ls -l "$work/a.webp" "$work/b.png" "$work/c.jpg"
 
       - uses: actions/upload-artifact@v4
         with:
           name: cli-${{ matrix.rid }}
           path: .artifacts/release/SharpImageConverter.Cli-*
           if-no-files-found: error
-
-  # 可选的实机验证：只在手动触发时尝试（arm64 runner 排队失败也不影响发布）
-  osx-arm64-native-smoke:
-    name: osx-arm64 实机冒烟（可选）
-    if: github.event_name == 'workflow_dispatch' && needs.cli.result == 'success'
-    needs: cli
-    continue-on-error: true
-    runs-on: macos-15
-    steps:
-      - uses: actions/checkout@v5
-        with:
-          ref: refs/tags/${{ inputs.tag || github.ref_name }}
-      - uses: actions/download-artifact@v4
-        with:
-          name: cli-osx-arm64
-          path: .artifacts/dl
-      - name: 解包 + 实机冒烟
-        shell: bash
-        run: |
-          set -euo pipefail
-          work=.artifacts/smoke
-          rm -rf "$work"; mkdir -p "$work"
-          tar xzf .artifacts/dl/*-osx-arm64.tar.gz -C "$work"
-          file "$work/SharpImageConverter.Cli"
-          codesign --force --sign - "$work/SharpImageConverter.Cli"   # 未签名的 arm64 二进制会被系统杀掉
-          cd "$work"
-          ./SharpImageConverter.Cli ../../examples/car.png a.webp
-          ./SharpImageConverter.Cli a.webp b.png
-          ./SharpImageConverter.Cli ../../examples/car.png c.jpg --quality 85
-          ls -l a.webp b.png c.jpg
 
   release:
     name: 创建 / 更新 Release
