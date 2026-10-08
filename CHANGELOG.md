@@ -1,10 +1,11 @@
 ## 未发布
 ### 工具
-- 新增 `.github/workflows/release.yml`：推送 `v*` tag 即自动在**原生** runner 上构建 win-x64 / linux-x64 / osx-arm64
-  三套 CLI 单文件资产（每套都跑 `PNG→WebP→PNG` + `PNG→JPEG` 冒烟测试，用于证明原生 libwebp 能加载）、
-  打包 nupkg/snupkg、生成 `SHA256SUMS.txt` 并创建/更新 GitHub Release。手动 `workflow_dispatch`
-  只接受一个已存在的 tag 且只写**草稿** Release（试跑/补发不会公开发布）。
-  macos runner 上先做 `codesign --sign -` 再跑（未签名的 arm64 二进制会被系统直接杀掉）。
+- 新增 `.github/workflows/release.yml`：推送 `v*` tag 即自动构建 win-x64 / linux-x64 / osx-arm64
+  三套 CLI 单文件资产、打包 nupkg/snupkg、生成 `SHA256SUMS.txt` 并创建/更新 GitHub Release。
+  win/linux 在原生 runner 上构建并实机冒烟（`PNG→WebP→PNG` + `PNG→JPEG`，用于证明原生 libwebp 能加载）；
+  **osx-arm64 走 `macos-15-intel` 交叉构建**（GitHub 的 macOS arm64 runner 容量紧张，实测排队 15 分钟后被取消，
+  不能作为发版前置），CI 做架构静态校验；需要 arm64 实机验证时手动 dispatch，会额外尝试原生冒烟。
+  手动 `workflow_dispatch` 只接受一个已存在的 tag 且只写**草稿** Release（试跑/补发不会公开发布）。
   （`.github/` 在 `.gitignore` 中，新增 workflow 需 `git add -f`。）
 - 新增 `tools/build-cli.sh`：构建 CLI 的单文件自包含可执行文件（含原生 WebP 库，使用者无需安装 .NET），
   支持 win-x64 / linux-x64 / osx-arm64，产物落在 `.artifacts/release/` 并生成 `SHA256SUMS.txt`。
