@@ -12,11 +12,10 @@
 
 可选补充：
 
-- `发版 1.0.1，带 linux` —— 连 linux-x64 CLI 资产一起发
 - `发版 1.0.1-rc.1` —— 预发布版本
 - `只打 tag 不发 NuGet` —— 极少用，仅在你明确要求时
 
-我会按下面的《执行清单》做完所有动作，并按《回报格式》汇报。**你只需要提供目标版本号。**
+我会按下面的《执行清单》做完前置动作（改版本号、提交、打 tag、推送），**Release 本身由 GitHub Actions 自动生成**，之后我盯 CI 并回报。
 版本号不合法（不是 `X.Y.Z` / 该版本已被 NuGet 占用 / 工作树不干净）我会先停下来问，不会擅自换号。
 
 ## 二、唯一事实来源
@@ -26,7 +25,7 @@
 | 包版本 | `src/SharpImageConverter.csproj` 的 `<Version>` | 三段式 `X.Y.Z`（NuGet 不接受 `1.0` 这种两段式） |
 | git tag | `vX.Y.Z` | 与 `<Version>` 一一对应，附注 tag |
 | NuGet 发布 | `.github/workflows/nuget-publish.yml` | 推 tag 自动触发（OIDC trusted publishing），**不要手动 `dotnet nuget push`** |
-| GitHub Release | 由我创建 | 资产见第五节 |
+| GitHub Release | `.github/workflows/release.yml` | 推 tag 自动触发：三平台构建 CLI 资产 + 打包 + 创建 Release + 上传 |
 
 ## 三、执行清单（收到「发版 X.Y.Z」后）
 
@@ -34,13 +33,15 @@
 1. **改版本号**：`src/SharpImageConverter.csproj` → `<Version>X.Y.Z</Version>`
 2. **改 CHANGELOG**：把顶部 `## 未发布` 落成 `## X.Y.Z（相对 v<上一版>）`，并在最上面补一个空的 `## 未发布`
 3. **提交并推 master**：`chore(release): bump version to X.Y.Z` → gitee + github
-4. **打 tag 并推**：`vX.Y.Z` 推到两个远端（推 github 即触发 NuGet 自动发布）
-5. **构建 CLI 资产**：`tools/build-cli.sh win-x64`（需要时追加 `linux-x64`）
-6. **取回 NuGet 上的同一份包**：从 `www.nuget.org` 下载 CI 刚发布的 nupkg/snupkg，保证 Release 资产与已发布包一致；连同 CLI 资产生成 `SHA256SUMS.txt`
-7. **创建 Release**：`gh release create vX.Y.Z`，写入人话版说明 + 上传全部资产
-8. 确认 CI（nuget-publish）运行成功、Release 不是 Draft
+4. **打 tag 并推**：`vX.Y.Z` 推到两个远端。推 github 后同时触发两个工作流：
+   - `nuget-publish` → 测试 + 打包 + 推 NuGet.org
+   - `release` → win-x64 / linux-x64 / osx-arm64 三平台构建 CLI（各带冒烟测试）+ 打包 + 创建 Release + 上传资产
+5. **盯 CI 并核验**：两个工作流都 success；Release 不是 Draft；资产齐全、`SHA256SUMS.txt` 覆盖全部资产
+6. **回报**（格式见第七节）
 
 **顺序很重要**：先改版本号再打 tag。反过来做会踩第四节坑 1。
+
+**注意**：Release 现在由工作流自动创建，所以「版本号写错就发错」的代价变高了 —— 推 tag 之前一定先确认 csproj 里的版本号。
 
 ## 四、必须避开的坑（都是踩过的）
 
@@ -53,50 +54,65 @@
 3. **`api.nuget.org` 的 flatcontainer 索引在国内可能命中滞后镜像**（会被 302 到 `nuget.azure.cn`，看不到刚发布的版本）。判断版本是否存在请用上面的 `www.nuget.org/api/v2/package/...`。
 4. **`.github/` 被 `.gitignore` 忽略**（见 `.gitignore` 末尾）：新增或修改 workflow 必须 `git add -f`。
 5. **NuGet 认证是 OIDC trusted publishing**（`NuGet/login@v1` + `id-token: write` + environment `production`），不要改成长期 API Key。
-6. **Windows 文件系统不保存 Linux 可执行位**：打包 linux/osx 的 `tar.gz` 必须显式 `--mode`，否则用户解压后 `Permission denied`（脚本已处理）。
+6. **Windows 文件系统不保存 Linux 可执行位**：打包 linux/osx 的 `tar.gz` 必须显式写入模式，否则用户解压后 `Permission denied`（`tools/build-cli.sh` 里用 GNU tar 的 `--mode`；macOS 的 BSD tar 不需要）。CI 在原生 Linux/macOS runner 上构建，天然没有这个问题。
 7. **原生 WebP 库按 RID 选择**：`src/SharpImageConverter.csproj` 的 `_SicNativeRid` 决定拷贝哪套原生库。指定 `RuntimeIdentifier` 时以 RID 为准（跨平台发布不会混入宿主平台的原生库）；未指定时按宿主 OS。CLI 项目不再重复拷贝 `runtimes/**`。
+8. **未签名的 arm64 二进制在 macOS 上会被直接杀掉**：CI 的冒烟测试里先做 `codesign --force --sign -` 再运行。
 
-## 五、Release 资产约定
+## 五、自动化：`.github/workflows/release.yml`
+
+| 触发方式 | 行为 |
+|---|---|
+| 推送 `v*` tag | 构建三平台 CLI → 冒烟测试 → 打包 → **创建并公开发布** Release、上传资产 |
+| 手动 `workflow_dispatch`（输入一个已存在的 tag） | 同上，但创建的是**草稿** Release（试跑/补发用，不会公开） |
+
+矩阵（一律在**原生** runner 上构建，这样原生库按宿主 OS 选择即可正确，也才能真跑冒烟测试）：
+
+| RID | runner | 产物 |
+|---|---|---|
+| win-x64 | `windows-latest` | `.exe` |
+| linux-x64 | `ubuntu-latest` | `.tar.gz` |
+| osx-arm64 | `macos-latest` | `.tar.gz` |
+
+冒烟测试（每个平台都跑，用仓库里已跟踪的 `examples/car.png`）：`PNG→WebP`、`WebP→PNG`、`PNG→JPEG`，三者输出都必须非空 —— **主要用来证明原生 libwebp 在该平台能加载**。
+
+手动触发命令（草稿 Release）：
+
+```bash
+gh workflow run release.yml --repo lastonesky/SharpImageConverter --ref master -f tag=v1.0.1
+```
+
+## 六、Release 资产约定
 
 | 资产 | 说明 |
 |---|---|
-| `SharpImageConverter.X.Y.Z.nupkg` | 与 nuget.org 上 CI 构建的**同一份**（从 nuget.org 下载后上传） |
+| `SharpImageConverter.X.Y.Z.nupkg` | 由 `release` 工作流从**该 tag 的源码**打包上传；`nuget-publish` 工作流也把同版本推到了 nuget.org。同源同版本，但不保证逐字节相同（两者打包环境不同），以 nuget.org 上的为权威。 |
 | `SharpImageConverter.X.Y.Z.snupkg` | 同上（符号包） |
 | `SharpImageConverter.Cli-X.Y.Z-win-x64.exe` | 单文件自包含（原生库内嵌，运行时自解压），**无需安装 .NET** |
 | `SharpImageConverter.Cli-X.Y.Z-linux-x64.tar.gz` | 同上 |
+| `SharpImageConverter.Cli-X.Y.Z-osx-arm64.tar.gz` | 同上 |
 | `SHA256SUMS.txt` | 覆盖以上全部资产 |
 
-CLI 资产由 `tools/build-cli.sh` 生成（版本号自动取自 csproj，产物落在被 gitignore 的 `.artifacts/release/`）：
+本机构建 CLI 资产用同名脚本（版本号自动取自 csproj，产物落在被 gitignore 的 `.artifacts/release/`）：
 
 ```bash
-tools/build-cli.sh win-x64                     # 默认
-tools/build-cli.sh win-x64 linux-x64           # 多平台
+tools/build-cli.sh win-x64                       # 默认
+tools/build-cli.sh win-x64 linux-x64 osx-arm64   # 多平台，需在对应平台上各自构建
 ```
 
 发布参数：`-c Release -r <rid> --self-contained true -p:PublishSingleFile=true
 -p:IncludeNativeLibrariesForSelfExtract=true -p:EnableCompressionInSingleFile=true
 -p:DebugType=none -p:GenerateDocumentationFile=false`。
 
-## 六、发布前验证（必做）
-
-| RID | 验证方式 | 本机可行性 |
-|---|---|---|
-| win-x64 | 直接跑一次 `PNG→WebP→PNG` 往返（覆盖原生 libwebp）+ `PNG→JPEG` | ✅ |
-| linux-x64 | WSL 里解包后跑同一套往返：`wsl.exe -e bash -lc '...'` | ✅ |
-| osx-arm64 | 需在 macOS 上实测 | ❌ 未纳入默认资产 |
-
-**osx-arm64 是脚本支持的第三个 RID，但在本机无法验证运行**，因此默认不发。需要在 macOS 上实测通过（尤其是原生 libwebp 能否加载）后，再把它加进发版参数。
-
 ## 七、回报格式
 
 每次发版我会回：
 
 - tag 与指向的 commit（两个远端各一行 `git ls-remote` 证据）
-- 两个远端的 CI 运行链接（nuget-publish 状态）
+- 两个工作流（`nuget-publish` / `release`）的运行链接与结论，以及每个平台的冒烟测试是否通过
 - GitHub Release URL + 资产清单（含大小、状态）
 - `SHA256SUMS.txt` 内容
 - nuget.org 版本页链接
-- 已知残留风险（例如「osx 未验证」「某平台未发」）
+- 已知残留风险
 
 ## 八、版本号规范
 

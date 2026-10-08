@@ -1,14 +1,21 @@
 ## 未发布
 ### 工具
+- 新增 `.github/workflows/release.yml`：推送 `v*` tag 即自动在**原生** runner 上构建 win-x64 / linux-x64 / osx-arm64
+  三套 CLI 单文件资产（每套都跑 `PNG→WebP→PNG` + `PNG→JPEG` 冒烟测试，用于证明原生 libwebp 能加载）、
+  打包 nupkg/snupkg、生成 `SHA256SUMS.txt` 并创建/更新 GitHub Release。手动 `workflow_dispatch`
+  只接受一个已存在的 tag 且只写**草稿** Release（试跑/补发不会公开发布）。
+  macos runner 上先做 `codesign --sign -` 再跑（未签名的 arm64 二进制会被系统直接杀掉）。
+  （`.github/` 在 `.gitignore` 中，新增 workflow 需 `git add -f`。）
 - 新增 `tools/build-cli.sh`：构建 CLI 的单文件自包含可执行文件（含原生 WebP 库，使用者无需安装 .NET），
   支持 win-x64 / linux-x64 / osx-arm64，产物落在 `.artifacts/release/` 并生成 `SHA256SUMS.txt`。
   脚本放 `tools/` 根目录而非 `tools/release/`：`.gitignore` 的 `[Rr]elease/` 会匹配任意层级的 release 目录。
-  非 Windows 平台的 `tar.gz` 需显式写入可执行位（Windows 文件系统不保存该位）。
+  已做跨平台适配：GNU tar 才加 `--mode` 强制可执行位（BSD tar/macOS 不需要），校验和优先 `sha256sum`、
+  缺省回退 `shasum -a 256`。
 
 ### 文档
 - 新增 `docs/Release.md`：固化发版口径（版本号 → tag → GitHub Release → 资产清单 → NuGet 自动发布触发），
-  含逐步执行清单、回报格式与本机验证手段（win 直接跑、linux 走 WSL）；`docs/README.md` 索引同步更新，
-  `README.md` 的 CLI 章节补充预编译版本的下载入口。
+  含逐步执行清单、回报格式与本机验证手段（win 直接跑、linux 走 WSL、osx-arm64 由 CI 的 macos runner 验证）；
+  `docs/README.md` 索引同步更新，`README.md` 的 CLI 章节补充预编译版本的下载入口。
 
 ### 修复
 - 原生库选择由「宿主 OS」改为「按 RID」（`src/SharpImageConverter.csproj` 的 `_SicNativeRid`）：
