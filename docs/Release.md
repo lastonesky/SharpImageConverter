@@ -56,7 +56,8 @@
 5. **NuGet 认证是 OIDC trusted publishing**（`NuGet/login@v1` + `id-token: write` + environment `production`），不要改成长期 API Key。
 6. **Windows 文件系统不保存 Linux 可执行位**：打包 linux/osx 的 `tar.gz` 必须显式写入模式，否则用户解压后 `Permission denied`（`tools/build-cli.sh` 里用 GNU tar 的 `--mode`；macOS 的 BSD tar 不需要）。CI 在原生 Linux/macOS runner 上构建，天然没有这个问题。
 7. **原生 WebP 库按 RID 选择**：`src/SharpImageConverter.csproj` 的 `_SicNativeRid` 决定拷贝哪套原生库。指定 `RuntimeIdentifier` 时以 RID 为准（跨平台发布不会混入宿主平台的原生库）；未指定时按宿主 OS。CLI 项目不再重复拷贝 `runtimes/**`。
-8. **未签名的 arm64 二进制在 macOS 上会被直接杀掉**：CI 的冒烟测试里先做 `codesign --force --sign -` 再运行。
+8. **未签名的 arm64 二进制在 macOS 上会被直接杀掉**：冒烟测试里先做 `codesign --force --sign -` 再运行。
+9. **macOS arm64 runner 不可靠**：排队 15 分钟后会被 GitHub 直接取消。所以 osx-arm64 的**发布产物**走 Intel 交叉构建（必得），arm64 实机验证只作为可选手动步骤。
 
 ## 五、自动化：`.github/workflows/release.yml`
 
@@ -65,15 +66,17 @@
 | 推送 `v*` tag | 构建三平台 CLI → 冒烟测试 → 打包 → **创建并公开发布** Release、上传资产 |
 | 手动 `workflow_dispatch`（输入一个已存在的 tag） | 同上，但创建的是**草稿** Release（试跑/补发用，不会公开） |
 
-矩阵（一律在**原生** runner 上构建，这样原生库按宿主 OS 选择即可正确，也才能真跑冒烟测试）：
+矩阵（win/linux 在**原生** runner 上构建，这样原生库按宿主 OS 选择即可正确，也才能真跑冒烟测试）：
 
-| RID | runner | 产物 |
+| RID | runner | 冒烟测试 |
 |---|---|---|
-| win-x64 | `windows-latest` | `.exe` |
-| linux-x64 | `ubuntu-latest` | `.tar.gz` |
-| osx-arm64 | `macos-latest` | `.tar.gz` |
+| win-x64 | `windows-latest` | 实机：`PNG→WebP→PNG` + `PNG→JPEG` |
+| linux-x64 | `ubuntu-latest` | 实机：同上 |
+| osx-arm64 | `macos-15-intel`（交叉构建） | 静态校验（`file` 确认 arm64 + 原生库为 arm64） |
 
-冒烟测试（每个平台都跑，用仓库里已跟踪的 `examples/car.png`）：`PNG→WebP`、`WebP→PNG`、`PNG→JPEG`，三者输出都必须非空 —— **主要用来证明原生 libwebp 在该平台能加载**。
+**为什么 osx-arm64 走 Intel 交叉构建**：GitHub 的 macOS arm64 runner 容量紧张，实测排队 15 分钟后被直接取消（`The job was not acquired by Runner of type hosted even after multiple attempts`），不能当作发版的可靠前置。交叉构建能保证产出，且 `_SicNativeRid` 会正确地选 `runtimes/osx-arm64/native/*.dylib`（已确认这些库本身就是 arm64）。
+
+**需要 arm64 实机验证时**：发版后手动 dispatch 一次，工作流会额外跑一个 `osx-arm64 实机冒烟（可选）` 任务（`macos-15`，`continue-on-error: true`）——拿到 runner 就实机验证，拿不到也不影响发布。
 
 手动触发命令（草稿 Release）：
 
@@ -89,7 +92,7 @@ gh workflow run release.yml --repo lastonesky/SharpImageConverter --ref master -
 | `SharpImageConverter.X.Y.Z.snupkg` | 同上（符号包） |
 | `SharpImageConverter.Cli-X.Y.Z-win-x64.exe` | 单文件自包含（原生库内嵌，运行时自解压），**无需安装 .NET** |
 | `SharpImageConverter.Cli-X.Y.Z-linux-x64.tar.gz` | 同上 |
-| `SharpImageConverter.Cli-X.Y.Z-osx-arm64.tar.gz` | 同上 |
+| `SharpImageConverter.Cli-X.Y.Z-osx-arm64.tar.gz` | 同上；由 Intel runner 交叉构建，CI 只做架构/原生库静态校验（若要 arm64 实机验证，发版后手动 dispatch 一次） |
 | `SHA256SUMS.txt` | 覆盖以上全部资产 |
 
 本机构建 CLI 资产用同名脚本（版本号自动取自 csproj，产物落在被 gitignore 的 `.artifacts/release/`）：
