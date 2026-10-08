@@ -310,8 +310,12 @@ namespace Jpeg2Bmp.Tests
         [Fact]
         public void SimdPath_IsAvailable_OnThisMachine()
         {
-            // 若平台不支持，上面的测试只会覆盖标量回退，这里显式提示避免"SIMD 分支从未执行"
-            Assert.True(Ssse3.IsSupported && Sse41.IsSupported, "当前 CPU 不支持 SSSE3/SSE4.1，SIMD 分支未被覆盖");
+            // 若平台不支持，上面的测试只会覆盖标量回退，这里显式提示避免"SIMD 分支从未执行"。
+            // x86 走 SSSE3+SSE4.1；arm64 对应能力由 NEON（AdvSimd.Arm64）提供。
+            Assert.True(
+                (Ssse3.IsSupported && Sse41.IsSupported) ||
+                System.Runtime.Intrinsics.Arm.AdvSimd.Arm64.IsSupported,
+                "当前 CPU 不支持 SSSE3/SSE4.1 且无 NEON，SIMD 分支未被覆盖");
         }
 
         public static TheoryData<int, int, int, int> SizeCases =>

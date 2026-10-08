@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.IO;
 using SharpImageConverter;
 using SharpImageConverter.Formats.Jpeg;
@@ -224,7 +224,9 @@ namespace Jpeg2Bmp.Tests
             }
             finally
             {
-                SimdJpegEncodePipeline.ColorSupported = System.Runtime.Intrinsics.X86.Ssse3.IsSupported;
+                // 恢复到当前平台的原生默认值，而不是写死 x86 的 Ssse3.IsSupported
+                // （否则在 arm64 上会把 SIMD 色彩路径永久关掉）。
+                SimdJpegEncodePipeline.ResetSupportDefaults();
             }
             SimdJpegEncodePipeline.RgbToYCbCr444(buf, w, 0, 0, yv, cbv, crv);
             Assert.Equal(ys, yv);
@@ -244,8 +246,7 @@ namespace Jpeg2Bmp.Tests
             }
             finally
             {
-                SimdJpegEncodePipeline.ColorSupported = System.Runtime.Intrinsics.X86.Ssse3.IsSupported;
-                SimdJpegEncodePipeline.FdctSupported = System.Runtime.Intrinsics.X86.Sse2.IsSupported;
+                SimdJpegEncodePipeline.ResetSupportDefaults();
             }
         }
 

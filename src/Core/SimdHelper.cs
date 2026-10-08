@@ -121,10 +121,9 @@ internal static class SimdHelper
         int blocks = rgb.Length / 48;
         int i = 0;
 
-        if (Ssse3.IsSupported && blocks > 0)
+        if (SimdCompat.ByteShuffleSupported && blocks > 0)
         {
             ref byte r = ref MemoryMarshal.GetReference(rgb);
-            Vector128<byte> zero = Vector128<byte>.Zero;
             Vector128<short> w77 = Vector128.Create((short)77);
             Vector128<short> w150 = Vector128.Create((short)150);
             Vector128<short> w29 = Vector128.Create((short)29);
@@ -136,34 +135,40 @@ internal static class SimdHelper
                 Vector128<byte> c = Vector128.LoadUnsafe(ref r, o + 16);
                 Vector128<byte> d = Vector128.LoadUnsafe(ref r, o + 32);
 
-                Vector128<byte> rv = Sse2.Or(
-                    Sse2.Or(Ssse3.Shuffle(a, DeinterleaveRFromA), Ssse3.Shuffle(c, DeinterleaveRFromB)),
-                    Ssse3.Shuffle(d, DeinterleaveRFromC));
-                Vector128<byte> gv = Sse2.Or(
-                    Sse2.Or(Ssse3.Shuffle(a, DeinterleaveGFromA), Ssse3.Shuffle(c, DeinterleaveGFromB)),
-                    Ssse3.Shuffle(d, DeinterleaveGFromC));
-                Vector128<byte> bv = Sse2.Or(
-                    Sse2.Or(Ssse3.Shuffle(a, DeinterleaveBFromA), Ssse3.Shuffle(c, DeinterleaveBFromB)),
-                    Ssse3.Shuffle(d, DeinterleaveBFromC));
+                Vector128<byte> rv = SimdCompat.OrBytes(
+                    SimdCompat.OrBytes(
+                        SimdCompat.ShuffleBytes(a, DeinterleaveRFromA),
+                        SimdCompat.ShuffleBytes(c, DeinterleaveRFromB)),
+                    SimdCompat.ShuffleBytes(d, DeinterleaveRFromC));
+                Vector128<byte> gv = SimdCompat.OrBytes(
+                    SimdCompat.OrBytes(
+                        SimdCompat.ShuffleBytes(a, DeinterleaveGFromA),
+                        SimdCompat.ShuffleBytes(c, DeinterleaveGFromB)),
+                    SimdCompat.ShuffleBytes(d, DeinterleaveGFromC));
+                Vector128<byte> bv = SimdCompat.OrBytes(
+                    SimdCompat.OrBytes(
+                        SimdCompat.ShuffleBytes(a, DeinterleaveBFromA),
+                        SimdCompat.ShuffleBytes(c, DeinterleaveBFromB)),
+                    SimdCompat.ShuffleBytes(d, DeinterleaveBFromC));
 
                 // 字节 -> ushort，16 位定点运算即可容纳 (77+150+29)*255 = 65280
                 Vector128<ushort> grayLo = GrayCombine(
-                    Sse2.UnpackLow(rv, zero).AsUInt16(),
-                    Sse2.UnpackLow(gv, zero).AsUInt16(),
-                    Sse2.UnpackLow(bv, zero).AsUInt16(),
+                    SimdCompat.WidenLowerBytes(rv),
+                    SimdCompat.WidenLowerBytes(gv),
+                    SimdCompat.WidenLowerBytes(bv),
                     w77, w150, w29);
                 Vector128<ushort> grayHi = GrayCombine(
-                    Sse2.UnpackHigh(rv, zero).AsUInt16(),
-                    Sse2.UnpackHigh(gv, zero).AsUInt16(),
-                    Sse2.UnpackHigh(bv, zero).AsUInt16(),
+                    SimdCompat.WidenUpperBytes(rv),
+                    SimdCompat.WidenUpperBytes(gv),
+                    SimdCompat.WidenUpperBytes(bv),
                     w77, w150, w29);
 
                 // packuswb 只接受 short 输入；灰度值域 [0,255]，饱和不会截断有效数据
-                Vector128<byte> gray = Sse2.PackUnsignedSaturate(grayLo.AsInt16(), grayHi.AsInt16());
+                Vector128<byte> gray = SimdCompat.PackUnsignedSaturate(grayLo.AsInt16(), grayHi.AsInt16());
 
-                Vector128.StoreUnsafe(Ssse3.Shuffle(gray, GrayExpand0), ref r, o);
-                Vector128.StoreUnsafe(Ssse3.Shuffle(gray, GrayExpand1), ref r, o + 16);
-                Vector128.StoreUnsafe(Ssse3.Shuffle(gray, GrayExpand2), ref r, o + 32);
+                SimdCompat.StoreBytes(SimdCompat.ShuffleBytes(gray, GrayExpand0), ref r, o);
+                SimdCompat.StoreBytes(SimdCompat.ShuffleBytes(gray, GrayExpand1), ref r, o + 16);
+                SimdCompat.StoreBytes(SimdCompat.ShuffleBytes(gray, GrayExpand2), ref r, o + 32);
             }
 
             i = blocks * 16;
@@ -188,12 +193,12 @@ internal static class SimdHelper
         Vector128<short> w150,
         Vector128<short> w29)
     {
-        // Sse2.MultiplyLow 只有 short 重载；两个操作数均 <= 255，
+        // MultiplyLow 只有 short 重载（pmullw / NEON mul）：两个操作数均 <= 255，
         // 乘积 <= 38250，低 16 位与无符号乘法完全一致，因此这里按 16 位回绕语义是安全的。
-        Vector128<short> t = Sse2.MultiplyLow(r.AsInt16(), w77);
-        t = Sse2.Add(t, Sse2.MultiplyLow(g.AsInt16(), w150));
-        t = Sse2.Add(t, Sse2.MultiplyLow(b.AsInt16(), w29));
-        return Sse2.ShiftRightLogical(t.AsUInt16(), 8);
+        Vector128<short> t = SimdCompat.MultiplyLowInt16(r.AsInt16(), w77);
+        t = SimdCompat.AddInt16(t, SimdCompat.MultiplyLowInt16(g.AsInt16(), w150));
+        t = SimdCompat.AddInt16(t, SimdCompat.MultiplyLowInt16(b.AsInt16(), w29));
+        return SimdCompat.ShiftRightLogicalUInt16(t.AsUInt16(), 8);
     }
 
     /// <summary>
@@ -204,7 +209,7 @@ internal static class SimdHelper
         int n = gray.Length;
         int i = 0;
 
-        if (Ssse3.IsSupported)
+        if (SimdCompat.ByteShuffleSupported)
         {
             int blocks = n / 16;
             if (blocks > 0)
@@ -215,9 +220,9 @@ internal static class SimdHelper
                 {
                     Vector128<byte> g = Vector128.LoadUnsafe(ref src, (nuint)(b * 16));
                     nuint o = (nuint)(b * 48);
-                    Vector128.StoreUnsafe(Ssse3.Shuffle(g, GrayExpand0), ref dst, o);
-                    Vector128.StoreUnsafe(Ssse3.Shuffle(g, GrayExpand1), ref dst, o + 16);
-                    Vector128.StoreUnsafe(Ssse3.Shuffle(g, GrayExpand2), ref dst, o + 32);
+                    SimdCompat.StoreBytes(SimdCompat.ShuffleBytes(g, GrayExpand0), ref dst, o);
+                    SimdCompat.StoreBytes(SimdCompat.ShuffleBytes(g, GrayExpand1), ref dst, o + 16);
+                    SimdCompat.StoreBytes(SimdCompat.ShuffleBytes(g, GrayExpand2), ref dst, o + 32);
                 }
                 i = blocks * 16;
             }
@@ -241,7 +246,7 @@ internal static class SimdHelper
         int pixels = rgba.Length / 4;
         int p = 0;
 
-        if (Ssse3.IsSupported)
+        if (SimdCompat.ByteShuffleSupported)
         {
             // 每批 4 像素：读 16 字节，写 12 字节
             int blocks = rgba.Length / 16;
@@ -257,14 +262,14 @@ internal static class SimdHelper
                 for (int b = 0; b < fullBlocks; b++)
                 {
                     Vector128<byte> v = Vector128.LoadUnsafe(ref src, (nuint)(b * 16));
-                    Vector128.StoreUnsafe(Ssse3.Shuffle(v, RgbaToRgbShuffle), ref dst, (nuint)(b * 12));
+                    SimdCompat.StoreBytes(SimdCompat.ShuffleBytes(v, RgbaToRgbShuffle), ref dst, (nuint)(b * 12));
                 }
 
                 // 最后一块没有"下一块"来覆盖尾部，只能写真实的 12 字节：
                 // 拆成 8 字节 + 4 字节两次存储（仍是 2 次，而非原先逐元素 3 次）。
                 int last = fullBlocks;
                 Vector128<byte> lastV = Vector128.LoadUnsafe(ref src, (nuint)(last * 16));
-                Vector128<byte> lastPacked = Ssse3.Shuffle(lastV, RgbaToRgbShuffle);
+                Vector128<byte> lastPacked = SimdCompat.ShuffleBytes(lastV, RgbaToRgbShuffle);
                 int o = last * 12;
                 Unsafe.WriteUnaligned(ref Unsafe.Add(ref dst, o), lastPacked.AsUInt64().GetElement(0));
                 Unsafe.WriteUnaligned(ref Unsafe.Add(ref dst, o + 8), lastPacked.AsUInt32().GetElement(2));
@@ -289,7 +294,7 @@ internal static class SimdHelper
         int pixels = rgb.Length / 3;
         int p = 0;
 
-        if (Ssse3.IsSupported)
+        if (SimdCompat.ByteShuffleSupported)
         {
             ref byte src = ref MemoryMarshal.GetReference(rgb);
             ref byte dst = ref MemoryMarshal.GetReference(rgba);
@@ -298,8 +303,10 @@ internal static class SimdHelper
             while (b * 12 + 16 <= rgb.Length)
             {
                 Vector128<byte> v = Vector128.LoadUnsafe(ref src, (nuint)(b * 12));
-                Vector128<byte> expanded = Sse2.Or(Ssse3.Shuffle(v, RgbToRgbaShuffle), RgbToRgbaAlpha);
-                Vector128.StoreUnsafe(expanded, ref dst, (nuint)(b * 16));
+                Vector128<byte> expanded = SimdCompat.OrBytes(
+                    SimdCompat.ShuffleBytes(v, RgbToRgbaShuffle),
+                    RgbToRgbaAlpha);
+                SimdCompat.StoreBytes(expanded, ref dst, (nuint)(b * 16));
                 b++;
             }
             p = b * 4;

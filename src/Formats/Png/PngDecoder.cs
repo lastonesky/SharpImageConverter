@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Buffers;
 using System.IO;
@@ -925,39 +925,39 @@ public class PngDecoder
         switch (bpp)
         {
             case 1:
-                s = Sse2.Add(s, Sse2.ShiftLeftLogical128BitLane(s, 1));
-                s = Sse2.Add(s, Sse2.ShiftLeftLogical128BitLane(s, 2));
-                s = Sse2.Add(s, Sse2.ShiftLeftLogical128BitLane(s, 4));
-                s = Sse2.Add(s, Sse2.ShiftLeftLogical128BitLane(s, 8));
+                s = SimdCompat.AddBytes(s, SimdCompat.ShiftLeftBytes(s, 1));
+                s = SimdCompat.AddBytes(s, SimdCompat.ShiftLeftBytes(s, 2));
+                s = SimdCompat.AddBytes(s, SimdCompat.ShiftLeftBytes(s, 4));
+                s = SimdCompat.AddBytes(s, SimdCompat.ShiftLeftBytes(s, 8));
                 return s;
             case 2:
-                s = Sse2.Add(s, Sse2.ShiftLeftLogical128BitLane(s, 2));
-                s = Sse2.Add(s, Sse2.ShiftLeftLogical128BitLane(s, 4));
-                s = Sse2.Add(s, Sse2.ShiftLeftLogical128BitLane(s, 8));
+                s = SimdCompat.AddBytes(s, SimdCompat.ShiftLeftBytes(s, 2));
+                s = SimdCompat.AddBytes(s, SimdCompat.ShiftLeftBytes(s, 4));
+                s = SimdCompat.AddBytes(s, SimdCompat.ShiftLeftBytes(s, 8));
                 return s;
             case 3:
-                s = Sse2.Add(s, Sse2.ShiftLeftLogical128BitLane(s, 3));
-                s = Sse2.Add(s, Sse2.ShiftLeftLogical128BitLane(s, 6));
-                s = Sse2.Add(s, Sse2.ShiftLeftLogical128BitLane(s, 12));
+                s = SimdCompat.AddBytes(s, SimdCompat.ShiftLeftBytes(s, 3));
+                s = SimdCompat.AddBytes(s, SimdCompat.ShiftLeftBytes(s, 6));
+                s = SimdCompat.AddBytes(s, SimdCompat.ShiftLeftBytes(s, 12));
                 return s;
             case 4:
-                s = Sse2.Add(s, Sse2.ShiftLeftLogical128BitLane(s, 4));
-                s = Sse2.Add(s, Sse2.ShiftLeftLogical128BitLane(s, 8));
+                s = SimdCompat.AddBytes(s, SimdCompat.ShiftLeftBytes(s, 4));
+                s = SimdCompat.AddBytes(s, SimdCompat.ShiftLeftBytes(s, 8));
                 return s;
             case 5:
-                s = Sse2.Add(s, Sse2.ShiftLeftLogical128BitLane(s, 5));
-                s = Sse2.Add(s, Sse2.ShiftLeftLogical128BitLane(s, 10));
+                s = SimdCompat.AddBytes(s, SimdCompat.ShiftLeftBytes(s, 5));
+                s = SimdCompat.AddBytes(s, SimdCompat.ShiftLeftBytes(s, 10));
                 return s;
             case 6:
-                s = Sse2.Add(s, Sse2.ShiftLeftLogical128BitLane(s, 6));
-                s = Sse2.Add(s, Sse2.ShiftLeftLogical128BitLane(s, 12));
+                s = SimdCompat.AddBytes(s, SimdCompat.ShiftLeftBytes(s, 6));
+                s = SimdCompat.AddBytes(s, SimdCompat.ShiftLeftBytes(s, 12));
                 return s;
             case 7:
-                s = Sse2.Add(s, Sse2.ShiftLeftLogical128BitLane(s, 7));
-                s = Sse2.Add(s, Sse2.ShiftLeftLogical128BitLane(s, 14));
+                s = SimdCompat.AddBytes(s, SimdCompat.ShiftLeftBytes(s, 7));
+                s = SimdCompat.AddBytes(s, SimdCompat.ShiftLeftBytes(s, 14));
                 return s;
             default: // bpp == 8，链长 2，一步即可
-                return Sse2.Add(s, Sse2.ShiftLeftLogical128BitLane(s, 8));
+                return SimdCompat.AddBytes(s, SimdCompat.ShiftLeftBytes(s, 8));
         }
     }
 
@@ -970,14 +970,14 @@ public class PngDecoder
     {
         switch (bpp)
         {
-            case 1: return Sse2.ShiftRightLogical128BitLane(prev, 15);
-            case 2: return Sse2.ShiftRightLogical128BitLane(prev, 14);
-            case 3: return Sse2.ShiftRightLogical128BitLane(prev, 13);
-            case 4: return Sse2.ShiftRightLogical128BitLane(prev, 12);
-            case 5: return Sse2.ShiftRightLogical128BitLane(prev, 11);
-            case 6: return Sse2.ShiftRightLogical128BitLane(prev, 10);
-            case 7: return Sse2.ShiftRightLogical128BitLane(prev, 9);
-            default: return Sse2.ShiftRightLogical128BitLane(prev, 8);
+            case 1: return SimdCompat.ShiftRightBytes(prev, 15);
+            case 2: return SimdCompat.ShiftRightBytes(prev, 14);
+            case 3: return SimdCompat.ShiftRightBytes(prev, 13);
+            case 4: return SimdCompat.ShiftRightBytes(prev, 12);
+            case 5: return SimdCompat.ShiftRightBytes(prev, 11);
+            case 6: return SimdCompat.ShiftRightBytes(prev, 10);
+            case 7: return SimdCompat.ShiftRightBytes(prev, 9);
+            default: return SimdCompat.ShiftRightBytes(prev, 8);
         }
     }
 
@@ -992,7 +992,7 @@ public class PngDecoder
 
         // 向量化路径：一次 16 字节（覆盖 bpp 条链的 16/bpp 个元素）。
         // 首块进位为零向量，因此"首 bpp 字节左邻为 0"的边界条件天然满足，无需单独处理行首。
-        if (Sse2.IsSupported && len >= Vector128<byte>.Count && bpp >= 1 && bpp <= 8)
+        if (SimdCompat.VectorBytesSupported && len >= Vector128<byte>.Count && bpp >= 1 && bpp <= 8)
         {
             Vector128<byte> prev = Vector128<byte>.Zero;
             int i = 0;
@@ -1001,7 +1001,7 @@ public class PngDecoder
             {
                 nuint o = (nuint)i;
                 Vector128<byte> v = Vector128.LoadUnsafe(ref s, o);
-                Vector128<byte> r = SubPrefixSum(Sse2.Add(v, SubCarry(prev, bpp)), bpp);
+                Vector128<byte> r = SubPrefixSum(SimdCompat.AddBytes(v, SubCarry(prev, bpp)), bpp);
                 r.StoreUnsafe(ref d, o);
                 prev = r;
             }
@@ -1051,25 +1051,14 @@ public class PngDecoder
                     ref d, o);
             }
         }
-        else if (Sse2.IsSupported)
+        else if (SimdCompat.VectorBytesSupported)
         {
             int limit = len - Vector128<byte>.Count;
             for (; i <= limit; i += Vector128<byte>.Count)
             {
                 nuint o = (nuint)i;
                 Vector128.StoreUnsafe(
-                    Sse2.Add(Vector128.LoadUnsafe(ref s, o), Vector128.LoadUnsafe(ref p, o)),
-                    ref d, o);
-            }
-        }
-        else if (AdvSimd.IsSupported)
-        {
-            int limit = len - Vector128<byte>.Count;
-            for (; i <= limit; i += Vector128<byte>.Count)
-            {
-                nuint o = (nuint)i;
-                Vector128.StoreUnsafe(
-                    AdvSimd.Add(Vector128.LoadUnsafe(ref s, o), Vector128.LoadUnsafe(ref p, o)),
+                    SimdCompat.AddBytes(Vector128.LoadUnsafe(ref s, o), Vector128.LoadUnsafe(ref p, o)),
                     ref d, o);
             }
         }

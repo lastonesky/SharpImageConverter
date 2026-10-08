@@ -3,7 +3,7 @@ using System.Numerics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics;
-using System.Runtime.Intrinsics.X86;
+using SharpImageConverter.Core;
 
 namespace SharpImageConverter.Formats.Png;
 
@@ -56,7 +56,7 @@ public static class Adler32
             int k = len < NMAX ? len : (int)NMAX;
             len -= k;
 
-            if (Sse2.IsSupported)
+            if (SimdCompat.VectorBytesSupported)
             {
                 index = AccumulateSimd(buffer, index, k, ref s1, ref s2);
             }
@@ -81,8 +81,14 @@ public static class Adler32
     /// 一次 16 字节的 SIMD 累加，返回消耗后的 index。
     /// <para>
     /// s1 用 psadbw 求 8 字节一组的绝对差之和（与零做差 == 求字节和），两个 64 位 lane 各得一组和；
-    /// s2 的加权和用 pmaddwd 一次完成 8 个 16 位×16 位乘加，再两级 shuffle 归约。
+    /// s2 的加权和用 pmaddwd 一次完成 8 个 16 位×16 位乘加，再水平归约。
     /// 这样每个分块只剩 1 次 s2 更新，而不是每字节 1 次。
+    /// </para>
+    /// <para>
+    /// 全部原语经 <see cref="SimdCompat"/> 分派：x86 与 arm64 走同一套公式，
+    /// 每条内在函数在两侧逐位等价（NEON 用 <c>uabd+uaddlp×3</c> 合成 psadbw、
+    /// <c>smull+addp</c> 合成 pmaddwd、<c>addv</c> 合成 pshufd 两级归约），
+    /// 因此校验值跨架构逐位一致。原 x86 分支代码原样保留在 SimdCompat 内。
     /// </para>
     /// </summary>
     private static int AccumulateSimd(byte[] buffer, int index, int count, ref uint s1, ref uint s2)
@@ -97,16 +103,14 @@ public static class Adler32
 
             // s1: Σ b_i。psadbw 的结果是"每 64 位 lane 装一个 16 位和"，
             // 因此 .NET 把它建模为 Vector128<ushort>；两个 lane 相加即 16 个字节的总和。
-            Vector128<ushort> sad = Sse2.SumAbsoluteDifferences(v, Vector128<byte>.Zero);
+            Vector128<ushort> sad = SimdCompat.SumAbsoluteDifferences(v, Vector128<byte>.Zero);
             uint blockSum = (uint)(sad.AsUInt64().GetElement(0) + sad.AsUInt64().GetElement(1));
 
             // s2: Σ (16 - i)·b_i
-            Vector128<int> pLo = Sse2.MultiplyAddAdjacent(Vector128.WidenLower(v).AsInt16(), AdlerWeightLo);
-            Vector128<int> pHi = Sse2.MultiplyAddAdjacent(Vector128.WidenUpper(v).AsInt16(), AdlerWeightHi);
-            Vector128<int> t = Sse2.Add(pLo, pHi);
-            t = Sse2.Add(t, Sse2.Shuffle(t, 0x4E)); // 交换两个 64 位半区
-            t = Sse2.Add(t, Sse2.Shuffle(t, 0xB1)); // 交换每半区内的两个 dword
-            uint weighted = (uint)t.GetElement(0);
+            Vector128<int> pLo = SimdCompat.MultiplyAddAdjacent(SimdCompat.WidenLowerBytes(v).AsInt16(), AdlerWeightLo);
+            Vector128<int> pHi = SimdCompat.MultiplyAddAdjacent(SimdCompat.WidenUpperBytes(v).AsInt16(), AdlerWeightHi);
+            Vector128<int> t = SimdCompat.AddInt32(pLo, pHi);
+            uint weighted = (uint)SimdCompat.HorizontalSumInt32(t);
 
             s2 += 16u * s1 + weighted;
             s1 += blockSum;

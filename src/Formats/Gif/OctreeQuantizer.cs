@@ -4,6 +4,7 @@ using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
 using System.Threading.Tasks;
+using SharpImageConverter.Core;
 
 namespace SharpImageConverter.Formats.Gif;
 
@@ -513,7 +514,7 @@ public sealed class OctreeQuantizer
     /// </summary>
     private unsafe void MapPixels(byte* pixels, int width, int height, bool enableDithering, byte[] indices)
     {
-        bool simd = Ssse3.IsSupported && Sse2.IsSupported;
+        bool simd = SimdCompat.ByteShuffleSupported && SimdCompat.VectorBytesSupported;
         bool parallel = Environment.ProcessorCount > 1
             && (long)width * height >= MapParallelPixelThreshold;
 
@@ -597,7 +598,6 @@ public sealed class OctreeQuantizer
     /// </summary>
     private unsafe void MapDirectSimd(byte* pixels, int width, int yStart, int yEnd, byte[] indices)
     {
-        Vector128<byte> zero = Vector128<byte>.Zero;
         ushort* buf = stackalloc ushort[16];
 
         int w16 = width & ~15;
@@ -611,24 +611,24 @@ public sealed class OctreeQuantizer
                 int x = 0;
                 for (; x < w16; x += 16)
                 {
-                    var v0 = Sse2.LoadVector128(pixels + o);
-                    var v1 = Sse2.LoadVector128(pixels + o + 16);
-                    var v2 = Sse2.LoadVector128(pixels + o + 32);
-                    var R = Sse2.Or(Sse2.Or(Ssse3.Shuffle(v0, ShufR0), Ssse3.Shuffle(v1, ShufR1)), Ssse3.Shuffle(v2, ShufR2));
-                    var G = Sse2.Or(Sse2.Or(Ssse3.Shuffle(v0, ShufG0), Ssse3.Shuffle(v1, ShufG1)), Ssse3.Shuffle(v2, ShufG2));
-                    var B = Sse2.Or(Sse2.Or(Ssse3.Shuffle(v0, ShufB0), Ssse3.Shuffle(v1, ShufB1)), Ssse3.Shuffle(v2, ShufB2));
+                    var v0 = SimdCompat.LoadBytesPtr(pixels + o);
+                    var v1 = SimdCompat.LoadBytesPtr(pixels + o + 16);
+                    var v2 = SimdCompat.LoadBytesPtr(pixels + o + 32);
+                    var R = SimdCompat.OrBytes(SimdCompat.OrBytes(SimdCompat.ShuffleBytes(v0, ShufR0), SimdCompat.ShuffleBytes(v1, ShufR1)), SimdCompat.ShuffleBytes(v2, ShufR2));
+                    var G = SimdCompat.OrBytes(SimdCompat.OrBytes(SimdCompat.ShuffleBytes(v0, ShufG0), SimdCompat.ShuffleBytes(v1, ShufG1)), SimdCompat.ShuffleBytes(v2, ShufG2));
+                    var B = SimdCompat.OrBytes(SimdCompat.OrBytes(SimdCompat.ShuffleBytes(v0, ShufB0), SimdCompat.ShuffleBytes(v1, ShufB1)), SimdCompat.ShuffleBytes(v2, ShufB2));
 
-                    var rl = Sse2.ShiftRightLogical(Sse2.UnpackLow(R, zero).AsInt16(), 3);
-                    var rh = Sse2.ShiftRightLogical(Sse2.UnpackHigh(R, zero).AsInt16(), 3);
-                    var gl = Sse2.ShiftRightLogical(Sse2.UnpackLow(G, zero).AsInt16(), 3);
-                    var gh = Sse2.ShiftRightLogical(Sse2.UnpackHigh(G, zero).AsInt16(), 3);
-                    var bl = Sse2.ShiftRightLogical(Sse2.UnpackLow(B, zero).AsInt16(), 3);
-                    var bh = Sse2.ShiftRightLogical(Sse2.UnpackHigh(B, zero).AsInt16(), 3);
+                    var rl = SimdCompat.ShiftRightLogicalInt16(SimdCompat.WidenLowerBytes(R).AsInt16(), 3);
+                    var rh = SimdCompat.ShiftRightLogicalInt16(SimdCompat.WidenUpperBytes(R).AsInt16(), 3);
+                    var gl = SimdCompat.ShiftRightLogicalInt16(SimdCompat.WidenLowerBytes(G).AsInt16(), 3);
+                    var gh = SimdCompat.ShiftRightLogicalInt16(SimdCompat.WidenUpperBytes(G).AsInt16(), 3);
+                    var bl = SimdCompat.ShiftRightLogicalInt16(SimdCompat.WidenLowerBytes(B).AsInt16(), 3);
+                    var bh = SimdCompat.ShiftRightLogicalInt16(SimdCompat.WidenUpperBytes(B).AsInt16(), 3);
 
-                    var clo = Sse2.Or(Sse2.Or(Sse2.ShiftLeftLogical(rl, 10), Sse2.ShiftLeftLogical(gl, 5)), bl);
-                    var chi = Sse2.Or(Sse2.Or(Sse2.ShiftLeftLogical(rh, 10), Sse2.ShiftLeftLogical(gh, 5)), bh);
-                    Sse2.Store((byte*)buf, clo.AsByte());
-                    Sse2.Store((byte*)(buf + 8), chi.AsByte());
+                    var clo = SimdCompat.OrInt16(SimdCompat.OrInt16(SimdCompat.ShiftLeftLogicalInt16(rl, 10), SimdCompat.ShiftLeftLogicalInt16(gl, 5)), bl);
+                    var chi = SimdCompat.OrInt16(SimdCompat.OrInt16(SimdCompat.ShiftLeftLogicalInt16(rh, 10), SimdCompat.ShiftLeftLogicalInt16(gh, 5)), bh);
+                    SimdCompat.StoreBytes(clo.AsByte(), ref *(byte*)buf, 0);
+                    SimdCompat.StoreBytes(chi.AsByte(), ref *(byte*)(buf + 8), 0);
 
                     // 16 个 LUT 结果标量域拼两个 ulong、一条 16 字节向量 store 写出
                     //（消掉 16 次单字节散写 + 各自的边界检查），查表走 fixed 裸指针。
@@ -637,7 +637,7 @@ public sealed class OctreeQuantizer
                     // 过「修改部分 ≥7%」门槛；产物 md5 与原实现逐字节一致。
                     // 拆解：仅展开写出 −7.1%、仅去 LUT 边界检查 −1.0%、组合 −8.1%。
                     // 教训：A3-a 若写成 4 迭代小循环只有 −1.5%，完全展开才拿到收益。
-                    Sse2.Store(ip + rowBase + x, Vector128.Create(Pack8(lut, buf, 0), Pack8(lut, buf, 8)).AsByte());
+                    SimdCompat.StoreBytes(Vector128.Create(Pack8(lut, buf, 0), Pack8(lut, buf, 8)).AsByte(), ref *(ip + rowBase + x), 0);
                     o += 48;
                 }
                 for (; x < width; x++)
@@ -746,7 +746,6 @@ public sealed class OctreeQuantizer
             for (int j = 0; j < 16; j++) a[j] = (short)DitherOffset(Bayer4[ym, j & 3]);
             offTab[ym] = a;
         }
-        Vector128<byte> zero = Vector128<byte>.Zero;
         Vector128<short> c255 = Vector128.Create((short)255);
         Vector128<short> c0 = Vector128.Create((short)0);
         ushort* buf = stackalloc ushort[16];
@@ -761,36 +760,36 @@ public sealed class OctreeQuantizer
                 int rowBase = y * width;
                 fixed (short* op = offTab[y & 3])
                 {
-                    Vector128<short> offLo = Sse2.LoadVector128(op);
-                    Vector128<short> offHi = Sse2.LoadVector128(op + 8);
+                    Vector128<short> offLo = SimdCompat.LoadInt16(ref *op, 0);
+                    Vector128<short> offHi = SimdCompat.LoadInt16(ref *op, 8);
                     int x = 0;
                     for (; x < w16; x += 16)
                     {
-                        var v0 = Sse2.LoadVector128(pixels + o);
-                        var v1 = Sse2.LoadVector128(pixels + o + 16);
-                        var v2 = Sse2.LoadVector128(pixels + o + 32);
-                        var R = Sse2.Or(Sse2.Or(Ssse3.Shuffle(v0, ShufR0), Ssse3.Shuffle(v1, ShufR1)), Ssse3.Shuffle(v2, ShufR2));
-                        var G = Sse2.Or(Sse2.Or(Ssse3.Shuffle(v0, ShufG0), Ssse3.Shuffle(v1, ShufG1)), Ssse3.Shuffle(v2, ShufG2));
-                        var B = Sse2.Or(Sse2.Or(Ssse3.Shuffle(v0, ShufB0), Ssse3.Shuffle(v1, ShufB1)), Ssse3.Shuffle(v2, ShufB2));
+                        var v0 = SimdCompat.LoadBytesPtr(pixels + o);
+                        var v1 = SimdCompat.LoadBytesPtr(pixels + o + 16);
+                        var v2 = SimdCompat.LoadBytesPtr(pixels + o + 32);
+                        var R = SimdCompat.OrBytes(SimdCompat.OrBytes(SimdCompat.ShuffleBytes(v0, ShufR0), SimdCompat.ShuffleBytes(v1, ShufR1)), SimdCompat.ShuffleBytes(v2, ShufR2));
+                        var G = SimdCompat.OrBytes(SimdCompat.OrBytes(SimdCompat.ShuffleBytes(v0, ShufG0), SimdCompat.ShuffleBytes(v1, ShufG1)), SimdCompat.ShuffleBytes(v2, ShufG2));
+                        var B = SimdCompat.OrBytes(SimdCompat.OrBytes(SimdCompat.ShuffleBytes(v0, ShufB0), SimdCompat.ShuffleBytes(v1, ShufB1)), SimdCompat.ShuffleBytes(v2, ShufB2));
 
-                        var rl = Sse2.ShiftRightLogical(Sse2.Max(Sse2.Min(Sse2.Add(Sse2.UnpackLow(R, zero).AsInt16(), offLo), c255), c0), 3);
-                        var rh = Sse2.ShiftRightLogical(Sse2.Max(Sse2.Min(Sse2.Add(Sse2.UnpackHigh(R, zero).AsInt16(), offHi), c255), c0), 3);
-                        var gl = Sse2.ShiftRightLogical(Sse2.Max(Sse2.Min(Sse2.Add(Sse2.UnpackLow(G, zero).AsInt16(), offLo), c255), c0), 3);
-                        var gh = Sse2.ShiftRightLogical(Sse2.Max(Sse2.Min(Sse2.Add(Sse2.UnpackHigh(G, zero).AsInt16(), offHi), c255), c0), 3);
-                        var bl = Sse2.ShiftRightLogical(Sse2.Max(Sse2.Min(Sse2.Add(Sse2.UnpackLow(B, zero).AsInt16(), offLo), c255), c0), 3);
-                        var bh = Sse2.ShiftRightLogical(Sse2.Max(Sse2.Min(Sse2.Add(Sse2.UnpackHigh(B, zero).AsInt16(), offHi), c255), c0), 3);
+                        var rl = SimdCompat.ShiftRightLogicalInt16(SimdCompat.MaxInt16(SimdCompat.MinInt16(SimdCompat.AddInt16(SimdCompat.WidenLowerBytes(R).AsInt16(), offLo), c255), c0), 3);
+                        var rh = SimdCompat.ShiftRightLogicalInt16(SimdCompat.MaxInt16(SimdCompat.MinInt16(SimdCompat.AddInt16(SimdCompat.WidenUpperBytes(R).AsInt16(), offHi), c255), c0), 3);
+                        var gl = SimdCompat.ShiftRightLogicalInt16(SimdCompat.MaxInt16(SimdCompat.MinInt16(SimdCompat.AddInt16(SimdCompat.WidenLowerBytes(G).AsInt16(), offLo), c255), c0), 3);
+                        var gh = SimdCompat.ShiftRightLogicalInt16(SimdCompat.MaxInt16(SimdCompat.MinInt16(SimdCompat.AddInt16(SimdCompat.WidenUpperBytes(G).AsInt16(), offHi), c255), c0), 3);
+                        var bl = SimdCompat.ShiftRightLogicalInt16(SimdCompat.MaxInt16(SimdCompat.MinInt16(SimdCompat.AddInt16(SimdCompat.WidenLowerBytes(B).AsInt16(), offLo), c255), c0), 3);
+                        var bh = SimdCompat.ShiftRightLogicalInt16(SimdCompat.MaxInt16(SimdCompat.MinInt16(SimdCompat.AddInt16(SimdCompat.WidenUpperBytes(B).AsInt16(), offHi), c255), c0), 3);
 
-                        var clo = Sse2.Or(Sse2.Or(Sse2.ShiftLeftLogical(rl, 10), Sse2.ShiftLeftLogical(gl, 5)), bl);
-                        var chi = Sse2.Or(Sse2.Or(Sse2.ShiftLeftLogical(rh, 10), Sse2.ShiftLeftLogical(gh, 5)), bh);
-                        Sse2.Store((byte*)buf, clo.AsByte());
-                        Sse2.Store((byte*)(buf + 8), chi.AsByte());
+                        var clo = SimdCompat.OrInt16(SimdCompat.OrInt16(SimdCompat.ShiftLeftLogicalInt16(rl, 10), SimdCompat.ShiftLeftLogicalInt16(gl, 5)), bl);
+                        var chi = SimdCompat.OrInt16(SimdCompat.OrInt16(SimdCompat.ShiftLeftLogicalInt16(rh, 10), SimdCompat.ShiftLeftLogicalInt16(gh, 5)), bh);
+                        SimdCompat.StoreBytes(clo.AsByte(), ref *(byte*)buf, 0);
+                        SimdCompat.StoreBytes(chi.AsByte(), ref *(byte*)(buf + 8), 0);
 
                         // 与 MapDirectSimd 同一手法：16 个 LUT 结果拼两个 ulong、一条 16 字节
                         // 向量 store 写出（消掉 16 次单字节散写 + 各自的边界检查），
                         // 查表走 fixed 裸指针。2026-10-03 四臂同二进制 A/B：
                         // map 段 10.52→9.67ms（池化中位 −8.1%，10/10 轮胜），
                         // 过「修改部分 ≥7%」门槛，产物 md5 逐字节一致。
-                        Sse2.Store(ip + rowBase + x, Vector128.Create(Pack8(lut, buf, 0), Pack8(lut, buf, 8)).AsByte());
+                        SimdCompat.StoreBytes(Vector128.Create(Pack8(lut, buf, 0), Pack8(lut, buf, 8)).AsByte(), ref *(ip + rowBase + x), 0);
                         o += 48;
                     }
                     for (; x < width; x++)

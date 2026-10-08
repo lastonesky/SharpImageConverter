@@ -1,4 +1,5 @@
-using System.Buffers;
+﻿using System.Buffers;
+using SharpImageConverter.Core;
 using System.Runtime.Intrinsics.X86;
 
 namespace SharpImageConverter.Formats.Jpeg;
@@ -86,9 +87,9 @@ public static partial class JpegDecoder
 
     internal static bool TryDecodeInterleavedYCbCrSimd(ComponentState[] components, byte[] output, int width, int height, int fullWidth, int fullHeight, int[] componentOrder, QuantizationTable[] quantTables, bool useFloatingPointIdct, FrameHeader frame)
     {
-        // 交织阶段 ConvertRowYCbCrToRgb 用 pshufb 完成 RGB24 交错，因此需要 SSSE3；
-        // 其余部分（IDCT 蝶形、转置、打包）只需要 SSE2。
-        if (!Sse2.IsSupported || !Ssse3.IsSupported || useFloatingPointIdct) return false;
+        // 交织阶段 ConvertRowYCbCrToRgb 用 pshufb（ARM 侧为 NEON tbl）完成 RGB24 交错，
+        // 因此需要字节查表能力；其余部分（IDCT 蝶形、转置、打包）只需要 16 字节整型运算。
+        if (!SimdCompat.ByteShuffleSupported || !SimdCompat.VectorBytesSupported || useFloatingPointIdct) return false;
         if (componentOrder.Length != 3) return false;
         int yIdx = componentOrder[0];
         int cbIdx = componentOrder[1];

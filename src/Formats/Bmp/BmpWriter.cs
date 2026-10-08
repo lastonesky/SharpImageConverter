@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Buffers;
 using System.Buffers.Binary;
 using System.IO;
@@ -6,6 +6,7 @@ using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
+using SharpImageConverter.Core;
 using SharpImageConverter.Metadata;
 
 namespace SharpImageConverter.Formats.Bmp;
@@ -223,7 +224,7 @@ public static class BmpWriter
         stream.Write(header);
 
         int padding = rowStride - srcRowSize;
-        bool useSimd = Ssse3.IsSupported;
+        bool useSimd = SimdCompat.ByteShuffleSupported;
 
         // 行缓冲分级分配
         bool useStackRow = rowStride <= StackallocRowThreshold * 4;
@@ -253,9 +254,9 @@ public static class BmpWriter
                             for (; x < simdEnd; x += 12)
                             {
                                 // Load 12 bytes (with 4-byte over-read into 16-byte reg)
-                                var v = Sse2.LoadVector128(src + x);
+                                var v = SimdCompat.LoadBytesPtr(src + x);
                                 // Shuffle: RGB → BGR
-                                var bgr128 = Ssse3.Shuffle(v, shuffleMask);
+                                var bgr128 = SimdCompat.ShuffleBytes(v, shuffleMask);
                                 // Store 12 bytes
                                 *(ulong*)(dst + x) = *(ulong*)&bgr128;
                                 *(uint*)(dst + x + 8) = *(uint*)((byte*)&bgr128 + 8);

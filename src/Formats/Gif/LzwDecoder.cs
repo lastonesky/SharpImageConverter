@@ -192,13 +192,14 @@ namespace SharpImageConverter.Formats.Gif
 
         /// <summary>
         /// 把 src 逆序写入 dst（要求 dst.Length == src.Length，且两块内存不重叠）。
-        /// SSSE3 下用 pshufb 每 16 字节反转一次，替代逐字节回写。
+        /// 有字节查表能力时（x86 pshufb / ARM NEON tbl）每 16 字节反转一次，
+        /// 替代逐字节回写。
         /// </summary>
         private static void ReverseCopy(Span<byte> dst, ReadOnlySpan<byte> src)
         {
             int n = dst.Length;
             int i = 0;
-            if (Ssse3.IsSupported && n >= 16)
+            if (SimdCompat.ByteShuffleSupported && n >= 16)
             {
                 ref byte dstRef = ref MemoryMarshal.GetReference(dst);
                 ref byte srcRef = ref MemoryMarshal.GetReference(src);
@@ -207,7 +208,7 @@ namespace SharpImageConverter.Formats.Gif
                 for (; i <= limit; i += 16)
                 {
                     Vector128<byte> v = Vector128.LoadUnsafe(ref srcRef, (nuint)(n - i - 16));
-                    Vector128.StoreUnsafe(Ssse3.Shuffle(v, reverse), ref dstRef, (nuint)i);
+                    SimdCompat.StoreBytes(SimdCompat.ShuffleBytes(v, reverse), ref dstRef, (nuint)i);
                 }
             }
             for (; i < n; i++)

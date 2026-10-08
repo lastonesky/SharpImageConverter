@@ -184,9 +184,13 @@ namespace Jpeg2Bmp.Tests
         [Fact]
         public void Ssse3_IsAvailable_OnThisMachine()
         {
-            // 若本机不支持 SSSE3，上面的测试只会覆盖标量回退路径，这里显式提示，
+            // 若本机不支持字节查表，上面的测试只会覆盖标量回退路径，这里显式提示，
             // 避免"SIMD 分支从未被执行"被误认为已验证。
-            Assert.True(Ssse3.IsSupported, "当前 CPU 不支持 SSSE3，SIMD 分支未被覆盖");
+            // x86 需要 SSSE3（pshufb）；arm64 对应能力是 NEON 的 tbl（AdvSimd.Arm64）。
+            Assert.True(
+                System.Runtime.Intrinsics.X86.Ssse3.IsSupported ||
+                System.Runtime.Intrinsics.Arm.AdvSimd.Arm64.IsSupported,
+                "当前 CPU 既无 SSSE3 也无 NEON tbl，字节查表 SIMD 分支未被覆盖");
         }
     }
 }

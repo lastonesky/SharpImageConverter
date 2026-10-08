@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Buffers;
 using System.Buffers.Binary;
 using System.IO;
@@ -7,6 +7,7 @@ using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
+using SharpImageConverter.Core;
 
 namespace SharpImageConverter.Formats.Bmp;
 
@@ -466,7 +467,7 @@ public static class BmpReader
                 fixed (byte* pRow = row)
                 fixed (byte* pDst = rgb)
                 {
-                    bool useSsse3 = Ssse3.IsSupported;
+                    bool useSsse3 = SimdCompat.ByteShuffleSupported;
                     Vector128<byte> shuffleMask = ShuffleBgr0ToRgb;
 
                     for (int rowIndex = 0; rowIndex < height; rowIndex++)
@@ -484,9 +485,9 @@ public static class BmpReader
                             for (; x < simdEnd; x += 4)
                             {
                                 // Load 4 pixels = 16 bytes
-                                var v = Sse2.LoadVector128(src);
+                                var v = SimdCompat.LoadBytesPtr(src);
                                 // Shuffle: BGRX → RGB padding (12 useful bytes)
-                                var rgb128 = Ssse3.Shuffle(v, shuffleMask);
+                                var rgb128 = SimdCompat.ShuffleBytes(v, shuffleMask);
                                 // Store first 8 bytes via pointer cast
                                 *(ulong*)dst = *(ulong*)&rgb128;
                                 // Store bytes 8-11 via pointer cast

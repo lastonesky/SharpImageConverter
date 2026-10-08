@@ -1,7 +1,8 @@
-using SharpImageConverter.Metadata;
+﻿using SharpImageConverter.Metadata;
+using SharpImageConverter.Core;
 using System.Buffers;
 using System.Diagnostics;
-using System.Runtime.Intrinsics.X86; // JpegFrameState.cs:812 的融合 SIMD 路径门控使用 Sse2.IsSupported
+using System.Runtime.Intrinsics.X86; // 融合 SIMD 路径的 x86 侧门控（ARM 侧见 SimdCompat）
 
 namespace SharpImageConverter.Formats.Jpeg;
 
@@ -810,7 +811,7 @@ internal sealed class JpegFrameState
                 }
             }
 
-            if (!handled && colorSpace == JpegColorSpace.YCbCr && !useFloatingPointIdct && Sse2.IsSupported)
+            if (!handled && colorSpace == JpegColorSpace.YCbCr && !useFloatingPointIdct && SimdCompat.VectorBytesSupported)
             {
                 output = new byte[checked(width * height * channelCount)];
                 long pxStart = JpegPerfProbe.Enabled ? Stopwatch.GetTimestamp() : 0;
