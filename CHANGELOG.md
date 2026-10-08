@@ -1,17 +1,18 @@
 ## 未发布
 ### 工具
 - 新增 `.github/workflows/release.yml`：推送 `v*` tag 即自动构建 win-x64 / linux-x64 / osx-arm64
-  三套 CLI 单文件资产、打包 nupkg/snupkg、生成 `SHA256SUMS.txt` 并创建/更新 GitHub Release。
-  win/linux 在原生 runner 上构建并实机冒烟（`PNG→WebP→PNG` + `PNG→JPEG`，用于证明原生 libwebp 能加载）；
-  **osx-arm64 走 `macos-15-intel` 交叉构建**（GitHub 的 macOS arm64 runner 容量紧张，实测排队 15 分钟后被取消，
-  不能作为发版前置），CI 做架构静态校验；需要 arm64 实机验证时手动 dispatch，会额外尝试原生冒烟。
+  三套 CLI 资产（**每套都做实机冒烟**：`PNG→WebP→PNG` + `PNG→JPEG`，用于证明原生 libwebp 能加载）、
+  打包 nupkg/snupkg、生成 `SHA256SUMS.txt` 并创建/更新 GitHub Release。
   手动 `workflow_dispatch` 只接受一个已存在的 tag 且只写**草稿** Release（试跑/补发不会公开发布）。
+  runner 选择：`windows-latest` / `ubuntu-latest` / `macos-15`（arm64）——实测 `macos-latest`(=macos-26 arm64)
+  会排队超时被取消，`macos-15` 秒级拿到且能实机跑通。
   （`.github/` 在 `.gitignore` 中，新增 workflow 需 `git add -f`。）
-- 新增 `tools/build-cli.sh`：构建 CLI 的单文件自包含可执行文件（含原生 WebP 库，使用者无需安装 .NET），
+- 新增 `tools/build-cli.sh`：构建 CLI 的发布资产（含原生 WebP 库，使用者无需安装 .NET），
   支持 win-x64 / linux-x64 / osx-arm64，产物落在 `.artifacts/release/` 并生成 `SHA256SUMS.txt`。
   脚本放 `tools/` 根目录而非 `tools/release/`：`.gitignore` 的 `[Rr]elease/` 会匹配任意层级的 release 目录。
   已做跨平台适配：GNU tar 才加 `--mode` 强制可执行位（BSD tar/macOS 不需要），校验和优先 `sha256sum`、
-  缺省回退 `shasum -a 256`。
+  缺省回退 `shasum -a 256`；macOS 分支里的变量紧邻中文一律写成 `${VAR}`（macOS 的 bash 3.2 在非 UTF-8
+  locale 下会把中文首字节并入变量名，报 `RID?: unbound variable`）。
 
 ### 文档
 - 新增 `docs/Release.md`：固化发版口径（版本号 → tag → GitHub Release → 资产清单 → NuGet 自动发布触发），
@@ -19,6 +20,16 @@
   `docs/README.md` 索引同步更新，`README.md` 的 CLI 章节补充预编译版本的下载入口。
 
 ### 修复
+- **macOS 上 WebP 原生库加载不了（既有缺陷，影响 NuGet 的 macOS 消费者）**：仓库里的 `osx-arm64/*.dylib`
+  带着构建机的 `@rpath`（`/Users/lastonesky/Project/libwebp/build`）与版本化依赖名
+  （`@rpath/libsharpyuv.0.dylib`、`@rpath/libwebp.7.dylib`），在别的机器上依赖解析失败。
+  实测：无论单文件还是目录式打包，在真实 arm64 macOS 上都报「未能加载 WebP 原生库」。
+  - 发布产物侧已修：macOS 改为目录式发布，构建后用 `install_name_tool -add_rpath @loader_path`
+    给每个 dylib 补 rpath、按依赖名提供版本化副本（`libwebp.7.dylib` 等）、并对所有 dylib 与主程序
+    做 ad-hoc 签名（arm64 上未签名的可执行代码会被直接拒绝加载）；CI 在 `macos-15` 上实机冒烟通过。
+  - **尚未修**：仓库里这两个平台上随包发布的原生库本身（`src/runtimes/osx-arm64/native/*.dylib`）
+    未改动，因此 NuGet 包在 macOS 上仍会命中同一问题；linux 的 `.so` 也带着失效 RUNPATH
+    （`/home/ted/src/libwebp-main/build`，目前实测能加载，属侥幸）。
 - 原生库选择由「宿主 OS」改为「按 RID」（`src/SharpImageConverter.csproj` 的 `_SicNativeRid`）：
   此前在 Windows 上发布 linux-x64 会把 Windows 的 `libwebp.dll` 拷进 Linux 产物（反向同理）。
   未指定 `RuntimeIdentifier` 时行为不变（仍按宿主 OS），因此本机开发/测试/AOT 无影响。
