@@ -18,6 +18,8 @@ reasonix.toml
 mono_crash.*
 .codegraph/
 .reasonix/
+.vscode/
+.trae/
 # Build results
 [Dd]ebug/
 [Dd]ebugPublic/

@@ -1,4 +1,5 @@
-using System.Runtime.CompilerServices;
+﻿using System.Runtime.CompilerServices;
+using SharpImageConverter.Core;
 using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
@@ -82,12 +83,20 @@ internal static class SimdJpegEncodePipeline
     /// <summary>
     /// FDCT 是否可用 SIMD。可通过内部 setter 在测试中强制关闭，以校验与标量实现一致。
     /// </summary>
-    internal static bool FdctSupported { get; set; } = Sse2.IsSupported;
+    internal static bool FdctSupported { get; set; } = SimdCompat.VectorBytesSupported;
+
+    /// <summary>还原为当前平台的原生默认值（供测试保存/恢复）。</summary>
+    internal static void ResetSupportDefaults()
+    {
+        FdctSupported = SimdCompat.VectorBytesSupported;
+        ColorSupported = SimdCompat.ByteShuffleSupported;
+    }
 
     /// <summary>
-    /// RGB-&gt;YCbCr 是否可用 SIMD（需要 SSSE3 的 pshufb / phaddd）。可通过内部 setter 在测试中强制关闭。
+    /// RGB-&gt;YCbCr 是否可用 SIMD（需要字节查表 pshufb/NEON tbl 与成对相加 phaddd/NEON addp）。
+    /// 可通过内部 setter 在测试中强制关闭。
     /// </summary>
-    internal static bool ColorSupported { get; set; } = Ssse3.IsSupported;
+    internal static bool ColorSupported { get; set; } = SimdCompat.ByteShuffleSupported;
 
     // ===================== FDCT =====================
 
@@ -309,32 +318,32 @@ internal static class SimdJpegEncodePipeline
         ref Vector128<short> v0, ref Vector128<short> v1, ref Vector128<short> v2, ref Vector128<short> v3,
         ref Vector128<short> v4, ref Vector128<short> v5, ref Vector128<short> v6, ref Vector128<short> v7)
     {
-        Vector128<short> t0 = Sse2.UnpackLow(v0, v1);
-        Vector128<short> t1 = Sse2.UnpackHigh(v0, v1);
-        Vector128<short> t2 = Sse2.UnpackLow(v2, v3);
-        Vector128<short> t3 = Sse2.UnpackHigh(v2, v3);
-        Vector128<short> t4 = Sse2.UnpackLow(v4, v5);
-        Vector128<short> t5 = Sse2.UnpackHigh(v4, v5);
-        Vector128<short> t6 = Sse2.UnpackLow(v6, v7);
-        Vector128<short> t7 = Sse2.UnpackHigh(v6, v7);
+        Vector128<short> t0 = SimdCompat.UnpackLow(v0, v1);
+        Vector128<short> t1 = SimdCompat.UnpackHigh(v0, v1);
+        Vector128<short> t2 = SimdCompat.UnpackLow(v2, v3);
+        Vector128<short> t3 = SimdCompat.UnpackHigh(v2, v3);
+        Vector128<short> t4 = SimdCompat.UnpackLow(v4, v5);
+        Vector128<short> t5 = SimdCompat.UnpackHigh(v4, v5);
+        Vector128<short> t6 = SimdCompat.UnpackLow(v6, v7);
+        Vector128<short> t7 = SimdCompat.UnpackHigh(v6, v7);
 
-        Vector128<int> q0 = Sse2.UnpackLow(t0.AsInt32(), t2.AsInt32());
-        Vector128<int> q1 = Sse2.UnpackHigh(t0.AsInt32(), t2.AsInt32());
-        Vector128<int> q2 = Sse2.UnpackLow(t1.AsInt32(), t3.AsInt32());
-        Vector128<int> q3 = Sse2.UnpackHigh(t1.AsInt32(), t3.AsInt32());
-        Vector128<int> q4 = Sse2.UnpackLow(t4.AsInt32(), t6.AsInt32());
-        Vector128<int> q5 = Sse2.UnpackHigh(t4.AsInt32(), t6.AsInt32());
-        Vector128<int> q6 = Sse2.UnpackLow(t5.AsInt32(), t7.AsInt32());
-        Vector128<int> q7 = Sse2.UnpackHigh(t5.AsInt32(), t7.AsInt32());
+        Vector128<int> q0 = SimdCompat.UnpackLow(t0.AsInt32(), t2.AsInt32());
+        Vector128<int> q1 = SimdCompat.UnpackHigh(t0.AsInt32(), t2.AsInt32());
+        Vector128<int> q2 = SimdCompat.UnpackLow(t1.AsInt32(), t3.AsInt32());
+        Vector128<int> q3 = SimdCompat.UnpackHigh(t1.AsInt32(), t3.AsInt32());
+        Vector128<int> q4 = SimdCompat.UnpackLow(t4.AsInt32(), t6.AsInt32());
+        Vector128<int> q5 = SimdCompat.UnpackHigh(t4.AsInt32(), t6.AsInt32());
+        Vector128<int> q6 = SimdCompat.UnpackLow(t5.AsInt32(), t7.AsInt32());
+        Vector128<int> q7 = SimdCompat.UnpackHigh(t5.AsInt32(), t7.AsInt32());
 
-        v0 = Sse2.UnpackLow(q0.AsInt64(), q4.AsInt64()).AsInt16();
-        v1 = Sse2.UnpackHigh(q0.AsInt64(), q4.AsInt64()).AsInt16();
-        v2 = Sse2.UnpackLow(q1.AsInt64(), q5.AsInt64()).AsInt16();
-        v3 = Sse2.UnpackHigh(q1.AsInt64(), q5.AsInt64()).AsInt16();
-        v4 = Sse2.UnpackLow(q2.AsInt64(), q6.AsInt64()).AsInt16();
-        v5 = Sse2.UnpackHigh(q2.AsInt64(), q6.AsInt64()).AsInt16();
-        v6 = Sse2.UnpackLow(q3.AsInt64(), q7.AsInt64()).AsInt16();
-        v7 = Sse2.UnpackHigh(q3.AsInt64(), q7.AsInt64()).AsInt16();
+        v0 = SimdCompat.UnpackLow(q0.AsInt64(), q4.AsInt64()).AsInt16();
+        v1 = SimdCompat.UnpackHigh(q0.AsInt64(), q4.AsInt64()).AsInt16();
+        v2 = SimdCompat.UnpackLow(q1.AsInt64(), q5.AsInt64()).AsInt16();
+        v3 = SimdCompat.UnpackHigh(q1.AsInt64(), q5.AsInt64()).AsInt16();
+        v4 = SimdCompat.UnpackLow(q2.AsInt64(), q6.AsInt64()).AsInt16();
+        v5 = SimdCompat.UnpackHigh(q2.AsInt64(), q6.AsInt64()).AsInt16();
+        v6 = SimdCompat.UnpackLow(q3.AsInt64(), q7.AsInt64()).AsInt16();
+        v7 = SimdCompat.UnpackHigh(q3.AsInt64(), q7.AsInt64()).AsInt16();
     }
 
     // ===================== RGB -> YCbCr =====================
@@ -386,16 +395,16 @@ internal static class SimdJpegEncodePipeline
                     out Vector128<int> cbl, out Vector128<int> cbh,
                     out Vector128<int> crl, out Vector128<int> crh);
                 Store4(yLeft, yRow, yl, yh);
-                Vector128<int> cbPairL = Ssse3.HorizontalAdd(cbl, cbh);
-                Vector128<int> crPairL = Ssse3.HorizontalAdd(crl, crh);
+                Vector128<int> cbPairL = SimdCompat.HorizontalAddInt32(cbl, cbh);
+                Vector128<int> crPairL = SimdCompat.HorizontalAddInt32(crl, crh);
 
                 Convert8Pixels(rowPtr + 24,
                     out yl, out yh,
                     out cbl, out cbh,
                     out crl, out crh);
                 Store4(yRight, yRow, yl, yh);
-                Vector128<int> cbPairR = Ssse3.HorizontalAdd(cbl, cbh);
-                Vector128<int> crPairR = Ssse3.HorizontalAdd(crl, crh);
+                Vector128<int> cbPairR = SimdCompat.HorizontalAddInt32(cbl, cbh);
+                Vector128<int> crPairR = SimdCompat.HorizontalAddInt32(crl, crh);
 
                 if (evenRow)
                 {
@@ -429,42 +438,42 @@ internal static class SimdJpegEncodePipeline
         out Vector128<int> cbLo, out Vector128<int> cbHi,
         out Vector128<int> crLo, out Vector128<int> crHi)
     {
-        Vector128<byte> lo = Sse2.LoadVector128(src);
-        Vector128<byte> hi = Sse2.LoadVector128(src + 8);
+        Vector128<byte> lo = SimdCompat.LoadBytesPtr(src);
+        Vector128<byte> hi = SimdCompat.LoadBytesPtr(src + 8);
 
-        Vector128<byte> rB = Sse2.Or(Ssse3.Shuffle(lo, MaskRlo), Ssse3.Shuffle(hi, MaskRhi));
-        Vector128<byte> gB = Sse2.Or(Ssse3.Shuffle(lo, MaskGlo), Ssse3.Shuffle(hi, MaskGhi));
-        Vector128<byte> bB = Sse2.Or(Ssse3.Shuffle(lo, MaskBlo), Ssse3.Shuffle(hi, MaskBhi));
+        Vector128<byte> rB = SimdCompat.OrBytes(SimdCompat.ShuffleBytes(lo, MaskRlo), SimdCompat.ShuffleBytes(hi, MaskRhi));
+        Vector128<byte> gB = SimdCompat.OrBytes(SimdCompat.ShuffleBytes(lo, MaskGlo), SimdCompat.ShuffleBytes(hi, MaskGhi));
+        Vector128<byte> bB = SimdCompat.OrBytes(SimdCompat.ShuffleBytes(lo, MaskBlo), SimdCompat.ShuffleBytes(hi, MaskBhi));
 
         Vector128<short> r = Vector128.WidenLower(rB).AsInt16();
         Vector128<short> g = Vector128.WidenLower(gB).AsInt16();
         Vector128<short> b = Vector128.WidenLower(bB).AsInt16();
 
-        Vector128<short> rgLo = Sse2.UnpackLow(r, g);
-        Vector128<short> rgHi = Sse2.UnpackHigh(r, g);
+        Vector128<short> rgLo = SimdCompat.UnpackLow(r, g);
+        Vector128<short> rgHi = SimdCompat.UnpackHigh(r, g);
 
         // Y = (77R + 150G + 29B) >> 8 - 128
-        Vector128<int> yLoV = Sse2.MultiplyAddAdjacent(rgLo, CoeffY);
-        Vector128<int> yHiV = Sse2.MultiplyAddAdjacent(rgHi, CoeffY);
-        Vector128<short> bY = Sse2.MultiplyLow(b, CoeffBY);
+        Vector128<int> yLoV = SimdCompat.MultiplyAddAdjacent(rgLo, CoeffY);
+        Vector128<int> yHiV = SimdCompat.MultiplyAddAdjacent(rgHi, CoeffY);
+        Vector128<short> bY = SimdCompat.MultiplyLowInt16(b, CoeffBY);
         yLoV += Vector128.WidenLower(bY);
         yHiV += Vector128.WidenUpper(bY);
         yLo = (yLoV >> 8) - CConst128;
         yHi = (yHiV >> 8) - CConst128;
 
         // Cb = (-43R - 85G + 128B) >> 8 + 128
-        Vector128<int> cbLoV = Sse2.MultiplyAddAdjacent(rgLo, CoeffCb);
-        Vector128<int> cbHiV = Sse2.MultiplyAddAdjacent(rgHi, CoeffCb);
-        Vector128<short> bCb = Sse2.MultiplyLow(b, CoeffBCb);
+        Vector128<int> cbLoV = SimdCompat.MultiplyAddAdjacent(rgLo, CoeffCb);
+        Vector128<int> cbHiV = SimdCompat.MultiplyAddAdjacent(rgHi, CoeffCb);
+        Vector128<short> bCb = SimdCompat.MultiplyLowInt16(b, CoeffBCb);
         cbLoV += Vector128.WidenLower(bCb);
         cbHiV += Vector128.WidenUpper(bCb);
         cbLo = (cbLoV >> 8) + CConst128;
         cbHi = (cbHiV >> 8) + CConst128;
 
         // Cr = (128R - 107G - 21B) >> 8 + 128
-        Vector128<int> crLoV = Sse2.MultiplyAddAdjacent(rgLo, CoeffCr);
-        Vector128<int> crHiV = Sse2.MultiplyAddAdjacent(rgHi, CoeffCr);
-        Vector128<short> bCr = Sse2.MultiplyLow(b, CoeffBCr);
+        Vector128<int> crLoV = SimdCompat.MultiplyAddAdjacent(rgLo, CoeffCr);
+        Vector128<int> crHiV = SimdCompat.MultiplyAddAdjacent(rgHi, CoeffCr);
+        Vector128<short> bCr = SimdCompat.MultiplyLowInt16(b, CoeffBCr);
         crLoV += Vector128.WidenLower(bCr);
         crHiV += Vector128.WidenUpper(bCr);
         crLo = (crLoV >> 8) + CConst128;

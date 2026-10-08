@@ -199,9 +199,18 @@ internal static class Program
         Console.WriteLine($"cpu              : {Environment.GetEnvironmentVariable("PROCESSOR_IDENTIFIER")}");
         Console.WriteLine($"cores            : {Environment.ProcessorCount}");
         Console.WriteLine($"arch             : {RuntimeInformation.ProcessArchitecture}");
-        Console.WriteLine($"simd             : SSE2={Sse2.IsSupported} SSSE3={Ssse3.IsSupported} SSE41={Sse41.IsSupported} " +
+        Console.WriteLine($"simd-x86         : SSE2={Sse2.IsSupported} SSSE3={Ssse3.IsSupported} SSE41={Sse41.IsSupported} " +
                           $"AVX={Avx.IsSupported} AVX2={Avx2.IsSupported} AVX512F={Avx512F.IsSupported} " +
                           $"AVXVNNI={AvxVnni.IsSupported}");
+        Console.WriteLine($"simd-arm         : AdvSimd={System.Runtime.Intrinsics.Arm.AdvSimd.IsSupported} " +
+                          $"AdvSimd.Arm64={System.Runtime.Intrinsics.Arm.AdvSimd.Arm64.IsSupported} " +
+                          $"Crc32={System.Runtime.Intrinsics.Arm.Crc32.IsSupported} " +
+                          $"Aes={System.Runtime.Intrinsics.Arm.Aes.IsSupported} " +
+                          $"Dp={System.Runtime.Intrinsics.Arm.Dp.IsSupported} " +
+                          $"Rdm={System.Runtime.Intrinsics.Arm.Rdm.IsSupported}");
+        Console.WriteLine($"simd-generic     : Vector.IsHardwareAccelerated={System.Numerics.Vector.IsHardwareAccelerated} " +
+                          $"Vector<byte>.Count={System.Numerics.Vector<byte>.Count} " +
+                          $"Vector128<byte>.Count={System.Runtime.Intrinsics.Vector128<byte>.Count}");
         Console.WriteLine($"gc               : server={System.Runtime.GCSettings.IsServerGC} latency={System.Runtime.GCSettings.LatencyMode}");
         Console.WriteLine($"corpus           : {opt.Corpus}");
         Console.WriteLine($"timestamp        : {DateTime.Now:yyyy-MM-dd HH:mm:ss}");

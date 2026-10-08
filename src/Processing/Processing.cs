@@ -83,10 +83,10 @@ namespace SharpImageConverter.Processing
             int rowBase, int q0, int q1, int q2, int q3,
             Vector128<float> w0, Vector128<float> w1, Vector128<float> w2, Vector128<float> w3)
         {
-            var acc = Sse2.Multiply(w0, BicubicLoadRgb(ref srcRef, rowBase + q0));
-            acc = Sse2.Add(acc, Sse2.Multiply(w1, BicubicLoadRgb(ref srcRef, rowBase + q1)));
-            acc = Sse2.Add(acc, Sse2.Multiply(w2, BicubicLoadRgb(ref srcRef, rowBase + q2)));
-            return Sse2.Add(acc, Sse2.Multiply(w3, BicubicLoadRgb(ref srcRef, rowBase + q3)));
+            var acc = SimdCompat.MultiplySingle(w0, BicubicLoadRgb(ref srcRef, rowBase + q0));
+            acc = SimdCompat.AddSingle(acc, SimdCompat.MultiplySingle(w1, BicubicLoadRgb(ref srcRef, rowBase + q1)));
+            acc = SimdCompat.AddSingle(acc, SimdCompat.MultiplySingle(w2, BicubicLoadRgb(ref srcRef, rowBase + q2)));
+            return SimdCompat.AddSingle(acc, SimdCompat.MultiplySingle(w3, BicubicLoadRgb(ref srcRef, rowBase + q3)));
         }
 
         /// <summary>
@@ -98,7 +98,8 @@ namespace SharpImageConverter.Processing
         private static Vector128<float> BicubicLoadRgb(ref byte srcRef, int offset)
         {
             uint packed = Unsafe.ReadUnaligned<uint>(ref Unsafe.Add(ref srcRef, offset));
-            return Sse2.ConvertToVector128Single(Sse41.ConvertToVector128Int32(Vector128.CreateScalar(packed).AsByte()));
+            return SimdCompat.ConvertInt32ToSingle(
+                SimdCompat.ConvertBytesToInt32(Vector128.CreateScalar(packed).AsByte()));
         }
 
         // 把 4 个 int32 结果的低字节收成 4 个紧凑字节（第 4 个 lane 是多余读出，不参与写出）
@@ -182,19 +183,31 @@ namespace SharpImageConverter.Processing
             var outBytes = Vector128<byte>.Zero;
             for (int c = 0; c < 3; c++)
             {
-                var p0 = Sse2.Or(Ssse3.Shuffle(v01, BilinearPairMaskA[c]), Ssse3.Shuffle(v23, BilinearPairMaskB[c])).AsInt16();
-                var p1 = Sse2.Or(Ssse3.Shuffle(w01, BilinearPairMaskA[c]), Ssse3.Shuffle(w23, BilinearPairMaskB[c])).AsInt16();
+                var p0 = SimdCompat.OrBytes(
+                    SimdCompat.ShuffleBytes(v01, BilinearPairMaskA[c]),
+                    SimdCompat.ShuffleBytes(v23, BilinearPairMaskB[c])).AsInt16();
+                var p1 = SimdCompat.OrBytes(
+                    SimdCompat.ShuffleBytes(w01, BilinearPairMaskA[c]),
+                    SimdCompat.ShuffleBytes(w23, BilinearPairMaskB[c])).AsInt16();
 
                 // 水平：(a*q0 + b*q1) << 7 + (a*r0 + b*r1)
-                var h0 = Sse2.Add(Sse2.ShiftLeftLogical(Sse2.MultiplyAddAdjacent(p0, qVec), 7), Sse2.MultiplyAddAdjacent(p0, rVec));
-                var h1 = Sse2.Add(Sse2.ShiftLeftLogical(Sse2.MultiplyAddAdjacent(p1, qVec), 7), Sse2.MultiplyAddAdjacent(p1, rVec));
+                var h0 = SimdCompat.AddInt32(
+                    SimdCompat.ShiftLeftLogicalInt32(SimdCompat.MultiplyAddAdjacent(p0, qVec), 7),
+                    SimdCompat.MultiplyAddAdjacent(p0, rVec));
+                var h1 = SimdCompat.AddInt32(
+                    SimdCompat.ShiftLeftLogicalInt32(SimdCompat.MultiplyAddAdjacent(p1, qVec), 7),
+                    SimdCompat.MultiplyAddAdjacent(p1, rVec));
 
-                var val = Sse2.ShiftRightLogical(
-                    Sse2.Add(Sse2.Add(Sse41.MultiplyLow(h0, wy0Vec), Sse41.MultiplyLow(h1, wy1Vec)), roundVec),
+                var val = SimdCompat.ShiftRightLogicalInt32(
+                    SimdCompat.AddInt32(
+                        SimdCompat.AddInt32(
+                            SimdCompat.MultiplyLowInt32(h0, wy0Vec),
+                            SimdCompat.MultiplyLowInt32(h1, wy1Vec)),
+                        roundVec),
                     2 * Shift);
 
-                var chan = Ssse3.Shuffle(val.AsByte(), BilinearExtractMask);
-                outBytes = Sse2.Or(outBytes, Ssse3.Shuffle(chan, BilinearInterleaveMask[c]));
+                var chan = SimdCompat.ShuffleBytes(val.AsByte(), BilinearExtractMask);
+                outBytes = SimdCompat.OrBytes(outBytes, SimdCompat.ShuffleBytes(chan, BilinearInterleaveMask[c]));
             }
 
             return outBytes;
@@ -244,7 +257,7 @@ namespace SharpImageConverter.Processing
                     wx0Arr[x] = Scale - wx1;
                 }
 
-                bool useSimd = Ssse3.IsSupported && Sse41.IsSupported && width >= 4;
+                bool useSimd = SimdCompat.ByteShuffleAndPmulldSupported && width >= 4;
                 int simdXEnd = 0;
                 if (useSimd)
                 {
@@ -616,7 +629,7 @@ namespace SharpImageConverter.Processing
                 // SIMD 路径要求抽头只落在 [0, sw-2] 上（一次读 4 字节）；
                 // xIndex[x*4+3] 是该像素的最大抽头，且随 x 单调不减，找到第一个越界位置即可。
                 // 另外最后一个输出像素只能按 3 字节写，不参与 SIMD。
-                bool useSimd = Sse2.IsSupported && Ssse3.IsSupported && Sse41.IsSupported;
+                bool useSimd = SimdCompat.ByteShuffleAndPmulldSupported;
                 int simdEnd = width - 1;
                 if (useSimd)
                 {
@@ -675,17 +688,17 @@ namespace SharpImageConverter.Processing
                         var row3 = BicubicRow(ref srcRef, base3, q0, q1, q2, q3, w0, w1, w2, w3);
 
                         // 垂直方向同样是 (((wy0*row0) + (wy1*row1)) + ...) 的结合顺序
-                        var val = Sse2.Multiply(Vector128.Create(wy0), row0);
-                        val = Sse2.Add(val, Sse2.Multiply(Vector128.Create(wy1), row1));
-                        val = Sse2.Add(val, Sse2.Multiply(Vector128.Create(wy2), row2));
-                        val = Sse2.Add(val, Sse2.Multiply(Vector128.Create(wy3), row3));
+                        var val = SimdCompat.MultiplySingle(Vector128.Create(wy0), row0);
+                        val = SimdCompat.AddSingle(val, SimdCompat.MultiplySingle(Vector128.Create(wy1), row1));
+                        val = SimdCompat.AddSingle(val, SimdCompat.MultiplySingle(Vector128.Create(wy2), row2));
+                        val = SimdCompat.AddSingle(val, SimdCompat.MultiplySingle(Vector128.Create(wy3), row3));
 
                         // 先夹到 [0,255] 再 +0.5 截断——顺序必须和标量一致，否则边界取值会差 1
-                        val = Sse2.Min(Sse2.Max(val, Vector128<float>.Zero), MaxByte);
+                        val = SimdCompat.MinSingle(SimdCompat.MaxSingle(val, Vector128<float>.Zero), MaxByte);
                         // 必须用截断转换：标量路径是 (byte)(val + 0.5f)，协处理器语义等同于 cvtt。
                         // 若误用 cvtps2dq（最近取整）会整体偏 1，且 255.5 会取整成 256，取低字节时又绕回 0。
-                        Vector128<int> iv = Sse2.ConvertToVector128Int32WithTruncation(Sse2.Add(val, Half));
-                        var packed = Ssse3.Shuffle(iv.AsByte(), BicubicStoreMask);
+                        Vector128<int> iv = SimdCompat.ConvertToInt32WithTruncation(SimdCompat.AddSingle(val, Half));
+                        var packed = SimdCompat.ShuffleBytes(iv.AsByte(), BicubicStoreMask);
 
                         int d = dBase + x * 3;
                         if (x + 1 < width)

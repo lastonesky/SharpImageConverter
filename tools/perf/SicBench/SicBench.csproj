@@ -16,7 +16,13 @@
     <!-- keep both sides identical: workstation, non-concurrent GC -->
     <ServerGarbageCollection>false</ServerGarbageCollection>
     <ConcurrentGarbageCollection>false</ConcurrentGarbageCollection>
-    <TieredPGO>true</TieredPGO>
+    <!--
+      关掉分层编译：默认的 tier-0 解释/快速 JIT 代码会先跑几十上百次才被替换成
+      优化版（实测阈值 80~150 次），小图算子因此被测成 tier-0 性能。向量路径的
+      tier-0 代码体量远大于标量路径，受害的恰好是优化后的构建，会制造大量假回归。
+      TieredCompilation=false 让方法首次 JIT 即完全优化，热身次数因此可以压到个位数。
+    -->
+    <TieredCompilation>false</TieredCompilation>
   </PropertyGroup>
 
   <ItemGroup>

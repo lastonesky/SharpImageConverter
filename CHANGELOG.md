@@ -13,6 +13,52 @@
   经封死性上界判负（多付的查表/清表开销 > 收回的出码收益），只分析未实现。
 
 ### 改进
+- **arm64 全面补齐 SIMD：新增跨架构原语层 `SimdCompat`，JPEG/PNG/GIF/BMP/缩放全链路提速（47% 的项超过 7% 阈值，JPEG 解码最高 5.9x）。**
+  起因：库中所有 SIMD 路径都由 `Sse2/Ssse3/Sse41/Avx2/AvxVnni.IsSupported` 守卫，
+  而 arm64 上这几个属性**全部为 false** ⇒ 整条向量路径在 ARM 上静默退化为标量死代码
+  （14 个文件、约 490 处调用点）。
+  - **做法**：新建 `src/Core/SimdCompat.cs` 作为跨架构原语层，每个方法按 `IsSupported` 分派。
+    **x86 分支保持逐字不变**（对 x86 零影响），arm64 分支走 NEON。
+    映射要点：`UnpackLow/High`→`ZipLow/ZipHigh`；`PackUnsignedSaturate`→`ExtractNarrowingSaturateUnsigned{Lower,Upper}`；
+    `pmaddwd`→`MultiplyWideningLower/Upper`+`AddPairwise`；`psadbw`→`uabd`+3×`AddPairwiseWidening`；
+    `phaddd`→`AddPairwise`；`pmovzxbd`→两级 `ZeroExtendWidening`；整寄存器移位→`ExtractVector128`。
+  - **纠正两处认知**（均有单测固定）：
+    1. `tbl` 与 `pshufb` **不完全等价**——`pshufb` 在掩码 bit7=1 时出 0、否则取 `mask & 0x0F`（16..127 会**折叠**），
+       而 `tbl` 索引 ≥16 一律出 0。`ShuffleBytes` 统一按 `mask & 0x8F` 归一化后才等价。
+    2. NEON `EXT` 方向：`ExtractVector128(v, zero, n)` ≡ `psrldq(v,n)`、`ExtractVector128(zero, v, 16-n)` ≡ `pslldq(v,n)`；
+       且 **n=0 时 16-0=16 越界会抛异常**，而 x86 `pslldq x,0` 合法，已单独短路。
+  - **新增 `SimdCompatTests`（24 例）**：每个原语按 Intel SDM / ARM ARM **独立推导**标量参考实现后逐 lane 对拍
+    （不引用被测代码）。这套测试立即抓出真实 bug——`ShiftLeftBytes(v, 0)` 在 ARM 上抛
+    `ArgumentOutOfRangeException` 而 x86 合法。全量单测 189 → **213 通过**。
+  - **实测 A/B**（`tools/perf/run-ab.sh`，两侧各 2 轮、跨轮中位数、产物哈希比对）：
+    | 链路 | 加速 |
+    |---|---|
+    | JPEG 解码 large / medium / 渐进式 huge | **5.91x / 4.68x / 3.73x** |
+    | RGB→灰度 | 2.04x ~ 3.03x |
+    | WebP 解码 | 1.21x ~ 2.50x |
+    | 双线性缩放（200% 与 50%） | 1.75x ~ 2.06x |
+    | 双三次缩放 200% | 1.61x ~ 1.81x |
+    | BMP 编 / 解码 | 1.38x ~ 2.14x |
+    | PNG **编码**（Adler32） | +8.4% ~ +9.6% |
+    | PNG **解码** | +2%（**无收益**：走 BCL `ZLibStream`，不经本库 Adler32） |
+    | GIF 编解码 | +3.4% ~ +14.2%（标量回退本就是查表实现，天花板低） |
+    123 项中 58 项（47.2%）超 7% 阈值；118 项产物逐字节一致，
+    5 项 JPEG 解码差异为**继承自 x86 的既有差异**（SIMD 用色度复制、标量用双线性上采样）。
+    逐项取证与三个存疑项的分析见 `docs/ArmPerfBaseline.md` §7。
+  - **Adler32 移植**：`s1 += b[i]; s2 += s1;` 的跨迭代依赖链把标量吞吐锁在 1.62 GB/s；
+    改用 `psadbw` 求 s1、`pmaddwd` 求加权 s2、`HorizontalSumInt32`（NEON 单条 `addv`）归约后达 **7.81 GB/s（4.8x）**，
+    12 组数据（含 5552 边界与 `Update` 串联）逐位一致。
+  - **修掉基准自身三个会骗人的缺陷**（否则会把上面这些收益误判成回归）：
+    1. 固定热身 40 次不足以跨过 tier-0→tier-1 阈值（实测 **80~150 次**），而向量路径的 tier-0
+       代码体量远大于标量路径 ⇒ tiny/small 全项被系统性判慢，测出 `upscale-200%@tiny 0.271x`
+       这种"输出 0.9 MB 比输出 5.6 MB 还慢 2.4 倍"的物理不可能数字。
+       **改为在 `SicBench.csproj` 关掉分层编译**（`TieredCompilation=false`）：首次 JIT 即完全优化，
+       热身固定 8 次即可（实测 0.58/0.77/0.62 ms，与热身 1000 次的 0.55 ms 一致），
+       整轮 A/B 从 ~15 min 降到 **3 min 58 s**。
+    2. `Measure` 在**每个计时样本前**强制 compacting GC，GC 尾部开销反而落进计时窗口：
+       改成只在循环开始前整理一次（同算子三轮 2.028/0.888/0.847 ms 乱跳 → 1.000/1.070/1.104 ms 稳定）。
+    3. `best()` 用 `current*` glob 会命中上一轮的 `*-final-*.csv`，把**不同构建**的行混进一张表，
+       导致产物哈希 DIFF 被"更快的那一行"掩盖 ⇒ 改为按 stamp 精确匹配 + **跨轮中位数**选择器。
 - **JPEG 编码器新增「按图优化的 Huffman 表」（`JpegEncoderOptions.OptimizeHuffman`）。**
   起因：`progressive.jpg`（143MP，约 2/3 是近纯白背景，TinyPNG 能压 28.5%、我们却判「无收益」）。
   取证：同一量化表下（q72 的表 ≈ 原图表，luma 64 值和 2097 vs 2136）我们出 4.38 MB、原图 3.09 MB（+42%）；

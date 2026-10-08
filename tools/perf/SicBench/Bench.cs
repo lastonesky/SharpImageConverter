@@ -1,5 +1,4 @@
 using System.Diagnostics;
-using System.Globalization;
 using SharpImageConverter;
 using SharpImageConverter.Core;
 using SharpImageConverter.Formats.Bmp;
@@ -87,12 +86,7 @@ internal static class Bench
         Measure("encode-gray", "webp-q75", "webp", e, iter, () => WebpEncode(ms, grayRgb, w, h));
 
         // ---- color -> grayscale ----
-        Measure("grayscale", "rgb24->gray", "gray", e, iter, () =>
-        {
-            var img = new Image<Rgb24>(w, h, rgb);
-            var g = img.Clone(c => c.Grayscale());
-            return ((long)g.Buffer.Length, Hash(g.Buffer));
-        });
+        MeasureGrayscale(e, iter, rgb, w, h);
 
         // ---- resize ----
         Measure("resize", "downscale-50%-auto", "rgb24", e, iter, () => ResizeOp(rgb, w, h, w / 2, h / 2, Mode.Auto));
@@ -143,6 +137,28 @@ internal static class Bench
         return ((long)r.Buffer.Length, Hash(r.Buffer));
     }
 
+
+    /// <summary>
+    /// 原地灰度算子。
+    /// <para>
+    /// <b>不能用 Clone()</b>：大数组克隆本身就会触发 LOH GC，扣除项自带巨大噪声，
+    /// 足以把信号淹没——项目既有方法论已记录过这一点（docs/PerfReport.md「方法」一节）。
+    /// 这里预先分配好暂存缓冲，每轮只做一次无分配拷贝 + 一次原地运算，
+    /// 因此测得的是算子本身，而不是分配器与 GC。
+    /// </para>
+    /// </summary>
+    private static void MeasureGrayscale(CorpusEntry e, int iter, byte[] rgb, int w, int h)
+    {
+        byte[] scratch = new byte[rgb.Length];
+        var img = new Image<Rgb24>(w, h, scratch);
+        Measure("grayscale", "rgb24->gray", "gray", e, iter, () =>
+        {
+            Buffer.BlockCopy(rgb, 0, scratch, 0, rgb.Length);
+            img.Mutate(c => c.Grayscale());
+            return ((long)scratch.Length, Hash(scratch));
+        });
+    }
+
     // ---------------------------------------------------------------- huge
 
     private static void RunHuge(CorpusEntry e)
@@ -185,12 +201,7 @@ internal static class Bench
         int w = decoded.Width, h = decoded.Height;
         var ms = new MemoryStream(1 << 26);
 
-        Measure("grayscale", "rgb24->gray", "gray", e, iter, () =>
-        {
-            var img = new Image<Rgb24>(w, h, rgb);
-            var g = img.Clone(c => c.Grayscale());
-            return ((long)g.Buffer.Length, Hash(g.Buffer));
-        });
+        MeasureGrayscale(e, iter, rgb, w, h);
 
         Measure("resize", "downscale-25%-auto", "rgb24", e, iter, () => ResizeOp(rgb, w, h, w / 4, h / 4, Mode.Auto));
         Measure("resize", "downscale-50%-auto", "rgb24", e, iter, () => ResizeOp(rgb, w, h, w / 2, h / 2, Mode.Auto));
@@ -250,11 +261,34 @@ internal static class Bench
         Console.Write($"  {key,-46}");
         Console.Out.Flush();
 
-        // warm-up (also JIT / tiered-compilation promotion)
+        // 预热：只做**少量**次调用，让 JIT 完成方法编译、并让分支预测与缓存进入正常状态。
+        //
+        // 这里刻意不靠"多热身几十上百次"去跨过 tier-0→tier-1 的调用计数阈值：
+        // 那条路既慢又不可靠。实测阈值落在 80~150 次之间，而且向量路径的 tier-0
+        // 代码体量远大于标量路径（大量内联的 SimdCompat 包装 + 内在函数），
+        // 于是 tiny/small 全项被系统性误判成"变慢"，出现
+        // `upscale-200%@tiny` 0.27x 这种比大 8 倍的 small 还慢 2.4 倍的物理不可能数字。
+        //
+        // 正确做法是**在进程级关掉分层编译**（见 SicBench.csproj 的 TieredCompilation=false）：
+        // 方法第一次 JIT 就产出完全优化的代码，根本不存在 tier-0 平台期。
+        // 因此热身只需覆盖"首次调用"即可，下面这几次纯粹是留给运行时的余量。
+        const int WarmCalls = 8;
+        const double WarmCapMs = 800;
+        var warmSw = Stopwatch.StartNew();
+        int warmDone = 0;
         (long bytes, uint hash) first;
         try
         {
             first = body();
+            warmDone = 1;
+            for (int w = 1; w < WarmCalls; w++)
+            {
+                first = body();
+                warmDone++;
+                // 巨型算子单次就可能几百毫秒，给个硬上限避免热身把总时长拖垮
+                if (warmSw.Elapsed.TotalMilliseconds > WarmCapMs)
+                    break;
+            }
         }
         catch (Exception ex)
         {
@@ -264,11 +298,18 @@ internal static class Bench
             return;
         }
 
+        // 只在本轮计时**开始前**整理一次堆。
+        // 原实现在每个计时样本前都强制一次 compacting gen2 GC，但 GC 的尾部开销
+        // （页回收、段整理）会落进紧随其后的计时窗口——正是它想消除的那种噪声。
+        // 实测同一算子（tiny bicubic 200%，标量）连续三轮：
+        //   每样本前 GC    : 2.028 / 0.888 / 0.847 ms  ⇒ 加速比 3.41x / 1.63x / 1.54x 乱跳
+        //   仅循环前 GC 一次: 1.000 / 1.070 / 1.104 ms  ⇒ 加速比 1.65x / 1.84x / 1.60x 稳定
+        // 分配开销本身仍计入样本（resize 之类本来就要分配），只是不再人为制造 GC 尖峰。
+        CollectGarbage();
         var times = new List<double>(iterations);
         bool stable = true;
         for (int i = 0; i < iterations; i++)
         {
-            CollectGarbage();
             var sw = Stopwatch.StartNew();
             var r = body();
             sw.Stop();
@@ -284,7 +325,7 @@ internal static class Bench
             median, sorted[0], times.Average(), sorted[^1], first.bytes, first.hash, stable);
         Results.Add(result);
 
-        Console.WriteLine($"{median,10:F2} ms   {result.MpxPerSec,8:F2} Mpx/s   {(first.bytes / 1024.0),10:F0} KB   it={iterations}{(stable ? "" : "  [UNSTABLE]")}");
+        Console.WriteLine($"{median,10:F2} ms   {result.MpxPerSec,8:F2} Mpx/s   {(first.bytes / 1024.0),10:F0} KB   it={iterations} w={warmDone}{(stable ? "" : "  [UNSTABLE]")}");
     }
 
     private static void CollectGarbage()

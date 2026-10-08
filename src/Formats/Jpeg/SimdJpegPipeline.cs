@@ -1,4 +1,5 @@
-using System.Runtime.CompilerServices;
+﻿using System.Runtime.CompilerServices;
+using SharpImageConverter.Core;
 using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
@@ -152,32 +153,32 @@ internal static class SimdJpegPipeline
     private static void Transpose8x8Sse2(ref Vector128<short> v0, ref Vector128<short> v1, ref Vector128<short> v2, ref Vector128<short> v3,
                                          ref Vector128<short> v4, ref Vector128<short> v5, ref Vector128<short> v6, ref Vector128<short> v7)
     {
-        Vector128<short> t0 = Sse2.UnpackLow(v0, v1);
-        Vector128<short> t1 = Sse2.UnpackHigh(v0, v1);
-        Vector128<short> t2 = Sse2.UnpackLow(v2, v3);
-        Vector128<short> t3 = Sse2.UnpackHigh(v2, v3);
-        Vector128<short> t4 = Sse2.UnpackLow(v4, v5);
-        Vector128<short> t5 = Sse2.UnpackHigh(v4, v5);
-        Vector128<short> t6 = Sse2.UnpackLow(v6, v7);
-        Vector128<short> t7 = Sse2.UnpackHigh(v6, v7);
+        Vector128<short> t0 = SimdCompat.UnpackLow(v0, v1);
+        Vector128<short> t1 = SimdCompat.UnpackHigh(v0, v1);
+        Vector128<short> t2 = SimdCompat.UnpackLow(v2, v3);
+        Vector128<short> t3 = SimdCompat.UnpackHigh(v2, v3);
+        Vector128<short> t4 = SimdCompat.UnpackLow(v4, v5);
+        Vector128<short> t5 = SimdCompat.UnpackHigh(v4, v5);
+        Vector128<short> t6 = SimdCompat.UnpackLow(v6, v7);
+        Vector128<short> t7 = SimdCompat.UnpackHigh(v6, v7);
 
-        Vector128<int> q0 = Sse2.UnpackLow(t0.AsInt32(), t2.AsInt32());
-        Vector128<int> q1 = Sse2.UnpackHigh(t0.AsInt32(), t2.AsInt32());
-        Vector128<int> q2 = Sse2.UnpackLow(t1.AsInt32(), t3.AsInt32());
-        Vector128<int> q3 = Sse2.UnpackHigh(t1.AsInt32(), t3.AsInt32());
-        Vector128<int> q4 = Sse2.UnpackLow(t4.AsInt32(), t6.AsInt32());
-        Vector128<int> q5 = Sse2.UnpackHigh(t4.AsInt32(), t6.AsInt32());
-        Vector128<int> q6 = Sse2.UnpackLow(t5.AsInt32(), t7.AsInt32());
-        Vector128<int> q7 = Sse2.UnpackHigh(t5.AsInt32(), t7.AsInt32());
+        Vector128<int> q0 = SimdCompat.UnpackLow(t0.AsInt32(), t2.AsInt32());
+        Vector128<int> q1 = SimdCompat.UnpackHigh(t0.AsInt32(), t2.AsInt32());
+        Vector128<int> q2 = SimdCompat.UnpackLow(t1.AsInt32(), t3.AsInt32());
+        Vector128<int> q3 = SimdCompat.UnpackHigh(t1.AsInt32(), t3.AsInt32());
+        Vector128<int> q4 = SimdCompat.UnpackLow(t4.AsInt32(), t6.AsInt32());
+        Vector128<int> q5 = SimdCompat.UnpackHigh(t4.AsInt32(), t6.AsInt32());
+        Vector128<int> q6 = SimdCompat.UnpackLow(t5.AsInt32(), t7.AsInt32());
+        Vector128<int> q7 = SimdCompat.UnpackHigh(t5.AsInt32(), t7.AsInt32());
 
-        v0 = Sse2.UnpackLow(q0.AsInt64(), q4.AsInt64()).AsInt16();
-        v1 = Sse2.UnpackHigh(q0.AsInt64(), q4.AsInt64()).AsInt16();
-        v2 = Sse2.UnpackLow(q1.AsInt64(), q5.AsInt64()).AsInt16();
-        v3 = Sse2.UnpackHigh(q1.AsInt64(), q5.AsInt64()).AsInt16();
-        v4 = Sse2.UnpackLow(q2.AsInt64(), q6.AsInt64()).AsInt16();
-        v5 = Sse2.UnpackHigh(q2.AsInt64(), q6.AsInt64()).AsInt16();
-        v6 = Sse2.UnpackLow(q3.AsInt64(), q7.AsInt64()).AsInt16();
-        v7 = Sse2.UnpackHigh(q3.AsInt64(), q7.AsInt64()).AsInt16();
+        v0 = SimdCompat.UnpackLow(q0.AsInt64(), q4.AsInt64()).AsInt16();
+        v1 = SimdCompat.UnpackHigh(q0.AsInt64(), q4.AsInt64()).AsInt16();
+        v2 = SimdCompat.UnpackLow(q1.AsInt64(), q5.AsInt64()).AsInt16();
+        v3 = SimdCompat.UnpackHigh(q1.AsInt64(), q5.AsInt64()).AsInt16();
+        v4 = SimdCompat.UnpackLow(q2.AsInt64(), q6.AsInt64()).AsInt16();
+        v5 = SimdCompat.UnpackHigh(q2.AsInt64(), q6.AsInt64()).AsInt16();
+        v6 = SimdCompat.UnpackLow(q3.AsInt64(), q7.AsInt64()).AsInt16();
+        v7 = SimdCompat.UnpackHigh(q3.AsInt64(), q7.AsInt64()).AsInt16();
     }
 
     // --- Full-link vectorized methods ---
@@ -252,10 +253,10 @@ internal static class SimdJpegPipeline
     private static unsafe void UpsampleAndConvert(Vector128<short> yL, Vector128<short> yR, Vector128<short> cbRow, Vector128<short> crRow, byte* pRowDest)
     {
         // 水平上采样：用 Unpack 完美将 8 个像素拉伸为两组包含 8 个像素的 128位 向量
-        Vector128<short> cbL = Sse2.UnpackLow(cbRow, cbRow);
-        Vector128<short> cbR = Sse2.UnpackHigh(cbRow, cbRow);
-        Vector128<short> crL = Sse2.UnpackLow(crRow, crRow);
-        Vector128<short> crR = Sse2.UnpackHigh(crRow, crRow);
+        Vector128<short> cbL = SimdCompat.UnpackLow(cbRow, cbRow);
+        Vector128<short> cbR = SimdCompat.UnpackHigh(cbRow, cbRow);
+        Vector128<short> crL = SimdCompat.UnpackLow(crRow, crRow);
+        Vector128<short> crR = SimdCompat.UnpackHigh(crRow, crRow);
 
         // 转换左边 8 个像素，直接传入当前行的起始指针
         ConvertRowYCbCrToRgb(yL, cbL, crL, pRowDest);
@@ -307,9 +308,9 @@ internal static class SimdJpegPipeline
         ConvertCore(yh, cbh, crh, out Vector128<int> rh, out Vector128<int> gh, out Vector128<int> bh);
 
         // 1. 正确打包成 byte (把低 4 位和高 4 位拼成完整的 8 字节有效数据)
-        Vector128<byte> r = Sse2.PackUnsignedSaturate(Sse2.PackSignedSaturate(rl, rh), Vector128<short>.Zero);
-        Vector128<byte> g = Sse2.PackUnsignedSaturate(Sse2.PackSignedSaturate(gl, gh), Vector128<short>.Zero);
-        Vector128<byte> b = Sse2.PackUnsignedSaturate(Sse2.PackSignedSaturate(bl, bh), Vector128<short>.Zero);
+        Vector128<byte> r = SimdCompat.PackUnsignedSaturate(SimdCompat.PackSignedSaturateInt32(rl, rh), Vector128<short>.Zero);
+        Vector128<byte> g = SimdCompat.PackUnsignedSaturate(SimdCompat.PackSignedSaturateInt32(gl, gh), Vector128<short>.Zero);
+        Vector128<byte> b = SimdCompat.PackUnsignedSaturate(SimdCompat.PackSignedSaturateInt32(bl, bh), Vector128<short>.Zero);
 
         InterleaveRgb24(r, g, b, pDest);
     }
@@ -324,17 +325,17 @@ internal static class SimdJpegPipeline
     internal static unsafe void InterleaveRgb24(Vector128<byte> r, Vector128<byte> g, Vector128<byte> b, byte* pDest)
     {
         // 1. UnpackLow 把 R/G 交错成 [R0 G0 R1 G1 ... R7 G7]（16 字节，正好一个向量）
-        Vector128<byte> rg = Sse2.UnpackLow(r, g);
+        Vector128<byte> rg = SimdCompat.UnpackLow(r, g);
 
         // 2. RGB24 交错**全程留在向量域**：两次 pshufb 分别从 rg 与 b 里挑字节，
         //    掩码中 0x80 的位置由 pshufb 置零，故两组结果可直接按位或合并。
         //    out0 覆盖输出字节 0..15（像素 0..4 完整 + 像素 5 的 R），
         //    out1 覆盖输出字节 16..23（像素 5 的 G/B + 像素 6..7 完整）。
         //    此前这里是 3 次 GetElement 拆成 ulong、再 12 次标量字节/ushort 写入。
-        Vector128<byte> out0 = Sse2.Or(Ssse3.Shuffle(rg, RgbInterleaveLowFromRg),
-                                       Ssse3.Shuffle(b, RgbInterleaveLowFromB));
-        Vector128<byte> out1 = Sse2.Or(Ssse3.Shuffle(rg, RgbInterleaveHighFromRg),
-                                       Ssse3.Shuffle(b, RgbInterleaveHighFromB));
+        Vector128<byte> out0 = SimdCompat.OrBytes(SimdCompat.ShuffleBytes(rg, RgbInterleaveLowFromRg),
+                                       SimdCompat.ShuffleBytes(b, RgbInterleaveLowFromB));
+        Vector128<byte> out1 = SimdCompat.OrBytes(SimdCompat.ShuffleBytes(rg, RgbInterleaveHighFromRg),
+                                       SimdCompat.ShuffleBytes(b, RgbInterleaveHighFromB));
 
         // 3. 两次存储写满 24 字节（调用方保证一行至少可写 8 像素 = 24 字节）
         out0.StoreUnsafe(ref *pDest);
@@ -344,11 +345,11 @@ internal static class SimdJpegPipeline
     /// <summary><see cref="InterleaveRgb24(Vector128{byte}, Vector128{byte}, Vector128{byte}, byte*)"/> 的安全重载，供测试直接对拍。</summary>
     internal static void InterleaveRgb24(Vector128<byte> r, Vector128<byte> g, Vector128<byte> b, Span<byte> dest)
     {
-        Vector128<byte> rg = Sse2.UnpackLow(r, g);
-        Vector128<byte> out0 = Sse2.Or(Ssse3.Shuffle(rg, RgbInterleaveLowFromRg),
-                                       Ssse3.Shuffle(b, RgbInterleaveLowFromB));
-        Vector128<byte> out1 = Sse2.Or(Ssse3.Shuffle(rg, RgbInterleaveHighFromRg),
-                                       Ssse3.Shuffle(b, RgbInterleaveHighFromB));
+        Vector128<byte> rg = SimdCompat.UnpackLow(r, g);
+        Vector128<byte> out0 = SimdCompat.OrBytes(SimdCompat.ShuffleBytes(rg, RgbInterleaveLowFromRg),
+                                       SimdCompat.ShuffleBytes(b, RgbInterleaveLowFromB));
+        Vector128<byte> out1 = SimdCompat.OrBytes(SimdCompat.ShuffleBytes(rg, RgbInterleaveHighFromRg),
+                                       SimdCompat.ShuffleBytes(b, RgbInterleaveHighFromB));
 
         ref byte d = ref MemoryMarshal.GetReference(dest);
         out0.StoreUnsafe(ref d);
