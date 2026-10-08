@@ -122,7 +122,13 @@ for RID in "${RIDS[@]}"; do
       echo "错误：未找到产物 $BIN" >&2
       exit 1
     fi
-    cp "$BIN" "$OUT/$NAME$EXT"
+    if [ "$EXT" = ".exe" ]; then
+      cp "$BIN" "$OUT/$NAME.exe"
+    else
+      # linux：单文件产物直接打成 tar（保留可执行位）
+      # shellcheck disable=SC2086
+      tar $TAR_EXTRA -czf "$OUT/$NAME.tar.gz" -C "$STAGE/$RID" "SharpImageConverter.Cli"
+    fi
   fi
 
   echo "    -> $(ls -1 "$OUT/$NAME"* | tr '\n' ' ')"
