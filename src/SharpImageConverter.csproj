@@ -31,7 +31,16 @@
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
   </PropertyGroup>
 
-  <ItemGroup Condition="$([System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform($([System.Runtime.InteropServices.OSPlatform]::Windows)))">
+  <!-- 原生库选择：指定 RuntimeIdentifier 时以 RID 为准；未指定时按宿主 OS。
+       这样跨平台发布（如在 Windows 上发布 linux-x64）不会混入错误平台的原生库。 -->
+  <PropertyGroup>
+    <_SicNativeRid Condition="'$(RuntimeIdentifier)' != ''">$(RuntimeIdentifier)</_SicNativeRid>
+    <_SicNativeRid Condition="'$(_SicNativeRid)' == '' And $([System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform($([System.Runtime.InteropServices.OSPlatform]::Windows)))">win-x64</_SicNativeRid>
+    <_SicNativeRid Condition="'$(_SicNativeRid)' == '' And $([System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform($([System.Runtime.InteropServices.OSPlatform]::Linux)))">linux-x64</_SicNativeRid>
+    <_SicNativeRid Condition="'$(_SicNativeRid)' == '' And $([System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform($([System.Runtime.InteropServices.OSPlatform]::OSX)))">osx-arm64</_SicNativeRid>
+  </PropertyGroup>
+
+  <ItemGroup Condition="'$(_SicNativeRid)' == 'win-x64'">
     <None Include="runtimes/win-x64/libwebp.dll" CopyToOutputDirectory="PreserveNewest" TargetPath="libwebp.dll" />
     <None Include="runtimes/win-x64/libwebpdecoder.dll" CopyToOutputDirectory="PreserveNewest" TargetPath="libwebpdecoder.dll" />
     <None Include="runtimes/win-x64/libsharpyuv.dll" CopyToOutputDirectory="PreserveNewest" TargetPath="libsharpyuv.dll" />
@@ -39,7 +48,7 @@
 	<None Include="runtimes/win-x64/libwebpmux.dll" CopyToOutputDirectory="PreserveNewest" TargetPath="libwebpmux.dll" />
   </ItemGroup>
 
-  <ItemGroup Condition="$([System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform($([System.Runtime.InteropServices.OSPlatform]::Linux)))">
+  <ItemGroup Condition="'$(_SicNativeRid)' == 'linux-x64'">
     <None Include="runtimes/linux-x64/libwebp.so.7.2.0" CopyToOutputDirectory="PreserveNewest" TargetPath="libwebp.so" />
     <None Include="runtimes/linux-x64/libwebpdecoder.so.3.2.0" CopyToOutputDirectory="PreserveNewest" TargetPath="libwebpdecoder.so" />
     <None Include="runtimes/linux-x64/libsharpyuv.so.0.1.2" CopyToOutputDirectory="PreserveNewest" TargetPath="libsharpyuv.so" />
@@ -47,7 +56,7 @@
 	<None Include="runtimes/linux-x64/libwebpmux.so.3.1.2" CopyToOutputDirectory="PreserveNewest" TargetPath="libwebpmux.so" />
   </ItemGroup>
 
-  <ItemGroup Condition="$([System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform($([System.Runtime.InteropServices.OSPlatform]::OSX)))">
+  <ItemGroup Condition="'$(_SicNativeRid)' == 'osx-arm64'">
     <None Include="runtimes/osx-arm64/native/libwebp.dylib" CopyToOutputDirectory="PreserveNewest" TargetPath="libwebp.dylib" />
     <None Include="runtimes/osx-arm64/native/libwebpdecoder.dylib" CopyToOutputDirectory="PreserveNewest" TargetPath="libwebpdecoder.dylib" />
     <None Include="runtimes/osx-arm64/native/libsharpyuv.dylib" CopyToOutputDirectory="PreserveNewest" TargetPath="libsharpyuv.dylib" />

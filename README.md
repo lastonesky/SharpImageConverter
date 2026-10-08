@@ -206,6 +206,9 @@ Console.WriteLine($"{r.SavedRatio:P1} / {r.Quality.PerceptualPsnr:F2} dB");
 
 ### 运行方式
 
+不想自己编译的话，可直接到 [Releases](https://github.com/lastonesky/SharpImageConverter/releases) 下载预编译版本：
+Windows 为单文件 `.exe`，Linux 为 `.tar.gz`，两者都是自包含的，**无需安装 .NET**，也无需额外放置原生 WebP 库。
+
 ```bash
 # 在 Cli 目录下运行
 dotnet run -- <输入文件或文件夹路径> [输出文件或文件夹路径] [操作] [参数]
