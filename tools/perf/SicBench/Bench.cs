@@ -32,7 +32,11 @@ internal static class Bench
 
         foreach (var e in entries)
         {
-            if (e.Tag == "huge") RunHuge(e);
+            if (e.Tag == "huge")
+            {
+                if (_opt.SkipHuge) continue;
+                RunHuge(e);
+            }
             else RunTier(e);
         }
 
@@ -272,16 +276,18 @@ internal static class Bench
         // 正确做法是**在进程级关掉分层编译**（见 SicBench.csproj 的 TieredCompilation=false）：
         // 方法第一次 JIT 就产出完全优化的代码，根本不存在 tier-0 平台期。
         // 因此热身只需覆盖"首次调用"即可，下面这几次纯粹是留给运行时的余量。
-        const int WarmCalls = 8;
+        int warmCalls = _opt.WarmCalls;
         const double WarmCapMs = 800;
         var warmSw = Stopwatch.StartNew();
         int warmDone = 0;
         (long bytes, uint hash) first;
         try
         {
+            // 这一次调用是必须的：它提供后续样本比对的基准 (bytes, hash)。
+            // WarmCalls=0 时它同时也是唯一的计时样本。
             first = body();
             warmDone = 1;
-            for (int w = 1; w < WarmCalls; w++)
+            for (int w = 1; w < warmCalls; w++)
             {
                 first = body();
                 warmDone++;

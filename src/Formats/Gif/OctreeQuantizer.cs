@@ -588,10 +588,20 @@ public sealed class OctreeQuantizer
     }
 
     /// <summary>
-    /// 不抖动路径的 SSSE3 版：一次 16 像素（48 字节）。<c>pshufb</c> 解交织出 R/G/B 三个平面，
+    /// 不抖动路径的向量版：一次 16 像素（48 字节）。解交织出 R/G/B 三个平面，
     /// 16 位通道内 <c>psrlw 3</c> 得到 5-bit 分量（输入是 0-255 的字节，无需饱和处理），
     /// 合成 16 个 cube 下标后仍用标量查 <see cref="_mapLut"/>——
     /// 字节表 + 15 位下标的 gather 在 AVX2 下没有可用的向量指令（见 docs/PerfReport.md）。
+    /// <para>
+    /// 解交织走 <see cref="SimdCompat.LoadRgb24Unzip3"/>。该封装在 arm64 上走
+    /// <c>tbl</c>、x86 上走 <c>pshufb</c>，两条都是 3 次加载 + 9 次置换 + 6 次 or，
+    /// 产物与性能不受影响。曾评估的 <c>LD3</c> 单指令方案已在 M4 实测否决（慢 9.4%），
+    /// 详见 docs/ArmExclusiveSimd.md §3.2。
+    /// </para>
+    /// <para>
+    /// 每轮 16 像素 / 48 字节。NEON 寄存器定长 128 位且 .NET 未暴露任何 ARM 侧
+    /// <c>Vector256</c> API，因此 16 像素是这个粒度的上限，无法靠展开提到 32/64。
+    /// </para>
     /// <para>
     /// 与 <see cref="MapWithBayerSimd"/> 结构完全一致，只少了偏移表与 pminsw/pmaxsw，便于对照维护。
     /// </para>
@@ -611,12 +621,8 @@ public sealed class OctreeQuantizer
                 int x = 0;
                 for (; x < w16; x += 16)
                 {
-                    var v0 = SimdCompat.LoadBytesPtr(pixels + o);
-                    var v1 = SimdCompat.LoadBytesPtr(pixels + o + 16);
-                    var v2 = SimdCompat.LoadBytesPtr(pixels + o + 32);
-                    var R = SimdCompat.OrBytes(SimdCompat.OrBytes(SimdCompat.ShuffleBytes(v0, ShufR0), SimdCompat.ShuffleBytes(v1, ShufR1)), SimdCompat.ShuffleBytes(v2, ShufR2));
-                    var G = SimdCompat.OrBytes(SimdCompat.OrBytes(SimdCompat.ShuffleBytes(v0, ShufG0), SimdCompat.ShuffleBytes(v1, ShufG1)), SimdCompat.ShuffleBytes(v2, ShufG2));
-                    var B = SimdCompat.OrBytes(SimdCompat.OrBytes(SimdCompat.ShuffleBytes(v0, ShufB0), SimdCompat.ShuffleBytes(v1, ShufB1)), SimdCompat.ShuffleBytes(v2, ShufB2));
+                    // w16 保证每轮 16 像素 = 48 字节完整可读，LD3 不会越界。
+                    SimdCompat.LoadRgb24Unzip3(pixels + o, out var R, out var G, out var B);
 
                     var rl = SimdCompat.ShiftRightLogicalInt16(SimdCompat.WidenLowerBytes(R).AsInt16(), 3);
                     var rh = SimdCompat.ShiftRightLogicalInt16(SimdCompat.WidenUpperBytes(R).AsInt16(), 3);
@@ -717,19 +723,11 @@ public sealed class OctreeQuantizer
         return d5;
     }
 
-    // RGB24 → 三个 16 字节平面的解交织掩码（0x80 位置置零）
-    private static readonly Vector128<byte> ShufR0 = Vector128.Create((byte)0, 3, 6, 9, 12, 15, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80);
-    private static readonly Vector128<byte> ShufR1 = Vector128.Create((byte)0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 2, 5, 8, 11, 14, 0x80, 0x80, 0x80, 0x80, 0x80);
-    private static readonly Vector128<byte> ShufR2 = Vector128.Create((byte)0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 1, 4, 7, 10, 13);
-    private static readonly Vector128<byte> ShufG0 = Vector128.Create((byte)1, 4, 7, 10, 13, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80);
-    private static readonly Vector128<byte> ShufG1 = Vector128.Create((byte)0x80, 0x80, 0x80, 0x80, 0x80, 0, 3, 6, 9, 12, 15, 0x80, 0x80, 0x80, 0x80, 0x80);
-    private static readonly Vector128<byte> ShufG2 = Vector128.Create((byte)0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 2, 5, 8, 11, 14);
-    private static readonly Vector128<byte> ShufB0 = Vector128.Create((byte)2, 5, 8, 11, 14, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80);
-    private static readonly Vector128<byte> ShufB1 = Vector128.Create((byte)0x80, 0x80, 0x80, 0x80, 0x80, 1, 4, 7, 10, 13, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80);
-    private static readonly Vector128<byte> ShufB2 = Vector128.Create((byte)0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0, 3, 6, 9, 12, 15);
+    // RGB24 → 三个 16 字节平面的解交织掩码已上移到 SimdCompat（RgbShufR*/G*/B*），
+    // 由 LoadRgb24Unzip3 统一持有：arm64 走 LD3、x86 走这组 pshufb。
 
     /// <summary>
-    /// SSSE3 路径：一次处理 16 像素（48 字节）。pshufb 解交织出 R/G/B 三个平面，
+    /// Bayer 抖动路径的向量版：一次处理 16 像素（48 字节）。解交织出 R/G/B 三个平面，
     /// 在 16 位通道内做「加偏移 + pminsw/pmaxsw 饱和 + psrlw 3」得到 5-bit 分量，
     /// 合成 16 个 cube 下标后仍用标量查 <see cref="_mapLut"/>。
     /// <para>
@@ -765,12 +763,8 @@ public sealed class OctreeQuantizer
                     int x = 0;
                     for (; x < w16; x += 16)
                     {
-                        var v0 = SimdCompat.LoadBytesPtr(pixels + o);
-                        var v1 = SimdCompat.LoadBytesPtr(pixels + o + 16);
-                        var v2 = SimdCompat.LoadBytesPtr(pixels + o + 32);
-                        var R = SimdCompat.OrBytes(SimdCompat.OrBytes(SimdCompat.ShuffleBytes(v0, ShufR0), SimdCompat.ShuffleBytes(v1, ShufR1)), SimdCompat.ShuffleBytes(v2, ShufR2));
-                        var G = SimdCompat.OrBytes(SimdCompat.OrBytes(SimdCompat.ShuffleBytes(v0, ShufG0), SimdCompat.ShuffleBytes(v1, ShufG1)), SimdCompat.ShuffleBytes(v2, ShufG2));
-                        var B = SimdCompat.OrBytes(SimdCompat.OrBytes(SimdCompat.ShuffleBytes(v0, ShufB0), SimdCompat.ShuffleBytes(v1, ShufB1)), SimdCompat.ShuffleBytes(v2, ShufB2));
+                        // w16 保证每轮 16 像素 = 48 字节完整可读，LD3 不会越界。
+                        SimdCompat.LoadRgb24Unzip3(pixels + o, out var R, out var G, out var B);
 
                         var rl = SimdCompat.ShiftRightLogicalInt16(SimdCompat.MaxInt16(SimdCompat.MinInt16(SimdCompat.AddInt16(SimdCompat.WidenLowerBytes(R).AsInt16(), offLo), c255), c0), 3);
                         var rh = SimdCompat.ShiftRightLogicalInt16(SimdCompat.MaxInt16(SimdCompat.MinInt16(SimdCompat.AddInt16(SimdCompat.WidenUpperBytes(R).AsInt16(), offHi), c255), c0), 3);
