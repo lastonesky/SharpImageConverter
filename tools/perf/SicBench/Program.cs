@@ -16,6 +16,8 @@ internal sealed class Options
     public string Filter = "";             // only run tests whose name contains this
     public double IterScale = 1.0;
     public bool IncludeHugeEncode = true;
+    public int WarmCalls = 8;              // 预热调用次数；0 = 完全不预热
+    public bool SkipHuge = false;          // 跳过 huge(143MP) 档，避免单次也要好几秒
 }
 
 internal static class Program
@@ -68,6 +70,8 @@ internal static class Program
                 case "--filter": opt.Filter = Next(); break;
                 case "--iter-scale": opt.IterScale = double.Parse(Next(), CultureInfo.InvariantCulture); break;
                 case "--no-huge-encode": opt.IncludeHugeEncode = false; break;
+                case "--warm": opt.WarmCalls = int.Parse(Next(), CultureInfo.InvariantCulture); break;
+                case "--skip-huge": opt.SkipHuge = true; break;
             }
         }
         if (string.IsNullOrEmpty(opt.Corpus))

@@ -1,5 +1,10 @@
 <Solution>
   <Project Path="SharpImageConverter.Tests/SharpImageConverter.Tests.csproj" />
   <Project Path="src/SharpImageConverter.csproj" />
+  <Folder Name="/src/" />
+  <Folder Name="/tools/" />
+  <Folder Name="/tools/perf/">
+    <Project Path="tools/perf/SicBench/SicBench.csproj" />
+  </Folder>
   <Project Path="Cli/SharpImageConverter.Cli.csproj" />
 </Solution>
