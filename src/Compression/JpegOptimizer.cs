@@ -12,9 +12,30 @@ namespace SharpImageConverter.Compression
     /// </summary>
     internal static class JpegOptimizer
     {
+        /// <summary>
+        /// 同格式优化：读入源文件，按 JPEG 重编码为最小体积。
+        /// </summary>
         internal static OptimizationResult Run(string input, string output, long originalSize, OptimizeOptions o)
         {
             var image = Configuration.Default.LoadRgb24(input);
+            var artifact = Produce(image, o);
+            return ImageOptimizer.Finish(input, output, originalSize, artifact.Bytes, artifact.Method, artifact.Quality, o, artifact.Reason);
+        }
+
+        /// <summary>
+        /// 跨格式优化：源图已解码为 RGB24，直接按 JPEG 产出最小体积文件。
+        /// </summary>
+        internal static OptimizationResult RunFromImage(Image<Rgb24> image, string input, string output, long originalSize, OptimizeOptions o)
+        {
+            var artifact = Produce(image, o);
+            return ImageOptimizer.FinishConverted(input, output, originalSize, artifact, o);
+        }
+
+        /// <summary>
+        /// 计算最优 JPEG 产物（不落盘）。
+        /// </summary>
+        internal static OptimizeArtifact Produce(Image<Rgb24> image, OptimizeOptions o)
+        {
             int width = image.Width;
             int height = image.Height;
             byte[] rgb = image.Buffer;
@@ -64,7 +85,7 @@ namespace SharpImageConverter.Compression
             string method = result.Accepted
                 ? $"JPEG 质量 {result.Quality}（{chroma}）"
                 : $"JPEG 质量 {result.Quality}（{chroma}，未达画质下限，取最高档）";
-            return ImageOptimizer.Finish(input, output, originalSize, result.Bytes, method, result.Score, o);
+            return new OptimizeArtifact(result.Bytes, method, result.Score, result.Accepted);
         }
     }
 }

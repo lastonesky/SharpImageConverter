@@ -3,6 +3,10 @@ using System.Collections.Generic;
 using System.IO;
 using System.IO.Compression;
 using SharpImageConverter.Core;
+using SharpImageConverter.Formats.Bmp;
+using SharpImageConverter.Formats.Gif;
+using SharpImageConverter.Formats.Jpeg;
+using SharpImageConverter.Formats.Png;
 using SharpImageConverter.Formats.Webp;
 using SharpImageConverter.Metadata;
 
@@ -21,6 +25,12 @@ namespace SharpImageConverter.Compression
         /// <param name="outputPath">输出文件路径；为 null 时自动生成（原名后加 .min）</param>
         /// <param name="options">优化选项，null 表示均衡档</param>
         /// <returns>优化结果（体积、画质、采用方案）</returns>
+        /// <remarks>
+        /// 输出路径的扩展名决定目标格式：
+        /// 与源格式一致时按「同格式压缩」处理（无收益可保留原图）；
+        /// 不一致时走「转换即最优」——直接按目标格式做质量 / 调色板搜索，
+        /// 一步产出最小体积文件，无需再单独 optimize 一遍。
+        /// </remarks>
         public static OptimizationResult Optimize(string inputPath, string? outputPath = null, OptimizeOptions? options = null)
         {
             ArgumentException.ThrowIfNullOrEmpty(inputPath);
@@ -32,7 +42,16 @@ namespace SharpImageConverter.Compression
             string? outDir = Path.GetDirectoryName(output);
             if (!string.IsNullOrEmpty(outDir)) Directory.CreateDirectory(outDir);
 
-            switch (DetectFormat(inputPath))
+            var sourceKind = DetectFormat(inputPath);
+            var targetKind = DetectKindByExtension(output);
+
+            // 目标扩展名能识别、且与源格式不同 → 一步完成「转换 + 智能压缩」
+            if (targetKind != ImageKind.Unknown && targetKind != sourceKind)
+            {
+                return OptimizeConverted(inputPath, output, targetKind, originalSize, o);
+            }
+
+            switch (sourceKind)
             {
                 case ImageKind.Png:
                     return PngOptimizer.Run(inputPath, output, originalSize, o);
@@ -41,7 +60,7 @@ namespace SharpImageConverter.Compression
                 case ImageKind.Gif:
                     return GifOptimizer.Run(inputPath, output, originalSize, o);
                 case ImageKind.Webp:
-                    return OptimizeWebp(inputPath, output, originalSize, o);
+                    return WebpOptimizer.Run(inputPath, output, originalSize, o);
                 case ImageKind.Bmp:
                     return OptimizeBmp(inputPath, output, originalSize, o);
                 default:
@@ -104,6 +123,20 @@ namespace SharpImageConverter.Compression
                 _ => ImageKind.Unknown,
             };
         }
+
+        /// <summary>
+        /// 按扩展名判断目标格式（转换的落点以扩展名为准，不嗅探文件头）。
+        /// </summary>
+        /// <param name="path">输出路径</param>
+        internal static ImageKind DetectKindByExtension(string path) => Path.GetExtension(path).ToLowerInvariant() switch
+        {
+            ".jpg" or ".jpeg" => ImageKind.Jpeg,
+            ".png" => ImageKind.Png,
+            ".gif" => ImageKind.Gif,
+            ".webp" => ImageKind.Webp,
+            ".bmp" => ImageKind.Bmp,
+            _ => ImageKind.Unknown,
+        };
 
         /// <summary>
         /// 按选项处理元数据：默认只丢弃 EXIF，保留 ICC（影响色彩呈现）。
@@ -307,41 +340,129 @@ namespace SharpImageConverter.Compression
         }
 
         /// <summary>
-        /// WebP：算法本身已很优秀，这里仍做一轮质量搜索，通常收益有限。
+        /// 跨格式优化：源格式与目标格式不同，直接按目标格式产出最小体积文件。
+        /// 因为用户显式要求转换，无论目标体积是否小于源文件都会写出目标格式。
         /// </summary>
-        private static OptimizationResult OptimizeWebp(string input, string output, long originalSize, OptimizeOptions o)
+        private static OptimizationResult OptimizeConverted(string input, string output, ImageKind target, long originalSize, OptimizeOptions o)
         {
-            var image = Configuration.Default.LoadRgb24(input);
-            int w = image.Width, h = image.Height;
-            byte[] rgb = image.Buffer;
-            var meta = PrepareMetadata(image.Metadata, o.StripMetadata);
-
-            byte[] Encode(int q)
+            switch (target)
             {
-                using var ms = new MemoryStream();
-                var encoder = new WebpEncoderAdapter { Quality = q };
-                encoder.EncodeRgb24(ms, new Image<Rgb24>(w, h, rgb, meta));
-                return ms.ToArray();
+                case ImageKind.Jpeg:
+                    return JpegOptimizer.RunFromImage(Configuration.Default.LoadRgb24(input), input, output, originalSize, o);
+                case ImageKind.Png:
+                    return PngOptimizer.RunFromImage(Configuration.Default.LoadRgba32(input), input, output, originalSize, o);
+                case ImageKind.Webp:
+                    return WebpOptimizer.RunFromImage(Configuration.Default.LoadRgba32(input), input, output, originalSize, o);
+                case ImageKind.Gif:
+                    return GifOptimizer.RunFromImage(Configuration.Default.LoadRgba32(input), input, output, originalSize, o);
+                case ImageKind.Bmp:
+                    return FinishConverted(input, output, originalSize, ProduceBmp(Configuration.Default.LoadRgba32(input)), o);
+                default:
+                    throw new NotSupportedException($"不支持转换到 {target} 格式");
             }
+        }
 
-            byte[] Decode(byte[] bytes)
+        /// <summary>
+        /// 收尾（跨格式）：始终写出目标格式字节；没有可用产物时退回目标格式的普通编码。
+        /// </summary>
+        internal static OptimizationResult FinishConverted(
+            string inputPath,
+            string outputPath,
+            long originalSize,
+            OptimizeArtifact artifact,
+            OptimizeOptions options)
+        {
+            byte[] bytes = artifact.Bytes ?? EncodePlain(inputPath, outputPath);
+            File.WriteAllBytes(outputPath, bytes);
+
+            // 跨格式时「无收益保留原图」没有意义（原格式 ≠ 目标格式），
+            // 因此把无法优化的原因并入方案描述，而不是走 KeptOriginal。
+            string method = artifact.Method
+                ?? (artifact.Reason != null ? $"常规编码（{artifact.Reason}）" : "常规编码（未做有损搜索）");
+
+            return new OptimizationResult
             {
-                using var ms = new MemoryStream(bytes, false);
-                return new WebpDecoderAdapter().DecodeRgb24(ms).Buffer;
-            }
+                InputPath = inputPath,
+                OutputPath = outputPath,
+                OriginalSize = originalSize,
+                OptimizedSize = bytes.Length,
+                Method = method,
+                Quality = artifact.Quality,
+                Converted = true,
+            };
+        }
 
-            if (o.JpegQuality.HasValue)
+        /// <summary>
+        /// BMP 无压缩：跨格式输出时按无损真彩色直写，没有进一步压缩空间。
+        /// </summary>
+        private static OptimizeArtifact ProduceBmp(Image<Rgba32> image)
+        {
+            var rgb = new byte[image.Width * image.Height * 3];
+            SimdHelper.PackRgbaToRgb(image.Buffer, rgb);
+            using var ms = new MemoryStream();
+            BmpWriter.Write24(ms, image.Width, image.Height, rgb);
+            return new OptimizeArtifact(
+                ms.ToArray(),
+                "BMP 无损（该格式无压缩）",
+                new ImageQuality(ImageQuality.MaxPsnr, ImageQuality.MaxPsnr, 0),
+                true);
+        }
+
+        /// <summary>
+        /// 兜底：按目标格式做一次普通编码（不做质量搜索），保证输出文件始终存在且可用。
+        /// </summary>
+        private static byte[] EncodePlain(string inputPath, string outputPath)
+        {
+            string ext = Path.GetExtension(outputPath).ToLowerInvariant();
+            using var ms = new MemoryStream();
+            switch (ext)
             {
-                byte[] bytes = Encode(o.JpegQuality.Value);
-                return Finish(input, output, originalSize, bytes, $"WebP 质量 {o.JpegQuality.Value}",
-                    QualityMetrics.Compare(rgb, Decode(bytes), w, h, 3), o);
+                case ".jpg" or ".jpeg":
+                    JpegEncoder.Encode(Configuration.Default.LoadRgb24(inputPath), ms,
+                        new JpegEncoderOptions(90, subsample420: true, keepMetadata: false, enableDiagnostics: false));
+                    break;
+                case ".png":
+                {
+                    var img = Configuration.Default.LoadRgba32(inputPath);
+                    if (IsOpaque(img.Buffer))
+                    {
+                        var rgb = new byte[img.Width * img.Height * 3];
+                        SimdHelper.PackRgbaToRgb(img.Buffer, rgb);
+                        PngWriter.Write(ms, img.Width, img.Height, rgb);
+                    }
+                    else
+                    {
+                        PngWriter.WriteRgba(ms, img.Width, img.Height, img.Buffer);
+                    }
+                    break;
+                }
+                case ".webp":
+                    new WebpEncoderAdapterRgba { Quality = 90 }.EncodeRgba32(ms, Configuration.Default.LoadRgba32(inputPath));
+                    break;
+                case ".gif":
+                    new GifEncoderAdapter().EncodeRgb24(ms, Configuration.Default.LoadRgb24(inputPath));
+                    break;
+                case ".bmp":
+                {
+                    var img = Configuration.Default.LoadRgba32(inputPath);
+                    var rgb = new byte[img.Width * img.Height * 3];
+                    SimdHelper.PackRgbaToRgb(img.Buffer, rgb);
+                    BmpWriter.Write24(ms, img.Width, img.Height, rgb);
+                    break;
+                }
+                default:
+                    throw new NotSupportedException($"不支持的目标格式: {ext}");
             }
+            return ms.ToArray();
+        }
 
-            // WebP 本身已很高效：低质量区间省不了多少体积，却会明显糊掉高频细节，
-            // 因此搜索下界比 JPEG 高一截（块状平均的感知度量对「变糊」不够敏感）。
-            int minQuality = Math.Max(o.JpegMinQuality, 65);
-            var (quality, best, q) = SearchQuality(Encode, Decode, rgb, w, h, minQuality, 95, o.Accept, o.Log);
-            return Finish(input, output, originalSize, best, $"WebP 质量 {quality}", q, o);
+        private static bool IsOpaque(byte[] rgba)
+        {
+            for (int i = 3; i < rgba.Length; i += 4)
+            {
+                if (rgba[i] != 255) return false;
+            }
+            return true;
         }
 
         /// <summary>

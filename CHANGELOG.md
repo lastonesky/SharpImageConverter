@@ -1,5 +1,20 @@
 ## 未发布
 ### 新增
+- **格式转换与智能压缩打通（CLI `--to <格式> --optimize`）**：转成目标格式时直接产出该格式下体积最小的版本，
+  无需「先转换、再单独 optimize 一遍」。库层 `ImageOptimizer.Optimize(input, output)` 现在按输出扩展名路由：
+  与源格式相同仍是同格式压缩，不同则解码一次后按目标格式做质量 / 调色板搜索并写出（只经过一代编码，
+  画质下限以原始图像为参考，优于对转换产物再压一次的二次有损链）。支持 `.jpg/.jpeg/.png/.webp/.gif/.bmp`
+  作为目标（BMP 无压缩，如实标记为无损直写）。`OptimizationResult` 新增 `Converted` 标记；
+  跨格式时不走「无收益保留原图」（原格式 ≠ 目标格式），始终写出目标格式文件。
+- 压缩器内部重构为「纯计算产物（`OptimizeArtifact`）+ 统一落盘」两段式：
+  `Jpeg/Png/GifOptimizer` 拆出 `Produce` 与 `RunFromImage`；WebP 优化独立为 `WebpOptimizer`。
+- **WebP 优化改为 RGBA 编解码**：同格式优化此前走 RGB24、透明通道会被丢弃，现在保留 alpha。
+- **修复单帧透明 GIF 优化丢透明**：帧映射此前用「RGB24 展开成 RGBA（alpha 恒为 255）」，
+  导致预留的 0 号透明槽永远不被命中；现在带透明时用真实 RGBA 参与映射。
+- **修复单文件输入时 `--to` 被忽略**：`--to webp photo.jpg` 之前会落到默认的 `.png`；
+  现在单文件同样尊重 `--to`。`--to gif` 也不再被归一化成 `.png`（`NormalizeOutputExtension` 补上 `.gif`）。
+- 新增单元测试 6 项：PNG→WebP / JPEG→PNG（校验写出的是真 PNG 而非原文件副本）/ PNG→BMP 无损 /
+  PNG→GIF / 同格式目标不被误判为转换。
 - **ImageFrame 兼容 BGR24 / BGRA32 / RGBA32 中间格式**：`ImagePixelFormat` 新增 `Bgr24`、`Bgra32`、`Rgba32`，
   `ImageFrame` 构造函数支持以这些格式直接装载（按每像素字节数自动校验长度）。
 - **SIMD 加速的通道转换原语（`SimdHelper`）**：`SwapRgbBgr24`（RGB24⇄BGR24 就地/异处交换）、
