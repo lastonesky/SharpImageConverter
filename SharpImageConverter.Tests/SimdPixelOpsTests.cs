@@ -182,6 +182,131 @@ namespace Jpeg2Bmp.Tests
         }
 
         [Fact]
+        public void SwapRgbBgr24_InPlace_MatchesScalar_ForAllLengths()
+        {
+            for (int pixels = 0; pixels <= 70; pixels++)
+            {
+                var buf = MakeData(pixels * 3, pixels + 41);
+                var expected = (byte[])buf.Clone();
+                for (int p = 0; p + 2 < expected.Length; p += 3)
+                {
+                    byte t = expected[p];
+                    expected[p] = expected[p + 2];
+                    expected[p + 2] = t;
+                }
+
+                SimdHelper.SwapRgbBgr24(buf, buf);
+                Assert.Equal(expected, buf);
+            }
+        }
+
+        [Fact]
+        public void SwapRgbBgr24_OutOfPlace_MatchesScalar_ForAllLengths()
+        {
+            for (int pixels = 0; pixels <= 70; pixels++)
+            {
+                var src = MakeData(pixels * 3, pixels + 53);
+                var dst = new byte[pixels * 3];
+                var expected = (byte[])src.Clone();
+                for (int p = 0; p + 2 < expected.Length; p += 3)
+                {
+                    byte t = expected[p];
+                    expected[p] = expected[p + 2];
+                    expected[p + 2] = t;
+                }
+
+                SimdHelper.SwapRgbBgr24(src, dst);
+                Assert.Equal(expected, dst);
+            }
+        }
+
+        [Fact]
+        public void ConvertRgb24ToBgra32_MatchesScalar_ForAllLengths()
+        {
+            for (int pixels = 0; pixels <= 40; pixels++)
+            {
+                var rgb = MakeData(pixels * 3, pixels + 211);
+                var actual = new byte[pixels * 4];
+                SimdHelper.ConvertRgb24ToBgra32(rgb, actual);
+
+                var expected = new byte[pixels * 4];
+                for (int p = 0; p < pixels; p++)
+                {
+                    expected[p * 4 + 0] = rgb[p * 3 + 2];
+                    expected[p * 4 + 1] = rgb[p * 3 + 1];
+                    expected[p * 4 + 2] = rgb[p * 3 + 0];
+                    expected[p * 4 + 3] = 255;
+                }
+
+                Assert.Equal(expected, actual);
+            }
+        }
+
+        [Fact]
+        public void ConvertBgr24ToBgra32_MatchesScalar_ForAllLengths()
+        {
+            for (int pixels = 0; pixels <= 40; pixels++)
+            {
+                var bgr = MakeData(pixels * 3, pixels + 311);
+                var actual = new byte[pixels * 4];
+                SimdHelper.ConvertBgr24ToBgra32(bgr, actual);
+
+                var expected = new byte[pixels * 4];
+                for (int p = 0; p < pixels; p++)
+                {
+                    expected[p * 4 + 0] = bgr[p * 3 + 0];
+                    expected[p * 4 + 1] = bgr[p * 3 + 1];
+                    expected[p * 4 + 2] = bgr[p * 3 + 2];
+                    expected[p * 4 + 3] = 255;
+                }
+
+                Assert.Equal(expected, actual);
+            }
+        }
+
+        [Fact]
+        public void ConvertBgra32ToRgb24_MatchesScalar_ForAllLengths()
+        {
+            for (int pixels = 0; pixels <= 40; pixels++)
+            {
+                var bgra = MakeData(pixels * 4, pixels + 411);
+                var actual = new byte[pixels * 3];
+                SimdHelper.ConvertBgra32ToRgb24(bgra, actual);
+
+                var expected = new byte[pixels * 3];
+                for (int p = 0; p < pixels; p++)
+                {
+                    expected[p * 3 + 0] = bgra[p * 4 + 2];
+                    expected[p * 3 + 1] = bgra[p * 4 + 1];
+                    expected[p * 3 + 2] = bgra[p * 4 + 0];
+                }
+
+                Assert.Equal(expected, actual);
+            }
+        }
+
+        [Fact]
+        public void ConvertBgra32ToBgr24_MatchesScalar_ForAllLengths()
+        {
+            for (int pixels = 0; pixels <= 40; pixels++)
+            {
+                var bgra = MakeData(pixels * 4, pixels + 511);
+                var actual = new byte[pixels * 3];
+                SimdHelper.ConvertBgra32ToBgr24(bgra, actual);
+
+                var expected = new byte[pixels * 3];
+                for (int p = 0; p < pixels; p++)
+                {
+                    expected[p * 3 + 0] = bgra[p * 4 + 0];
+                    expected[p * 3 + 1] = bgra[p * 4 + 1];
+                    expected[p * 3 + 2] = bgra[p * 4 + 2];
+                }
+
+                Assert.Equal(expected, actual);
+            }
+        }
+
+        [Fact]
         public void Ssse3_IsAvailable_OnThisMachine()
         {
             // 若本机不支持字节查表，上面的测试只会覆盖标量回退路径，这里显式提示，

@@ -5,6 +5,7 @@ using SharpImageConverter.Formats.Jpeg;
 using SharpImageConverter.Formats.Png;
 using SharpImageConverter.Formats.Webp;
 using SharpImageConverter.Formats.Bmp;
+using SharpImageConverter.Core;
 using SharpImageConverter.Metadata;
 
 namespace SharpImageConverter;
@@ -17,7 +18,15 @@ public enum ImagePixelFormat
     /// <summary>
     /// 每像素 24 位的 RGB 格式（8 位 R、G、B）
     /// </summary>
-    Rgb24
+    Rgb24,
+    /// <summary>
+    /// 每像素 24 位的 BGR 格式（8 位 B、G、R，与 RGB24 仅是通道顺序相反）
+    /// </summary>
+    Bgr24,
+    /// <summary>
+    /// 每像素 32 位的 BGRA 格式（8 位 B、G、R、A）
+    /// </summary>
+    Bgra32
 }
 
 /// <summary>
@@ -34,35 +43,51 @@ public sealed class ImageFrame
     /// </summary>
     public int Height { get; }
     /// <summary>
-    /// 像素格式（当前固定为 Rgb24）
+    /// 像素格式（Rgb24 / Bgr24 / Bgra32）
     /// </summary>
-    public ImagePixelFormat PixelFormat { get; }
+    public ImagePixelFormat PixelFormat => _pixelFormat;
     /// <summary>
-    /// 像素数据缓冲区，长度为 Width * Height * 3，按 RGB 顺序排列
+    /// 像素数据缓冲区。长度与格式相关：Rgb24/Bgr24 为 Width * Height * 3；Bgra32 为 Width * Height * 4。
+    /// 24 位格式按 R/G/B 或 B/G/R 顺序排列，32 位格式按 B/G/R/A 顺序排列。
     /// </summary>
     public byte[] Pixels { get; }
 
     public ImageMetadata Metadata { get; }
+
+    private ImagePixelFormat _pixelFormat;
 
     /// <summary>
     /// 创建一个新的图像帧
     /// </summary>
     /// <param name="width">图像宽度</param>
     /// <param name="height">图像高度</param>
-    /// <param name="rgb24">RGB24 像素缓冲区</param>
-    public ImageFrame(int width, int height, byte[] rgb24, ImageMetadata? metadata = null)
+    /// <param name="pixels">像素缓冲区（长度需与 width * height * 每像素字节数 匹配）</param>
+    /// <param name="pixelFormat">像素格式，默认 Rgb24</param>
+    /// <param name="metadata">图像元数据</param>
+    public ImageFrame(int width, int height, byte[] pixels, ImagePixelFormat pixelFormat = ImagePixelFormat.Rgb24, ImageMetadata? metadata = null)
     {
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(width, nameof(width));
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(height, nameof(height));
-        ArgumentNullException.ThrowIfNull(rgb24, nameof(rgb24));        
-        if (rgb24.Length != checked(width * height * 3)) throw new ArgumentException("RGB24 像素长度不匹配", nameof(rgb24));
+        ArgumentNullException.ThrowIfNull(pixels, nameof(pixels));
+
+        int bpp = GetBytesPerPixel(pixelFormat);
+        if (pixels.Length != checked(width * height * bpp))
+            throw new ArgumentException($"{pixelFormat} 像素长度不匹配：应为 width * height * {bpp} 字节", nameof(pixels));
 
         Width = width;
         Height = height;
-        PixelFormat = ImagePixelFormat.Rgb24;
-        Pixels = rgb24;
+        _pixelFormat = pixelFormat;
+        Pixels = pixels;
         Metadata = metadata ?? new ImageMetadata();
     }
+
+    private static int GetBytesPerPixel(ImagePixelFormat format) => format switch
+    {
+        ImagePixelFormat.Rgb24 => 3,
+        ImagePixelFormat.Bgr24 => 3,
+        ImagePixelFormat.Bgra32 => 4,
+        _ => throw new NotSupportedException($"不支持的像素格式：{format}")
+    };
 
     /// <summary>
     /// 从指定路径加载图像（自动根据扩展名识别格式）
@@ -329,10 +354,10 @@ public sealed class ImageFrame
             {
                 var t = ApplyExifOrientationInPlace(rgb, img.Width, img.Height, orientation);
                 img.Metadata.Orientation = 1;
-                return new ImageFrame(t.width, t.height, t.pixels, img.Metadata);
+                return new ImageFrame(t.width, t.height, t.pixels, metadata: img.Metadata);
             }
 
-            return new ImageFrame(img.Width, img.Height, rgb, img.Metadata);
+            return new ImageFrame(img.Width, img.Height, rgb, metadata: img.Metadata);
         }
 
         var streaming = JpegDecoder.DecodeFromStreamAsync(stream, cancellationToken: default, useFloatingPointIdct: useFloatingPointIdct).GetAwaiter().GetResult();
@@ -343,10 +368,10 @@ public sealed class ImageFrame
         {
             var t = ApplyExifOrientationInPlace(rgbStream, jpeg.Width, jpeg.Height, streamOrientation);
             jpeg.Metadata.Orientation = 1;
-            return new ImageFrame(t.width, t.height, t.pixels, jpeg.Metadata);
+            return new ImageFrame(t.width, t.height, t.pixels, metadata: jpeg.Metadata);
         }
 
-        return new ImageFrame(jpeg.Width, jpeg.Height, rgbStream, jpeg.Metadata);
+        return new ImageFrame(jpeg.Width, jpeg.Height, rgbStream, metadata: jpeg.Metadata);
     }
 
     /// <summary>
@@ -473,7 +498,7 @@ public sealed class ImageFrame
     /// <param name="stream">输出流</param>
     public void SaveAsBmp(Stream stream)
     {
-        BmpWriter.Write24(stream, Width, Height, Pixels);
+        BmpWriter.Write24(stream, Width, Height, GetRgb24Pixels());
     }
 
     /// <summary>
@@ -492,7 +517,7 @@ public sealed class ImageFrame
     /// <param name="stream">输出流</param>
     public void SaveAsPng(Stream stream)
     {
-        PngWriter.Write(stream, Width, Height, Pixels);
+        PngWriter.Write(stream, Width, Height, GetRgb24Pixels());
     }
 
     /// <summary>
@@ -513,7 +538,7 @@ public sealed class ImageFrame
     /// <param name="quality">JPEG 质量（1-100）</param>
     public void SaveAsJpeg(Stream stream, int quality = 75)
     {
-        JpegEncoder.Write(stream, Width, Height, Pixels, quality);
+        JpegEncoder.Write(stream, Width, Height, GetRgb24Pixels(), quality);
     }
 
     /// <summary>
@@ -536,7 +561,7 @@ public sealed class ImageFrame
     /// <param name="subsample420">是否使用 4:2:0 子采样</param>
     public void SaveAsJpeg(Stream stream, int quality, bool subsample420)
     {
-        JpegEncoder.Write(stream, Width, Height, Pixels, quality, subsample420);
+        JpegEncoder.Write(stream, Width, Height, GetRgb24Pixels(), quality, subsample420);
     }
 
     public void SaveAsJpeg(string path, int quality, bool subsample420, bool keepMetadata)
@@ -547,7 +572,7 @@ public sealed class ImageFrame
 
     public void SaveAsJpeg(Stream stream, int quality, bool subsample420, bool keepMetadata)
     {
-        JpegEncoder.Write(stream, Width, Height, Pixels, quality, subsample420, Metadata, keepMetadata);
+        JpegEncoder.Write(stream, Width, Height, GetRgb24Pixels(), quality, subsample420, Metadata, keepMetadata);
     }
 
     /// <summary>
@@ -567,7 +592,15 @@ public sealed class ImageFrame
     public void SaveAsGif(Stream stream)
     {
         var encoder = new Formats.Gif.GifEncoder();
-        encoder.Encode(this, stream);
+        if (PixelFormat == ImagePixelFormat.Rgb24)
+        {
+            encoder.Encode(this, stream);
+        }
+        else
+        {
+            // 非 RGB24 帧先规范化为 RGB24（保留元数据），再交给 GIF 编码器
+            encoder.Encode(ToRgb24(), stream);
+        }
     }
 
     /// <summary>
@@ -580,7 +613,108 @@ public sealed class ImageFrame
         if (orientation == 1) return this;
         var t = ApplyExifOrientation(Pixels, Width, Height, orientation);
         Metadata.Orientation = 1;
-        return new ImageFrame(t.width, t.height, t.pixels, Metadata);
+        return new ImageFrame(t.width, t.height, t.pixels, metadata: Metadata);
+    }
+
+    /// <summary>
+    /// 返回 RGB24 格式的图像帧，供各 Save 路径在编码前规范化使用。
+    /// 若当前已是 Rgb24 则直接返回原缓冲区（零分配）；
+    /// 否则通过 SIMD 转换生成新的 RGB24 缓冲区（不修改原帧）。
+    /// </summary>
+    private byte[] GetRgb24Pixels()
+    {
+        return PixelFormat == ImagePixelFormat.Rgb24 ? Pixels : ToRgb24().Pixels;
+    }
+
+    /// <summary>
+    /// 返回 RGB24 格式的图像帧。若当前不是 Rgb24，会分配新的缓冲区并做 SIMD 转换，不修改原帧。
+    /// </summary>
+    public ImageFrame ToRgb24()
+    {
+        switch (PixelFormat)
+        {
+            case ImagePixelFormat.Rgb24:
+                return this;
+            case ImagePixelFormat.Bgr24:
+            {
+                var dst = GC.AllocateUninitializedArray<byte>(Pixels.Length);
+                SimdHelper.SwapRgbBgr24(Pixels, dst);
+                return new ImageFrame(Width, Height, dst, ImagePixelFormat.Rgb24, Metadata);
+            }
+            case ImagePixelFormat.Bgra32:
+            {
+                var dst = GC.AllocateUninitializedArray<byte>((Pixels.Length / 4) * 3);
+                SimdHelper.ConvertBgra32ToRgb24(Pixels, dst);
+                return new ImageFrame(Width, Height, dst, ImagePixelFormat.Rgb24, Metadata);
+            }
+            default:
+                throw new NotSupportedException($"不支持的像素格式：{PixelFormat}");
+        }
+    }
+
+    /// <summary>
+    /// 返回 BGR24 格式的图像帧。若当前不是 Bgr24，会分配新的缓冲区并做 SIMD 转换，不修改原帧。
+    /// </summary>
+    public ImageFrame ToBgr24()
+    {
+        switch (PixelFormat)
+        {
+            case ImagePixelFormat.Bgr24:
+                return this;
+            case ImagePixelFormat.Rgb24:
+            {
+                var dst = GC.AllocateUninitializedArray<byte>(Pixels.Length);
+                SimdHelper.SwapRgbBgr24(Pixels, dst);
+                return new ImageFrame(Width, Height, dst, ImagePixelFormat.Bgr24, Metadata);
+            }
+            case ImagePixelFormat.Bgra32:
+            {
+                var dst = GC.AllocateUninitializedArray<byte>((Pixels.Length / 4) * 3);
+                SimdHelper.ConvertBgra32ToBgr24(Pixels, dst);
+                return new ImageFrame(Width, Height, dst, ImagePixelFormat.Bgr24, Metadata);
+            }
+            default:
+                throw new NotSupportedException($"不支持的像素格式：{PixelFormat}");
+        }
+    }
+
+    /// <summary>
+    /// 返回 BGRA32 格式的图像帧（alpha 置 255）。若当前不是 Bgra32，会分配新的缓冲区并做 SIMD 转换，不修改原帧。
+    /// </summary>
+    public ImageFrame ToBgra32()
+    {
+        switch (PixelFormat)
+        {
+            case ImagePixelFormat.Bgra32:
+                return this;
+            case ImagePixelFormat.Rgb24:
+            {
+                var dst = GC.AllocateUninitializedArray<byte>(Pixels.Length / 3 * 4);
+                SimdHelper.ConvertRgb24ToBgra32(Pixels, dst);
+                return new ImageFrame(Width, Height, dst, ImagePixelFormat.Bgra32, Metadata);
+            }
+            case ImagePixelFormat.Bgr24:
+            {
+                var dst = GC.AllocateUninitializedArray<byte>(Pixels.Length / 3 * 4);
+                SimdHelper.ConvertBgr24ToBgra32(Pixels, dst);
+                return new ImageFrame(Width, Height, dst, ImagePixelFormat.Bgra32, Metadata);
+            }
+            default:
+                throw new NotSupportedException($"不支持的像素格式：{PixelFormat}");
+        }
+    }
+
+    /// <summary>
+    /// 就地把 24 位格式（Rgb24 / Bgr24）转换为另一种 24 位格式：交换 R 与 B 通道。
+    /// 该操作零额外内存分配（原地交换），最适合"不再需要原通道顺序"的低内存场景。
+    /// 32 位格式（Bgra32）无法就地改变位深，请改用 <see cref="ToBgra32"/>。
+    /// </summary>
+    public void SwapRgbBgrInPlace()
+    {
+        if (PixelFormat != ImagePixelFormat.Rgb24 && PixelFormat != ImagePixelFormat.Bgr24)
+            throw new InvalidOperationException("SwapRgbBgrInPlace 仅适用于 24 位格式（Rgb24 或 Bgr24）");
+        SimdHelper.SwapRgbBgr24(Pixels, Pixels);
+        _pixelFormat = PixelFormat == ImagePixelFormat.Rgb24 ? ImagePixelFormat.Bgr24 : ImagePixelFormat.Rgb24;
     }
 
     private static (byte[] pixels, int width, int height) ApplyExifOrientation(byte[] src, int width, int height, int orientation)
