@@ -68,7 +68,15 @@ class Program
         {
             if (options.Optimize)
             {
-                RunOptimize(options, isDir);
+                // --optimize 与 --to / 目标扩展名同时给出 → 一步完成「转换 + 智能压缩」
+                if (TryResolveConvertTarget(options, isDir, out string targetExt))
+                {
+                    RunConvertOptimize(options, isDir, targetExt);
+                }
+                else
+                {
+                    RunOptimize(options, isDir);
+                }
                 swTotal.Stop();
                 Console.WriteLine($"⏱️ 总耗时: {swTotal.ElapsedMilliseconds} ms");
                 return;
@@ -101,9 +109,11 @@ class Program
         Console.WriteLine("JPEG 耗时统计: --jpeg-bench N（重复 N 次；配合环境变量 SIC_JPEG_STAGE_TIMING=1 输出分阶段耗时）");
         Console.WriteLine("GIF 量化器: --gif-quantizer octree(默认,八叉树+Bayer) | wu/legacy(原 Wu+Floyd–Steinberg)");
         Console.WriteLine("GIF 抖动幅度: --gif-dither N (默认 8 = 一个量化步长; 调大会放大颗粒与缩放摩尔纹)");
-        Console.WriteLine("文件夹选项: --recursive | --to bmp/png/jpg/webp | --parallel N | --skip-existing");
+        Console.WriteLine("文件夹选项: --recursive | --to bmp/png/jpg/webp/gif | --parallel N | --skip-existing");
         Console.WriteLine("智能压缩: --optimize [--opt-quality N] [--max-colors N] [--no-dither] [--opt-verbose] [--min-saving 百分比]");
         Console.WriteLine("  说明: 在画质基本不变的前提下把 JPG/PNG/GIF/WEBP/BMP 压到最小，默认输出 <原名>.min.<原扩展名>");
+        Console.WriteLine("转换+压缩: --to <格式> --optimize   转成目标格式并直接输出该格式下最小体积（无需再 optimize 一遍）");
+        Console.WriteLine("  示例: dotnet run -- photo.jpg --to webp --optimize   →  photo.webp（已是最小体积）");
     }
 
     /// <summary>
@@ -169,6 +179,111 @@ class Program
     }
 
     /// <summary>
+    /// 判断 <c>--optimize</c> 是否应走「转换 + 智能压缩」路径，并给出目标扩展名。
+    /// 命中条件：显式给了 <c>--to</c>，或输出路径带一个与源格式不同的可识别扩展名。
+    /// 目标与源同扩展名时视为「同格式压缩」，交给原本的 <see cref="RunOptimize"/>。
+    /// </summary>
+    static bool TryResolveConvertTarget(CliOptions options, bool isDir, out string targetExt)
+    {
+        targetExt = string.Empty;
+        string sourceExt = Path.GetExtension(options.InputPath);
+
+        if (!string.IsNullOrEmpty(options.OutputExtension))
+        {
+            string ext = options.OutputExtension!;
+            if (!IsSupportedImageExtension(ext)) return false;
+            // 单文件且目标扩展名与源一致：等价于同格式压缩
+            if (!isDir && string.Equals(ext, sourceExt, StringComparison.OrdinalIgnoreCase)) return false;
+            targetExt = ext;
+            return true;
+        }
+
+        if (!isDir && !string.IsNullOrEmpty(options.OutputPath))
+        {
+            string ext = Path.GetExtension(options.OutputPath).ToLowerInvariant();
+            if (IsSupportedImageExtension(ext)
+                && !string.Equals(ext, sourceExt, StringComparison.OrdinalIgnoreCase))
+            {
+                targetExt = ext;
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    static bool IsSupportedImageExtension(string ext) =>
+        ext is ".jpg" or ".jpeg" or ".png" or ".bmp" or ".webp" or ".gif";
+
+    /// <summary>
+    /// 转换 + 智能压缩：把输入转成目标格式，并直接产出该格式下体积最小的版本，
+    /// 无需再单独跑一遍 <c>--optimize</c>。
+    /// </summary>
+    static void RunConvertOptimize(CliOptions options, bool isDir, string targetExt)
+    {
+        var opt = BuildOptimizeOptions(options);
+
+        if (!isDir)
+        {
+            string output = !string.IsNullOrEmpty(options.OutputPath)
+                ? options.OutputPath!
+                : Path.ChangeExtension(options.InputPath, targetExt);
+            var result = ImageOptimizer.Optimize(options.InputPath, output, opt);
+            PrintOptimizeResult(result);
+            options.OutputPath = result.OutputPath;
+            return;
+        }
+
+        string inputDir = options.InputPath;
+        string outDir = options.OutputPath ?? inputDir;
+        if (!Directory.Exists(outDir)) Directory.CreateDirectory(outDir);
+        var searchOption = options.Recursive ? SearchOption.AllDirectories : SearchOption.TopDirectoryOnly;
+        var exts = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { ".jpg", ".jpeg", ".png", ".bmp", ".webp", ".gif" };
+        var files = Directory.EnumerateFiles(inputDir, "*.*", searchOption).Where(f => exts.Contains(Path.GetExtension(f))).ToList();
+        int parallel = options.Parallelism.HasValue && options.Parallelism.Value > 0 ? options.Parallelism.Value : Environment.ProcessorCount;
+        // WebP 编码器内部已并行，外层再按核数并行会叠加内存占用
+        if (string.Equals(targetExt, ".webp", StringComparison.OrdinalIgnoreCase)) parallel = 1;
+        long savedTotal = 0, beforeTotal = 0, afterTotal = 0;
+        int converted = 0;
+        var locker = new object();
+
+        Parallel.ForEach(files, new ParallelOptions { MaxDegreeOfParallelism = parallel }, file =>
+        {
+            try
+            {
+                string rel = Path.GetRelativePath(inputDir, file);
+                string targetDir = Path.Combine(outDir, Path.GetDirectoryName(rel) ?? ".");
+                Directory.CreateDirectory(targetDir);
+                string nameNoExt = Path.GetFileNameWithoutExtension(file);
+                string target = Path.Combine(targetDir, nameNoExt + targetExt);
+                // --to 与源扩展名相同且输出到原目录时，改用 .min 避免覆盖源文件
+                if (string.Equals(Path.GetFullPath(target), Path.GetFullPath(file), StringComparison.OrdinalIgnoreCase))
+                {
+                    target = Path.Combine(targetDir, nameNoExt + ".min" + targetExt);
+                }
+                if (options.SkipExisting && File.Exists(target)) return;
+
+                var result = ImageOptimizer.Optimize(file, target, opt);
+                lock (locker)
+                {
+                    beforeTotal += result.OriginalSize;
+                    afterTotal += result.OptimizedSize;
+                    savedTotal += result.SavedBytes;
+                    converted++;
+                }
+                PrintOptimizeResult(result);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"❌ {Path.GetFileName(file)}: {ex.GetType().Name}: {ex.Message}");
+            }
+        });
+
+        Console.WriteLine($"✅ 转换+智能压缩完成: {converted} 个文件 → {targetExt}，{FormatSize(beforeTotal)} → {FormatSize(afterTotal)}");
+        options.OutputPath = outDir;
+    }
+
+    /// <summary>
     /// 把 CLI 选项映射为 <see cref="OptimizeOptions"/>。
     /// </summary>
     static OptimizeOptions BuildOptimizeOptions(CliOptions options)
@@ -199,6 +314,11 @@ class Program
         if (result.KeptOriginal)
         {
             Console.WriteLine($"➖ {Path.GetFileName(result.InputPath)}: 无收益，保留原图（{FormatSize(result.OriginalSize)}）");
+            return;
+        }
+        if (result.Converted)
+        {
+            Console.WriteLine($"✅ {Path.GetFileName(result.InputPath)} → {Path.GetFileName(result.OutputPath)}: {FormatSize(result.OriginalSize)} → {FormatSize(result.OptimizedSize)} | {result.Method} | {result.Quality}");
             return;
         }
         Console.WriteLine($"✅ {Path.GetFileName(result.InputPath)}: {FormatSize(result.OriginalSize)} → {FormatSize(result.OptimizedSize)}（省 {result.SavedRatio:P1}）| {result.Method} | {result.Quality}");
@@ -803,8 +923,8 @@ class Program
 
     static void ProcessNoOps(CliOptions options, string inExt)
     {
-        // 默认输出后缀为 PNG
-        options.OutputPath = EnsureOutputPath(options.InputPath, options.OutputPath, ".png");
+        // 默认输出后缀：优先取 --to，否则 PNG
+        options.OutputPath = EnsureOutputPath(options.InputPath, options.OutputPath, options.OutputExtension ?? ".png");
         string outputPath = options.OutputPath ?? throw new InvalidOperationException("输出路径为空");
         string outExt = Path.GetExtension(outputPath).ToLowerInvariant();
 
@@ -856,8 +976,8 @@ class Program
 
     static void ProcessWithOps(CliOptions options, string inExt)
     {
-        // 有操作时默认输出后缀为 BMP
-        options.OutputPath = EnsureOutputPath(options.InputPath, options.OutputPath, ".bmp");
+        // 有操作时默认输出后缀：优先取 --to，否则 BMP
+        options.OutputPath = EnsureOutputPath(options.InputPath, options.OutputPath, options.OutputExtension ?? ".bmp");
         string outputPath = options.OutputPath ?? throw new InvalidOperationException("输出路径为空");
         string outExt = Path.GetExtension(outputPath).ToLowerInvariant();
 
@@ -1062,7 +1182,7 @@ class Program
     static string NormalizeOutputExtension(string ext)
     {
         string lower = ext.ToLowerInvariant();
-        if (lower is ".bmp" or ".png" or ".jpg" or ".jpeg" or ".webp") return lower;
+        if (lower is ".bmp" or ".png" or ".jpg" or ".jpeg" or ".webp" or ".gif") return lower;
         return ".png";
     }
 

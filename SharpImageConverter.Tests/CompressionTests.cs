@@ -6,6 +6,7 @@ using SharpImageConverter;
 using SharpImageConverter.Core;
 using SharpImageConverter.Formats.Gif;
 using SharpImageConverter.Formats.Png;
+using SharpImageConverter.Formats.Webp;
 using Xunit;
 
 namespace Jpeg2Bmp.Tests
@@ -457,6 +458,174 @@ namespace Jpeg2Bmp.Tests
             double aggressive = OptimizeOptions.Aggressive.MinPerceptualPsnr;
             Assert.True(conservative > balanced);
             Assert.True(balanced > aggressive);
+        }
+
+        // ───────────────────────── 跨格式「转换即最优」─────────────────────────
+
+        /// <summary>
+        /// 构造接近真实照片的 RGB 像素（平滑渐变 + 噪声），便于比较不同格式的压缩率。
+        /// </summary>
+        private static byte[] BuildPhotoLikeRgb(int w, int h, int seed)
+        {
+            var rgb = new byte[w * h * 3];
+            var rng = new Random(seed);
+            for (int y = 0; y < h; y++)
+            {
+                for (int x = 0; x < w; x++)
+                {
+                    int o = (y * w + x) * 3;
+                    int noise = rng.Next(-8, 8);
+                    rgb[o] = (byte)Math.Clamp(128 + 90 * Math.Sin(x * 0.05) + noise, 0, 255);
+                    rgb[o + 1] = (byte)Math.Clamp(120 + 80 * Math.Cos(y * 0.06) + noise, 0, 255);
+                    rgb[o + 2] = (byte)Math.Clamp(140 + 70 * Math.Sin((x + y) * 0.03) + noise, 0, 255);
+                }
+            }
+            return rgb;
+        }
+
+        private static void Cleanup(params string[] paths)
+        {
+            foreach (var f in paths)
+            {
+                if (File.Exists(f)) File.Delete(f);
+            }
+        }
+
+        [Fact]
+        public void Optimize_ConvertPngToWebp_ProducesSmallerValidWebp()
+        {
+            int w = 240, h = 160;
+            var rgb = BuildPhotoLikeRgb(w, h, seed: 5);
+            string input = NewTemp(".png");
+            string output = NewTemp(".webp");
+            try
+            {
+                PngWriter.Write(input, w, h, rgb);
+                long before = new FileInfo(input).Length;
+
+                var result = ImageOptimizer.Optimize(input, output);
+
+                Assert.True(result.Converted);
+                Assert.False(result.KeptOriginal);
+                Assert.True(File.Exists(output));
+                Assert.True(result.OptimizedSize < before, $"{result.OptimizedSize} 应小于 {before}");
+                Assert.True(OptimizeOptions.Balanced.Accept(result.Quality), result.Quality.ToString());
+
+                var decoded = new WebpDecoderAdapter().DecodeRgb24(output);
+                Assert.Equal(w, decoded.Width);
+                Assert.Equal(h, decoded.Height);
+            }
+            finally
+            {
+                Cleanup(input, output);
+            }
+        }
+
+        [Fact]
+        public void Optimize_ConvertJpegToPng_WritesRealPngNotOriginalCopy()
+        {
+            // 源 JPEG 已经很小，转成 PNG 后更大；关键是要「如实写出 PNG」，
+            // 而不是走同格式路径的「无收益就复制原图」把 JPEG 字节塞进 .png 文件。
+            int w = 200, h = 150;
+            var rgb = BuildPhotoLikeRgb(w, h, seed: 9);
+            string input = NewTemp(".jpg");
+            string output = NewTemp(".png");
+            try
+            {
+                JpegEncoder.Encode(new Image<Rgb24>(w, h, rgb), input, new JpegEncoderOptions(90, true, false, false));
+                long before = new FileInfo(input).Length;
+
+                var result = ImageOptimizer.Optimize(input, output);
+
+                Assert.True(result.Converted);
+                Assert.False(result.KeptOriginal);
+                Assert.True(result.OptimizedSize > before, "PNG 无损容器通常比高质量 JPEG 更大");
+
+                // PNG 魔数：89 50 4E 47
+                var head = new byte[8];
+                using (var fs = File.OpenRead(output)) fs.ReadExactly(head);
+                Assert.Equal(new byte[] { 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A }, head);
+
+                var decoded = Configuration.Default.LoadRgb24(output);
+                Assert.Equal(w, decoded.Width);
+                Assert.Equal(h, decoded.Height);
+            }
+            finally
+            {
+                Cleanup(input, output);
+            }
+        }
+
+        [Fact]
+        public void Optimize_ConvertPngToBmp_IsLossless()
+        {
+            int w = 64, h = 48;
+            var rgb = BuildPhotoLikeRgb(w, h, seed: 12);
+            string input = NewTemp(".png");
+            string output = NewTemp(".bmp");
+            try
+            {
+                PngWriter.Write(input, w, h, rgb);
+
+                var result = ImageOptimizer.Optimize(input, output);
+
+                Assert.True(result.Converted);
+                Assert.True(result.Quality.IsLossless, result.Quality.ToString());
+                var decoded = Configuration.Default.LoadRgb24(output);
+                Assert.Equal(rgb, decoded.Buffer);
+            }
+            finally
+            {
+                Cleanup(input, output);
+            }
+        }
+
+        [Fact]
+        public void Optimize_ConvertPngToGif_ProducesValidGif()
+        {
+            int w = 120, h = 90;
+            var rgb = BuildPhotoLikeRgb(w, h, seed: 21);
+            string input = NewTemp(".png");
+            string output = NewTemp(".gif");
+            try
+            {
+                PngWriter.Write(input, w, h, rgb);
+
+                var result = ImageOptimizer.Optimize(input, output);
+
+                Assert.True(result.Converted);
+                Assert.True(File.Exists(output));
+                var decoded = new GifDecoder().DecodeRgb24(output);
+                Assert.Equal(w, decoded.Width);
+                Assert.Equal(h, decoded.Height);
+            }
+            finally
+            {
+                Cleanup(input, output);
+            }
+        }
+
+        [Fact]
+        public void Optimize_SameFormatTarget_IsNotMarkedConverted()
+        {
+            // 输出扩展名与源格式一致时必须继续走同格式压缩，不能被误判成跨格式转换
+            int w = 120, h = 90;
+            var rgb = BuildPhotoLikeRgb(w, h, seed: 33);
+            string input = NewTemp(".png");
+            string output = NewTemp(".png");
+            try
+            {
+                PngWriter.Write(input, w, h, rgb);
+
+                var result = ImageOptimizer.Optimize(input, output);
+
+                Assert.False(result.Converted);
+                Assert.Equal(output, result.OutputPath);
+            }
+            finally
+            {
+                Cleanup(input, output);
+            }
         }
     }
 }

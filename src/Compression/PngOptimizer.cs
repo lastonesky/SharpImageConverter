@@ -13,9 +13,33 @@ namespace SharpImageConverter.Compression
     /// </summary>
     internal static class PngOptimizer
     {
+        /// <summary>
+        /// 同格式优化：读入源文件，按 PNG 重写为最小体积。
+        /// </summary>
         internal static OptimizationResult Run(string input, string output, long originalSize, OptimizeOptions o)
         {
             var image = Configuration.Default.LoadRgba32(input);
+            var artifact = Produce(image, originalSize, o);
+            return ImageOptimizer.Finish(input, output, originalSize, artifact.Bytes, artifact.Method, artifact.Quality, o, artifact.Reason);
+        }
+
+        /// <summary>
+        /// 跨格式优化：源图已解码为 RGBA32，直接按 PNG 产出最小体积文件。
+        /// </summary>
+        internal static OptimizationResult RunFromImage(Image<Rgba32> image, string input, string output, long originalSize, OptimizeOptions o)
+        {
+            var artifact = Produce(image, originalSize, o);
+            return ImageOptimizer.FinishConverted(input, output, originalSize, artifact, o);
+        }
+
+        /// <summary>
+        /// 计算最优 PNG 产物（不落盘）。
+        /// </summary>
+        /// <param name="image">源图（RGBA32）</param>
+        /// <param name="originalSize">源文件字节数；用于判断量化收益是否值得</param>
+        /// <param name="o">优化选项</param>
+        internal static OptimizeArtifact Produce(Image<Rgba32> image, long originalSize, OptimizeOptions o)
+        {
             int width = image.Width;
             int height = image.Height;
             int pixels = width * height;
@@ -106,7 +130,9 @@ namespace SharpImageConverter.Compression
                 }
             }
 
-            return ImageOptimizer.Finish(input, output, originalSize, bestBytes, bestMethod, bestQuality, o);
+            // PNG 走到这里必然有产物（量化或无损重写），且无损重写一定达标
+            bool meetsBar = bestQuality.IsLossless || o.Accept(bestQuality);
+            return new OptimizeArtifact(bestBytes, bestMethod, bestQuality, meetsBar);
         }
 
         private static bool IsOpaque(byte[] rgba)

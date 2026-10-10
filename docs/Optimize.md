@@ -1,10 +1,11 @@
 # 智能有损压缩（`SharpImageConverter.Compression`）
 
 TinyPNG 式的「丢进去就能小很多、肉眼几乎看不出差别」能力。
-输入 JPG / PNG / GIF / WebP / BMP，输出**同格式**（BMP 例外，转 PNG）的最小版本。
+默认输入 JPG / PNG / GIF / WebP / BMP，输出**同格式**（BMP 例外，转 PNG）的最小版本；
+输出扩展名与源格式不同时，自动走「转换即最优」——一步产出目标格式的最小体积（见 §5）。
 
 - 库入口：`ImageOptimizer.Optimize(input, output?, options?)`
-- CLI：`--optimize`
+- CLI：`--optimize`；与 `--to <格式>` 组合即为「转换 + 智能压缩」
 - 源码：`src/Compression/`
 
 ---
@@ -114,14 +115,16 @@ MinPerceptualPsnr = 33 + 0.14 * TargetQuality
 
 | 文件 | 作用 |
 |---|---|
-| `src/Compression/ImageOptimizer.cs` | 入口、格式嗅探、二分搜索、收尾写盘 |
+| `src/Compression/ImageOptimizer.cs` | 入口、格式嗅探、同格式/跨格式路由、二分搜索、收尾写盘 |
 | `src/Compression/PngOptimizer.cs` | 调色板量化 + 无损重写回退 |
 | `src/Compression/JpegOptimizer.cs` | 质量搜索 + 4:2:0/4:4:4 回退 |
 | `src/Compression/GifOptimizer.cs` | 跨帧共享调色板 + 降色 |
+| `src/Compression/WebpOptimizer.cs` | WebP 质量搜索（RGBA，保留 alpha） |
+| `src/Compression/OptimizeArtifact.cs` | 「纯计算产物」中间结构，供同格式/跨格式两条路径复用 |
 | `src/Compression/PaletteQuantizer.cs` | RGBA 中位切分量化器 |
 | `src/Compression/ImageQuality.cs` | 感知 / 逐像素画质度量 |
 | `src/Compression/OptimizeOptions.cs` | 选项与画质档位 |
-| `src/Compression/OptimizationResult.cs` | 结果（体积、方案、画质） |
+| `src/Compression/OptimizationResult.cs` | 结果（体积、方案、画质、是否跨格式转换） |
 
 配套改动：
 
@@ -182,7 +185,74 @@ dotnet run -- d:\site d:\site-min --optimize --recursive --parallel 8
 
 ---
 
-## 5. 已知边界
+## 5. 转换 + 智能压缩（一步到位）
+
+### 5.1 动机
+
+优化与格式转换原本是两条互斥路径：`--optimize` 保持原格式，`--to` 只转换。
+想把 JPG 转成最小体积的 WebP，得先 `--to webp` 再对产物 `--optimize`。
+后者的画质下限是拿**已经降质过的中间产物**当参考，属于二次有损，质量白丢一代。
+
+现在 `--optimize` 与 `--to`（或带不同扩展名的显式输出路径）组合时，
+会**解码一次源图，直接按目标格式做质量 / 调色板搜索并写出**，只经过一代编码。
+
+### 5.2 库层语义
+
+`ImageOptimizer.Optimize(input, output, options)` 的路由以**输出扩展名**为准：
+
+| 输出扩展名 | 行为 |
+|---|---|
+| 与源格式相同 | 同格式压缩（原有行为）：无收益可复制原图，默认输出 `<原名>.min.<原扩展名>` |
+| 与源格式不同 | **跨格式转换**：按目标格式搜索最小体积并写出；无论是否比源文件小都写出目标格式 |
+
+跨格式时 `OptimizationResult.Converted == true`。此时 `KeptOriginal` 恒为 false
+（「无收益保留原图」在跨格式场景没有意义——原格式 ≠ 目标格式），
+`SavedRatio` 是两种格式的体积对比，仅供参考。
+
+CLI 路由条件：显式给了 `--to`，或输出路径带一个与源格式不同的可识别扩展名（`.jpg/.jpeg/.png/.bmp/.webp/.gif`）。
+目标扩展名与源一致时仍走同格式压缩，避免误覆盖源文件。
+
+### 5.3 各目标格式
+
+| 目标 | 做法 | 备注 |
+|---|---|---|
+| `.jpg` / `.jpeg` | 质量二分搜索（4:2:0 → 4:4:4 回退）+ 按图优化 Huffman 表 | alpha 被丢弃（JPEG 不支持） |
+| `.png` | 调色板量化二分搜索，必要时回退无损真彩色重写 | 保留 alpha |
+| `.webp` | 质量搜索，下界 65 | 保留 alpha（此前同格式优化只走 RGB） |
+| `.gif` | 单帧调色板降色搜索 | 静态图；透明像素保留（索引 0 预留） |
+| `.bmp` | 无损真彩色直写 | BMP 无压缩，写明「该格式无压缩」 |
+
+> 从 `.png` 转 `.gif` / `.bmp` 等场景下，产物可能比源文件大（容器特性所致），
+> 但因为用户显式要求转换，仍会写出目标格式，不会退化成复制原文件。
+
+### 5.4 用法
+
+```bash
+# 单文件：JPG 转最小体积 WebP
+dotnet run -- photo.jpg --to webp --optimize
+
+# 显式输出路径：扩展名与源不同即自动走转换+压缩
+dotnet run -- photo.jpg out.webp --optimize
+
+# 目录批量：整目录转 WebP 并压到最小
+dotnet run -- d:\images d:\out --to webp --optimize --recursive --parallel 8
+
+# 调参同样生效
+dotnet run -- photo.png --to jpg --optimize --opt-quality 75 --opt-verbose
+```
+
+输出示例（实测 240×160 合成照片）：
+
+```text
+✅ photo.jpg → photo.webp: 54.8 KB → 12.8 KB | WebP 质量 65 | PSNR 43.12dB / 感知 53.78dB / 平均误差 0.76
+✅ photo.png → photo.jpg: 77.2 KB → 4.9 KB | JPEG 质量 68（4:2:0） | PSNR 43.61dB / 感知 45.44dB / 平均误差 1.18
+✅ photo.png → photo.gif: 77.2 KB → 73.1 KB | GIF 调色板 32 色 + 抖动 | PSNR 36.78dB / 感知 48.33dB / 平均误差 2.38
+✅ photo.png → photo.bmp: 77.2 KB → 791.1 KB | BMP 无损（该格式无压缩） | PSNR 99.00dB / 感知 99.00dB
+```
+
+---
+
+## 6. 已知边界
 
 - **带透明通道的动画 GIF** 不做有损优化（解码器只暴露 RGB24 帧序列），会保留原图并说明原因。
 - 半透明 PNG 的 alpha 不参与抖动，极平滑的 alpha 渐变可能出现轻微色带（5 bit 桶精度上限）。

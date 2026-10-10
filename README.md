@@ -243,16 +243,20 @@ dotnet run -- <输入文件或文件夹路径> [输出文件或文件夹路径] 
   - `--dithering on|off`：GIF 编码抖动开关（默认 on）。
 - 目录批处理参数：
   - `--recursive`：递归处理子目录。
-  - `--to ext` / `--to=ext`（同义：`--out-ext`）：指定输出后缀（bmp/png/jpg/jpeg/webp）。
+  - `--to ext` / `--to=ext`（同义：`--out-ext`）：指定输出后缀（bmp/png/jpg/jpeg/webp/gif；单文件同样生效）。
   - `--parallel N`：并行度（目录模式；WebP 输出强制串行）。
   - `--skip-existing`：目标文件存在时跳过。
 - 智能压缩参数（配合 `--optimize`）：
   - `--opt-quality N`：目标画质 0-100（默认 88）。95≈保守、88≈均衡、75≈激进。
   - `--max-colors N`：PNG/GIF 调色板颜色上限（默认 256）。
   - `--no-dither`：关闭 Floyd–Steinberg 抖动（体积更小，但渐变容易出色带）。
-  - `--min-saving N`：至少省 N%（如 `--min-saving 10`）才采用，否则保留原图。
+  - `--min-saving N`：至少省 N%（如 `--min-saving 10`）才采用，否则保留原图（仅同格式压缩生效）。
   - `--opt-verbose`：打印每个候选方案的体积与画质，便于调参。
   - `--keep-metadata`：保留元数据（默认丢弃 EXIF、保留 ICC）。
+
+> `--optimize` 与 `--to` 组合即为「转换 + 智能压缩」：转成目标格式时**直接产出该格式下体积最小的版本**，
+> 无需先转换再单独 optimize 一遍。输出扩展名与源格式不同的显式输出路径（如 `photo.jpg out.webp --optimize`）会自动走同一路径。
+> 画质下限以**原始图像**为参考，只经过一代编码，因此比「先转换、再对转换产物 optimize」的两次有损链质量更高。
 
 ### 文件夹批量转换
 - 递归：`--recursive`（遍历子目录）
@@ -294,6 +298,12 @@ dotnet run -- photo.jpg photo.small.jpg --optimize --opt-quality 75 --opt-verbos
 
 # 智能压缩：整站图片批量压（指定输出目录，保持文件名与目录结构）
 dotnet run -- d:\site d:\site-min --optimize --recursive --parallel 8
+
+# 转换 + 压缩：JPEG 转 WebP，直接输出该格式下最小体积（无需再 optimize 一遍）
+dotnet run -- photo.jpg --to webp --optimize
+
+# 转换 + 压缩：整目录批量转 WebP 并压到最小
+dotnet run -- d:\images d:\out --to webp --optimize --recursive
 ```
 
 ### 智能压缩输出示例

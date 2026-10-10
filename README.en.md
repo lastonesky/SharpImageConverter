@@ -245,11 +245,17 @@ Special cases:
 
 ### Folder Batch Conversion
 - Recursion: `--recursive` (traverse subdirectories)
-- Output format: `--to bmp|png|jpg|webp` or `--out-ext .bmp|.png|.jpg|.webp`
+- Output format: `--to bmp|png|jpg|webp|gif` or `--out-ext .bmp|.png|.jpg|.webp|.gif` (also honored for single-file input)
 - Parallelism: `--parallel N` (defaults to logical CPU count; for `.webp` output in directory mode, automatically reduces to 1 to ensure thread-safety)
 - Skip existing: `--skip-existing` (skip if target file already exists)
 - Output location: when the second argument is a folder, preserves the relative structure of the source directory; if not specified, outputs next to the source files
 - Default extension: `.png` when no operation; `.bmp` when operations are present; explicit `--to/--out-ext` takes precedence
+
+> Combining `--optimize` with `--to` performs **convert + smart compression in one pass**: the output is written in the
+> target format at its smallest size, so you no longer need to convert first and then optimize the result.
+> An explicit output path with a different extension (`photo.jpg out.webp --optimize`) triggers the same path.
+> The quality floor is measured against the **original** image and only one encode generation is applied, so it is
+> higher quality than the two-lossy-generation chain of "convert, then optimize the converted file".
 ### Examples
 
 ```bash
@@ -282,6 +288,12 @@ dotnet run -- photo.jpg photo.small.jpg --optimize --opt-quality 75 --opt-verbos
 
 # Smart compression: whole site
 dotnet run -- d:\site d:\site-min --optimize --recursive --parallel 8
+
+# Convert + compress in one pass: JPEG to the smallest possible WebP
+dotnet run -- photo.jpg --to webp --optimize
+
+# Convert + compress a whole folder to WebP
+dotnet run -- d:\images d:\out --to webp --optimize --recursive
 ```
 
 ## License
