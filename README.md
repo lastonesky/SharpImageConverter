@@ -57,9 +57,9 @@
 - WebP 实现依赖 Google 的 libwebp 及相关组件（BSD-3-Clause License），其版权与许可信息详见 `THIRD-PARTY-NOTICES.md`
 
 ### 中间格式
-- 引入 `ImageFrame` 作为格式转换的中间数据结构，支持 `Rgb24`（默认）、`Bgr24`、`Bgra32` 三种像素格式
+- 引入 `ImageFrame` 作为格式转换的中间数据结构，支持 `Rgb24`（默认）、`Bgr24`、`Bgra32`、`Rgba32` 四种像素格式
 - 统一加载为 RGB，再根据输出扩展名选择编码器写回；非 RGB24 帧在保存时会通过 SIMD 自动规范化为 RGB24
-- 提供 `ToRgb24() / ToBgr24() / ToBgra32()` 非破坏式转换，以及零额外内存的就地交换 `SwapRgbBgrInPlace()`（仅 24 位格式），便于与 OpenCV / 相机 / GPU 等 BGR/BGRA 数据源互操作
+- 提供 `ToRgb24() / ToBgr24() / ToBgra32() / ToRgba32()` 非破坏式转换，以及零额外内存的就地交换 `SwapRgbBgrInPlace()`（24 位与 32 位均可，同一位深内交换 R/B），便于与 OpenCV / 相机 / GPU 等 BGR/BGRA 数据源互操作
 
 ### 智能有损压缩（TinyPNG 式）
 - 一行 API / 一条命令把 JPG、PNG、GIF、WebP、BMP 压到「肉眼几乎无差别」的最小体积，输出格式与输入一致

@@ -125,6 +125,15 @@ internal static class SimdHelper
     private static readonly Vector128<byte> BgraToBgrMask = Vector128.Create((byte)0, 1, 2, 4, 5, 6, 8, 9, 10, 12, 13, 14, 0x80, 0x80, 0x80, 0x80);
     private static readonly Vector128<byte> BgraAlpha = Vector128.Create((byte)0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255);
 
+    // ---- RGBA32 与 BGRA32 / 24 位格式的互转掩码 ----
+    // BGRA32 ⇄ RGBA32：交换每个像素的 B(0) 与 R(2)，alpha(3) 保持不变，每批 4 像素（16 字节）。
+    // 该置换完全发生在像素内、且源目标等长，因此支持就地交换（读写均为整 16 字节）。
+    private static readonly Vector128<byte> SwapRgbaBgraMask = Vector128.Create((byte)2, 1, 0, 3, 6, 5, 4, 7, 10, 9, 8, 11, 14, 13, 12, 15);
+    // RGBA32 -> BGR24：丢弃 alpha 并交换 R/B，搬成 [B G R]。
+    private static readonly Vector128<byte> RgbaToBgrMask = Vector128.Create((byte)2, 1, 0, 6, 5, 4, 10, 9, 8, 14, 13, 12, 0x80, 0x80, 0x80, 0x80);
+    // BGR24 -> RGBA32：搬成 [R G B ?]，再 Or 上 alpha。
+    private static readonly Vector128<byte> BgrToRgbaMask = Vector128.Create((byte)2, 1, 0, 0x80, 5, 4, 3, 0x80, 8, 7, 6, 0x80, 11, 10, 9, 0x80);
+
     /// <summary>
     /// 就地把 RGB24 缓冲区转为灰度：y = (77*R + 150*G + 29*B) &gt;&gt; 8，三通道写入同一值。
     /// </summary>
@@ -569,6 +578,149 @@ internal static class SimdHelper
             bgr[di] = bgra[si];
             bgr[di + 1] = bgra[si + 1];
             bgr[di + 2] = bgra[si + 2];
+        }
+    }
+
+    /// <summary>
+    /// BGRA32 ⇄ RGBA32：交换每个像素的 B 与 R 通道，alpha 保持不变。源与目标长度必须相等（同为 32bpp）。
+    /// 支持 source == destination（就地交换），此时不分配任何额外缓冲区。
+    /// 与 24 位不同，SIMD 路径每批恰好读/写 16 字节（4 像素），就地时完全对齐、无需部分写入保护。
+    /// </summary>
+    public static void SwapRgbaBgra32(ReadOnlySpan<byte> source, Span<byte> destination)
+    {
+        if (destination.Length != source.Length)
+            throw new ArgumentException("源与目标缓冲区长度必须相等（均为 32bpp）", nameof(destination));
+        if ((destination.Length & 3) != 0)
+            throw new ArgumentException("32bpp 缓冲区长度必须是 4 的倍数", nameof(destination));
+
+        int length = destination.Length;
+        int i = 0;
+
+        if (Ssse3.IsSupported)
+        {
+            ref byte s = ref MemoryMarshal.GetReference(source);
+            ref byte d = ref MemoryMarshal.GetReference(destination);
+            while (i + 16 <= length)
+            {
+                nuint o = (nuint)i;
+                Vector128<byte> v = Vector128.LoadUnsafe(ref s, o);
+                Vector128.StoreUnsafe(Ssse3.Shuffle(v, SwapRgbaBgraMask), ref d, o);
+                i += 16;
+            }
+        }
+        else if (AdvSimd.Arm64.IsSupported)
+        {
+            ref byte s = ref MemoryMarshal.GetReference(source);
+            ref byte d = ref MemoryMarshal.GetReference(destination);
+            while (i + 16 <= length)
+            {
+                nuint o = (nuint)i;
+                Vector128<byte> v = Vector128.LoadUnsafe(ref s, o);
+                Vector128.StoreUnsafe(AdvSimd.Arm64.VectorTableLookup(SwapRgbaBgraMask, v), ref d, o);
+                i += 16;
+            }
+        }
+
+        for (int p = i; p + 3 < length; p += 4)
+        {
+            // 先取出两端的原始字节，保证 source == destination 时就地交换安全
+            byte b0 = source[p];
+            byte r0 = source[p + 2];
+            destination[p] = r0;
+            destination[p + 1] = source[p + 1];
+            destination[p + 2] = b0;
+            destination[p + 3] = source[p + 3];
+        }
+    }
+
+    /// <summary>
+    /// RGBA32 → BGR24（丢弃 alpha，交换 R/B）。要求 bgr.Length == (rgba.Length / 4) * 3。
+    /// </summary>
+    public static void ConvertRgba32ToBgr24(ReadOnlySpan<byte> rgba, Span<byte> bgr)
+    {
+        int pixels = rgba.Length / 4;
+        int b = 0;
+
+        if (Ssse3.IsSupported)
+        {
+            ref byte s = ref MemoryMarshal.GetReference(rgba);
+            ref byte d = ref MemoryMarshal.GetReference(bgr);
+            while (b * 16 + 16 <= rgba.Length)
+            {
+                nuint o = (nuint)(b * 16);
+                Vector128<byte> v = Vector128.LoadUnsafe(ref s, o);
+                Vector128<byte> e = Ssse3.Shuffle(v, RgbaToBgrMask);
+                Unsafe.WriteUnaligned(ref Unsafe.Add(ref d, (nuint)(b * 12)), e.AsUInt64().GetElement(0));
+                Unsafe.WriteUnaligned(ref Unsafe.Add(ref d, (nuint)(b * 12 + 8)), e.AsUInt32().GetElement(2));
+                b++;
+            }
+        }
+        else if (AdvSimd.Arm64.IsSupported)
+        {
+            ref byte s = ref MemoryMarshal.GetReference(rgba);
+            ref byte d = ref MemoryMarshal.GetReference(bgr);
+            while (b * 16 + 16 <= rgba.Length)
+            {
+                nuint o = (nuint)(b * 16);
+                Vector128<byte> v = Vector128.LoadUnsafe(ref s, o);
+                Vector128<byte> e = AdvSimd.Arm64.VectorTableLookup(RgbaToBgrMask, v);
+                Unsafe.WriteUnaligned(ref Unsafe.Add(ref d, (nuint)(b * 12)), e.AsUInt64().GetElement(0));
+                Unsafe.WriteUnaligned(ref Unsafe.Add(ref d, (nuint)(b * 12 + 8)), e.AsUInt32().GetElement(2));
+                b++;
+            }
+        }
+
+        for (int p = b * 4; p < pixels; p++)
+        {
+            int si = p * 4, di = p * 3;
+            bgr[di] = rgba[si + 2];
+            bgr[di + 1] = rgba[si + 1];
+            bgr[di + 2] = rgba[si];
+        }
+    }
+
+    /// <summary>
+    /// BGR24 → RGBA32（交换 R/B，alpha 置 255）。要求 rgba.Length == (bgr.Length / 3) * 4。
+    /// </summary>
+    public static void ConvertBgr24ToRgba32(ReadOnlySpan<byte> bgr, Span<byte> rgba)
+    {
+        int pixels = bgr.Length / 3;
+        int b = 0;
+
+        if (Ssse3.IsSupported)
+        {
+            ref byte s = ref MemoryMarshal.GetReference(bgr);
+            ref byte d = ref MemoryMarshal.GetReference(rgba);
+            while (b * 12 + 16 <= bgr.Length)
+            {
+                nuint o = (nuint)(b * 12);
+                Vector128<byte> v = Vector128.LoadUnsafe(ref s, o);
+                Vector128<byte> e = Sse2.Or(Ssse3.Shuffle(v, BgrToRgbaMask), BgraAlpha);
+                Vector128.StoreUnsafe(e, ref d, (nuint)(b * 16));
+                b++;
+            }
+        }
+        else if (AdvSimd.Arm64.IsSupported)
+        {
+            ref byte s = ref MemoryMarshal.GetReference(bgr);
+            ref byte d = ref MemoryMarshal.GetReference(rgba);
+            while (b * 12 + 16 <= bgr.Length)
+            {
+                nuint o = (nuint)(b * 12);
+                Vector128<byte> v = Vector128.LoadUnsafe(ref s, o);
+                Vector128<byte> e = AdvSimd.Or(AdvSimd.Arm64.VectorTableLookup(BgrToRgbaMask, v), BgraAlpha);
+                Vector128.StoreUnsafe(e, ref d, (nuint)(b * 16));
+                b++;
+            }
+        }
+
+        for (int p = b * 4; p < pixels; p++)
+        {
+            int si = p * 3, di = p * 4;
+            rgba[di] = bgr[si + 2];
+            rgba[di + 1] = bgr[si + 1];
+            rgba[di + 2] = bgr[si];
+            rgba[di + 3] = 255;
         }
     }
 

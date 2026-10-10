@@ -26,11 +26,15 @@ public enum ImagePixelFormat
     /// <summary>
     /// 每像素 32 位的 BGRA 格式（8 位 B、G、R、A）
     /// </summary>
-    Bgra32
+    Bgra32,
+    /// <summary>
+    /// 每像素 32 位的 RGBA 格式（8 位 R、G、B、A，与 BGRA32 仅是通道顺序相反）
+    /// </summary>
+    Rgba32
 }
 
 /// <summary>
-/// 表示一帧 24 位 RGB 图像数据，包含宽高与像素缓冲区。
+/// 表示一帧图像数据（支持 Rgb24 / Bgr24 / Bgra32 / Rgba32 像素格式），包含宽高与像素缓冲区。
 /// </summary>
 public sealed class ImageFrame
 {
@@ -43,12 +47,12 @@ public sealed class ImageFrame
     /// </summary>
     public int Height { get; }
     /// <summary>
-    /// 像素格式（Rgb24 / Bgr24 / Bgra32）
+    /// 像素格式（Rgb24 / Bgr24 / Bgra32 / Rgba32）
     /// </summary>
     public ImagePixelFormat PixelFormat => _pixelFormat;
     /// <summary>
-    /// 像素数据缓冲区。长度与格式相关：Rgb24/Bgr24 为 Width * Height * 3；Bgra32 为 Width * Height * 4。
-    /// 24 位格式按 R/G/B 或 B/G/R 顺序排列，32 位格式按 B/G/R/A 顺序排列。
+    /// 像素数据缓冲区。长度与格式相关：Rgb24/Bgr24 为 Width * Height * 3；Bgra32/Rgba32 为 Width * Height * 4。
+    /// 24 位格式按 R/G/B 或 B/G/R 顺序排列，32 位格式按 B/G/R/A 或 R/G/B/A 顺序排列。
     /// </summary>
     public byte[] Pixels { get; }
 
@@ -86,6 +90,7 @@ public sealed class ImageFrame
         ImagePixelFormat.Rgb24 => 3,
         ImagePixelFormat.Bgr24 => 3,
         ImagePixelFormat.Bgra32 => 4,
+        ImagePixelFormat.Rgba32 => 4,
         _ => throw new NotSupportedException($"不支持的像素格式：{format}")
     };
 
@@ -647,6 +652,12 @@ public sealed class ImageFrame
                 SimdHelper.ConvertBgra32ToRgb24(Pixels, dst);
                 return new ImageFrame(Width, Height, dst, ImagePixelFormat.Rgb24, Metadata);
             }
+            case ImagePixelFormat.Rgba32:
+            {
+                var dst = GC.AllocateUninitializedArray<byte>((Pixels.Length / 4) * 3);
+                SimdHelper.PackRgbaToRgb(Pixels, dst);
+                return new ImageFrame(Width, Height, dst, ImagePixelFormat.Rgb24, Metadata);
+            }
             default:
                 throw new NotSupportedException($"不支持的像素格式：{PixelFormat}");
         }
@@ -673,13 +684,19 @@ public sealed class ImageFrame
                 SimdHelper.ConvertBgra32ToBgr24(Pixels, dst);
                 return new ImageFrame(Width, Height, dst, ImagePixelFormat.Bgr24, Metadata);
             }
+            case ImagePixelFormat.Rgba32:
+            {
+                var dst = GC.AllocateUninitializedArray<byte>((Pixels.Length / 4) * 3);
+                SimdHelper.ConvertRgba32ToBgr24(Pixels, dst);
+                return new ImageFrame(Width, Height, dst, ImagePixelFormat.Bgr24, Metadata);
+            }
             default:
                 throw new NotSupportedException($"不支持的像素格式：{PixelFormat}");
         }
     }
 
     /// <summary>
-    /// 返回 BGRA32 格式的图像帧（alpha 置 255）。若当前不是 Bgra32，会分配新的缓冲区并做 SIMD 转换，不修改原帧。
+    /// 返回 BGRA32 格式的图像帧（缺失时 alpha 置 255）。若当前不是 Bgra32，会分配新的缓冲区并做 SIMD 转换，不修改原帧。
     /// </summary>
     public ImageFrame ToBgra32()
     {
@@ -699,22 +716,80 @@ public sealed class ImageFrame
                 SimdHelper.ConvertBgr24ToBgra32(Pixels, dst);
                 return new ImageFrame(Width, Height, dst, ImagePixelFormat.Bgra32, Metadata);
             }
+            case ImagePixelFormat.Rgba32:
+            {
+                // 同是 32bpp，仅交换 R/B；复用等长缓冲
+                var dst = GC.AllocateUninitializedArray<byte>(Pixels.Length);
+                SimdHelper.SwapRgbaBgra32(Pixels, dst);
+                return new ImageFrame(Width, Height, dst, ImagePixelFormat.Bgra32, Metadata);
+            }
             default:
                 throw new NotSupportedException($"不支持的像素格式：{PixelFormat}");
         }
     }
 
     /// <summary>
-    /// 就地把 24 位格式（Rgb24 / Bgr24）转换为另一种 24 位格式：交换 R 与 B 通道。
-    /// 该操作零额外内存分配（原地交换），最适合"不再需要原通道顺序"的低内存场景。
-    /// 32 位格式（Bgra32）无法就地改变位深，请改用 <see cref="ToBgra32"/>。
+    /// 返回 RGBA32 格式的图像帧（缺失时 alpha 置 255）。若当前不是 Rgba32，会分配新的缓冲区并做 SIMD 转换，不修改原帧。
+    /// </summary>
+    public ImageFrame ToRgba32()
+    {
+        switch (PixelFormat)
+        {
+            case ImagePixelFormat.Rgba32:
+                return this;
+            case ImagePixelFormat.Rgb24:
+            {
+                var dst = GC.AllocateUninitializedArray<byte>(Pixels.Length / 3 * 4);
+                SimdHelper.ExpandRgbToRgba(Pixels, dst);
+                return new ImageFrame(Width, Height, dst, ImagePixelFormat.Rgba32, Metadata);
+            }
+            case ImagePixelFormat.Bgr24:
+            {
+                var dst = GC.AllocateUninitializedArray<byte>(Pixels.Length / 3 * 4);
+                SimdHelper.ConvertBgr24ToRgba32(Pixels, dst);
+                return new ImageFrame(Width, Height, dst, ImagePixelFormat.Rgba32, Metadata);
+            }
+            case ImagePixelFormat.Bgra32:
+            {
+                // 同是 32bpp，仅交换 R/B；复用等长缓冲
+                var dst = GC.AllocateUninitializedArray<byte>(Pixels.Length);
+                SimdHelper.SwapRgbaBgra32(Pixels, dst);
+                return new ImageFrame(Width, Height, dst, ImagePixelFormat.Rgba32, Metadata);
+            }
+            default:
+                throw new NotSupportedException($"不支持的像素格式：{PixelFormat}");
+        }
+    }
+
+    /// <summary>
+    /// 就地在同一位深内交换 R 与 B 通道（alpha 保持不变），零额外内存分配：
+    /// 24 位为 Rgb24 ⇄ Bgr24，32 位为 Bgra32 ⇄ Rgba32。
+    /// 注意：位深变化（如 Rgb24 ⇄ Bgra32，每像素 3 ⇄ 4 字节）无法就地完成，请改用相应的 To* 方法。
     /// </summary>
     public void SwapRgbBgrInPlace()
     {
-        if (PixelFormat != ImagePixelFormat.Rgb24 && PixelFormat != ImagePixelFormat.Bgr24)
-            throw new InvalidOperationException("SwapRgbBgrInPlace 仅适用于 24 位格式（Rgb24 或 Bgr24）");
-        SimdHelper.SwapRgbBgr24(Pixels, Pixels);
-        _pixelFormat = PixelFormat == ImagePixelFormat.Rgb24 ? ImagePixelFormat.Bgr24 : ImagePixelFormat.Rgb24;
+        switch (PixelFormat)
+        {
+            case ImagePixelFormat.Rgb24:
+                SimdHelper.SwapRgbBgr24(Pixels, Pixels);
+                _pixelFormat = ImagePixelFormat.Bgr24;
+                break;
+            case ImagePixelFormat.Bgr24:
+                SimdHelper.SwapRgbBgr24(Pixels, Pixels);
+                _pixelFormat = ImagePixelFormat.Rgb24;
+                break;
+            case ImagePixelFormat.Bgra32:
+                // 32 位就地交换：SIMD 每批恰读/写 16 字节，无需部分写入保护
+                SimdHelper.SwapRgbaBgra32(Pixels, Pixels);
+                _pixelFormat = ImagePixelFormat.Rgba32;
+                break;
+            case ImagePixelFormat.Rgba32:
+                SimdHelper.SwapRgbaBgra32(Pixels, Pixels);
+                _pixelFormat = ImagePixelFormat.Bgra32;
+                break;
+            default:
+                throw new InvalidOperationException("SwapRgbBgrInPlace 仅适用于 24 位（Rgb24/Bgr24）或 32 位（Bgra32/Rgba32）格式");
+        }
     }
 
     private static (byte[] pixels, int width, int height) ApplyExifOrientation(byte[] src, int width, int height, int orientation)

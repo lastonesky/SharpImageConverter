@@ -56,9 +56,9 @@ This library was originally created to address several practical issues we encou
 - WebP implementation relies on Google's libwebp and related components (BSD-3-Clause License); see `THIRD-PARTY-NOTICES.md` for copyright and license details
 
 ### Intermediate Format
-- `ImageFrame` as the intermediate structure for format conversion, supporting `Rgb24` (default), `Bgr24` and `Bgra32` pixel formats
+- `ImageFrame` as the intermediate structure for format conversion, supporting `Rgb24` (default), `Bgr24`, `Bgra32` and `Rgba32` pixel formats
 - Always load as RGB, then encode according to output extension; non-RGB24 frames are normalized back to RGB24 via SIMD before saving
-- Provides non-destructive `ToRgb24() / ToBgr24() / ToBgra32()` conversions and a zero-allocation in-place `SwapRgbBgrInPlace()` (24-bit formats only) for interop with OpenCV / camera / GPU BGR/BGRA sources
+- Provides non-destructive `ToRgb24() / ToBgr24() / ToBgra32() / ToRgba32()` conversions and a zero-allocation in-place `SwapRgbBgrInPlace()` (both 24-bit and 32-bit, swapping R/B within the same bit depth) for interop with OpenCV / camera / GPU BGR/BGRA sources
 
 ### Smart Lossy Compression (TinyPNG-style)
 - One API call / one flag shrinks JPG, PNG, GIF, WebP and BMP to the smallest size that still looks identical, keeping the original format

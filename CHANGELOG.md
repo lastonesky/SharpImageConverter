@@ -1,13 +1,17 @@
 ## 未发布
 ### 新增
-- **ImageFrame 兼容 BGR24 / BGRA32 中间格式**：`ImagePixelFormat` 新增 `Bgr24`、`Bgra32`，
-  `ImageFrame` 构造函数支持以这两种格式直接装载（按每像素字节数自动校验长度）。
+- **ImageFrame 兼容 BGR24 / BGRA32 / RGBA32 中间格式**：`ImagePixelFormat` 新增 `Bgr24`、`Bgra32`、`Rgba32`，
+  `ImageFrame` 构造函数支持以这些格式直接装载（按每像素字节数自动校验长度）。
 - **SIMD 加速的通道转换原语（`SimdHelper`）**：`SwapRgbBgr24`（RGB24⇄BGR24 就地/异处交换）、
-  `ConvertRgb24ToBgra32`、`ConvertBgr24ToBgra32`、`ConvertBgra32ToRgb24`、`ConvertBgra32ToBgr24`，
-  x86 走 SSSE3 `pshufb`、arm64 走 NEON `tbl`，并带标量回退。
-- **ImageFrame 转换 API**：`ToRgb24() / ToBgr24() / ToBgra32()`（非破坏式，非 RGB24 帧保存时自动经 SIMD 规范化为 RGB24），
-  以及零额外内存的就地交换 `SwapRgbBgrInPlace()`（仅 24 位格式），便于与 OpenCV / 相机 / GPU 等 BGR/BGRA 数据源互操作。
-- 新增单元测试：5 个 SIMD 转换原语的「标量参考对比 + 全长度覆盖」校验，以及 7 个 ImageFrame BGR/BGRA 互操作测试。
+  `SwapRgbaBgra32`（BGRA32⇄RGBA32 就地/异处交换，每批恰好读写 16 字节，就地时无需部分写入保护）、
+  `ConvertRgb24ToBgra32`、`ConvertBgr24ToBgra32`、`ConvertBgra32ToRgb24`、`ConvertBgra32ToBgr24`、
+  `ConvertRgba32ToBgr24`、`ConvertBgr24ToRgba32`，
+  x86 走 SSSE3 `pshufb`、arm64 走 NEON `tbl`，并带标量回退（Rgba32⇄Rgb24 复用已有的 `ExpandRgbToRgba` / `PackRgbaToRgb`）。
+- **ImageFrame 转换 API**：`ToRgb24() / ToBgr24() / ToBgra32() / ToRgba32()`（非破坏式，非 RGB24 帧保存时自动经 SIMD 规范化为 RGB24），
+  以及零额外内存的就地交换 `SwapRgbBgrInPlace()`（同一位深内交换 R/B：24 位 `Rgb24⇄Bgr24`、32 位 `Bgra32⇄Rgba32`），
+  便于与 OpenCV / 相机 / GPU 等 BGR/BGRA 数据源互操作。
+- 新增单元测试：BGR24/BGRA32/RGBA32 共 8 个 SIMD 转换原语的「标量参考对比 + 全长度覆盖」校验，
+  以及 13 个 ImageFrame BGR/BGRA/RGBA 互操作测试。
 
 ### 工具
 - 新增 `.github/workflows/release.yml`：推送 `v*` tag 即自动构建 win-x64 / linux-x64 / osx-arm64
