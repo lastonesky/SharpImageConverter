@@ -1536,7 +1536,11 @@ public static class JpegEncoder
     /// <see cref="BuildHuffTable"/> 配套使用。实现要点：
     /// ① 只有一个非零符号时强制码长 1（JPEG 不允许 0 长表；也不引入虚拟符号占位，
     ///    避免 bits 计数与符号数不一致导致严格解码器拒读）；
-    /// ② 建树前先把总频率缩放到 1000 以内，从根上保证码长 ≤ 15。
+    /// ② 直接用真实频率建树，不做频率预缩放。缩放会把长尾稀有符号抹成同权、反而拉长
+    ///    高频符号的码长：1254×1254 高细节图 AC 亮度表实测劣化 6.8%，比固定 Annex K 表还差；
+    /// ③ 码长超过 16 位时用 libjpeg（jchuff.c jpeg_gen_optimal_table）的调整循环压回 16 位：
+    ///    从最长组取两枚码，一枚搬进短一位的组，同时把某个更短的码字前缀一分为二。
+    ///    Kraft 和与符号总数都守恒，因此仍是合法满前缀码。
     /// </summary>
     internal static (byte[] Counts, byte[] Symbols) BuildOptimalHuffmanTable(long[] freq)
     {
@@ -1578,22 +1582,6 @@ public static class JpegEncoder
             }
         }
 
-        // 频率缩放：Huffman 树深度的上界由「最深处叶子的权和 ≥ Fib(d+2)」给出
-        // （Fib(17)=1597），把总频率缩到 500 以内（后面可能整体 ×2）可保证码长 ≤ 14，
-        // 从而完全避开「事后限长调整只改计数、不改各符号码长」的一致性陷阱。
-        // (+1)>>1 保证非零频率不会缩成 0。
-        long sum = 0;
-        for (int i = 0; i < f.Length; i++) sum += f[i];
-        while (sum > 500)
-        {
-            sum = 0;
-            for (int i = 0; i < f.Length; i++)
-            {
-                f[i] = (f[i] + 1) >> 1;
-                sum += f[i];
-            }
-        }
-
         // 关键：libjpeg 规定任何码长的末码不得为全 1（no code is allowed to be all
         // ones，否则被 GDI+/libjpeg 系解码器以 "Bogus Huffman table definition" 拒绝）。
         // 满树的最深组恰好贴满时末码必为全 1（等频 3 符号的 bits=[1,2] 无论如何扰动都是它）。
@@ -1618,26 +1606,161 @@ public static class JpegEncoder
         f2[m] = 1;   // 虚拟叶子
         sym2[m] = 256;
 
-        var counts2 = BuildTreeAndAssemble(f2, sym2, m + 1, counts, out var symbolsAll);
+        byte[] symbolsAll = BuildTreeAndAssemble(f2, sym2, m + 1, out int[] bits, out int deepest);
+        LimitCodeLengths(bits, deepest);
 
-        // 虚拟符号值 256 最大，且深度全表最深 → 必在 symbolsAll 末位、其组为最深非零组。
-        // 去掉它：该组码数 -1（挖掉全 1 码位），符号表不含它。
-        var symbols = new byte[symbolsAll.Length - 1];
-        Array.Copy(symbolsAll, symbols, symbols.Length);
-        for (int l = 16; l >= 1; l--)
+        int expected = symbolsAll.Length;
+        if (IsUsableCodeLengths(bits, expected))
         {
-            if (counts2[l - 1] > 0)
+            // 虚拟符号值 256 最大，且深度全表最深 → 必在 symbolsAll 末位、其组为最深非零组。
+            // 去掉它：该组码数 -1（挖掉全 1 码位），符号表不含它。
+            for (int l = MaxHuffmanCodeLength; l >= 1; l--)
             {
-                counts2[l - 1]--;
+                if (bits[l] > 0)
+                {
+                    bits[l]--;
+                    break;
+                }
+            }
+            for (int l = 1; l <= MaxHuffmanCodeLength; l++) counts[l - 1] = (byte)bits[l];
+            if (IsLegalPrefixCode(counts))
+            {
+                var trimmed = new byte[expected - 1];
+                Array.Copy(symbolsAll, trimmed, trimmed.Length);
+                return (counts, trimmed);
+            }
+        }
+
+        // 极端分布下的兜底：退回「把总权重缩放到 500 再建树」的旧路径。码长天然 ≤15、
+        // 不依赖限长循环，保证 DHT 永远合法可解（代价是长尾分布下码长分配失真）。
+        return BuildScaledTable(f, sym, m);
+    }
+
+    /// <summary>JPEG 允许的最大 Huffman 码长。</summary>
+    private const int MaxHuffmanCodeLength = 16;
+
+    /// <summary>
+    /// 把超过 16 位的码长压回 16 位以内（libjpeg jchuff.c jpeg_gen_optimal_table 的调整循环）。
+    /// 从最长组取两枚码：一枚搬进短一位的组，同时把一个更短的码字前缀一分为二补足码数。
+    /// 该操作对 Kraft 和是守恒的（-2·2^-i + 2^-(i-1) = 0，另两项也相消），
+    /// 且符号总数不变，因此结果仍是满前缀码。
+    /// </summary>
+    /// <param name="bits">码长直方图，下标即码长（1..deepest）</param>
+    /// <param name="deepest">当前最大码长</param>
+    private static void LimitCodeLengths(int[] bits, int deepest)
+    {
+        for (int i = Math.Min(deepest, bits.Length - 1); i > MaxHuffmanCodeLength; i--)
+        {
+            while (bits[i] > 0)
+            {
+                int j = i - 2;
+                while (j > 0 && bits[j] == 0) j--;
+                bits[i] -= 2;
+                bits[i - 1] += 1;
+                bits[j + 1] += 2;
+                bits[j] -= 1;
+            }
+        }
+    }
+
+    /// <summary>
+    /// 校验限长后的码长直方图结构可用：全部落在 1..16、无负数、符号总数与建树时一致。
+    /// 注意此时虚拟符号尚未挖掉，满树的末码必然是全 1，因此这里<b>不</b>做前缀码合法性检查——
+    /// 那是挖掉虚拟符号之后由 <see cref="IsLegalPrefixCode"/> 负责的。
+    /// 任一项不满足（含 libjpeg 调整循环 j 触底导致符号数不守恒）则走兜底路径。
+    /// </summary>
+    /// <param name="bits">码长直方图</param>
+    /// <param name="expectedSymbols">期望的符号总数（未挖掉虚拟符号前）</param>
+    private static bool IsUsableCodeLengths(int[] bits, int expectedSymbols)
+    {
+        int total = 0;
+        for (int l = 1; l <= MaxHuffmanCodeLength; l++)
+        {
+            if (bits[l] < 0 || bits[l] > 255) return false;
+            total += bits[l];
+        }
+        for (int l = MaxHuffmanCodeLength + 1; l < bits.Length; l++)
+        {
+            if (bits[l] != 0) return false;
+        }
+        return total == expectedSymbols;
+    }
+
+    /// <summary>
+    /// 兜底建表：先把总频率缩放到 ≤500（(+1)&gt;&gt;1 保证非零频率不缩成 0），
+    /// 再按虚拟叶子方案建树。缩放后树深上界由 Fib(d+2) 给出，码长不会超过 16，
+    /// 因此不需要限长循环；代价是长尾分布下码长分配明显失真。
+    /// </summary>
+    /// <param name="f">真实符号频率（升序符号表）</param>
+    /// <param name="sym">升序符号值</param>
+    /// <param name="m">符号数</param>
+    private static (byte[] Counts, byte[] Symbols) BuildScaledTable(long[] f, int[] sym, int m)
+    {
+        var g = new long[m];
+        Array.Copy(f, g, m);
+        long sum = 0;
+        for (int i = 0; i < m; i++) sum += g[i];
+        while (sum > 500)
+        {
+            sum = 0;
+            for (int i = 0; i < m; i++)
+            {
+                g[i] = (g[i] + 1) >> 1;
+                sum += g[i];
+            }
+        }
+        long gmin = long.MaxValue;
+        for (int i = 0; i < m; i++)
+        {
+            if (g[i] < gmin) gmin = g[i];
+        }
+        if (gmin <= 1)
+        {
+            for (int i = 0; i < m; i++) g[i] <<= 1;
+        }
+
+        var g2 = new long[m + 1];
+        var s2 = new int[m + 1];
+        Array.Copy(g, g2, m);
+        Array.Copy(sym, s2, m);
+        g2[m] = 1;
+        s2[m] = 256;
+
+        byte[] symbolsAll = BuildTreeAndAssemble(g2, s2, m + 1, out int[] bits, out int deepest);
+        // 兜底路径不做限长，超长码统一并到 16 位组（正常输入不会触发）
+        for (int l = deepest; l > MaxHuffmanCodeLength; l--)
+        {
+            bits[MaxHuffmanCodeLength] += bits[l];
+            bits[l] = 0;
+        }
+        for (int l = MaxHuffmanCodeLength; l >= 1; l--)
+        {
+            if (bits[l] > 0)
+            {
+                bits[l]--;
                 break;
             }
         }
 
-        return (counts2, symbols);
+        var counts = new byte[16];
+        for (int l = 1; l <= MaxHuffmanCodeLength; l++) counts[l - 1] = (byte)Math.Min(bits[l], 255);
+        var symbols = new byte[symbolsAll.Length - 1];
+        Array.Copy(symbolsAll, symbols, symbols.Length);
+        return (counts, symbols);
     }
 
-    /// <summary>显式树建 Huffman 并组装 DHT 的 counts/symbols。节点 0..m-1 是叶子（含虚拟）。</summary>
-    private static byte[] BuildTreeAndAssemble(long[] f, int[] sym, int m, byte[] counts, out byte[] symbols)
+    /// <summary>
+    /// 显式树建 Huffman 并组装 DHT 的符号表。节点 0..m-1 是叶子（含虚拟）。
+    /// 返回的符号表按（码长，符号值）升序排列，与 <see cref="LimitCodeLengths"/> 调整后的
+    /// 码长直方图配套（顺序天然保持非降，两两配对搬码不会破坏这一性质）。
+    /// 不做任何码长截断：真实频率建树可能产生 &gt;16 位的码，由调用方按 libjpeg 规则限长。
+    /// </summary>
+    /// <param name="f">叶子频率</param>
+    /// <param name="sym">叶子符号值</param>
+    /// <param name="m">叶子数</param>
+    /// <param name="bits">输出码长直方图，下标即码长（1..<paramref name="deepest"/>）</param>
+    /// <param name="deepest">输出最大码长</param>
+    private static byte[] BuildTreeAndAssemble(long[] f, int[] sym, int m, out int[] bits, out int deepest)
     {
         // 每轮线性扫最小两个活跃节点（O(m²)，m≤256）
         int nodes = 2 * m - 1;
@@ -1701,24 +1824,26 @@ public static class JpegEncoder
             stack[sp++] = r;
         }
 
-        var bits = new int[17];
-        for (int i = 0; i < m; i++) bits[Math.Min(codesize[i], 16)]++;
-
-        int total = 0;
-        for (int i = 1; i <= 16; i++) total += bits[i];
-
-        symbols = new byte[total];
-        int p = 0;
-        for (int l = 1; l <= 16; l++)
+        deepest = 1;
+        for (int i = 0; i < m; i++)
         {
-            counts[l - 1] = (byte)bits[l];
+            if (codesize[i] > deepest) deepest = codesize[i];
+        }
+
+        bits = new int[Math.Max(deepest, MaxHuffmanCodeLength) + 1];
+        for (int i = 0; i < m; i++) bits[codesize[i]]++;
+
+        var symbols = new byte[m];
+        int p = 0;
+        for (int l = 1; l <= deepest; l++)
+        {
             for (int s = 0; s < m; s++)
             {
                 if (codesize[s] == l) symbols[p++] = (byte)sym[s];
             }
         }
 
-        return counts;
+        return symbols;
     }
 
     /// <summary>
