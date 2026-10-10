@@ -84,7 +84,7 @@ public class JpegHuffmanOptimizeTests
     [Fact]
     public void BuildOptimalHuffmanTable_SkewedDistribution_RespectsSixteenBitLimit()
     {
-        // 2 的幂频率会产生深树；总频率被缩放后码长不得超过 16
+        // 2 的幂频率会产生深树（深约 20 层）；限长后码长不得超过 16，且必须仍是合法前缀码
         var freq = new long[256];
         long v = 1;
         for (int i = 0; i < 20; i++)
@@ -99,6 +99,116 @@ public class JpegHuffmanOptimizeTests
         Assert.Equal(symbols.Length, total);
         Assert.Equal(20, total);
         for (int i = 0; i < 16; i++) Assert.True(counts[i] >= 0);
+        Assert.True(JpegEncoder.IsLegalPrefixCode(counts),
+            $"bits=[{string.Join(',', counts)}] 限长后仍是非法前缀码");
+        long kraft = 0;
+        for (int i = 0; i < 16; i++) kraft += (long)counts[i] << (16 - (i + 1));
+        Assert.True(kraft <= 65536, $"Kraft={kraft}");
+    }
+
+    /// <summary>
+    /// 回归：按图优化的表必须逼近「不限码长的 Huffman 最优解」。
+    /// 旧实现在建树前把符号频率缩放到总权重 ≤500，长尾分布下长尾符号被抹成同权、
+    /// 高频符号码长被拉长：同一批分布实测最差偏 +13.05%，1254×1254 高细节图的
+    /// AC 亮度表偏 +6.80%（比固定 Annex K 表还大 4.06%，正是「加 --optimize 体积反涨」的次因）。
+    /// 改用 libjpeg 限长循环后最差只偏 +0.26%。阈值取 1%：足以拦住旧实现，
+    /// 又给「虚拟叶子扰动 + 16 位限长」留出余量。
+    /// </summary>
+    [Fact]
+    public void BuildOptimalHuffmanTable_SteepTailDistribution_StaysNearOptimal()
+    {
+        var cases = new (string Name, long[] Freq)[]
+        {
+            ("幂律 1.5", PowerLaw(80, 66000, 1.5)),
+            ("幂律 3.0", PowerLaw(80, 66000, 3.0)),
+            ("双峰长尾", PeakyTail()),
+            ("极陡 2^n", SteepPowers()),
+        };
+
+        foreach (var (name, freq) in cases)
+        {
+            long optimum = OptimalHuffmanBits(freq);
+            var (counts, symbols) = JpegEncoder.BuildOptimalHuffmanTable(freq);
+            long cost = TableCost(counts, symbols, freq);
+
+            Assert.Equal(freq.Count(f => f > 0), symbols.Length);
+            Assert.True(JpegEncoder.IsLegalPrefixCode(counts), $"{name}: 含全 1 末码");
+            Assert.True(MaxCodeLength(counts) <= 16, $"{name}: 码长超过 16 位");
+
+            double ratio = (double)cost / optimum;
+            Assert.True(ratio < 1.01,
+                $"{name}: 码位 {cost} 相对最优 {optimum} 偏 +{(ratio - 1) * 100:F2}%（应 <1%）");
+        }
+    }
+
+    private static long[] PowerLaw(int n, long top, double expo)
+    {
+        var f = new long[256];
+        for (int i = 0; i < n; i++) f[i] = Math.Max(1, (long)Math.Round(top / Math.Pow(i + 1, expo)));
+        return f;
+    }
+
+    private static long[] PeakyTail()
+    {
+        var f = new long[256];
+        f[0] = 60000;
+        f[1] = 40000;
+        for (int i = 0; i < 70; i++) f[i + 10] = Math.Max(1, 3000 / (i + 1));
+        return f;
+    }
+
+    private static long[] SteepPowers()
+    {
+        var f = new long[256];
+        for (int i = 0; i < 20; i++) f[i] = 1L << i;
+        return f;
+    }
+
+    /// <summary>不限码长的 Huffman 最优总码位数（堆式合并）。</summary>
+    private static long OptimalHuffmanBits(long[] freq)
+    {
+        var heap = new PriorityQueue<long, long>();
+        foreach (var v in freq)
+        {
+            if (v > 0) heap.Enqueue(v, v);
+        }
+        if (heap.Count == 0) return 0;
+        if (heap.Count == 1) return heap.Peek();
+        long total = 0;
+        while (heap.Count > 1)
+        {
+            long a = heap.Dequeue();
+            long b = heap.Dequeue();
+            total += a + b;
+            heap.Enqueue(a + b, a + b);
+        }
+        return total;
+    }
+
+    /// <summary>按 DHT 的（counts, symbols）语义统计该表对这组频率的总码位数。</summary>
+    private static long TableCost(byte[] counts, byte[] symbols, long[] freq)
+    {
+        long bits = 0;
+        int p = 0;
+        for (int l = 1; l <= 16; l++)
+        {
+            for (int k = 0; k < counts[l - 1]; k++)
+            {
+                bits += freq[symbols[p]] * l;
+                p++;
+            }
+        }
+        Assert.Equal(symbols.Length, p);
+        return bits;
+    }
+
+    private static int MaxCodeLength(byte[] counts)
+    {
+        for (int l = 16; l >= 1; l--)
+        {
+            if (counts[l - 1] > 0) return l;
+        }
+        return 0;
     }
 
     [Fact]
@@ -153,7 +263,10 @@ public class JpegHuffmanOptimizeTests
         byte[] optimized = Encode(w, h, rgb, optimize: true);
 
         Assert.Equal(Decode(plain), Decode(optimized));
-        Assert.True(optimized.Length <= plain.Length * 1.02, $"optimized={optimized.Length} plain={plain.Length}");
+        // 高频细节图是旧实现的失分区（按图优化的表反而比固定表大 1.8%~2.2%）：
+        // 正确实现下「按图优化的表」必须严格优于固定 Annex K 表 + 更小的 DHT 段
+        Assert.True(optimized.Length < plain.Length,
+            $"optimized={optimized.Length} plain={plain.Length}");
     }
 
     [Theory]

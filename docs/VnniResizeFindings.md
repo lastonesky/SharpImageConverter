@@ -1,6 +1,6 @@
 # AVX-VNNI 在 Resize 上的落地实验与结论
 
-> 状态：【实验完成，代码已撤销】。结论：在当前架构下，INT8/INT16 量化 VNNI 路径**不快于**已有的浮点 SIMD 路径，按项目「提升不足 7% 视为无效」铁律不应保留。
+> 状态：【实验完成，代码已撤销】。结论：在当前架构下，INT8/INT16 量化 VNNI 路径**不快于**已有的浮点 SIMD 路径（实测为负提升），故不保留。
 > 关联：本次实验的完整代码改动已 `git checkout` 撤销并删除，未合入任何分支。
 
 ## 1. 背景与问题
@@ -54,7 +54,7 @@
 
 ## 7. 结论与处置
 
-- 按 `PerfReport.md` 的准入阈值（**提升不足 7% 视为无效，不保留**），本次 VNNI 改动为负提升，依规不保留、不提交。
+- 本次 VNNI 改动为**负提升**（比已有浮点 SIMD 路径更慢），故不保留、不提交。
 - 代码全部撤销：`Processing.cs` 与 `ResizeConsistencyTests.cs` 已 `git checkout` 还原；3 个新增文件（`src/Core/VnniIntrinsics.cs`、`SharpImageConverter.Tests/VnniIntrinsicsTests.cs`、`VnniResizeExperimentTests.cs`）已删除；md5 一致性硬判已恢复为开启。
 - VNNI 对 resize 的「正确但更慢」结论留存于本文档，供后续评估。若未来出现内存带宽不再是瓶颈的场景（如极小图高频 resize、或权重可完全预计算的固定缩放比流水线），可重新评估本条路线。
 
