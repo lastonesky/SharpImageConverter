@@ -640,7 +640,7 @@ public sealed class OctreeQuantizer
                     //（消掉 16 次单字节散写 + 各自的边界检查），查表走 fixed 裸指针。
                     // 2026-10-03 四臂同二进制 A/B 实测（143MP，10 轮×N=5）：
                     // map 段 10.52→9.67ms（池化中位 −8.1%，配对 −10.5%，10/10 轮胜），
-                    // 过「修改部分 ≥7%」门槛；产物 md5 与原实现逐字节一致。
+                    // 性能提升理想；产物 md5 与原实现逐字节一致。
                     // 拆解：仅展开写出 −7.1%、仅去 LUT 边界检查 −1.0%、组合 −8.1%。
                     // 教训：A3-a 若写成 4 迭代小循环只有 −1.5%，完全展开才拿到收益。
                     SimdCompat.StoreBytes(Vector128.Create(Pack8(lut, buf, 0), Pack8(lut, buf, 8)).AsByte(), ref *(ip + rowBase + x), 0);
@@ -782,7 +782,7 @@ public sealed class OctreeQuantizer
                         // 向量 store 写出（消掉 16 次单字节散写 + 各自的边界检查），
                         // 查表走 fixed 裸指针。2026-10-03 四臂同二进制 A/B：
                         // map 段 10.52→9.67ms（池化中位 −8.1%，10/10 轮胜），
-                        // 过「修改部分 ≥7%」门槛，产物 md5 逐字节一致。
+                        // 性能提升理想，产物 md5 逐字节一致。
                         SimdCompat.StoreBytes(Vector128.Create(Pack8(lut, buf, 0), Pack8(lut, buf, 8)).AsByte(), ref *(ip + rowBase + x), 0);
                         o += 48;
                     }

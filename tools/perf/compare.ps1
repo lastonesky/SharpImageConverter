@@ -126,9 +126,9 @@ W "| 指标 | 值 |"
 W "|---|---|"
 W "| 对比项数量 | $($rows.Count) |"
 W "| 几何平均提速 | **$($overall.ToString('F2'))x** |"
-W "| 明显变快 (>7%) | $win |"
-W "| 基本持平 (±7%) | $flat |"
-W "| 明显变慢 (<-7%) | $lose |"
+W "| 明显变快 | $win |"
+W "| 基本持平 | $flat |"
+W "| 明显变慢 | $lose |"
 W "| 输出字节完全一致 | $same / $($rows.Count) |"
 W ""
 
@@ -208,11 +208,11 @@ foreach ($r in ($rows | Where-Object { $_.SpeedUp -gt 0 } | Sort-Object -Propert
 }
 W ""
 
-W "## 变慢的项（< 0.93x）"
+W "## 变慢的项"
 W ""
 $regressions = @($rows | Where-Object { $_.SpeedUp -gt 0 -and $_.SpeedUp -lt 0.93 } | Sort-Object -Property SpeedUp)
 if ($regressions.Count -eq 0) {
-    W "无（没有观测到超过 7% 的性能回退）"
+    W "无（没有观测到明显的性能回退）"
 } else {
     W "| 项目 | 尺寸 | 基线 ms | 当前 ms | 变化 |"
     W "|---|---|---|---|---|"
