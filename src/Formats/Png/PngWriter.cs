@@ -136,6 +136,11 @@ public static class PngWriter
     /// <summary>
     /// 写入 RGBA32 PNG 流（颜色类型 6），可指定滤波策略与压缩级别。
     /// </summary>
+    /// <remarks>
+    /// 像素**全不透明**时自动改写为颜色类型 2（RGB）：像素信息完全等价，但少掉每像素一个
+    /// 恒为 255 的 alpha 字节，deflate 少处理 25% 原始数据。判定成本是一次顺序扫描，
+    /// 相比编码本身可忽略（见 <see cref="Core.SimdHelper.IsOpaqueRgba"/>）。
+    /// </remarks>
     /// <param name="stream">输出流</param>
     /// <param name="width">宽度</param>
     /// <param name="height">高度</param>
@@ -145,6 +150,28 @@ public static class PngWriter
     /// <param name="level">Deflate 压缩级别</param>
     public static void WriteRgba(Stream stream, int width, int height, byte[] rgba, ImageMetadata? metadata, PngFilterMode filter, CompressionLevel level)
     {
+        ArgumentNullException.ThrowIfNull(rgba);
+        int pixels = width * height;
+        if (pixels < 0 || rgba.Length < pixels * 4)
+        {
+            throw new ArgumentException("RGBA 缓冲区长度与宽高不匹配", nameof(rgba));
+        }
+
+        // 全不透明时按颜色类型 2（RGB）写：像素信息完全不变，只是不再重复 4 次 alpha=255。
+        // 实测 143 MP 照片 31,919,483 B → 29,469,583 B（−7.7%），deflate 还少处理 25% 原始字节。
+        // 代价是一次 alpha 扫描 + 一次 4→3 打包（22~29 + 45~55 ms，约编码时间的 3%），
+        // 端到端反而快 13%（deflate 少扫的 25% 字节把它盖过去了）。
+        if (SimdHelper.IsOpaqueRgba(rgba.AsSpan(0, pixels * 4)))
+        {
+            // 用 GC.AllocateUninitializedArray 而不是 ArrayPool：143 MP 要租 429 MB，
+            // 池会把它一直留着（ArrayPool.Shared 按 2 的幂分桶并且不主动收缩），
+            // 长驻进程宁可让它走 LOH 被正常回收。
+            byte[] rgb = GC.AllocateUninitializedArray<byte>(pixels * 3);
+            SimdHelper.PackRgbaToRgb(rgba.AsSpan(0, pixels * 4), rgb);
+            Write(stream, width, height, rgb, metadata, filter, level);
+            return;
+        }
+
         stream.Write(PngSignature, 0, PngSignature.Length);
         WriteChunk(stream, TypeIHDR, CreateIHDRRgba(width, height));
         WriteMetadata(stream, metadata);

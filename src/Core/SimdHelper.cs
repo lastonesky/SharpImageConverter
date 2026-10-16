@@ -261,6 +261,46 @@ internal static class SimdHelper
     }
 
     /// <summary>
+    /// 判断 RGBA32 缓冲区是否**全部不透明**（所有 alpha == 255）。
+    /// </summary>
+    /// <remarks>
+    /// 以 uint 视图比较每个像素的最高字节（小端下 RGBA 的 A 落在 bit24-31），
+    /// 这样一次能检查 <c>Vector&lt;uint&gt;.Count</c> 个像素，而不是步长 4 地逐字节扫。
+    /// 带 alpha 的图通常在头几个向量就返回 false，提前退出。
+    /// <para>
+    /// 成本是纯读带宽（143 MP / 545 MB 实测 22~29 ms），而由此换到的「全不透明图写 RGB」
+    /// 能让下游 PNG 少处理 25% 的原始字节（产物 −7.7%、deflate 同步变快），稳赚。
+    /// </para>
+    /// </remarks>
+    public static bool IsOpaqueRgba(ReadOnlySpan<byte> rgba)
+    {
+        const uint AlphaMask = 0xFF000000u;
+        int pixels = rgba.Length / 4;
+        if (pixels == 0) return true;
+
+        ReadOnlySpan<uint> words = MemoryMarshal.Cast<byte, uint>(rgba.Slice(0, pixels * 4));
+        int n = words.Length;
+        int i = 0;
+
+        if (Vector.IsHardwareAccelerated && n >= Vector<uint>.Count)
+        {
+            var mask = new Vector<uint>(AlphaMask);
+            int width = Vector<uint>.Count;
+            ref uint src = ref MemoryMarshal.GetReference(words);
+            for (; i <= n - width; i += width)
+            {
+                // Vector<uint> 的 != 是「任一元素不等」⇒ 直接当整体判据用。
+                if ((Vector.LoadUnsafe(ref src, (nuint)i) & mask) != mask) return false;
+            }
+        }
+        for (; i < n; i++)
+        {
+            if ((words[i] & AlphaMask) != AlphaMask) return false;
+        }
+        return true;
+    }
+
+    /// <summary>
     /// RGBA32 -> RGB24（丢弃 alpha）。要求 rgb.Length == (rgba.Length / 4) * 3。
     /// </summary>
     public static void PackRgbaToRgb(ReadOnlySpan<byte> rgba, Span<byte> rgb)

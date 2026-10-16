@@ -6,8 +6,19 @@ namespace SharpImageConverter.Formats.Png;
 
 /// <summary>
 /// PNG 自适应行滤波：逐行在 None / Sub / Up / Average / Paeth 五种滤波器中，
-/// 按「滤波后字节的有符号绝对值之和最小」挑一个，通常能比固定 Up 滤波再省 5%~20%。
+/// 按「滤波后字节的有符号绝对值之和最小」挑一个（PNG 经典的 MSAD 代价）。
 /// </summary>
+/// <remarks>
+/// <b>这是一个代价函数写错的启发式，别把它当成「一定更小」。</b>
+/// MSAD 最小化的是滤波后字节的 L1 范数，而 deflate 真正吃的是**跨行重复**：
+/// 整列统一 Up 时相邻行的差分高度相似，LZ77 能跨行匹配整行；逐行换滤波器会打断这条匹配链。
+/// 10650×13426（143 MP）照片实测（同一份像素、level 6、无元数据）：
+/// Up 29,469,583 B vs 自适应 35,142,122 B（<b>+19.2%</b>），且慢 2.4 倍（2040 → 4959 ms），
+/// 该图 2972/3000 行都被选成了 Paeth。
+/// 反过来 1000×1000 的 16 色调色板索引流，自适应 140,614 B 却比 Up 145,270 B 小 3.2%。
+/// ⇒ 两种滤波各有胜场，只能**各自编码后按实际体积取小**（见 <c>PngOptimizer.EncodeLosslessSmallest</c>）。
+/// 只用于 optimize；普通转换由 <c>PngWriter</c> 默认走固定 Up。
+/// </remarks>
 internal static class PngAdaptiveFilter
 {
     public const int FilterNone = 0;

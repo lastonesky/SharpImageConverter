@@ -84,8 +84,14 @@ namespace SharpImageConverter.Compression
         public bool JpegOptimizeHuffman { get; set; } = true;
 
         /// <summary>
-        /// PNG 输出是否使用自适应行滤波（逐行在 5 种滤波器中选最优）。默认开启。
+        /// PNG 无损重写是否额外尝试自适应行滤波（逐行在 5 种滤波器中选最优）。默认开启。
         /// </summary>
+        /// <remarks>
+        /// 开启后 <b>Up 与自适应各完整编码一遍、按实际字节数取小</b>，不是「一律用自适应」：
+        /// 自适应是 MSAD 启发式，在照片上会明显劣于固定 Up（143 MP 实测大 19.2%，见
+        /// <c>PngOptimizer.EncodeLosslessSmallest</c>），必须实测。
+        /// 关闭则只试 Up（省一遍编码，适合体积不敏感、只求快的批量场景）。
+        /// </remarks>
         public bool AdaptiveFiltering { get; set; } = true;
 
         /// <summary>

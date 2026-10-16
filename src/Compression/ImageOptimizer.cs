@@ -282,12 +282,33 @@ namespace SharpImageConverter.Compression
         /// </remarks>
         /// <param name="candidateCount">候选个数</param>
         /// <param name="perCandidateBytes">单个候选在评估期间的峰值占用估计</param>
-        /// <param name="memoryBudget">本次搜索允许的峰值内存预算</param>
-        internal static int CandidateParallelism(int candidateCount, long perCandidateBytes, long memoryBudget = 512L << 20)
+        /// <param name="memoryBudget">本次搜索允许的峰值内存预算；0 表示按运行时可用内存自动推导</param>
+        internal static int CandidateParallelism(int candidateCount, long perCandidateBytes, long memoryBudget = 0)
         {
             if (candidateCount <= 1) return 1;
-            long byMemory = Math.Max(1, memoryBudget / Math.Max(1, perCandidateBytes));
+            long budget = memoryBudget > 0 ? memoryBudget : AutoCandidateMemoryBudget;
+            long byMemory = Math.Max(1, budget / Math.Max(1, perCandidateBytes));
             return (int)Math.Max(1, Math.Min(candidateCount, Math.Min(Environment.ProcessorCount, byMemory)));
+        }
+
+        /// <summary>
+        /// 候选并行的默认内存预算：取运行时可用内存的 1/4，夹在 384 MB ~ 8 GB。
+        /// </summary>
+        /// <remarks>
+        /// 原先固定 512 MB。大图上的单候选峰值是「索引 1 B/px + 还原缓冲 4 B/px」≈ 5 B/px，
+        /// 143 MP 时约 716 MB ⇒ 512 MB / 716 MB = 0 被夹成 1，**并行度静默塌成 1、退化为串行**，
+        /// 而调用方仍以为在并行（这就是 143 MP 照片 optimize 要 31 s 的另一半原因）。
+        /// 改成跟着真实可用内存走：63.5 GB 的机器上 8 个候选全并行，
+        /// 8 GB 的小机器上自动退到 1~2。
+        /// </remarks>
+        private static long AutoCandidateMemoryBudget
+        {
+            get
+            {
+                long available = GC.GetGCMemoryInfo().TotalAvailableMemoryBytes;
+                if (available <= 0) available = 2L << 30;
+                return Math.Clamp(available / 4, 384L << 20, 8L << 30);
+            }
         }
 
         /// <summary>
@@ -667,14 +688,7 @@ namespace SharpImageConverter.Compression
             return ms.ToArray();
         }
 
-        private static bool IsOpaque(byte[] rgba)
-        {
-            for (int i = 3; i < rgba.Length; i += 4)
-            {
-                if (rgba[i] != 255) return false;
-            }
-            return true;
-        }
+        private static bool IsOpaque(byte[] rgba) => SimdHelper.IsOpaqueRgba(rgba);
 
         /// <summary>
         /// BMP 无法压缩，统一转成 PNG 走有损压缩（体积通常能降一个数量级）。
