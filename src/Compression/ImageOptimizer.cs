@@ -277,11 +277,20 @@ namespace SharpImageConverter.Compression
         }
 
         /// <summary>
-        /// 大图用 Optimal、小图用 SmallestSize：级别 9 在大图上耗时增长明显而收益有限。
+        /// optimize 路径写 PNG 时使用的 deflate 级别。
         /// </summary>
-        /// <param name="pixelCount">像素总数</param>
-        internal static CompressionLevel PickDeflateLevel(long pixelCount)
-            => pixelCount > 8_000_000 ? CompressionLevel.Optimal : CompressionLevel.SmallestSize;
+        /// <remarks>
+        /// 原先按像素数在 <see cref="CompressionLevel.Optimal"/>（zlib 6）与
+        /// <see cref="CompressionLevel.SmallestSize"/>（zlib 9）之间二选一（阈值 8 MP）。
+        /// 4.19 MP 上实测：调色板索引数据 6→9 是 <b>7.4 倍时间换 2.61% 体积</b>
+        /// （91.7 → 682.0 ms），真彩色无损重写是 10.4 倍换 6.64%（280.3 → 2905.3 ms）。
+        /// 而 optimize 的搜索期要为**每个候选各付一次**：4 个候选累计 3.3 s，
+        /// 占 PNG optimize 总耗时的 79%。
+        /// 搜索期真正需要的只是「候选之间的体积排序」，级别 9 多换来的那 2%~7%
+        /// 远小于候选之间的差距（相邻色档 10%~40%），故统一降到 Optimal。
+        /// 该级别只影响 optimize，普通转换走 <c>PngWriter</c> 自己的默认值。
+        /// </remarks>
+        internal const CompressionLevel OptimizePngDeflateLevel = CompressionLevel.Optimal;
 
         /// <summary>
         /// 收尾：写出最优产物，或在无收益 / 不支持时复制原图。

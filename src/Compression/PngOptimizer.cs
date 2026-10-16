@@ -47,7 +47,9 @@ namespace SharpImageConverter.Compression
             var metadata = ImageOptimizer.PrepareMetadata(image.Metadata, o.StripMetadata);
 
             var filter = o.AdaptiveFiltering ? PngFilterMode.Adaptive : PngFilterMode.Up;
-            var level = ImageOptimizer.PickDeflateLevel(pixels);
+            // 搜索期每个候选都要完整编码一次，级别 9 在这里是 7~10 倍的时间换 2.6%~6.6% 体积，
+            // 而候选之间的体积差距本身就有 10%~40%，故统一用 Optimal（详见该常量的注释）。
+            var level = ImageOptimizer.OptimizePngDeflateLevel;
 
             var quantizer = new PaletteQuantizer();
             var quantizeOptions = new QuantizeOptions { EnableDithering = o.EnableDithering };

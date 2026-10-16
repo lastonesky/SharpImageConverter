@@ -246,7 +246,8 @@ Special cases:
 ### Folder Batch Conversion
 - Recursion: `--recursive` (traverse subdirectories)
 - Output format: `--to bmp|png|jpg|webp|gif` or `--out-ext .bmp|.png|.jpg|.webp|.gif` (also honored for single-file input)
-- Parallelism: `--parallel N` (defaults to logical CPU count; for `.webp` output in directory mode, automatically reduces to 1 to ensure thread-safety)
+- Parallelism: `--parallel N` (**default 2**; for `.webp` output in directory mode, automatically reduces to 1 to ensure thread-safety)
+  - The codecs are already internally multi-stage parallel pipelines (three chained `Task.Run` stages for JPEG encoding, plus block/MCU-row `Parallel.For` passes), so fanning out files by logical CPU count oversubscribes by N × internal parallelism. Measured on 8 × 2048² images with `--optimize`: `--parallel 2` = 3874 ms, `4` = 11515 ms, `8` = 29360 ms vs the old default `12` = 25245 ms ⇒ the old default was 6.5–7.7x slower.
 - Skip existing: `--skip-existing` (skip if target file already exists)
 - Output location: when the second argument is a folder, preserves the relative structure of the source directory; if not specified, outputs next to the source files
 - Default extension: `.png` when no operation; `.bmp` when operations are present; explicit `--to/--out-ext` takes precedence

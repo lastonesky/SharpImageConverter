@@ -10,6 +10,22 @@ namespace SharpImageConverter;
 
 class Program
 {
+    /// <summary>
+    /// 目录批量处理的默认并行度（可被 <c>--parallel N</c> 覆盖）。
+    /// <para>
+    /// 编解码器内部本身已是多阶段并行流水线：JPEG 编码有 produce/dct/huffman 三段
+    /// <c>Task.Run</c> 串联，<c>JpegImage</c>/<c>JpegReconstruct</c> 里还有成排按 MCU 行带的
+    /// <c>Parallel.For</c>。外层若再按 <c>Environment.ProcessorCount</c>（本机 12）铺开文件，
+    /// 就是 12 × 内部并行度 的超订，线程争抢反而使总吞吐崩掉。
+    /// </para>
+    /// <para>
+    /// 实测（8 张 2048×2048 / 4.19MP 图，<c>--optimize</c>，墙钟）：
+    /// <c>--parallel 1</c> 5567 ms、<b>2 → 3874 ms</b>、4 → 11515 ms、8 → 29360 ms、
+    /// 12 → 25245 ms。即默认值比最优慢 6.5~7.7 倍，故取 2。
+    /// </para>
+    /// </summary>
+    const int DefaultDirectoryParallelism = 2;
+
     static void Main(string[] args)
     {
         if (args.Length < 1)
@@ -109,7 +125,7 @@ class Program
         Console.WriteLine("JPEG 耗时统计: --jpeg-bench N（重复 N 次；配合环境变量 SIC_JPEG_STAGE_TIMING=1 输出分阶段耗时）");
         Console.WriteLine("GIF 量化器: --gif-quantizer octree(默认,八叉树+Bayer) | wu/legacy(原 Wu+Floyd–Steinberg)");
         Console.WriteLine("GIF 抖动幅度: --gif-dither N (默认 8 = 一个量化步长; 调大会放大颗粒与缩放摩尔纹)");
-        Console.WriteLine("文件夹选项: --recursive | --to bmp/png/jpg/webp/gif | --parallel N | --skip-existing");
+        Console.WriteLine($"文件夹选项: --recursive | --to bmp/png/jpg/webp/gif | --parallel N（默认 {DefaultDirectoryParallelism}） | --skip-existing");
         Console.WriteLine("智能压缩: --optimize [--opt-quality N] [--max-colors N] [--no-dither] [--opt-verbose] [--min-saving 百分比]");
         Console.WriteLine("  说明: 在画质基本不变的前提下把 JPG/PNG/GIF/WEBP/BMP 压到最小，默认输出 <原名>.min.<原扩展名>");
         Console.WriteLine("转换+压缩: --to <格式> --optimize   转成目标格式并直接输出该格式下最小体积（无需再 optimize 一遍）");
@@ -138,7 +154,7 @@ class Program
         var searchOption = options.Recursive ? SearchOption.AllDirectories : SearchOption.TopDirectoryOnly;
         var exts = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { ".jpg", ".jpeg", ".png", ".bmp", ".webp", ".gif" };
         var files = Directory.EnumerateFiles(inputDir, "*.*", searchOption).Where(f => exts.Contains(Path.GetExtension(f))).ToList();
-        int parallel = options.Parallelism.HasValue && options.Parallelism.Value > 0 ? options.Parallelism.Value : Environment.ProcessorCount;
+        int parallel = options.Parallelism.HasValue && options.Parallelism.Value > 0 ? options.Parallelism.Value : DefaultDirectoryParallelism;
         long savedTotal = 0, beforeTotal = 0, afterTotal = 0;
         int kept = 0;
 
@@ -240,7 +256,7 @@ class Program
         var searchOption = options.Recursive ? SearchOption.AllDirectories : SearchOption.TopDirectoryOnly;
         var exts = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { ".jpg", ".jpeg", ".png", ".bmp", ".webp", ".gif" };
         var files = Directory.EnumerateFiles(inputDir, "*.*", searchOption).Where(f => exts.Contains(Path.GetExtension(f))).ToList();
-        int parallel = options.Parallelism.HasValue && options.Parallelism.Value > 0 ? options.Parallelism.Value : Environment.ProcessorCount;
+        int parallel = options.Parallelism.HasValue && options.Parallelism.Value > 0 ? options.Parallelism.Value : DefaultDirectoryParallelism;
         // WebP 编码器内部已并行，外层再按核数并行会叠加内存占用
         if (string.Equals(targetExt, ".webp", StringComparison.OrdinalIgnoreCase)) parallel = 1;
         long savedTotal = 0, beforeTotal = 0, afterTotal = 0;
@@ -554,7 +570,7 @@ class Program
         var exts = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { ".jpg", ".jpeg", ".png", ".bmp", ".webp", ".gif" };
         var files = Directory.EnumerateFiles(inputDir, "*.*", searchOption).Where(f => exts.Contains(Path.GetExtension(f)));
         string defaultExt = options.OutputExtension ?? (options.Operations.Count == 0 ? ".png" : ".bmp");
-        int parallel = options.Parallelism.HasValue && options.Parallelism.Value > 0 ? options.Parallelism.Value : Environment.ProcessorCount;
+        int parallel = options.Parallelism.HasValue && options.Parallelism.Value > 0 ? options.Parallelism.Value : DefaultDirectoryParallelism;
         if (string.Equals(defaultExt, ".webp", StringComparison.OrdinalIgnoreCase)) parallel = 1;
         int success = 0, fail = 0;
         var locker = new object();

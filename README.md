@@ -244,7 +244,7 @@ dotnet run -- <输入文件或文件夹路径> [输出文件或文件夹路径] 
 - 目录批处理参数：
   - `--recursive`：递归处理子目录。
   - `--to ext` / `--to=ext`（同义：`--out-ext`）：指定输出后缀（bmp/png/jpg/jpeg/webp/gif；单文件同样生效）。
-  - `--parallel N`：并行度（目录模式；WebP 输出强制串行）。
+  - `--parallel N`：并行度（目录模式，**默认 2**；WebP 输出强制串行）。
   - `--skip-existing`：目标文件存在时跳过。
 - 智能压缩参数（配合 `--optimize`）：
   - `--opt-quality N`：目标画质 0-100（默认 88）。95≈保守、88≈均衡、75≈激进。
@@ -261,7 +261,10 @@ dotnet run -- <输入文件或文件夹路径> [输出文件或文件夹路径] 
 ### 文件夹批量转换
 - 递归：`--recursive`（遍历子目录）
 - 指定输出格式：`--to bmp|png|jpg|webp` 或 `--out-ext .bmp|.png|.jpg|.webp`
-- 并行：`--parallel N`（默认使用逻辑 CPU 数；输出为 `.webp` 时为确保线程安全自动降为 1）
+- 并行：`--parallel N`（**默认 2**；输出为 `.webp` 时为确保线程安全自动降为 1）
+  - 编解码器内部本身已是多阶段并行流水线（JPEG 编码的 produce/dct/huffman 三段 `Task.Run`、按 MCU 行带的 `Parallel.For`），
+    外层再按逻辑 CPU 数铺开文件会造成 N × 内部并行度 的超订。实测 8 张 2048² 图 `--optimize`：
+    `--parallel 2` = 3874 ms、`4` = 11515 ms、`8` = 29360 ms、旧默认 `12` = 25245 ms ⇒ 旧默认慢 6.5~7.7 倍。
 - 跳过已存在：`--skip-existing`（目标文件已存在则跳过）
 - 输出位置：第二个参数为文件夹时，保持源目录的相对结构；未指定时输出到源文件所在目录
 - 默认扩展名：无操作默认 `.png`，存在操作默认 `.bmp`；显式指定优先生效
