@@ -183,6 +183,52 @@ namespace Jpeg2Bmp.Tests
             for (int p = 8; p < w * h; p++) Assert.Equal(0, result.Indices[p]);
         }
 
+        /// <summary>
+        /// 关闭抖动时走的是「直方图桶 → 最近调色板色」的查表路径。
+        /// 该路径曾用同一个下标 k 同时索引 _usedBins 与 _binArray，而 _binArray 已被
+        /// 中位切分就地排序过一次，两者不再对应 —— 每个桶因此拿到别的桶的代表色，
+        /// 整图错位（256 色下逐像素 PSNR 只有 ~2.6 dB、平均误差 ~158）。
+        /// </summary>
+        [Fact]
+        public void Quantizer_WithoutDithering_StillMapsBinsToTheirOwnNearestColor()
+        {
+            int w = 96, h = 64;
+            var rgba = new byte[w * h * 4];
+            var rng = new Random(2026);
+            for (int y = 0; y < h; y++)
+            {
+                for (int x = 0; x < w; x++)
+                {
+                    int o = (y * w + x) * 4;
+                    rgba[o] = (byte)Math.Clamp(128 + 90 * Math.Sin(x * 0.05) + rng.Next(-6, 6), 0, 255);
+                    rgba[o + 1] = (byte)Math.Clamp(120 + 80 * Math.Cos(y * 0.06) + rng.Next(-6, 6), 0, 255);
+                    rgba[o + 2] = (byte)Math.Clamp(140 + 70 * Math.Sin((x + y) * 0.03) + rng.Next(-6, 6), 0, 255);
+                    rgba[o + 3] = 255;
+                }
+            }
+
+            var result = PaletteQuantizer.Quantize(rgba, w, h, new QuantizeOptions
+            {
+                MaxColors = 256,
+                EnableDithering = false,
+            });
+            Assert.True(result.ColorCount > 2, $"颜色数 {result.ColorCount}");
+
+            var restored = new byte[rgba.Length];
+            for (int p = 0; p < w * h; p++)
+            {
+                int i = result.Indices[p] * 3;
+                restored[p * 4] = result.PaletteRgb[i];
+                restored[p * 4 + 1] = result.PaletteRgb[i + 1];
+                restored[p * 4 + 2] = result.PaletteRgb[i + 2];
+                restored[p * 4 + 3] = 255;
+            }
+
+            var q = QualityMetrics.Compare(rgba, restored, w, h, 4);
+            Assert.True(q.MeanError < 12, $"平均误差 {q.MeanError:0.00}（疑似桶号错位）");
+            Assert.True(q.Psnr > 25, $"逐像素 PSNR {q.Psnr:0.00} dB（疑似桶号错位）");
+        }
+
         [Fact]
         public void QualityMetrics_IdenticalImages_AreLossless()
         {

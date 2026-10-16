@@ -641,12 +641,22 @@ namespace SharpImageConverter.Compression
             int threshold = reserveTransparent ? options.TransparentAlphaThreshold : 0;
             int offset = reserveTransparent ? 1 : 0;
 
+            // 代表色必须按「桶号」现算，不能读 _binArray[k]：
+            // BuildPalette 会就地对 _binArray 做中位切分排序，排序后 _binArray[k] 与
+            // _usedBins[k] 已不再对应（下面这个循环按桶号取色，两者混用会让
+            // 每个桶都拿到别的桶的颜色 → 无抖动路径整图错位）。
+            // 这里复用 BuildBins 的均值公式，按 bin 直接由累加器还原。
+            int[] counts = _counts!, sr = _sumR!, sg = _sumG!, sb = _sumB!, sa = _sumA!;
             for (int k = 0; k < _usedBinCount; k++)
             {
                 int bin = _usedBins![k];
                 if (lut[bin] >= 0) continue;
-                ref var b = ref _binArray![k];
-                lut[bin] = FindNearest(b.R, b.G, b.B, b.A);
+                int c = counts[bin];
+                lut[bin] = FindNearest(
+                    (byte)((sr[bin] + (c >> 1)) / c),
+                    (byte)((sg[bin] + (c >> 1)) / c),
+                    (byte)((sb[bin] + (c >> 1)) / c),
+                    (byte)((sa[bin] + (c >> 1)) / c));
             }
 
             for (int p = 0; p < pixels; p++)

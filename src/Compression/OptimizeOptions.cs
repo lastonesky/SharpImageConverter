@@ -78,7 +78,7 @@ namespace SharpImageConverter.Compression
         public int JpegMinQuality { get; set; } = 40;
 
         /// <summary>
-        /// JPEG 是否按图像统计生成最优 Huffman 表（两遍编码，编码耗时约翻倍）。
+        /// JPEG 是否按图像统计生成最优 Huffman 表（两遍编码，编码耗时实测约 2x，见 1.9~2.4x）。
         /// 对大片平坦区域的图（扫描件、截图、大留白照片）可再省 20%~40%，默认开启。
         /// </summary>
         public bool JpegOptimizeHuffman { get; set; } = true;

@@ -46,7 +46,8 @@ namespace SharpImageConverter.Compression
                 byte[] Encode(int quality)
                 {
                     using var ms = new MemoryStream();
-                    // 按图优化的 Huffman 表：多花一倍编码时间换 20%~40% 体积，
+                    // 按图优化的 Huffman 表：多花约 2 倍编码时间（实测 1.9~2.4x）换 20%~40% 体积
+                    // （第一遍只为统计符号分布，第二遍重跑整条管线再熵编码）；
                     // 对大片平坦区域的图（扫描件、截图、大留白照片）收益最大
                     JpegEncoder.Encode(image, ms, new JpegEncoderOptions(quality, subsample420, keepMetadata, false, o.JpegOptimizeHuffman));
                     return ms.ToArray();
