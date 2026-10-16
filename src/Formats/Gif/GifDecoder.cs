@@ -12,11 +12,29 @@ using SharpImageConverter.Core;
 
 namespace SharpImageConverter.Formats.Gif
 {
-    public sealed class GifAnimation(IReadOnlyList<Image<Rgb24>> frames, IReadOnlyList<int> frameDurationsMs, int loopCount)
+    public sealed class GifAnimation(
+        IReadOnlyList<Image<Rgb24>> frames,
+        IReadOnlyList<int> frameDurationsMs,
+        int loopCount,
+        bool compositeFullyOpaque = false)
     {
         public IReadOnlyList<Image<Rgb24>> Frames { get; } = frames;
         public IReadOnlyList<int> FrameDurationsMs { get; } = frameDurationsMs;
         public int LoopCount { get; } = loopCount;
+
+        /// <summary>
+        /// 首帧合成结果是否**必然**全不透明（即每个像素的 alpha 都是 255）。
+        /// <para>
+        /// 为 true 时，调用方（如 <c>GifOptimizer</c>）可以省掉一次
+        /// <see cref="GifDecoder.DecodeRgba32(string)"/> 探测透明通道——
+        /// 那是本解码路径上唯一需要 RGBA 的理由。
+        /// </para>
+        /// <para>
+        /// 判定同样只看首帧，因为 <see cref="GifDecoder.DecodeRgba32(string)"/> 本身
+        /// 就只解首帧就返回。为 false 只表示「不确定」，调用方需照旧自行探测。
+        /// </para>
+        /// </summary>
+        public bool CompositeFullyOpaque { get; } = compositeFullyOpaque;
     }
 
     /// <summary>
@@ -60,7 +78,7 @@ namespace SharpImageConverter.Formats.Gif
         {
             var context = new DecodeContext(stream, DecodeMode.Animation);
             ExecuteDecode(context);
-            return new GifAnimation(context.RgbFrames!, context.Durations!, context.LoopCount);
+            return new GifAnimation(context.RgbFrames!, context.Durations!, context.LoopCount, context.FirstFrameFullyOpaque);
         }
 
         public Image<Rgb24> DecodeRgb24(string path)
@@ -101,6 +119,12 @@ namespace SharpImageConverter.Formats.Gif
             public List<int>? Durations;
             public Image<Rgba32>? RgbaFrame;
             public int LoopCount = 1;
+
+            /// <summary>
+            /// 首帧合成后是否每个像素都被写过（因而 RGBA 下 alpha 恒为 255）。
+            /// 只在首帧的 <c>!canvasReady</c> 分支里赋值一次。
+            /// </summary>
+            public bool FirstFrameFullyOpaque;
         }
 
         private void ExecuteDecode(DecodeContext ctx)
@@ -260,6 +284,13 @@ namespace SharpImageConverter.Formats.Gif
                             FillBackground(canvas, components, bgR, bgG, bgB);
                         }
                         canvasReady = true;
+
+                        // 只在首帧判定一次：此后的帧只会局部覆盖画布，被写入的像素 alpha 一律 255。
+                        //   - opaqueFullCover：整幅画布都被本帧覆盖；
+                        //   - hasBgColor：先整幅填了背景色（同样带 alpha=255）。
+                        // 两者皆不满足时存在「从未被写入」的像素，RGBA 下其 alpha 保持初始值 0；
+                        // 而 transIndex >= 0 时本帧可能写出 alpha=0。这两种情况都不断言全不透明。
+                        ctx.FirstFrameFullyOpaque = transIndex < 0 && (opaqueFullCover || hasBgColor);
                     }
                     long tb1 = Now(timing);
 

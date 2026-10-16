@@ -2,6 +2,9 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.IO.Compression;
+using System.Linq;
+using System.Runtime.ExceptionServices;
+using System.Threading.Tasks;
 using SharpImageConverter.Core;
 using SharpImageConverter.Formats.Bmp;
 using SharpImageConverter.Formats.Gif;
@@ -223,6 +226,205 @@ namespace SharpImageConverter.Compression
                 else lo = mid + 1;
             }
             return lo;
+        }
+
+        /// <summary>
+        /// 复刻 <see cref="SearchLadder"/> 的「候选访问序列」，用于并行搜索后保证行为完全一致。
+        /// </summary>
+        /// <remarks>
+        /// optimize 的搜索期要对每个候选各做一次完整编码，而 PNG/GIF/WebP 的候选内编码
+        /// （deflate / libwebp）都是**单线程**的，12 核上只用 1 个核。把候选并行评估后，
+        /// 就能把这段墙钟压到「最慢一个候选」的量级。
+        /// <para>
+        /// 但二分是串行的：下一个要评估哪个候选取决于上一个是否达标，无法事先知道。
+        /// 因此做法是「先并行全量评估 → 再按本函数复刻的访问序列挑结果」，
+        /// 这样最终参与体积比较的候选集合与串行二分**逐个相同**，产物逐字节不变。
+        /// 额外多评估出来的那些候选只用于内部，不参与挑选。
+        /// </para>
+        /// </remarks>
+        /// <param name="count">阶梯长度</param>
+        /// <param name="accept">达标判定（按下标）</param>
+        /// <returns>访问到的下标，按二分实际评估顺序排列；整体不达标时只有最高档一个</returns>
+        internal static List<int> ReplayLadderVisits(int count, Func<int, bool> accept)
+        {
+            var visits = new List<int>(count);
+            if (count <= 0) return visits;
+            var seen = new bool[count];
+            void Visit(int i)
+            {
+                if (seen[i]) return;
+                seen[i] = true;
+                visits.Add(i);
+            }
+
+            int lo = 0, hi = count - 1;
+            Visit(hi);
+            // 与 SearchLadder 一致：最高档不达标就直接收工，不再往下探
+            if (!accept(hi)) return visits;
+
+            while (lo < hi)
+            {
+                int mid = (lo + hi) >> 1;
+                Visit(mid);
+                if (accept(mid)) hi = mid;
+                else lo = mid + 1;
+            }
+            return visits;
+        }
+
+        /// <summary>
+        /// optimize 搜索期「并行评估候选」的并行度上限。
+        /// </summary>
+        /// <remarks>
+        /// 只在候选内编码是单线程的路径上用（PNG 的 deflate、WebP 的 libwebp）。
+        /// JPEG 不适用：它的编码器内部已经是并行流水线，外层再并行只会超订。
+        /// 按内存预算夹上限，避免目录批量时与外层并行度叠加爆内存。
+        /// </remarks>
+        /// <param name="candidateCount">候选个数</param>
+        /// <param name="perCandidateBytes">单个候选在评估期间的峰值占用估计</param>
+        /// <param name="memoryBudget">本次搜索允许的峰值内存预算</param>
+        internal static int CandidateParallelism(int candidateCount, long perCandidateBytes, long memoryBudget = 512L << 20)
+        {
+            if (candidateCount <= 1) return 1;
+            long byMemory = Math.Max(1, memoryBudget / Math.Max(1, perCandidateBytes));
+            return (int)Math.Max(1, Math.Min(candidateCount, Math.Min(Environment.ProcessorCount, byMemory)));
+        }
+
+        /// <summary>
+        /// <see cref="SearchQuality"/> 的并行版：结论完全一致，只是把候选评估并行铺开。
+        /// </summary>
+        /// <remarks>
+        /// 二分天生串行（下一个评估哪个取决于上一个是否达标），无法直接并行。
+        /// 这里改成「粗网格并行扫一遍 → 在 (前一格, 命中格) 的开区间里全枚举并行扫一遍」：
+        /// 因为画质随质量单调，两阶段找到的仍是**最低达标质量**，与二分同解。
+        /// 网格点数取并行度，故两阶段的墙钟都只有一波编码。
+        /// <para>
+        /// <paramref name="degree"/> 为 1 时直接落回 <see cref="SearchQuality"/>（逐位等价）。
+        /// </para>
+        /// </remarks>
+        /// <param name="encode">按质量编码，返回文件字节</param>
+        /// <param name="decode">把文件字节解回像素</param>
+        /// <param name="reference">参考像素</param>
+        /// <param name="width">宽度</param>
+        /// <param name="height">高度</param>
+        /// <param name="minQuality">质量下界</param>
+        /// <param name="maxQuality">质量上界</param>
+        /// <param name="accept">达标判定</param>
+        /// <param name="log">日志委托</param>
+        /// <param name="degree">并行度</param>
+        internal static (int Quality, byte[] Bytes, ImageQuality Score) SearchQualityParallel(
+            Func<int, byte[]> encode,
+            Func<byte[], byte[]> decode,
+            byte[] reference,
+            int width,
+            int height,
+            int minQuality,
+            int maxQuality,
+            Func<ImageQuality, bool> accept,
+            Action<string>? log,
+            int degree)
+        {
+            if (degree <= 1)
+            {
+                return SearchQuality(encode, decode, reference, width, height, minQuality, maxQuality, accept, log);
+            }
+
+            int lo = Math.Max(1, minQuality);
+            int hi = Math.Min(100, maxQuality);
+            int span = hi - lo;
+            var results = new Dictionary<int, (byte[] Bytes, ImageQuality Quality)>(span + 1);
+            var sync = new object();
+
+            void EvalBatch(List<int> qs, int dop)
+            {
+                var batch = new (int Q, byte[] Bytes, ImageQuality Quality)[qs.Count];
+                try
+                {
+                    Parallel.For(0, qs.Count, new ParallelOptions { MaxDegreeOfParallelism = dop }, i =>
+                    {
+                        int q = qs[i];
+                        byte[] bytes = encode(q);
+                        byte[] decoded = decode(bytes);
+                        // 与 SearchQuality 保持同一口径：这里历史上就按 3 通道比较（WebP 传进来的是 RGBA），
+                        // 改成 4 会改变可选的 q，属产品行为变化，本函数不擅自改。
+                        var quality = QualityMetrics.Compare(reference, decoded, width, height, 3);
+                        batch[i] = (q, bytes, quality);
+                    });
+                }
+                catch (AggregateException ex) when (ex.InnerExceptions.Count == 1)
+                {
+                    // 还原成单异常，保持调用方原有的异常类型与语义
+                    ExceptionDispatchInfo.Capture(ex.InnerExceptions[0]).Throw();
+                }
+
+                lock (sync)
+                {
+                    foreach (var e in batch) results[e.Q] = (e.Bytes, e.Quality);
+                }
+            }
+
+            // 阶段一：粗网格（两端必含）并行扫一遍，找第一个达标的网格点
+            int gridCount = Math.Max(1, Math.Min(span + 1, degree));
+            var grid = new List<int>(gridCount);
+            if (gridCount == 1)
+            {
+                grid.Add(hi);
+            }
+            else
+            {
+                for (int k = 0; k < gridCount; k++)
+                {
+                    grid.Add(lo + (int)Math.Round((double)span * k / (gridCount - 1)));
+                }
+            }
+            EvalBatch(grid, degree);
+
+            // 最高档不达标：与 SearchQuality 一致，直接把最高档交出去
+            if (!accept(results[hi].Quality))
+            {
+                EmitLog(log, results);
+                return (hi, results[hi].Bytes, results[hi].Quality);
+            }
+
+            int foundIdx = 0;
+            while (foundIdx < grid.Count && !accept(results[grid[foundIdx]].Quality)) foundIdx++;
+
+            int qStar;
+            if (foundIdx <= 0)
+            {
+                // 连下界都达标，最低达标质量就是下界
+                qStar = grid[0];
+            }
+            else
+            {
+                // 阶段二：在 (前一格, 命中格) 的开区间里全枚举
+                int from = grid[foundIdx - 1] + 1;
+                int to = grid[foundIdx] - 1;
+                qStar = grid[foundIdx];
+                if (from <= to)
+                {
+                    var window = new List<int>(to - from + 1);
+                    for (int q = from; q <= to; q++) window.Add(q);
+                    EvalBatch(window, degree);
+                    for (int q = from; q <= to; q++)
+                    {
+                        if (accept(results[q].Quality)) { qStar = q; break; }
+                    }
+                }
+            }
+
+            EmitLog(log, results);
+            return (qStar, results[qStar].Bytes, results[qStar].Quality);
+        }
+
+        /// <summary>并行评估后补日志：按质量升序输出，保证多次运行的日志稳定可比。</summary>
+        private static void EmitLog(Action<string>? log, Dictionary<int, (byte[] Bytes, ImageQuality Quality)> results)
+        {
+            if (log is null) return;
+            foreach (int q in results.Keys.OrderBy(k => k))
+            {
+                log($"  候选质量 {q}: {results[q].Bytes.Length} 字节, {results[q].Quality}");
+            }
         }
 
         /// <summary>

@@ -18,11 +18,26 @@ namespace SharpImageConverter.Formats.Webp
         public float Quality { get; }
         public WebpConcurrencyStrategy ConcurrencyStrategy { get; }
 
-        public WebpEncoderOptions(float quality, WebpConcurrencyStrategy concurrencyStrategy = WebpConcurrencyStrategy.Auto)
+        /// <summary>
+        /// libwebp 的 <c>config.method</c>（0~6）：越大越慢、体积越小，默认 4。
+        /// </summary>
+        /// <remarks>
+        /// 2048²（4.19 MP）/ q80 实测单次编码：method 2 = 147.5 ms / 70,838 B、
+        /// method 3 = 501.7 ms / 67,784 B、method 4 = 490.9 ms / 67,818 B、
+        /// method 6 = 579.4 ms / 64,872 B。悬崖在 2→3 之间：≥3 才走完整 RD 优化。
+        /// </remarks>
+        public int Method { get; }
+
+        public WebpEncoderOptions(
+            float quality,
+            WebpConcurrencyStrategy concurrencyStrategy = WebpConcurrencyStrategy.Auto,
+            int method = 4)
         {
             if (quality < 0f || quality > 100f) throw new ArgumentOutOfRangeException(nameof(quality));
+            if (method is < 0 or > 6) throw new ArgumentOutOfRangeException(nameof(method));
             Quality = quality;
             ConcurrencyStrategy = concurrencyStrategy;
+            Method = method;
         }
 
         public static WebpEncoderOptions Default => new(75f, WebpConcurrencyStrategy.Auto);
@@ -106,13 +121,19 @@ namespace SharpImageConverter.Formats.Webp
         public float Quality
         {
             get => Options.Quality;
-            set => Options = new WebpEncoderOptions(value, Options.ConcurrencyStrategy);
+            set => Options = new WebpEncoderOptions(value, Options.ConcurrencyStrategy, Options.Method);
         }
 
         public WebpConcurrencyStrategy ConcurrencyStrategy
         {
             get => Options.ConcurrencyStrategy;
-            set => Options = new WebpEncoderOptions(Options.Quality, value);
+            set => Options = new WebpEncoderOptions(Options.Quality, value, Options.Method);
+        }
+
+        public int Method
+        {
+            get => Options.Method;
+            set => Options = new WebpEncoderOptions(Options.Quality, Options.ConcurrencyStrategy, value);
         }
 
         /// <summary>
@@ -147,13 +168,19 @@ namespace SharpImageConverter.Formats.Webp
         public float Quality
         {
             get => Options.Quality;
-            set => Options = new WebpEncoderOptions(value, Options.ConcurrencyStrategy);
+            set => Options = new WebpEncoderOptions(value, Options.ConcurrencyStrategy, Options.Method);
         }
 
         public WebpConcurrencyStrategy ConcurrencyStrategy
         {
             get => Options.ConcurrencyStrategy;
-            set => Options = new WebpEncoderOptions(Options.Quality, value);
+            set => Options = new WebpEncoderOptions(Options.Quality, value, Options.Method);
+        }
+
+        public int Method
+        {
+            get => Options.Method;
+            set => Options = new WebpEncoderOptions(Options.Quality, Options.ConcurrencyStrategy, value);
         }
 
         /// <summary>

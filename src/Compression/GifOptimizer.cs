@@ -30,8 +30,16 @@ namespace SharpImageConverter.Compression
                 return ImageOptimizer.Finish(input, output, originalSize, null, null, default, o, "GIF 中没有可用帧");
             }
 
-            byte[] rgba = decoder.DecodeRgba32(input).Buffer;
-            bool hasTransparency = HasTransparency(rgba);
+            byte[]? rgba = null;
+            bool hasTransparency = false;
+            if (!animation.CompositeFullyOpaque)
+            {
+                // 首帧合成不可能全不透明时才需要真的解一次 RGBA 来探测：
+                // 该解码只解首帧就返回，实测 2048² 约 20 ms（动/静帧同价）。
+                rgba = decoder.DecodeRgba32(input).Buffer;
+                hasTransparency = HasTransparency(rgba);
+            }
+
             var artifact = Produce(animation, hasTransparency, hasTransparency ? rgba : null, o);
             if (artifact.Bytes == null || !artifact.MeetsBar)
             {

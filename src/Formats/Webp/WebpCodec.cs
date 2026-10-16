@@ -102,14 +102,14 @@ namespace SharpImageConverter.Formats.Webp
             throw new InvalidOperationException("WebPNewInternal 创建失败（ABI 版本不匹配或库不兼容）");
         }
 
-        private static void InitConfig(ref WebPConfig config, float quality)
+        private static void InitConfig(ref WebPConfig config, float quality, int method = 4)
         {
             for (int i = 0; i < EncoderAbiVersionsToTry.Length; i++)
             {
                 if (WebPConfigInitInternal(ref config, WebPPreset.WEBP_PRESET_DEFAULT, quality, EncoderAbiVersionsToTry[i]) != 0)
                 {
                     config.quality = quality;
-                    config.method = 4;
+                    config.method = method;
                     if (WebPValidateConfig(ref config) == 0) throw new InvalidOperationException("WebP 编码参数无效");
                     return;
                 }
@@ -126,14 +126,14 @@ namespace SharpImageConverter.Formats.Webp
             throw new InvalidOperationException("WebPPictureInitInternal 创建失败（ABI 版本不匹配或库不兼容）");
         }
 
-        private static byte[] EncodeWithConfig(ReadOnlySpan<byte> pixels, int width, int height, int stride, bool hasAlpha, float quality)
+        private static byte[] EncodeWithConfig(ReadOnlySpan<byte> pixels, int width, int height, int stride, bool hasAlpha, float quality, int method = 4)
         {
             using var ms = new MemoryStream();
-            EncodeWithConfigToStream(ms, pixels, width, height, stride, hasAlpha, quality);
+            EncodeWithConfigToStream(ms, pixels, width, height, stride, hasAlpha, quality, method);
             return ms.ToArray();
         }
 
-        private static void EncodeWithConfigToStream(Stream stream, ReadOnlySpan<byte> pixels, int width, int height, int stride, bool hasAlpha, float quality)
+        private static void EncodeWithConfigToStream(Stream stream, ReadOnlySpan<byte> pixels, int width, int height, int stride, bool hasAlpha, float quality, int method = 4)
         {
             WebPConfig config = default;
             WebPPicture picture = default;
@@ -141,7 +141,7 @@ namespace SharpImageConverter.Formats.Webp
             WebPWriterState? state = null;
             try
             {
-                InitConfig(ref config, quality);
+                InitConfig(ref config, quality, method);
                 InitPicture(ref picture);
                 picture.width = width;
                 picture.height = height;
@@ -339,7 +339,7 @@ namespace SharpImageConverter.Formats.Webp
                 byte[]? result = null;
                 ExecuteWithConcurrency(options.ConcurrencyStrategy, () =>
                 {
-                    result = EncodeWithConfig(rgba, width, height, width * 4, true, options.Quality);
+                    result = EncodeWithConfig(rgba, width, height, width * 4, true, options.Quality, options.Method);
                 });
                 return result!;
             }
@@ -360,7 +360,7 @@ namespace SharpImageConverter.Formats.Webp
                 byte[]? result = null;
                 ExecuteWithConcurrency(options.ConcurrencyStrategy, () =>
                 {
-                    result = EncodeWithConfig(rgb, width, height, width * 3, false, options.Quality);
+                    result = EncodeWithConfig(rgb, width, height, width * 3, false, options.Quality, options.Method);
                 });
                 return result!;
             }
@@ -424,13 +424,13 @@ namespace SharpImageConverter.Formats.Webp
             {
                 if (options.ConcurrencyStrategy == WebpConcurrencyStrategy.Parallel)
                 {
-                    EncodeWithConfigToStream(stream, rgba, width, height, width * 4, true, options.Quality);
+                    EncodeWithConfigToStream(stream, rgba, width, height, width * 4, true, options.Quality, options.Method);
                 }
                 else
                 {
                     lock (EncodeLock)
                     {
-                        EncodeWithConfigToStream(stream, rgba, width, height, width * 4, true, options.Quality);
+                        EncodeWithConfigToStream(stream, rgba, width, height, width * 4, true, options.Quality, options.Method);
                     }
                 }
             }
@@ -452,13 +452,13 @@ namespace SharpImageConverter.Formats.Webp
             {
                 if (options.ConcurrencyStrategy == WebpConcurrencyStrategy.Parallel)
                 {
-                    EncodeWithConfigToStream(stream, rgb, width, height, width * 3, false, options.Quality);
+                    EncodeWithConfigToStream(stream, rgb, width, height, width * 3, false, options.Quality, options.Method);
                 }
                 else
                 {
                     lock (EncodeLock)
                     {
-                        EncodeWithConfigToStream(stream, rgb, width, height, width * 3, false, options.Quality);
+                        EncodeWithConfigToStream(stream, rgb, width, height, width * 3, false, options.Quality, options.Method);
                     }
                 }
             }

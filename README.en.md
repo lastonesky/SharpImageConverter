@@ -246,8 +246,10 @@ Special cases:
 ### Folder Batch Conversion
 - Recursion: `--recursive` (traverse subdirectories)
 - Output format: `--to bmp|png|jpg|webp|gif` or `--out-ext .bmp|.png|.jpg|.webp|.gif` (also honored for single-file input)
-- Parallelism: `--parallel N` (**default 2**; for `.webp` output in directory mode, automatically reduces to 1 to ensure thread-safety)
-  - The codecs are already internally multi-stage parallel pipelines (three chained `Task.Run` stages for JPEG encoding, plus block/MCU-row `Parallel.For` passes), so fanning out files by logical CPU count oversubscribes by N × internal parallelism. Measured on 8 × 2048² images with `--optimize`: `--parallel 2` = 3874 ms, `4` = 11515 ms, `8` = 29360 ms vs the old default `12` = 25245 ms ⇒ the old default was 6.5–7.7x slower.
+- Parallelism: `--parallel N` (directory mode; **the default is chosen from the batch's formats**, and an explicit value always wins)
+  - The codecs are already internally multi-stage parallel pipelines (three chained `Task.Run` stages for JPEG encoding, plus block/MCU-row `Parallel.For` passes), so fanning out files by logical CPU count oversubscribes by N × internal parallelism. Measured on 8 × 2048² images with `--optimize`: `--parallel 2` = 3026 ms, `4` = 12548 ms, `8` = 13863 ms ⇒ **JPEG batches use 2** (4 is a 4.1x cliff).
+  - PNG/GIF/WebP have no such cliff (same batch: `png` 4 = 3069 ms, `gif` 4 = 2182 ms, `webp` 8 = 6926 ms), so **non-JPEG batches widen to 4**.
+  - **One exception**: `--optimize` for WebP already saturates the candidates internally (libwebp encoding is single-threaded, so candidate parallelism is its only multi-core lever), therefore the outer level stays at 1 to avoid stacking with the inner one.
 - Skip existing: `--skip-existing` (skip if target file already exists)
 - Output location: when the second argument is a folder, preserves the relative structure of the source directory; if not specified, outputs next to the source files
 - Default extension: `.png` when no operation; `.bmp` when operations are present; explicit `--to/--out-ext` takes precedence

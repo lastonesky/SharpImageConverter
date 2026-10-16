@@ -1,9 +1,13 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.IO.Compression;
+using System.Runtime.ExceptionServices;
+using System.Threading.Tasks;
 using SharpImageConverter.Core;
 using SharpImageConverter.Formats.Png;
+using SharpImageConverter.Metadata;
 
 namespace SharpImageConverter.Compression
 {
@@ -51,30 +55,16 @@ namespace SharpImageConverter.Compression
             // 而候选之间的体积差距本身就有 10%~40%，故统一用 Optimal（详见该常量的注释）。
             var level = ImageOptimizer.OptimizePngDeflateLevel;
 
+            // 无损取色短路用到的临时状态（只在那一支里用）
             var quantizer = new PaletteQuantizer();
             var quantizeOptions = new QuantizeOptions { EnableDithering = o.EnableDithering };
             byte[] restored = new byte[(long)pixels * 4];
-
-            var produced = new Dictionary<int, (byte[] Bytes, QuantizeResult Quantized, ImageQuality Quality)>();
 
             byte[] Encode(QuantizeResult q)
             {
                 using var ms = new MemoryStream();
                 PngWriter.WritePalette(ms, width, height, q.Indices, q.PaletteRgb, q.PaletteAlpha, metadata, filter, level);
                 return ms.ToArray();
-            }
-
-            ImageQuality Evaluate(int colors)
-            {
-                if (produced.TryGetValue(colors, out var cached)) return cached.Quality;
-                quantizeOptions.MaxColors = colors;
-                var q = quantizer.QuantizeCore(rgba, width, height, quantizeOptions);
-                byte[] bytes = Encode(q);
-                ImageOptimizer.RestoreRgba(q, restored);
-                var quality = QualityMetrics.Compare(rgba, restored, width, height, 4);
-                o.Log?.Invoke($"  候选 {q.ColorCount} 色: {bytes.Length} 字节, {quality}");
-                produced[colors] = (bytes, q, quality);
-                return quality;
             }
 
             // 颜色本来就不多：优先无损取色，不再做有损尝试
@@ -97,16 +87,22 @@ namespace SharpImageConverter.Compression
             if (bestBytes == null)
             {
                 int[] ladder = ImageOptimizer.BuildColorLadder(o.MaxColors);
-                ImageOptimizer.SearchLadder(ladder, Evaluate, o.Accept);
-                // 体积并不严格随颜色数单调（中位切分的切法不同会有几个百分点的抖动），
-                // 因此在所有达标候选里按体积取最小，而不是直接取颜色最少的那个。
-                foreach (var pair in produced)
+                var candidates = EvaluateLadderParallel(ladder, rgba, width, height, pixels, metadata, filter, level, o);
+
+                // 并行全量评估之后，仍按二分**实际会访问的序列**来挑结果：
+                // 这样「参与体积比较的候选集合」与串行二分逐个相同，产物逐字节不变。
+                // 多评估出来的那些候选只用于内部，不参与挑选（日志同样只输出被访问过的）。
+                foreach (int i in ImageOptimizer.ReplayLadderVisits(ladder.Length, i => o.Accept(candidates[i].Quality)))
                 {
-                    if (!o.Accept(pair.Value.Quality)) continue;
-                    if (bestBytes != null && pair.Value.Bytes.Length >= bestBytes.Length) continue;
-                    bestBytes = pair.Value.Bytes;
-                    bestQuality = pair.Value.Quality;
-                    bestMethod = $"PNG 调色板 {pair.Value.Quantized.ColorCount} 色" + (o.EnableDithering ? " + 抖动" : "");
+                    var c = candidates[i];
+                    o.Log?.Invoke($"  候选 {c.ColorCount} 色: {c.Bytes.Length} 字节, {c.Quality}");
+                    if (!o.Accept(c.Quality)) continue;
+                    // 体积并不严格随颜色数单调（中位切分的切法不同会有几个百分点的抖动），
+                    // 因此在所有达标候选里按体积取最小，而不是直接取颜色最少的那个。
+                    if (bestBytes != null && c.Bytes.Length >= bestBytes.Length) continue;
+                    bestBytes = c.Bytes;
+                    bestQuality = c.Quality;
+                    bestMethod = $"PNG 调色板 {c.ColorCount} 色" + (o.EnableDithering ? " + 抖动" : "");
                 }
             }
             // 量化收益不明显（或压根没达标）时，再试一次无损真彩色重写：
@@ -135,6 +131,65 @@ namespace SharpImageConverter.Compression
             // PNG 走到这里必然有产物（量化或无损重写），且无损重写一定达标
             bool meetsBar = bestQuality.IsLossless || o.Accept(bestQuality);
             return new OptimizeArtifact(bestBytes, bestMethod, bestQuality, meetsBar);
+        }
+
+        /// <summary>
+        /// 并行评估整条颜色阶梯，返回每个候选的产物字节、实际颜色数与画质。
+        /// </summary>
+        /// <remarks>
+        /// PNG 候选内的编码是 <c>DeflateStream</c>（单线程流式，且 PNG 规范把 IDAT 锁死在 deflate，
+        /// 换不了算法），所以候选并行是这条路径上唯一能吃到多核的杠杆。
+        /// 每个候选实例化自己的 <see cref="PaletteQuantizer"/>——它内部持有可变的装箱与 LUT 状态，
+        /// 不能跨候选共享。
+        /// </remarks>
+        private static (byte[] Bytes, int ColorCount, ImageQuality Quality)[] EvaluateLadderParallel(
+            int[] ladder,
+            byte[] rgba,
+            int width,
+            int height,
+            int pixels,
+            ImageMetadata? metadata,
+            PngFilterMode filter,
+            CompressionLevel level,
+            OptimizeOptions o)
+        {
+            long restoredBytes = (long)pixels * 4;
+            int dop = ImageOptimizer.CandidateParallelism(ladder.Length, (long)pixels * 5 + (1L << 20));
+            var results = new (byte[] Bytes, int ColorCount, ImageQuality Quality)[ladder.Length];
+
+            // 还原缓冲是「每候选一份、用完即还」，按并发数开个小池子，避免整条阶梯各留一份 16 MB
+            var buffers = new ConcurrentQueue<byte[]>();
+            for (int i = 0; i < dop; i++) buffers.Enqueue(new byte[restoredBytes]);
+
+            try
+            {
+                Parallel.For(0, ladder.Length, new ParallelOptions { MaxDegreeOfParallelism = dop }, i =>
+                {
+                    var quantizer = new PaletteQuantizer();
+                    var quantizeOptions = new QuantizeOptions
+                    {
+                        EnableDithering = o.EnableDithering,
+                        MaxColors = ladder[i],
+                    };
+                    var q = quantizer.QuantizeCore(rgba, width, height, quantizeOptions);
+
+                    using var ms = new MemoryStream();
+                    PngWriter.WritePalette(ms, width, height, q.Indices, q.PaletteRgb, q.PaletteAlpha, metadata, filter, level);
+                    byte[] bytes = ms.ToArray();
+
+                    if (!buffers.TryDequeue(out var restored)) restored = new byte[restoredBytes];
+                    ImageOptimizer.RestoreRgba(q, restored);
+                    var quality = QualityMetrics.Compare(rgba, restored, width, height, 4);
+                    buffers.Enqueue(restored);
+
+                    results[i] = (bytes, q.ColorCount, quality);
+                });
+            }
+            catch (AggregateException ex) when (ex.InnerExceptions.Count == 1)
+            {
+                ExceptionDispatchInfo.Capture(ex.InnerExceptions[0]).Throw();
+            }
+            return results;
         }
 
         private static bool IsOpaque(byte[] rgba)

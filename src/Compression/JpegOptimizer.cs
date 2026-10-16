@@ -43,13 +43,13 @@ namespace SharpImageConverter.Compression
 
             (bool Accepted, int Quality, byte[] Bytes, ImageQuality Score, bool Subsample420) TrySearch(bool subsample420)
             {
-                byte[] Encode(int quality)
+                byte[] Encode(int quality, bool optimizeHuffman)
                 {
                     using var ms = new MemoryStream();
                     // 按图优化的 Huffman 表：多花约 2 倍编码时间（实测 1.9~2.4x）换 20%~40% 体积
                     // （第一遍只为统计符号分布，第二遍重跑整条管线再熵编码）；
                     // 对大片平坦区域的图（扫描件、截图、大留白照片）收益最大
-                    JpegEncoder.Encode(image, ms, new JpegEncoderOptions(quality, subsample420, keepMetadata, false, o.JpegOptimizeHuffman));
+                    JpegEncoder.Encode(image, ms, new JpegEncoderOptions(quality, subsample420, keepMetadata, false, optimizeHuffman));
                     return ms.ToArray();
                 }
 
@@ -62,13 +62,27 @@ namespace SharpImageConverter.Compression
                 if (o.JpegQuality.HasValue)
                 {
                     int q = o.JpegQuality.Value;
-                    byte[] bytes = Encode(q);
+                    byte[] bytes = Encode(q, o.JpegOptimizeHuffman);
                     var score = QualityMetrics.Compare(rgb, Decode(bytes), width, height, 3);
                     return (o.Accept(score), q, bytes, score, subsample420);
                 }
 
+                // 搜索期改用**标准** Huffman 表（单遍）：
+                // 二分判定只看解码后的像素，而 Huffman 表只影响系数的熵编码、不影响系数本身，
+                // 故「选中哪个质量」与用哪张表无关（实测四档解码像素逐字节一致、Δ感知 0.000e+00），
+                // 但搜索期每个候选都省掉了「多跑一遍整条管线」的那份开销。
+                // 赢家确定后再按最终设置补编一次，产物与改动前逐字节相同。
+                Func<int, byte[]> searchEncode = o.JpegOptimizeHuffman
+                    ? q => Encode(q, false)
+                    : q => Encode(q, o.JpegOptimizeHuffman);
+
                 var (quality, best, s) = ImageOptimizer.SearchQuality(
-                    Encode, Decode, rgb, width, height, o.JpegMinQuality, 95, o.Accept, o.Log);
+                    searchEncode, Decode, rgb, width, height, o.JpegMinQuality, 95, o.Accept, o.Log);
+
+                if (o.JpegOptimizeHuffman)
+                {
+                    best = Encode(quality, true);
+                }
                 return (o.Accept(s), quality, best, s, subsample420);
             }
 

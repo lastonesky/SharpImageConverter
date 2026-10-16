@@ -26,6 +26,24 @@ class Program
     /// </summary>
     const int DefaultDirectoryParallelism = 2;
 
+    /// <summary>
+    /// 批次里不会出现 JPEG 编码时的目录默认并行度。
+    /// </summary>
+    /// <remarks>
+    /// JPEG 编码器内部是并行流水线，对超订极敏感；PNG/GIF/WebP 没有这个悬崖。
+    /// 8 张 2048²/4.19MP 图 <c>--optimize</c> 单次实测（墙钟，同一份二进制）：
+    /// <code>
+    /// 格式   p1      p2      p4      p8
+    /// jpg    4705    3026   12548   13863     ← p4 起 4.1x 悬崖，故 JPEG 走 2
+    /// png    3871    3365    3069    3136
+    /// gif    5991    3551    2182    1511
+    /// webp   7598    7093    7004    6926
+    /// </code>
+    /// 故非 JPEG 批次放宽到 4（PNG 在 4 最优，GIF 在 4 明显优于 2；GIF 在 8 还更快，
+    /// 但那属于需要 <c>--parallel</c> 显式声明的激进档）。
+    /// </remarks>
+    const int DefaultDirectoryParallelismNoJpeg = 4;
+
     static void Main(string[] args)
     {
         if (args.Length < 1)
@@ -154,7 +172,7 @@ class Program
         var searchOption = options.Recursive ? SearchOption.AllDirectories : SearchOption.TopDirectoryOnly;
         var exts = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { ".jpg", ".jpeg", ".png", ".bmp", ".webp", ".gif" };
         var files = Directory.EnumerateFiles(inputDir, "*.*", searchOption).Where(f => exts.Contains(Path.GetExtension(f))).ToList();
-        int parallel = options.Parallelism.HasValue && options.Parallelism.Value > 0 ? options.Parallelism.Value : DefaultDirectoryParallelism;
+        int parallel = ResolveDirectoryParallelism(options, files, optimizing: true, targetExt: null);
         long savedTotal = 0, beforeTotal = 0, afterTotal = 0;
         int kept = 0;
 
@@ -256,9 +274,7 @@ class Program
         var searchOption = options.Recursive ? SearchOption.AllDirectories : SearchOption.TopDirectoryOnly;
         var exts = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { ".jpg", ".jpeg", ".png", ".bmp", ".webp", ".gif" };
         var files = Directory.EnumerateFiles(inputDir, "*.*", searchOption).Where(f => exts.Contains(Path.GetExtension(f))).ToList();
-        int parallel = options.Parallelism.HasValue && options.Parallelism.Value > 0 ? options.Parallelism.Value : DefaultDirectoryParallelism;
-        // WebP 编码器内部已并行，外层再按核数并行会叠加内存占用
-        if (string.Equals(targetExt, ".webp", StringComparison.OrdinalIgnoreCase)) parallel = 1;
+        int parallel = ResolveDirectoryParallelism(options, files, optimizing: true, targetExt);
         long savedTotal = 0, beforeTotal = 0, afterTotal = 0;
         int converted = 0;
         var locker = new object();
@@ -568,10 +584,15 @@ class Program
         if (!Directory.Exists(outDir)) Directory.CreateDirectory(outDir);
         var searchOption = options.Recursive ? SearchOption.AllDirectories : SearchOption.TopDirectoryOnly;
         var exts = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { ".jpg", ".jpeg", ".png", ".bmp", ".webp", ".gif" };
-        var files = Directory.EnumerateFiles(inputDir, "*.*", searchOption).Where(f => exts.Contains(Path.GetExtension(f)));
+        var files = Directory.EnumerateFiles(inputDir, "*.*", searchOption).Where(f => exts.Contains(Path.GetExtension(f))).ToList();
         string defaultExt = options.OutputExtension ?? (options.Operations.Count == 0 ? ".png" : ".bmp");
-        int parallel = options.Parallelism.HasValue && options.Parallelism.Value > 0 ? options.Parallelism.Value : DefaultDirectoryParallelism;
-        if (string.Equals(defaultExt, ".webp", StringComparison.OrdinalIgnoreCase)) parallel = 1;
+        int parallel = ResolveDirectoryParallelism(options, files, optimizing: false, defaultExt);
+        // 纯转换路径没有候选并行可叠加，libwebp 自身也是单线程；但编码入口默认走 EncodeLock，
+        // 会把外层并行整体串行化，故这条路径显式改用 Parallel。
+        if (defaultExt.Equals(".webp", StringComparison.OrdinalIgnoreCase) && parallel > 1)
+        {
+            options.ParallelWebpEncode = true;
+        }
         int success = 0, fail = 0;
         var locker = new object();
         Parallel.ForEach(files, new ParallelOptions { MaxDegreeOfParallelism = parallel }, file =>
@@ -610,6 +631,43 @@ class Program
         return true;
     }
 
+    /// <summary>
+    /// 目录批量的外层并行度：显式 <c>--parallel N</c> 优先，否则按「本批次会不会与内层并行叠加 /
+    /// 会不会踩 JPEG 的超订悬崖」来选。
+    /// </summary>
+    /// <param name="options">CLI 选项</param>
+    /// <param name="files">本批次文件</param>
+    /// <param name="optimizing">是否走 optimize（决定内层是否有并行）</param>
+    /// <param name="targetExt">统一的目标扩展名；为 null 表示按各自格式原地处理</param>
+    static int ResolveDirectoryParallelism(CliOptions options, IReadOnlyCollection<string> files, bool optimizing, string? targetExt)
+    {
+        if (options.Parallelism.HasValue && options.Parallelism.Value > 0) return options.Parallelism.Value;
+
+        string? outExt = targetExt;
+        bool anyJpeg = false, anyWebp = false;
+        foreach (string f in files)
+        {
+            string e = Path.GetExtension(f);
+            if (IsJpegExt(e)) anyJpeg = true;
+            else if (e.Equals(".webp", StringComparison.OrdinalIgnoreCase)) anyWebp = true;
+        }
+        bool jpegOutput = outExt is not null ? IsJpegExt(outExt) : anyJpeg;
+        bool webpOptimize = optimizing
+            && (outExt is not null
+                ? outExt.Equals(".webp", StringComparison.OrdinalIgnoreCase)
+                : anyWebp);
+
+        // WebP 的 optimize 内部已按候选并行铺满（libwebp 编码是单线程，候选并行是它唯一的多核杠杆），
+        // 外层再并行就会与内层叠加，故保持 1。
+        if (webpOptimize) return 1;
+
+        // 其余情况按「本批次是否可能出现 JPEG 编码」取保守/放宽值。
+        return jpegOutput ? DefaultDirectoryParallelism : DefaultDirectoryParallelismNoJpeg;
+    }
+
+    static bool IsJpegExt(string ext) =>
+        ext.Equals(".jpg", StringComparison.OrdinalIgnoreCase) || ext.Equals(".jpeg", StringComparison.OrdinalIgnoreCase);
+
     static CliOptions CloneOptionsForFile(CliOptions src, string inputFile, string outputFile)
     {
         var dst = new CliOptions(inputFile)
@@ -633,6 +691,7 @@ class Program
             NoDither = src.NoDither,
             OptimizeVerbose = src.OptimizeVerbose,
             MinSaving = src.MinSaving,
+            ParallelWebpEncode = src.ParallelWebpEncode,
         };
         foreach (var op in src.Operations) dst.Operations.Add(op);
         return dst;
@@ -1147,7 +1206,11 @@ class Program
 
         if (ext == ".webp")
         {
-            var encoder = new WebpEncoderAdapter { Quality = options.JpegQuality ?? 75 };
+            var encoder = new WebpEncoderAdapter
+            {
+                Quality = options.JpegQuality ?? 75,
+                ConcurrencyStrategy = options.ParallelWebpEncode ? WebpConcurrencyStrategy.Parallel : WebpConcurrencyStrategy.Auto,
+            };
             encoder.EncodeRgb24(outputPath, image);
             return;
         }
@@ -1187,7 +1250,11 @@ class Program
 
         if (ext == ".webp")
         {
-            var encoder = new WebpEncoderAdapterRgba { Quality = options.JpegQuality ?? 75 };
+            var encoder = new WebpEncoderAdapterRgba
+            {
+                Quality = options.JpegQuality ?? 75,
+                ConcurrencyStrategy = options.ParallelWebpEncode ? WebpConcurrencyStrategy.Parallel : WebpConcurrencyStrategy.Auto,
+            };
             encoder.EncodeRgba32(outputPath, image);
             return;
         }
@@ -1479,5 +1546,12 @@ class Program
         public bool NoDither { get; set; }
         public bool OptimizeVerbose { get; set; }
         public int? MinSaving { get; set; }
+
+        /// <summary>
+        /// 允许 WebP 编码绕过 <c>WebpCodec</c> 的全局 EncodeLock，从而让**外层**文件级并行真正并发。
+        /// 只在「纯转换路径 + 外层已并行」时由目录批量打开：该路径没有候选并行可叠加，
+        /// 而默认的 EncodeLock 会把外层并行整体串行化。
+        /// </summary>
+        public bool ParallelWebpEncode { get; set; }
     }
 }

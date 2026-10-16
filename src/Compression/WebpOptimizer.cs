@@ -12,6 +12,20 @@ namespace SharpImageConverter.Compression
     internal static class WebpOptimizer
     {
         /// <summary>
+        /// 搜索期的 libwebp <c>method</c>（便宜档，只用来给候选排序）。
+        /// </summary>
+        /// <remarks>
+        /// method 2 相对 method 4 便宜一个数量级（4.19 MP / q80 单次编码 147.5 vs 490.9 ms，
+        /// 体积比 1.045x），而搜索只需要「候选之间谁更小」的相对次序。
+        /// 赢家确定后再按 <see cref="OutputMethod"/> 补编一次，产物不受影响。
+        /// 实测（2048²，同一份二进制开关对照）：photo 源 1769 → 1191 ms、webp 源 1125 → 1076 ms、
+        /// jpeg 源 1407 → 1208 ms，且三张图产物与「全程 method 4」**逐字节一致**。
+        /// </remarks>
+        private const int SearchMethod = 2;
+
+        /// <summary>产出期的 libwebp <c>method</c>（正式档，决定最终体积/画质）。</summary>
+        private const int OutputMethod = 4;
+        /// <summary>
         /// 同格式优化：读入源文件，按 WebP 重编码为最小体积。
         /// </summary>
         internal static OptimizationResult Run(string input, string output, long originalSize, OptimizeOptions o)
@@ -40,10 +54,19 @@ namespace SharpImageConverter.Compression
             byte[] rgba = image.Buffer;
             var meta = ImageOptimizer.PrepareMetadata(image.Metadata, o.StripMetadata);
 
-            byte[] Encode(int q)
+            byte[] Encode(int q) => EncodeAt(q, SearchMethod);
+
+            byte[] EncodeAt(int q, int method)
             {
                 using var ms = new MemoryStream();
-                var encoder = new WebpEncoderAdapterRgba { Quality = q };
+                // 搜索期多个候选会并发进入 libwebp。WebpCodec 默认走 EncodeLock（针对「线程安全未知」的
+                // 保守闸门），那把锁会把候选并行**完全串行化**（实测 2405 → 2407 ms，×1.00，等于白并行），
+                // 故这里显式声明 Parallel 绕过它。并发一致性由「逐质量串行基线 vs 高并发多轮 md5 比对」
+                // 验证通过后才启用。
+                var encoder = new WebpEncoderAdapterRgba
+                {
+                    Options = new WebpEncoderOptions(q, WebpConcurrencyStrategy.Parallel, method),
+                };
                 encoder.EncodeRgba32(ms, new Image<Rgba32>(w, h, rgba, meta));
                 return ms.ToArray();
             }
@@ -61,10 +84,23 @@ namespace SharpImageConverter.Compression
                 return new OptimizeArtifact(bytes, $"WebP 质量 {o.JpegQuality.Value}", score, o.Accept(score));
             }
 
-            // WebP 本身已很高效：低质量区间省不了多少体积，却会明显糊掉高频细节，
-            // 因此搜索下界比 JPEG 高一截（块状平均的感知度量对「变糊」不够敏感）。
-            int minQuality = Math.Max(o.JpegMinQuality, 65);
-            var (quality, best, q) = ImageOptimizer.SearchQuality(Encode, Decode, rgba, w, h, minQuality, 95, o.Accept, o.Log);
+            // 搜索下界取 JpegMinQuality（默认 40）。
+            // 原先额外抬到 65，理由是「低质量区间省不了多少体积却会明显糊掉细节」；
+            // 但 4.19 MP 实测 q=65 时感知 PSNR 已达标并被搜索选中，
+            // 说明 40~64 从未被真正试过——不是搜索慢，是搜索够不到更小的解。
+            // 达标判定（o.Accept）本身会拦住过低的 q，故放开下界是安全的。
+            int minQuality = o.JpegMinQuality;
+            // libwebp 编码是单线程的（thread_level=0），候选并行是这条路径唯一能吃到多核的杠杆。
+            // 每次并发调用自身要拷贝一份输入（RGBA）并解码一次结果，故按像素数估峰值内存。
+            int degree = ImageOptimizer.CandidateParallelism(
+                96 - minQuality, (long)w * h * 8 + (4L << 20), memoryBudget: 384L << 20);
+            var (quality, best, q) = ImageOptimizer.SearchQualityParallel(
+                Encode, Decode, rgba, w, h, minQuality, 95, o.Accept, o.Log, degree);
+            if (SearchMethod != OutputMethod)
+            {
+                // 搜索期用便宜档排序，赢家再补编一次到正式档
+                best = EncodeAt(quality, OutputMethod);
+            }
             return new OptimizeArtifact(best, $"WebP 质量 {quality}", q, o.Accept(q));
         }
     }
