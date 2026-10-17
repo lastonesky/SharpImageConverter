@@ -1,5 +1,7 @@
 using System;
+using System.Diagnostics;
 using System.IO;
+using System.Threading;
 using SharpImageConverter.Core;
 using SharpImageConverter.Formats.Webp;
 
@@ -61,9 +63,14 @@ namespace SharpImageConverter.Compression
             byte[] rgba = image.Buffer;
             var meta = ImageOptimizer.PrepareMetadata(image.Metadata, o.StripMetadata);
 
+            // 分阶段耗时探针（SIC_WEBP_OPT_TIMING=1）：搜索期的编码 / 解码 / 产出期编码各花了多少。
+            // 与 SIC_JPEG_STAGE_TIMING 同一套约定；计数用 Interlocked，因为候选是并行的。
+            long searchEncodeTicks = 0, searchDecodeTicks = 0, finalEncodeTicks = 0;
+            int searchCandidates = 0;
+
             byte[] Encode(int q) => EncodeAt(q, SearchMethod);
 
-            byte[] EncodeAt(int q, int method)
+            byte[] EncodeAt(int q, int method, bool isFinal = false)
             {
                 using var ms = new MemoryStream();
                 // 搜索期多个候选会并发进入 libwebp。WebpCodec 默认走 EncodeLock（针对「线程安全未知」的
@@ -74,19 +81,33 @@ namespace SharpImageConverter.Compression
                 {
                     Options = new WebpEncoderOptions(q, WebpConcurrencyStrategy.Parallel, method),
                 };
+                long t0 = TimingEnabled ? Stopwatch.GetTimestamp() : 0;
                 encoder.EncodeRgba32(ms, new Image<Rgba32>(w, h, rgba, meta));
+                if (TimingEnabled)
+                {
+                    long ticks = Stopwatch.GetTimestamp() - t0;
+                    if (isFinal) Interlocked.Add(ref finalEncodeTicks, ticks);
+                    else
+                    {
+                        Interlocked.Add(ref searchEncodeTicks, ticks);
+                        Interlocked.Increment(ref searchCandidates);
+                    }
+                }
                 return ms.ToArray();
             }
 
             byte[] Decode(byte[] bytes)
             {
+                long t0 = TimingEnabled ? Stopwatch.GetTimestamp() : 0;
                 using var ms = new MemoryStream(bytes, false);
-                return new WebpDecoderAdapterRgba().DecodeRgba32(ms).Buffer;
+                byte[] result = new WebpDecoderAdapterRgba().DecodeRgba32(ms).Buffer;
+                if (TimingEnabled) Interlocked.Add(ref searchDecodeTicks, Stopwatch.GetTimestamp() - t0);
+                return result;
             }
 
             if (o.JpegQuality.HasValue)
             {
-                byte[] bytes = Encode(o.JpegQuality.Value);
+                byte[] bytes = EncodeAt(o.JpegQuality.Value, SearchMethod, isFinal: true);
                 var score = QualityMetrics.Compare(rgba, Decode(bytes), w, h, 4);
                 return new OptimizeArtifact(bytes, $"WebP 质量 {o.JpegQuality.Value}", score, o.Accept(score));
             }
@@ -99,16 +120,47 @@ namespace SharpImageConverter.Compression
             int minQuality = o.JpegMinQuality;
             // libwebp 编码是单线程的（thread_level=0），候选并行是这条路径唯一能吃到多核的杠杆。
             // 每次并发调用自身要拷贝一份输入（RGBA）并解码一次结果，故按像素数估峰值内存。
+            // 内存预算**不再写死 384 MB**：143 MP 时单候选 ≈ 8 B/px ≈ 1.14 GB，
+            // 384 MB / 1.14 GB 被夹成 1 ⇒ 并行度静默塌成串行（与之前 PNG 那处同一类坑）。
+            // 现在跟随 CandidateParallelism 的默认预算（可用内存的 1/4，夹 384 MB~8 GB）。
             int degree = ImageOptimizer.CandidateParallelism(
-                96 - minQuality, (long)w * h * 8 + (4L << 20), memoryBudget: 384L << 20);
+                96 - minQuality, (long)w * h * 8 + (4L << 20));
+            long searchStart = TimingEnabled ? Stopwatch.GetTimestamp() : 0;
             var (quality, best, q) = ImageOptimizer.SearchQualityParallel(
                 Encode, Decode, rgba, w, h, minQuality, 95, o.Accept, o.Log, degree);
+            long searchTicks = TimingEnabled ? Stopwatch.GetTimestamp() - searchStart : 0;
+            long finalStart = TimingEnabled ? Stopwatch.GetTimestamp() : 0;
             if (SearchMethod != OutputMethod)
             {
                 // 搜索期用便宜档排序，赢家再补编一次到正式档
-                best = EncodeAt(quality, OutputMethod);
+                best = EncodeAt(quality, OutputMethod, isFinal: true);
+            }
+            if (TimingEnabled)
+            {
+                ReportTiming(w, h, degree, quality, searchCandidates,
+                    ToMs(searchTicks), ToMs(searchEncodeTicks), ToMs(searchDecodeTicks),
+                    ToMs(finalEncodeTicks), ToMs(Stopwatch.GetTimestamp() - finalStart));
             }
             return new OptimizeArtifact(best, $"WebP 质量 {quality}", q, o.Accept(q));
+        }
+
+        /// <summary>分阶段耗时探针开关：<c>SIC_WEBP_OPT_TIMING=1</c>（与 <c>SIC_JPEG_STAGE_TIMING</c> 同一约定）。</summary>
+        private static readonly bool TimingEnabled =
+            Environment.GetEnvironmentVariable("SIC_WEBP_OPT_TIMING") == "1";
+
+        private static long ToMs(long ticks) => ticks * 1000 / Stopwatch.Frequency;
+
+        private static void ReportTiming(
+            int w, int h, int degree, int quality, int candidates,
+            long searchMs, long searchEncodeMs, long searchDecodeMs, long finalEncodeMs, long finalStageMs)
+        {
+            // 搜索期的编码/解码是**并发累加**（CPU 时间），故只报「每候选平均」，不拿它去减墙钟。
+            long perEncode = candidates > 0 ? searchEncodeMs / candidates : 0;
+            long perDecode = candidates > 0 ? searchDecodeMs / candidates : 0;
+            Console.WriteLine(
+                $"[webp-opt-timing] {w}x{h} ({w * (double)h / 1e6:F1} MP) degree={degree} -> q={quality}\n" +
+                $"  search {searchMs,7} ms 墙钟 / {candidates} 个候选，每候选 CPU：编码 {perEncode} + 解码 {perDecode} ms\n" +
+                $"  output {finalStageMs,7} ms 墙钟 / method {OutputMethod} 编码 {finalEncodeMs} ms");
         }
     }
 }

@@ -448,6 +448,32 @@ namespace SharpImageConverter.Compression
                 }
             }
 
+            // 阶段零：先探**下界**，再按需探上界；两者都只在需要时才编码。
+            //   · 下界达标 → 直接收尾：它已是最低允许质量，任何二分轨迹都收敛到 lo，中间全是白算。
+            //   · 下界不达标 → 必看最高档：最高档都达不到就得把最高档交出去，此时不该铺开网格
+            //     （64 MP 噪声图实测：铺开会白编十几个候选，34 MB 输出，多花 30 s）。
+            // 为什么不像从前那样把两端**并行**编：上界（q=95）比下界贵得多（143 MP m2 实测
+            // 3.62 s vs 2.42 s），而下界达标时上界结果直接被丢弃 —— 墙钟被贵的那个占满，等于白付 1.2 s。
+            // 串行的代价只落在「下界不达标」的图像上（多等一个下界编码），而照片类大图几乎都是下界达标。
+            // 只在**大图**这么做：小图（<8 MP）一个候选只有几十 ms，多探一波反而净亏
+            // （1.2 MP 实测 443 → 530 ms，+18%），且小图网格含两端、命中 lo 即返回，本来就是一波的事。
+            bool probeBottomFirst = (long)width * height >= 8_000_000;
+            if (probeBottomFirst && lo != hi)
+            {
+                EvalBatch(new List<int> { lo }, 1);
+                if (accept(results[lo].Quality))
+                {
+                    EmitLog(log, results);
+                    return (lo, results[lo].Bytes, results[lo].Quality);
+                }
+                EvalBatch(new List<int> { hi }, 1);
+                if (!accept(results[hi].Quality))
+                {
+                    EmitLog(log, results);
+                    return (hi, results[hi].Bytes, results[hi].Quality);
+                }
+            }
+
             // 阶段一：粗网格（两端必含）并行扫一遍，找第一个达标的网格点
             int gridCount = Math.Max(1, Math.Min(span + 1, degree));
             var grid = new List<int>(gridCount);
@@ -462,23 +488,32 @@ namespace SharpImageConverter.Compression
                     grid.Add(lo + (int)Math.Round((double)span * k / (gridCount - 1)));
                 }
             }
-            EvalBatch(grid, degree);
+            // 阶段零已算过的点（下界）不重复编码
+            EvalBatch(grid.Where(q => !results.ContainsKey(q)).ToList(), degree);
 
-            // 最高档不达标：与 SearchQuality 一致，直接把最高档交出去
+            // 最高档不达标：按原语义直接把最高档交出去（hi 是网格最后一格，必定已评估过）
             if (!accept(results[hi].Quality))
             {
                 EmitLog(log, results);
                 return (hi, results[hi].Bytes, results[hi].Quality);
             }
+            // 命中 lo（网格第一格）时，lo 就是答案，不必再枚举窗口。
+            // 预探过下界的分支已在阶段零返回，这里只对「小图 / 下界不达标」两种情形生效。
+            if (accept(results[grid[0]].Quality))
+            {
+                EmitLog(log, results);
+                return (grid[0], results[grid[0]].Bytes, results[grid[0]].Quality);
+            }
 
-            int foundIdx = 0;
+            // 第一个达标网格点：grid[0]（= lo）已知不达标，从 1 起找
+            int foundIdx = 1;
             while (foundIdx < grid.Count && !accept(results[grid[foundIdx]].Quality)) foundIdx++;
 
             int qStar;
-            if (foundIdx <= 0)
+            if (foundIdx >= grid.Count)
             {
-                // 连下界都达标，最低达标质量就是下界
-                qStar = grid[0];
+                // hi 必在网格里且已达标，理论上走不到这里，仅作兜底
+                qStar = hi;
             }
             else
             {
@@ -550,17 +585,26 @@ namespace SharpImageConverter.Compression
 
             int lo = Math.Max(1, minQuality);
             int hi = Math.Min(100, maxQuality);
+
+            // 先探下界：质量下界本身达标时，答案只可能是它（它已是允许范围里最小的质量），
+            // 任何二分轨迹都会收敛到 lo，中间的档位全是白算。
+            // 实测（143 MP 照片，q 下界 40 / 上界 95）：accept 在 q=40 就成立，
+            // 旧轨迹评估 95→67→53→46→43→41→40 共 7 次，每次 = 编码 2.8 s + 解码 + 画质比较。
+            var bottom = Eval(lo);
+            if (accept(bottom.Quality) || lo == hi) return (lo, bottom.Bytes, bottom.Quality);
+
             var top = Eval(hi);
             if (!accept(top.Quality)) return (hi, top.Bytes, top.Quality);
 
-            while (lo < hi)
+            // 至此 lo 已知不达标、hi 已知达标，二分只需在开区间 (lo, hi) 里找最低达标质量。
+            while (lo + 1 < hi)
             {
                 int mid = (lo + hi) >> 1;
                 if (accept(Eval(mid).Quality)) hi = mid;
-                else lo = mid + 1;
+                else lo = mid;
             }
-            var best = Eval(lo);
-            return (lo, best.Bytes, best.Quality);
+            var best = Eval(hi);
+            return (hi, best.Bytes, best.Quality);
         }
 
         /// <summary>
