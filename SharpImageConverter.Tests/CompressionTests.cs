@@ -11,6 +11,7 @@ using Xunit;
 
 namespace Jpeg2Bmp.Tests
 {
+    [Collection(SharpImageConverter.Tests.JpegSimdStateCollection.Name)]
     public class CompressionTests
     {
         private static string NewTemp(string ext) => Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString("N") + ext);

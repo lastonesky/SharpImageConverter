@@ -12,6 +12,7 @@ namespace SharpImageConverter.Tests;
 /// <summary>
 /// 按图优化的 Huffman 表（jpegtran -optimize 同类能力）。
 /// </summary>
+[Collection(JpegSimdStateCollection.Name)]
 public class JpegHuffmanOptimizeTests
 {
     [Fact]

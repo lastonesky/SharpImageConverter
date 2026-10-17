@@ -755,7 +755,17 @@ internal sealed class JpegFrameState
         }
     }
 
-    public JpegImage ReconstructImage()
+    public JpegImage ReconstructImage() => ReconstructImage(null);
+
+    /// <summary>
+    /// 重建整幅图像。
+    /// </summary>
+    /// <param name="outputBuffer">
+    /// 可选的输出缓冲（必须恰好是 <c>width * height * 通道数</c> 字节）。给定时直接写入、不再分配，
+    /// 供 optimize 搜索期逐候选复用：每个像素都会被写满，所以不需要事先清零。
+    /// 注意返回的 <see cref="JpegImage"/> 直接引用这块缓冲，调用方用完之前不能再重建。
+    /// </param>
+    internal JpegImage ReconstructImage(byte[]? outputBuffer)
     {
         long probeStart = JpegPerfProbe.Enabled ? Stopwatch.GetTimestamp() : 0;
         int width = frame.Width;
@@ -777,6 +787,10 @@ internal sealed class JpegFrameState
         int[] planeHeights = new int[components.Length];
         byte[]? output = null;
 
+        // 尺寸完全对上才复用：宁可多分配一次，也不要拿一块大小不符的缓冲去接像素。
+        byte[] TakeOutput(int size)
+            => outputBuffer is not null && outputBuffer.Length == size ? outputBuffer : new byte[checked(size)];
+
         try
         {
             bool handled = false;
@@ -784,7 +798,7 @@ internal sealed class JpegFrameState
             if (colorSpace == JpegColorSpace.Gray && components.Length == 1)
             {
                 long pxStart = JpegPerfProbe.Enabled ? Stopwatch.GetTimestamp() : 0;
-                output = new byte[checked(width * height)];
+                output = TakeOutput(width * height);
                 handled = JpegDecoder.TryReconstructGrayDirect(frame, components[0], quantTables, useFloatingPointIdct, output);
                 if (JpegPerfProbe.Enabled)
                 {
@@ -799,7 +813,7 @@ internal sealed class JpegFrameState
             if (!handled && colorSpace == JpegColorSpace.Rgb && channelCount == 3)
             {
                 long pxStart = JpegPerfProbe.Enabled ? Stopwatch.GetTimestamp() : 0;
-                output = new byte[checked(width * height * 3)];
+                output = TakeOutput(width * height * 3);
                 handled = JpegDecoder.TryReconstructRgbDirect(frame, components, quantTables, componentOrder, useFloatingPointIdct, output);
                 if (JpegPerfProbe.Enabled)
                 {
@@ -813,7 +827,7 @@ internal sealed class JpegFrameState
 
             if (!handled && colorSpace == JpegColorSpace.YCbCr && !useFloatingPointIdct && SimdCompat.VectorBytesSupported)
             {
-                output = new byte[checked(width * height * channelCount)];
+                output = TakeOutput(width * height * channelCount);
                 long pxStart = JpegPerfProbe.Enabled ? Stopwatch.GetTimestamp() : 0;
                 if (JpegDecoder.TryDecodeInterleavedYCbCrSimd(components, output, width, height, fullWidth, fullHeight, componentOrder, quantTables, useFloatingPointIdct, frame))
                 {
@@ -886,6 +900,33 @@ internal sealed class JpegFrameState
         result.Metadata.Orientation = exifOrientation;
         result.Metadata.IccProfile = iccProfile;
         return result;
+    }
+
+    /// <summary>
+    /// 接管外部的量化系数与组件几何，供「跳过熵解码」的重建使用。
+    /// </summary>
+    /// <remarks>
+    /// 只给 optimize 搜索期用（见 <see cref="JpegEncoder.EncodeCoefficients"/>）。
+    /// 系数由调用方按组件平面布局填好后，本状态机只负责反量化 + IDCT + 上采样 + 色彩转换，
+    /// 走的仍是与正常解码完全相同的 <see cref="ReconstructImage()"/>，因此像素结果一致。
+    /// </remarks>
+    internal void AdoptCoefficients(FrameHeader header, ComponentState[] comps, QuantizationTable[] tables)
+    {
+        frame = header;
+        hasFrame = true;
+        components = comps;
+        hasJfif = true;
+        hasAdobe = false;
+        adobeTransform = 0;
+        int n = Math.Min(tables.Length, quantTables.Length);
+        for (int i = 0; i < n; i++)
+        {
+            quantTables[i] = tables[i];
+        }
+        for (int i = 0; i < comps.Length; i++)
+        {
+            comps[i].HasCoefficients = true;
+        }
     }
 
     public void DisposeResources()

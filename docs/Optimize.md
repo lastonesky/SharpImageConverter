@@ -101,14 +101,74 @@ CPU 核数和内存预算夹上限，避免目录批量时与外层并行度叠�
 单候选峰值是「索引 1 B/px + 还原缓冲 4 B/px」≈ 5 B/px，原先固定 512 MB 在 143 MP 上会被夹成
 `dop = 1` 并**静默退化为串行**。
 
+#### 1.3.2 搜索期不经过比特流（JPEG）
+
+JPEG 的二分判定只看画质分数，体积从不参与决策（赢家最终一定会重新完整编码一次）。
+而 Huffman 只改变系数的**编码形式**、不改变系数本身（熵编解码严格无损），
+所以「编成字节流、再解码回来算 PSNR」这一趟对结果零影响，纯属浪费：
+143 MP 上熵解码 **192 ms/候选**，编码侧熵编码另有 192 ms（并行，墙钟被色转换遮住）。
+
+搜索期因此改走系数直通：
+
+```
+RGB24 ─produce(色彩转换)→ YCbCr 采样 ─FDCT+量化→ 量化系数
+         │(只跟源图有关，采一次缓存)                │
+         ▼                                          │
+   JpegSampleCache (sbyte/MCU)                      │
+         │各质量档复用                               │
+         ▼                                          ▼
+  EncodeFromSamples ─FDCT+量化→ 系数 ── IMcuCoefficientSink 按「解码器组件平面」布局收下
+                                                    ▼
+                        ReconstructImage（反量化 + IDCT + 上采样 + YCbCr→RGB）
+                                                    ▼
+                            QualityMetrics.Compare（按带分片并行）
+```
+
+- `JpegEncoder.EncodeCoefficients` 把每个 MCU 的量化系数直接交给 `JpegCoefficientSink`，
+  不产生任何字节流（`ProcessHuffmanOrdered` 在 `coefficientSink != null` 时整段跳过 `WriteMcuHuffman`）。
+- `JpegFrameState.AdoptCoefficients` 让这批系数走**与正常解码完全相同**的 `ReconstructImage`，
+  因此像素逐字节一致：q = 30 / 46 / 53 / 90 × 4:2:0 / 4:4:4，重建结果的 SHA-256 与
+  「编码成字节流再解码」全等（`JpegCoefficientBypassTests`）。
+  注意这条断言是必要的 —— 只看最终产物 md5 是不够的，选中的质量有可能碰巧没变。
+- 落盘产物仍走完整编码，最终文件 md5 逐字节不变。
+- `--opt-verbose` 的候选日志不再带「N 字节」：搜索期没有字节流可报。
+
+**produce 也不是每档都要重算的。** 它只读源图和几何（RGB→YCbCr、4:2:0 下采样、电平平移），
+与质量档无关，却占单候选 56%（143 MP：186 / 334 ms）。`JpegSampleCache` 把它按 MCU 存成
+`sbyte`（电平平移后取值域恰好 [-128, 127]，4:2:0 约 215 MB），整幅采一次（按行并行，**13 ms**），
+之后每档只做量化：`JpegEncoder.EncodeFromSamples` 按行并行、每 MCU 用 1.5 KB 栈缓冲原地
+DCT+量化，省掉 MCU 批的池化租借、队列同步与 `LastNzPacked`（只有熵编码用）。
+搜索期因此也从「流式管线」变成「批量并行」，`--opt-verbose` 的候选顺序仍按二分访问序。
+
+**重建输出缓冲跨候选复用。** `ReconstructImage` 的 `new byte[w*h*3]`（143 MP = 429 MB）会被
+运行时清零，实测 **26 ms/次**，而重建会把每个像素写满。`JpegCoefficientSink.Reconstruct`
+改用一块 `GC.AllocateUninitializedArray` 缓冲（0.1 ms 量级）。这块缓冲是「借」的：
+下一次重建会覆写，`JpegImage` 也直接引用它，所以调用方必须立刻消费（搜索期正是「重建 → 比较」紧邻）。
+
+`QualityMetrics.Compare` 同时改成按带分片并行（一带 = `blockSize` 行，4×4 块不跨带，
+分片内的累加顺序与串行逐项相同；分片数固定为 `min(核数, 带数)`、合并按分片下标，
+因此同一台机器上结果完全确定，不会因线程调度让「刚好压线」的候选随机翻转）。
+
+实测（143 MP / 6 候选，同机交错 A/B）：
+
+| 项 | 改前 | 改后 |
+|---|---|---|
+| 搜索期合计 | 5895 / 5791 ms | **526 ms + 采集 13 ms** |
+| 其中单候选 | 334 ms | **85 ms**（量化+重建+评估） |
+| 单次 `Compare` | 880 ms | **65 ms**（13.5×，`|ΔPSNR| ≤ 2.6e-8 dB`） |
+| 端到端 `--optimize`（同二进制 `SIC_JPEG_NOCACHE` 对照） | 3145 / 3551 / 3334 ms | **2648 / 2700 / 2468 ms** |
+
+`SIC_JPEG_NOCACHE=1` 可让搜索期退回「每候选重跑 produce」，用于同二进制内对照 —— 跨二进制
+比较有 ±2% 系统偏差，不足以判断这个量级的收益。
+产物 md5 `543a15bb…` 四份全等；PNG（`2e1e62a5…`）与 WebP（`6341e94c…`）路径回归一致。
+
 4.19 MP 的 PNG `--optimize` 全流程约 0.75~1.1 s（最高档候选 + 达标后的并行阶梯 + 必要时无损重写）。
 
-搜索是这条链路的主要开销：每次候选 = 一次完整编码（开启 `OptimizeHuffman` 时是两遍管线，
-先统计符号分布再编码）+ 一次解码 + 一次画质评估。1.57 MP 的 PNG→JPEG 实测
+搜索是这条链路的主要开销：每次候选 = 一次量化与重建（开启 `OptimizeHuffman` 时赢家再走两遍
+完整编码：先统计符号分布再编码）+ 一次画质评估。1.57 MP 的 PNG→JPEG 实测
 （1254×1254，Release）：单次普通编码 0.17 s、单次带优化 Huffman 的候选 0.32 s、
 7 次候选的完整搜索 1.10 s —— 即**搜索约占 70%**（二分 [40,95] 恰好 7 次评估，
-`--opt-verbose` 会把每个候选的体积与画质打出来）。想省时间就显式给 `--quality`（或
-`OptimizeOptions.JpegQuality`），跳过搜索直接编码一次。
+`--opt-verbose` 会把每个候选的画质打出来）。
 
 体积并不严格随颜色数单调（中位切分在不同预算下切法不同，会有几个百分点的抖动），
 所以最后一步是在**所有达标候选中按体积取最小**，而不是直接取最激进的那个。
@@ -135,6 +195,7 @@ CPU 核数和内存预算夹上限，避免目录批量时与外层并行度叠�
 ### JPEG
 
 1. 解码 → 以 4:2:0 重编码，二分搜索「刚好达标」的最低质量。
+   搜索期不经过比特流（系数直通 + 并行画质评估），见 [1.3.2](#132-搜索期不经过比特流jpeg)。
 2. 若 4:2:0 始终不达标（彩色文字、色度高频丰富的图），自动退回 4:4:4 再搜一轮。
 3. **按图优化的 Huffman 表**（`JpegEncoderOptions.OptimizeHuffman`，默认开启）：
    编码器的标准 Annex K 表是固定的，与实际符号分布不匹配，空块开销高达 5.38 bits/块

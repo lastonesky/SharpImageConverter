@@ -312,6 +312,44 @@ namespace SharpImageConverter.Compression
         }
 
         /// <summary>
+        /// 二分搜索「刚好达标」的最低质量，但只依赖画质分数 —— 不需要编码出字节流。
+        /// </summary>
+        /// <remarks>
+        /// 与 <see cref="SearchQuality"/> 同一套二分轨迹（含「最高档不达标就直接返回最高档」），
+        /// 区别只是评估函数直接返回分数。JPEG 用它跳过熵编解码：
+        /// 体积在搜索期从不参与决策，赢家最终还会完整重编一次。
+        /// </remarks>
+        internal static (int Quality, ImageQuality Score) SearchQualityByScore(
+            Func<int, ImageQuality> evaluate,
+            int minQuality,
+            int maxQuality,
+            Func<ImageQuality, bool> accept,
+            Action<int, ImageQuality>? log)
+        {
+            var cache = new Dictionary<int, ImageQuality>(8);
+            ImageQuality Eval(int q)
+            {
+                if (cache.TryGetValue(q, out var cached)) return cached;
+                var score = evaluate(q);
+                log?.Invoke(q, score);
+                cache[q] = score;
+                return score;
+            }
+
+            int lo = Math.Max(1, minQuality);
+            int hi = Math.Min(100, maxQuality);
+            if (!accept(Eval(hi))) return (hi, cache[hi]);
+
+            while (lo < hi)
+            {
+                int mid = (lo + hi) >> 1;
+                if (accept(Eval(mid))) hi = mid;
+                else lo = mid + 1;
+            }
+            return (lo, Eval(lo));
+        }
+
+        /// <summary>
         /// <see cref="SearchQuality"/> 的并行版：结论完全一致，只是把候选评估并行铺开。
         /// </summary>
         /// <remarks>

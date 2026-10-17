@@ -60,6 +60,40 @@
   `docs/README.md` 索引同步更新，`README.md` 的 CLI 章节补充预编译版本的下载入口。
 
 ### 修复
+- **JPEG `--optimize` 的搜索期把与质量无关的 produce 重复算了 6 遍**：`produce`（RGB→YCbCr + 4:2:0
+  下采样 + 电平平移）只读源图和几何，**与质量档无关**，但旧实现每评估一个候选就从头跑一遍；
+  143 MP 实测它占单候选 **56%（186/334 ms）**，5~6 个候选白白重复。
+  新增 `JpegSampleCache`：把采样后的样本按 MCU 存成 `sbyte`（电平平移后取值域正好 [-128,127]，
+  143 MP 的 4:2:0 约 215 MB），整幅采一次（按行并行，13 ms）后各档共用；
+  新增 `JpegEncoder.EncodeFromSamples`：按行并行做「量化 + scatter 到组件平面」，
+  每 MCU 用 1.5 KB 栈缓冲原地 DCT+量化，不再走 MCU 批的池化租借与队列同步。
+  样本逐位相同 ⇒ 量化系数逐位相同 ⇒ 产物 **md5 逐字节不变**（`543a15bb…`）。
+  同二进制交错 A/B（143 MP）：端到端 3145/3551/3334 → **2648/2700/2468 ms**；
+  搜索期单独计量 1611 → 526 ms（−67%）。
+- **搜索期重建的输出缓冲每个候选都重新分配 429 MB**：`ReconstructImage` 里 `new byte[w*h*3]`
+  会被运行时清零，实测 **26 ms/次**，而重建会把每个像素都写满，清零纯属浪费。
+  `Reconstruct` 现在复用一块 `GC.AllocateUninitializedArray` 缓冲（不清零，0.1 ms 量级）。
+  注意返回的数组是「借」的：下一次重建会覆写，调用方必须立刻消费（搜索期正是「重建 → 比较」紧邻）。
+- **JPEG `--optimize` 的搜索期不必要地走了一趟熵编码 + 熵解码**：二分判定只看画质分数，
+  体积从不参与决策（赢家最终一定会重新完整编码一次），但旧实现每个候选都先编码成字节流、
+  再解码回像素来算 PSNR。Huffman 只改变系数的**编码形式**、不改变系数本身（熵编解码严格无损），
+  所以这趟往返对结果零影响，纯属浪费：143 MP 实测熵解码 **192 ms/候选**、熵编码 192 ms（并行，墙钟被色转换遮住）。
+  现在搜索期改走新的 `JpegEncoder.EncodeCoefficients` + `JpegCoefficientSink`：编码器在熵编码之前
+  把每个 MCU 的量化系数直接按「解码器组件平面」布局交出，再经 `JpegFrameState.AdoptCoefficients`
+  走与正常解码**完全相同**的 `ReconstructImage`（反量化 + IDCT + 上采样 + 色彩转换）得到像素。
+  落盘产物仍走完整编码，**md5 逐字节不变**。
+  新增 `JpegCoefficientBypassTests`（4 个质量档 + 4:2:0/4:4:4，断言「系数直通重建」与「字节流解码」
+  的 SHA-256 相等），以及 `CoefficientBypass_ReusesBufferAcrossQualities`（跨候选复用同一份缓冲）。
+  实测（143 MP / 6 候选，同进程交错两轮）：搜索期 5895/5791 ms → **4809/5063 ms**。
+- **`QualityMetrics.Compare` 是 JPEG `--optimize` 的头号开销，却是标量单线程**：143 MP 单次 ≈ 880 ms，
+  6 个候选约 5.3 s，占搜索期八成。改成按「带」分片并行（一带 = `blockSize` 行，4×4 块不跨带，
+  分片内的累加顺序与串行逐项相同；分片数固定为 `min(核数, 带数)`，合并按分片下标，
+  因此同机结果完全确定，不会因线程调度让「刚好压线」的候选随机翻转）。
+  **5280 ms → 391 ms（13.5×）**，分数差最大 `|ΔPSNR| = 2.6e-8 dB` / `|Δ感知| = 2.2e-10 dB`。
+  并行入口要求输入坐在数组上（Span 不能跨线程捕获），传 Span 的调用仍走串行实现，口径一致。
+  新增 `QualityMetricsParallelTests`（含 4 个像素以内不整除的边缘尺寸）。
+  合计：143 MP `--optimize` 端到端（同机交错 A/B ×2）7124/7105 ms → **3473/3251 ms（−52%）**，
+  产物 md5 `543a15bb…` 四份全等；`--opt-verbose` 的候选日志不再带「N 字节」（搜索期不再产字节流）。
 - **普通转换写 PNG 时对不透明图也输出 RGBA（颜色类型 6）**：`PngWriter.WriteRgba` 不看 alpha，
   而 `Configuration.SaveRgba32` 一律走它，于是每像素都白写一个恒为 255 的 alpha 字节。
   10650×13426（143 MP）不透明照片实测 **31,919,483 B → 29,469,583 B（−7.7%）**，
@@ -126,6 +160,13 @@
   未指定 `RuntimeIdentifier` 时行为不变（仍按宿主 OS），因此本机开发/测试/AOT 无影响。
 - `Cli/SharpImageConverter.Cli.csproj` 不再重复拷贝 `../src/runtimes/**`：原先会把其他平台的原生库
   （linux `.so` / osx `.dylib`）一并带进发布目录，并被单文件 exe 的原生库清单引用（产物已实测可跑）。
+- **JPEG 测试之间通过全局 SIMD 开关互相污染**：`JpegEncoderSimdTests` 为拿标量基线会把
+  `SimdJpegEncodePipeline.ColorSupported` / `FdctSupported` 置 `false` 再在 `finally` 里恢复，
+  而 xUnit 默认让不同测试类并行；窗口期内别的 JPEG 测试会跑到标量路径上，一旦「同一输入编两遍」
+  的比较两侧分处窗口内外，结果就不再逐位相同。实测 `JpegCoefficientBypassTests` 的
+  `CoefficientBypass_MatchesBitstreamDecode(q=60, 4:2:0)` 在首轮全量里偶发失败一次、其后 8 轮全过。
+  新增 `JpegSimdStateCollection`（`DisableParallelization = true`），把 6 个跑 JPEG 编解码的测试类
+  收进同一 collection 串行执行。生产代码从不写这两个静态属性，因此不是产品缺陷。
 
 ## 1.0.0（相对 v0.2.8）
 ### 规则

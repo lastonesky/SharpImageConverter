@@ -9,6 +9,7 @@ namespace Jpeg2Bmp.Tests
     /// <summary>
     /// 验证编码方向 SIMD（FDCT / RGB-&gt;YCbCr）与标量实现逐位一致。
     /// </summary>
+    [Collection(SharpImageConverter.Tests.JpegSimdStateCollection.Name)]
     public class JpegEncoderSimdTests
     {
         [Fact]

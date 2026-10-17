@@ -45,6 +45,28 @@ public readonly struct JpegEncoderOptions
 }
 
 /// <summary>
+/// 量化系数的旁路接收器：编码器在熵编码之前把每个 MCU 的量化系数直接交出来，
+/// 调用方据此跳过「写位流 → 逐位读回」这一整趟往返。
+/// </summary>
+/// <remarks>
+/// 仅用于 optimize 的搜索期。Huffman 只改变系数的编码形式、不改变系数本身
+/// （熵编解码是无损的），所以「从字节流熵解码得到的系数」与本回调收到的系数逐位相同，
+/// 由此重建的像素也逐字节相同 —— 但省掉了 6 次熵编码与 6 次熵解码。
+/// 真正的落盘产物仍然走完整编码，不受此通道影响。
+/// </remarks>
+internal interface IMcuCoefficientSink
+{
+    /// <summary>编码开始前调用一次，交出本次编码的几何与量化表（自然顺序，每表 64 项）。</summary>
+    void Begin(int width, int height, bool subsample420, ReadOnlySpan<byte> lumaTable, ReadOnlySpan<byte> chromaTable);
+
+    /// <param name="sequence">MCU 的光栅序号（0 起，与编码顺序一致）</param>
+    /// <param name="blocks">量化后的系数，每个块 64 个 int 紧凑排列</param>
+    /// <param name="blockCount">该 MCU 内的块数（4:2:0 为 6，4:4:4 为 3）</param>
+    /// <param name="order">每块所属的分量下标（0=Y，1=Cb，2=Cr）</param>
+    void Accept(int sequence, ReadOnlySpan<int> blocks, int blockCount, byte[] order);
+}
+
+/// <summary>
 /// JPEG 编码器，支持 4:2:0 与 4:4:4 采样，将 RGB24 编码为 JPEG。
 /// </summary>
 public static class JpegEncoder
@@ -485,6 +507,73 @@ public static class JpegEncoder
         WriteInternal(stream, width, height, rgb24, NormalizeQuality(options.Quality), options.Subsample420, metadata, options.KeepMetadata, options.EnableDiagnostics, options.OptimizeHuffman);
     }
 
+    /// <summary>
+    /// 只跑到量化为止：把每个 MCU 的量化系数交给 <paramref name="sink"/>，不产生任何字节流。
+    /// </summary>
+    /// <remarks>
+    /// optimize 搜索期专用。搜索期只需要「该质量下的重建像素」，而体积不参与决策
+    /// （<see cref="Compression.ImageOptimizer.SearchQuality"/> 的历史签名里 bytes 从不参与比较，
+    /// 赢家最终还会完整重编一次），所以这里可以把熵编码整段跳过，
+    /// 调用方拿到系数后直接重建，省掉「写位流 → 逐位读回」一个来回。
+    /// 前置条件与真实编码相同（入参校验、采样方式、量化表都由同一个 quality 推导）。
+    /// </remarks>
+    internal static void EncodeCoefficients(byte[] rgb24, int width, int height, int quality, bool subsample420, bool keepMetadata, ImageMetadata? metadata, IMcuCoefficientSink sink)
+    {
+        WriteInternal(Stream.Null, width, height, rgb24, NormalizeQuality(quality), subsample420, metadata, keepMetadata, false, false, sink);
+    }
+
+    /// <summary>
+    /// 用已缓存的 YCbCr 样本编码到「量化系数」为止，完全不产比特流、也不做 produce。
+    /// </summary>
+    /// <remarks>
+    /// 供 optimize 搜索期的多档质量评估使用：produce 只跟源图和几何有关，与质量无关，
+    /// 所以 <see cref="JpegSampleCache"/> 采一次、这里按质量档反复量化即可。
+    /// 与 <see cref="EncodeCoefficients"/> 的差别只有「样本从哪来」——两者喂给
+    /// <c>DctQuantizeInPlace</c> 的样本逐位相同，量化系数因此也逐位相同。
+    ///
+    /// 与流式管线相比还省掉了 MCU 批的池化租借、队列同步和 <c>LastNzPacked</c>（只有熵编码用）：
+    /// 这里是按行并行的批处理，每个 MCU 用 1.5 KB 栈缓冲原地 DCT+量化，结果直接过
+    /// <see cref="IMcuCoefficientSink.Accept"/> 落到组件平面。各线程写的 MCU 下标互不相交，
+    /// <see cref="IMcuCoefficientSink.Begin"/> 也在并行区之外调用，因此无需同步。
+    /// </remarks>
+    internal static void EncodeFromSamples(JpegSampleCache cache, int width, int height, bool subsample420, int quality, IMcuCoefficientSink sink)
+    {
+        int normalized = NormalizeQuality(quality);
+        QuantTables luma = GetQuantTables(normalized, luma: true);
+        QuantTables chroma = GetQuantTables(normalized, luma: false);
+        int[] qYRecip = luma.Recip;
+        int[] qCRecip = chroma.Recip;
+
+        // 只有量化表随质量变化；几何与表都要先交给下游，重建方才能按同一套表反量化。
+        sink.Begin(width, height, subsample420, luma.Table, chroma.Table);
+
+        byte[] order = subsample420 ? Order420 : Order444;
+        int blockCount = subsample420 ? 6 : 3;
+        int coefficients = blockCount * 64;
+        int mcuX = cache.McuX;
+
+        Parallel.For(0, cache.McuY, my =>
+        {
+            Span<int> blocks = stackalloc int[6 * 64];
+            for (int mx = 0; mx < mcuX; mx++)
+            {
+                int sequence = my * mcuX + mx;
+                ReadOnlySpan<sbyte> src = cache.GetMcu(sequence);
+                for (int k = 0; k < coefficients; k++)
+                {
+                    blocks[k] = src[k];
+                }
+
+                for (int i = 0; i < blockCount; i++)
+                {
+                    DctQuantizeInPlace(blocks.Slice(i * 64, 64), order[i] == 0 ? qYRecip : qCRecip);
+                }
+
+                sink.Accept(sequence, blocks[..coefficients], blockCount, order);
+            }
+        });
+    }
+
     public static void WriteGray8(string path, int width, int height, byte[] gray8, int quality = 75)
     {
         using var fs = new FileStream(path, FileMode.Create, FileAccess.Write);
@@ -599,7 +688,7 @@ public static class JpegEncoder
         }
     }
 
-    private static void WriteInternal(Stream stream, int width, int height, byte[] rgb24, int quality, bool subsample420, ImageMetadata? metadata, bool keepMetadata, bool enableDiagnostics, bool optimizeHuffman = false)
+    private static void WriteInternal(Stream stream, int width, int height, byte[] rgb24, int quality, bool subsample420, ImageMetadata? metadata, bool keepMetadata, bool enableDiagnostics, bool optimizeHuffman = false, IMcuCoefficientSink? coefficientSink = null)
     {
         long totalStartTicks = Stopwatch.GetTimestamp();
         EncodeMetrics? metrics = enableDiagnostics ? new EncodeMetrics() : null;
@@ -615,6 +704,9 @@ public static class JpegEncoder
         byte[] qC = chromaTables.Table;
         int[] qYRecip = lumaTables.Recip;
         int[] qCRecip = chromaTables.Recip;
+
+        // 系数旁路：先交出几何与量化表，重建方才能按同一套表反量化。
+        coefficientSink?.Begin(width, height, subsample420, qY, qC);
 
         // Huffman 表：默认用标准 Annex K 表；开启优化时先统计真实符号分布再生成最优表。
         byte[] dcYCounts = DcLumaCounts, acYCounts = AcLumaCounts, dcCCounts = DcChromaCounts, acCCounts = AcChromaCounts;
@@ -655,9 +747,12 @@ public static class JpegEncoder
         WriteSos(stream);
 
         using var bw = new JpegBitWriter(stream);
-        EncodeRgbPipeline(bw, width, height, rgb24, subsample420, qYRecip, qCRecip, dcY, acY, dcC, acC, metrics);
-        bw.FlushFinal();
-        WriteMarker(stream, 0xD9);
+        EncodeRgbPipeline(bw, width, height, rgb24, subsample420, qYRecip, qCRecip, dcY, acY, dcC, acC, metrics, coefficientSink);
+        if (coefficientSink == null)
+        {
+            bw.FlushFinal();
+            WriteMarker(stream, 0xD9);
+        }
 
         long totalEndTicks = Stopwatch.GetTimestamp();
 
@@ -728,7 +823,8 @@ public static class JpegEncoder
         HuffCode[] acY,
         HuffCode[] dcC,
         HuffCode[] acC,
-        EncodeMetrics? metrics)
+        EncodeMetrics? metrics,
+        IMcuCoefficientSink? coefficientSink = null)
     {
         int capacity = Math.Clamp(Environment.ProcessorCount, 2, 16);
         var sampleQueue = new PipeQueue<McuBatch>(capacity, JpegPerfProbe.ProduceWait, JpegPerfProbe.DctWait);
@@ -746,7 +842,7 @@ public static class JpegEncoder
         {
             dctTasks[i] = Task.Run(() => RunStage(() => ProcessDct(sampleQueue, dctQueue, qYRecip, qCRecip, token), cts), token);
         }
-        var t4 = Task.Run(() => RunStage(() => ProcessHuffmanOrdered(dctQueue, dctWorkers, bw, dcY, acY, dcC, acC, token), cts), token);
+        var t4 = Task.Run(() => RunStage(() => ProcessHuffmanOrdered(dctQueue, dctWorkers, bw, dcY, acY, dcC, acC, token, coefficientSink), cts), token);
 
         Task.WaitAll(dctTasks);
         Task.WaitAll(t1, t4);
@@ -1228,7 +1324,8 @@ public static class JpegEncoder
         HuffCode[] acY,
         HuffCode[] dcC,
         HuffCode[] acC,
-        CancellationToken token)
+        CancellationToken token,
+        IMcuCoefficientSink? coefficientSink = null)
     {
         int prevYdc = 0;
         int prevCbdc = 0;
@@ -1237,6 +1334,22 @@ public static class JpegEncoder
         int completed = 0;
         long probeStart = JpegPerfProbe.Enabled ? Stopwatch.GetTimestamp() : 0;
         RentPendingState(256, out var pendingItems, out var pendingSequences, out int pendingCapacity, out int pendingMask);
+
+        // 有序消费一个 MCU：先按需交出量化系数，再决定是否写位流。
+        // coefficientSink 非空即「只产系数」模式 —— 此时后续不会有任何字节被 FlushFinal 写出，
+        // 所以这里直接不跑 WriteMcuHuffman（省掉整趟熵编码），只保留排序与系数移交。
+        void Emit(ref SampledMcuRef mcu, ref int py, ref int pcb, ref int pcr)
+        {
+            if (coefficientSink != null)
+            {
+                coefficientSink.Accept(mcu.Sequence, mcu.Buffer.AsSpan(0, mcu.BlockCount * 64), mcu.BlockCount, mcu.Order!);
+            }
+            else
+            {
+                WriteMcuHuffman(mcu, bw, dcY, acY, dcC, acC, ref py, ref pcb, ref pcr);
+            }
+            mcu.Free();
+        }
 
         try
         {
@@ -1256,8 +1369,7 @@ public static class JpegEncoder
                         ref SampledMcuRef mcu = ref batch.Items[i];
                         if (mcu.Sequence == expected)
                         {
-                            WriteMcuHuffman(mcu, bw, dcY, acY, dcC, acC, ref prevYdc, ref prevCbdc, ref prevCrdc);
-                            mcu.Free();
+                            Emit(ref mcu, ref prevYdc, ref prevCbdc, ref prevCrdc);
                             expected++;
 
                             while (true)
@@ -1270,8 +1382,7 @@ public static class JpegEncoder
 
                                 ref SampledMcuRef pending = ref pendingItems[expectedIndex];
                                 pendingSequences[expectedIndex] = -1;
-                                WriteMcuHuffman(pending, bw, dcY, acY, dcC, acC, ref prevYdc, ref prevCbdc, ref prevCrdc);
-                                pending.Free();
+                                Emit(ref pending, ref prevYdc, ref prevCbdc, ref prevCrdc);
                                 expected++;
                             }
                         }
@@ -1308,8 +1419,7 @@ public static class JpegEncoder
                 }
                 ref SampledMcuRef pending = ref pendingItems[index];
                 pendingSequences[index] = -1;
-                WriteMcuHuffman(pending, bw, dcY, acY, dcC, acC, ref prevYdc, ref prevCbdc, ref prevCrdc);
-                pending.Free();
+                Emit(ref pending, ref prevYdc, ref prevCbdc, ref prevCrdc);
                 expected++;
             }
         }

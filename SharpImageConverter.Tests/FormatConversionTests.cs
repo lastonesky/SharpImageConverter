@@ -19,6 +19,7 @@ using SharpImageConverter.Formats;
 
 namespace Jpeg2Bmp.Tests
 {
+    [Collection(SharpImageConverter.Tests.JpegSimdStateCollection.Name)]
     public class FormatConversionTests
     {
         private static string NewTemp(string ext)
