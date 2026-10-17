@@ -19,12 +19,19 @@ namespace SharpImageConverter.Compression
         /// 体积比 1.045x），而搜索只需要「候选之间谁更小」的相对次序。
         /// 赢家确定后再按 <see cref="OutputMethod"/> 补编一次，产物不受影响。
         /// 实测（2048²，同一份二进制开关对照）：photo 源 1769 → 1191 ms、webp 源 1125 → 1076 ms、
-        /// jpeg 源 1407 → 1208 ms，且三张图产物与「全程 method 4」**逐字节一致**。
+        /// jpeg 源 1407 → 1208 ms，且三张图产物与「全程 method 4」**逐字节一致**（当时 OutputMethod 为 4；
+        /// 换成 3 后同样的性质成立——补编用的是原始像素，与搜索期编码无关）。
         /// </remarks>
         private const int SearchMethod = 2;
 
         /// <summary>产出期的 libwebp <c>method</c>（正式档，决定最终体积/画质）。</summary>
-        private const int OutputMethod = 4;
+        /// <remarks>
+        /// 与 <c>WebpEncoderOptions</c> 的默认档保持一致（3）。libwebp 1.6.0 的 method 4 在 &gt;140 MP
+        /// 有 4 倍悬崖且体积不比 m3 小（143 MP：m3 8.2 s / 1,597,784 B vs m4 32.3 s / 1,655,814 B），
+        /// 超大图走 optimize 时 m4 会直接吃掉整个时间预算。
+        /// 搜索期仍用 <see cref="SearchMethod"/>（m2）排序，赢家在此档补编一次。
+        /// </remarks>
+        private const int OutputMethod = 3;
         /// <summary>
         /// 同格式优化：读入源文件，按 WebP 重编码为最小体积。
         /// </summary>

@@ -139,6 +139,7 @@ class Program
         Console.WriteLine("支持输出: .jpg/.jpeg/.png/.bmp/.webp/.gif");
         Console.WriteLine("操作: resize:WxH | resizebilinear:WxH | resizefit:WxH | grayscale");
         Console.WriteLine("参数: --quality N | --subsample 420/444 | --keep-metadata | --idct int/float | --stream | --jpeg-debug | --gif-frames | --gray | --dithering on/off");
+        Console.WriteLine("WebP 档位: --webp-method 0~6（默认 3；4 在 >140 MP 有 4 倍悬崖且体积不更小，6 最省体积最慢）");
         Console.WriteLine("GIF 耗时统计: --gif-debug（分阶段耗时）| --gif-bench N（重复 N 次取最小/中位/平均，默认 5）");
         Console.WriteLine("JPEG 耗时统计: --jpeg-bench N（重复 N 次；配合环境变量 SIC_JPEG_STAGE_TIMING=1 输出分阶段耗时）");
         Console.WriteLine("GIF 量化器: --gif-quantizer octree(默认,八叉树+Bayer) | wu/legacy(原 Wu+Floyd–Steinberg)");
@@ -530,6 +531,12 @@ class Program
                 options.JpegQuality = quality;
                 continue;
             }
+            if (TryParseNamedInt(args, ref i, "--webp-method", out int? webpMethod))
+            {
+                if (webpMethod is >= 0 and <= 6) options.WebpMethod = webpMethod;
+                else Console.Error.WriteLine($"⚠️ --webp-method 取值需为 0~6，已忽略: {webpMethod}");
+                continue;
+            }
             if (TryParseSubsample(args, ref i, out bool? subsample420))
             {
                 options.Subsample420 = subsample420;
@@ -692,6 +699,7 @@ class Program
             OptimizeVerbose = src.OptimizeVerbose,
             MinSaving = src.MinSaving,
             ParallelWebpEncode = src.ParallelWebpEncode,
+            WebpMethod = src.WebpMethod,
         };
         foreach (var op in src.Operations) dst.Operations.Add(op);
         return dst;
@@ -1211,6 +1219,8 @@ class Program
                 Quality = options.JpegQuality ?? 75,
                 ConcurrencyStrategy = options.ParallelWebpEncode ? WebpConcurrencyStrategy.Parallel : WebpConcurrencyStrategy.Auto,
             };
+            // 只在用户显式指定时覆盖，默认档由 WebpEncoderOptions 决定（当前为 method 3）
+            if (options.WebpMethod.HasValue) encoder.Method = options.WebpMethod.Value;
             encoder.EncodeRgb24(outputPath, image);
             return;
         }
@@ -1255,6 +1265,7 @@ class Program
                 Quality = options.JpegQuality ?? 75,
                 ConcurrencyStrategy = options.ParallelWebpEncode ? WebpConcurrencyStrategy.Parallel : WebpConcurrencyStrategy.Auto,
             };
+            if (options.WebpMethod.HasValue) encoder.Method = options.WebpMethod.Value;
             encoder.EncodeRgba32(outputPath, image);
             return;
         }
@@ -1553,5 +1564,10 @@ class Program
         /// 而默认的 EncodeLock 会把外层并行整体串行化。
         /// </summary>
         public bool ParallelWebpEncode { get; set; }
+
+        /// <summary>
+        /// libwebp 的 <c>config.method</c>（0~6），null 表示用库默认（<see cref="WebpEncoderOptions"/> 的 3）。
+        /// </summary>
+        public int? WebpMethod { get; set; }
     }
 }

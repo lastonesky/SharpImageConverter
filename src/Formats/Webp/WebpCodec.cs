@@ -102,7 +102,7 @@ namespace SharpImageConverter.Formats.Webp
             throw new InvalidOperationException("WebPNewInternal 创建失败（ABI 版本不匹配或库不兼容）");
         }
 
-        private static void InitConfig(ref WebPConfig config, float quality, int method = 4)
+        private static void InitConfig(ref WebPConfig config, float quality, int method = 3)
         {
             for (int i = 0; i < EncoderAbiVersionsToTry.Length; i++)
             {
@@ -126,14 +126,14 @@ namespace SharpImageConverter.Formats.Webp
             throw new InvalidOperationException("WebPPictureInitInternal 创建失败（ABI 版本不匹配或库不兼容）");
         }
 
-        private static byte[] EncodeWithConfig(ReadOnlySpan<byte> pixels, int width, int height, int stride, bool hasAlpha, float quality, int method = 4)
+        private static byte[] EncodeWithConfig(ReadOnlySpan<byte> pixels, int width, int height, int stride, bool hasAlpha, float quality, int method = 3)
         {
             using var ms = new MemoryStream();
             EncodeWithConfigToStream(ms, pixels, width, height, stride, hasAlpha, quality, method);
             return ms.ToArray();
         }
 
-        private static void EncodeWithConfigToStream(Stream stream, ReadOnlySpan<byte> pixels, int width, int height, int stride, bool hasAlpha, float quality, int method = 4)
+        private static void EncodeWithConfigToStream(Stream stream, ReadOnlySpan<byte> pixels, int width, int height, int stride, bool hasAlpha, float quality, int method = 3)
         {
             WebPConfig config = default;
             WebPPicture picture = default;

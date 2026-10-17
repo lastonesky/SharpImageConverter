@@ -19,19 +19,22 @@ namespace SharpImageConverter.Formats.Webp
         public WebpConcurrencyStrategy ConcurrencyStrategy { get; }
 
         /// <summary>
-        /// libwebp 的 <c>config.method</c>（0~6）：越大越慢、体积越小，默认 4。
+        /// libwebp 的 <c>config.method</c>（0~6）：越大越慢、体积越小，默认 3。
         /// </summary>
         /// <remarks>
         /// 2048²（4.19 MP）/ q80 实测单次编码：method 2 = 147.5 ms / 70,838 B、
         /// method 3 = 501.7 ms / 67,784 B、method 4 = 490.9 ms / 67,818 B、
         /// method 6 = 579.4 ms / 64,872 B。悬崖在 2→3 之间：≥3 才走完整 RD 优化。
+        /// 默认取 3（不取 4）的原因：libwebp 1.6.0 的 method 4 在 &gt;140 MP 有 4 倍悬崖
+        /// （143 MP 实测 m3 8.2 s / 1,597,784 B vs m4 32.3 s / 1,655,814 B，m4 更慢还更大），
+        /// 且在 7 个样本（1~143 MP，含真实照片）上 m3 体积均 ≤ m4。详见 docs 与 .perf/results。
         /// </remarks>
         public int Method { get; }
 
         public WebpEncoderOptions(
             float quality,
             WebpConcurrencyStrategy concurrencyStrategy = WebpConcurrencyStrategy.Auto,
-            int method = 4)
+            int method = 3)
         {
             if (quality < 0f || quality > 100f) throw new ArgumentOutOfRangeException(nameof(quality));
             if (method is < 0 or > 6) throw new ArgumentOutOfRangeException(nameof(method));
