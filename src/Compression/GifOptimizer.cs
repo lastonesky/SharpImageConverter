@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using SharpImageConverter.Core;
 using SharpImageConverter.Formats.Gif;
 
@@ -94,15 +95,32 @@ namespace SharpImageConverter.Compression
                 EnableDithering = o.EnableDithering,
                 TransparentAlphaThreshold = reserveTransparent ? 128 : 0,
             };
-            var produced = new Dictionary<int, (byte[] Bytes, ImageQuality Quality)>();
+            // key = (颜色数, 是否抖动)。抖动与否是独立的搜索维度：
+            // Floyd–Steinberg 的误差扩散把索引流打成高频噪声，LZW 命中率暴跌，
+            // 实测同一张图同一色数下体积可差 5 倍以上（car.png 256 色：抖动 92 KB / 不抖 17 KB），
+            // 因此两个变体都必须参与体积竞争，不能预设「抖动画质更好就该选它」。
+            var produced = new Dictionary<(int Colors, bool Dither), (byte[] Bytes, ImageQuality Quality)>();
             byte[] restored = new byte[(long)framePixels * sampleFrames * 4];
             byte[] frameRgbaBuffer = new byte[(long)framePixels * 4];
+            int preparedColors = -1;
 
-            (byte[] Bytes, ImageQuality Quality) Evaluate(int colors)
+            (byte[] Bytes, ImageQuality Quality) Evaluate(int colors, bool dithering)
             {
-                if (produced.TryGetValue(colors, out var cached)) return cached;
-                quantizeOptions.MaxColors = colors;
-                quantizer.Prepare(sample, width, sampleRows, quantizeOptions);
+                var key = (colors, dithering);
+                if (produced.TryGetValue(key, out var cached)) return cached;
+                if (preparedColors != colors)
+                {
+                    quantizeOptions.MaxColors = colors;
+                    quantizer.Prepare(sample, width, sampleRows, quantizeOptions);
+                    preparedColors = colors;
+                }
+                else
+                {
+                    // 同色数的第二个变体：查找缓存被上一个变体污染过（桶级记忆化依赖首个像素），
+                    // 必须清空，保证每个变体的映射与「独立评估」逐字节一致。
+                    quantizer.ResetLookupCache();
+                }
+                quantizeOptions.EnableDithering = dithering;
 
                 var frames = new List<byte[]>(animation.Frames.Count);
                 for (int i = 0; i < animation.Frames.Count; i++)
@@ -137,45 +155,132 @@ namespace SharpImageConverter.Compression
                 };
                 ImageOptimizer.RestoreRgba(sampled, restored);
                 var quality = QualityMetrics.Compare(sample, restored, width, sampleRows, 4);
-                o.Log?.Invoke($"  候选 {colors} 色: {bytes.Length} 字节, {quality}");
+                o.Log?.Invoke($"  候选 {colors} 色{(dithering ? " + 抖动" : "")}: {bytes.Length} 字节, {quality}");
                 var entry = (bytes, quality);
-                produced[colors] = entry;
+                produced[key] = entry;
                 return entry;
+            }
+
+            // 二分定位用：该色数下「最能达标」的变体画质（默认抖动版感知 PSNR 更高）。
+            // 两个变体在这里都完成评估，后续挑选直接查表；精确取色调色板不走抖动，两变体同产物，只评一次。
+            ImageQuality EvaluateBest(int colors)
+            {
+                if (!o.EnableDithering) return Evaluate(colors, false).Quality;
+                var dithered = Evaluate(colors, true);
+                if (quantizer.IsExactPalette) return dithered.Quality;
+                Evaluate(colors, false);
+                return dithered.Quality;
             }
 
             // GIF 本身就是调色板格式：颜色数等于上限时重写没有收益，
             // 因此不做「颜色够少就只走无损」的短路，统一进入阶梯搜索继续降色。
             int[] ladder = ImageOptimizer.BuildColorLadder(o.MaxColors);
-            int hit = ImageOptimizer.SearchLadder(ladder, c => Evaluate(c).Quality, o.Accept);
+            int hit = ImageOptimizer.SearchLadder(ladder, EvaluateBest, o.Accept);
+
+            // 抖动的体积代价预算：抖动变体不得超过同色数无抖动变体的该倍数，
+            // 否则视为「抖动收益抵不过 LZW 损失」，直接放弃抖动候选。
+            const double MaxDitherCostRatio = 2.0;
 
             byte[]? bestBytes = null;
             ImageQuality bestQuality = default;
             int bestColors = 0;
-            foreach (var pair in produced)
+            bool bestDither = false;
+
+            // 按 (颜色数, 抖动) 排序保证平局时的选择确定（取色数更小、无抖动优先）
+            foreach (var pair in produced.OrderBy(p => p.Key.Colors).ThenBy(p => p.Key.Dither))
             {
+                var (colors, dither) = pair.Key;
+                var (bytes, quality) = pair.Value;
+                if (dither
+                    && produced.TryGetValue((colors, false), out var noDither)
+                    && bytes.Length > noDither.Bytes.Length * MaxDitherCostRatio)
+                {
+                    o.Log?.Invoke($"  跳过 {colors} 色 + 抖动：体积 {bytes.Length} 超过无抖动 {noDither.Bytes.Length} 的 {MaxDitherCostRatio:0.#} 倍预算");
+                    continue;
+                }
+
                 if (hit >= 0)
                 {
                     // 体积并不严格随颜色数单调（体积与画质都会有几个百分点的抖动），
                     // 因此在所有达标候选里按体积取最小。
-                    if (!o.Accept(pair.Value.Quality)) continue;
-                    if (bestBytes != null && pair.Value.Bytes.Length >= bestBytes.Length) continue;
+                    if (!o.Accept(quality)) continue;
+                    if (bestBytes != null && bytes.Length >= bestBytes.Length) continue;
                 }
                 else
                 {
                     // 全部不达标时退回「画质最高」的候选，跨格式输出至少保证文件可用
-                    if (bestBytes != null && pair.Value.Quality.PerceptualPsnr <= bestQuality.PerceptualPsnr) continue;
+                    if (bestBytes != null && quality.PerceptualPsnr <= bestQuality.PerceptualPsnr) continue;
                 }
 
-                bestBytes = pair.Value.Bytes;
-                bestQuality = pair.Value.Quality;
-                bestColors = pair.Key;
+                bestBytes = bytes;
+                bestQuality = quality;
+                bestColors = colors;
+                bestDither = dither;
+            }
+
+            if (hit >= 0 && bestBytes == null)
+            {
+                // 达标候选可能全被抖动预算拒绝（抖动达标但代价过高、无抖动不达标）：
+                // 此时降级为「未达标」语义，在剩余候选里挑画质最高的，交由基线兜底。
+                hit = -1;
+                foreach (var pair in produced.OrderBy(p => p.Key.Colors).ThenBy(p => p.Key.Dither))
+                {
+                    var (colors, dither) = pair.Key;
+                    var (bytes, quality) = pair.Value;
+                    if (dither
+                        && produced.TryGetValue((colors, false), out var noDither)
+                        && bytes.Length > noDither.Bytes.Length * MaxDitherCostRatio)
+                    {
+                        continue;
+                    }
+                    if (bestBytes != null && quality.PerceptualPsnr <= bestQuality.PerceptualPsnr) continue;
+                    bestBytes = bytes;
+                    bestQuality = quality;
+                    bestColors = colors;
+                    bestDither = dither;
+                }
+            }
+
+            // 单帧时补一条「常规编码」基线（Octree + Bayer8、256 色，与不加 --optimize 的转换完全同参）：
+            // 任何候选若不比它小就是负收益 —— 用户加 --optimize 却得到更大的文件是不可接受的，直接退回基线。
+            // 多帧动画不需要：同格式路径有 KeepOriginalWhenNoGain 兜底，不会写出更大的文件。
+            if (!animated && bestBytes != null)
+            {
+                var baseline = EncodeBaseline(animation.Frames[0], reserveTransparent ? singleFrameRgba : null, width, height, sample);
+                if (baseline.Bytes.Length <= bestBytes.Length)
+                {
+                    o.Log?.Invoke($"  常规编码基线 {baseline.Bytes.Length} 字节 ≤ 最优候选 {bestBytes.Length} 字节，退回基线");
+                    return baseline;
+                }
             }
 
             if (bestBytes == null) return OptimizeArtifact.Unsupported("GIF 量化未产出可用候选");
 
-            string method = $"GIF 调色板 {bestColors} 色" + (o.EnableDithering ? " + 抖动" : "") + (animated ? $"（{animation.Frames.Count} 帧）" : "");
+            string method = $"GIF 调色板 {bestColors} 色" + (bestDither ? " + 抖动" : "") + (animated ? $"（{animation.Frames.Count} 帧）" : "");
             if (hit < 0) method += "（未达画质下限，取最高画质档）";
             return new OptimizeArtifact(bestBytes, method, bestQuality, hit >= 0);
+        }
+
+        /// <summary>
+        /// 单帧「常规编码」基线：与不加 --optimize 的普通转换同参（八叉树量化 + Bayer 有序抖动 8、256 色）。
+        /// 用于保证 optimize 的产物体积不会劣于普通转换。
+        /// </summary>
+        private static OptimizeArtifact EncodeBaseline(Image<Rgb24> frame, byte[]? rgba, int width, int height, byte[] sample)
+        {
+            var encoder = new GifEncoder(); // 默认八叉树 + Bayer8、256 色，与普通转换同参
+            using var ms = new MemoryStream();
+            if (rgba != null) encoder.EncodeRgba(width, height, rgba, ms);
+            else encoder.Encode(new ImageFrame(width, height, frame.Buffer), ms);
+
+            byte[] bytes = ms.ToArray();
+            using var decodeStream = new MemoryStream(bytes);
+            byte[] decoded = new GifDecoder().DecodeRgba32(decodeStream).Buffer;
+            var quality = QualityMetrics.Compare(sample, decoded, width, height, 4);
+            return new OptimizeArtifact(
+                bytes,
+                "GIF 常规 256 色（优化无额外收益，退回普通编码）",
+                quality,
+                true);
         }
 
         private static bool HasTransparency(byte[] rgba)

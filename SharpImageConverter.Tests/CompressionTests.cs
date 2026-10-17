@@ -674,5 +674,49 @@ namespace Jpeg2Bmp.Tests
                 Cleanup(input, output);
             }
         }
+
+        [Fact]
+        public void Optimize_ConvertPngToGif_NotLargerThanPlainConversion()
+        {
+            // 回归（2026-10-17）：--optimize 走 Floyd–Steinberg 抖动时索引流熵高、LZW 命中率暴跌，
+            // 全范围渐变图上曾出现 optimize 产物比不加 optimize 的普通转换大 1~4 倍。
+            // 修复后抖动候选受「同色数无抖动体积 × 2」预算约束，且单帧有常规编码基线兜底。
+            int w = 600, h = 450;
+            var rgb = new byte[w * h * 3];
+            for (int y = 0; y < h; y++)
+            {
+                for (int x = 0; x < w; x++)
+                {
+                    int i = (y * w + x) * 3;
+                    rgb[i] = (byte)(x * 255 / (w - 1));
+                    rgb[i + 1] = (byte)(y * 255 / (h - 1));
+                    rgb[i + 2] = 128;
+                }
+            }
+
+            string input = NewTemp(".png");
+            string output = NewTemp(".gif");
+            string plain = NewTemp(".gif");
+            try
+            {
+                PngWriter.Write(input, w, h, rgb);
+
+                var result = ImageOptimizer.Optimize(input, output);
+
+                // 基线：与不加 --optimize 的普通转换完全同参（八叉树 + Bayer8、256 色）
+                new GifEncoderAdapter().EncodeRgb24(plain, Configuration.Default.LoadRgb24(input));
+                long plainSize = new FileInfo(plain).Length;
+
+                Assert.True(File.Exists(output));
+                Assert.True(result.OptimizedSize <= plainSize, $"{result.OptimizedSize} > 普通转换 {plainSize}");
+                var decoded = new GifDecoder().DecodeRgb24(output);
+                Assert.Equal(w, decoded.Width);
+                Assert.Equal(h, decoded.Height);
+            }
+            finally
+            {
+                Cleanup(input, output, plain);
+            }
+        }
     }
 }

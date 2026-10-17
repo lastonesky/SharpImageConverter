@@ -237,6 +237,25 @@ namespace SharpImageConverter.Compression
         }
 
         /// <summary>
+        /// 当前调色板是否为「精确取色」（颜色数不超过预算时的无损调色板）。
+        /// 精确调色板的映射不走抖动，调用方可以据此跳过无意义的重复评估。
+        /// </summary>
+        public bool IsExactPalette => _exactMap != null;
+
+        /// <summary>
+        /// 清空「颜色桶 → 最近调色板色」的记忆化缓存。
+        /// </summary>
+        /// <remarks>
+        /// 缓存以粗粒度颜色桶为 key，首个落入该桶的像素决定缓存值；抖动会先修改像素颜色再查桶，
+        /// 因此抖动 / 无抖动两种映射不能共享缓存 —— 同一调色板下切换抖动开关时必须调用，
+        /// 否则后一次映射会拿到被前一次污染的次优最近色（结果依赖评估顺序，产物不可复现）。
+        /// </remarks>
+        public void ResetLookupCache()
+        {
+            if (_lut != null) Array.Fill(_lut, -1);
+        }
+
+        /// <summary>
         /// 输出当前调色板与给定索引构成的结果。
         /// </summary>
         /// <param name="indices">调色板索引</param>
