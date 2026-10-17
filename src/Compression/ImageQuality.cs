@@ -102,7 +102,7 @@ namespace SharpImageConverter.Compression
             int height,
             int bytesPerPixel,
             int blockSize = DefaultBlockSize)
-            => CompareCore(reference, test, width, height, bytesPerPixel, blockSize, null, null);
+            => CompareCore(reference, test, width, height, bytesPerPixel, blockSize, null, null, true);
 
         /// <summary>
         /// 数组重载：允许按带分片并行。
@@ -118,7 +118,25 @@ namespace SharpImageConverter.Compression
             int height,
             int bytesPerPixel,
             int blockSize = DefaultBlockSize)
-            => CompareCore(reference, test, width, height, bytesPerPixel, blockSize, reference, test);
+            => CompareCore(reference, test, width, height, bytesPerPixel, blockSize, reference, test, true);
+
+        /// <summary>
+        /// 数组重载（可关闭内层并行）。
+        /// </summary>
+        /// <param name="allowInnerParallel">
+        /// false 时强制串行累加。调用方本身已经在「按候选并行」时用（GIF / PNG / WebP 的 optimize
+        /// 搜索期会有 8~16 个候选同时跑），内层再按核数展开只会超订：核数² 个线程互相抢占，
+        /// 每条带的 cache 局部性也被打散。
+        /// </param>
+        internal static ImageQuality Compare(
+            byte[] reference,
+            byte[] test,
+            int width,
+            int height,
+            int bytesPerPixel,
+            bool allowInnerParallel,
+            int blockSize = DefaultBlockSize)
+            => CompareCore(reference, test, width, height, bytesPerPixel, blockSize, reference, test, allowInnerParallel);
 
         private static ImageQuality CompareCore(
             ReadOnlySpan<byte> reference,
@@ -128,7 +146,8 @@ namespace SharpImageConverter.Compression
             int bytesPerPixel,
             int blockSize,
             byte[]? refArray,
-            byte[]? testArray)
+            byte[]? testArray,
+            bool allowInnerParallel)
         {
             if (bytesPerPixel is not (3 or 4))
             {
@@ -213,6 +232,7 @@ namespace SharpImageConverter.Compression
             // 不会因为线程调度而让「刚好压线」的候选随机翻转。
             // Span 不能跨线程捕获，所以分片路径要求两个输入都坐在数组上（调用方传的都是 byte[]）。
             if (bandCount >= 2
+                && allowInnerParallel
                 && (long)width * height >= ParallelPixelThreshold
                 && Environment.ProcessorCount > 1
                 && refArray is not null

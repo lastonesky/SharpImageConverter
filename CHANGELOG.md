@@ -59,6 +59,30 @@
   含逐步执行清单、回报格式与本机验证手段（win 直接跑、linux 走 WSL、osx-arm64 由 CI 的 macos runner 验证）；
   `docs/README.md` 索引同步更新，`README.md` 的 CLI 章节补充预编译版本的下载入口。
 
+### 改进
+- **GIF `--optimize` 候选并行 + 三处零散浪费**（沿用 PNG / JPEG optimize 的同一套优化思路）。
+  GIF 的量化 / 映射 / LZW 全是单线程（与 PNG 的 deflate、WebP 的 libwebp 同构），
+  搜索期 8~16 个候选此前串行执行，24 核单文件只用到 1 个核。
+  1. **候选并行**：并行评估「阶梯 × 抖动」全部候选，再用 `ImageOptimizer.ReplayLadderVisits`
+     复刻串行二分**实际会访问**的候选子集，只把这一子集交给挑选逻辑 —— 多算的候选直接丢弃，
+     产物与串行路径 **md5 逐字节相同**。并行度走既有的 `CandidateParallelism` 内存预算
+     （单候选峰值 ≈ 索引 1 B/px + 还原缓冲 4 B/px），大图自动塌回串行。
+     同二进制交错 A/B（`SIC_GIF_NO_PARALLEL=1` 切串行）：1 MP 733 → **320 ms**（−56%，5/5 轮胜）、
+     5 MP 1740 → **688 ms**（−61%），产物 md5 全等。
+  2. **画质比较的内层并行按核数自适应**：`QualityMetrics.Compare` 新增 `allowInnerParallel` 重载。
+     候选数喂不满核数时保留按带并行（填满空闲核），已能占满核数时关掉（16 候选 × 核数 只会互相抢占）。
+     5 MP 实测：无脑关掉 768~812 ms，自适应后 645~722 ms。
+  3. **`RestoreRgba` 改为 32 位查表**：调色板先展开成「索引 → RGBA32 打包」，逐像素从
+     4 次字节查表 + 4 次字节写降到 1 次 32 位查表 + 1 次 32 位写（1 MP 单次 4.6 → 2.3 ms，
+     8 候选省 ~18 ms；PNG optimize 走同一函数同样受益）。大端平台保留标量回退。
+  4. **单帧免拼索引 + 基线画质延迟评估**：`BuildSampleIndices` 单帧直接复用索引缓冲（省一次全图复制）；
+     「常规编码基线」的画质此前每次都跑一遍解码 + 全图比较（1 MP 约 40 ms），
+     现在只编码字节，只有真正退回基线这条冷路径才评估画质（1 MP 65 → 25 ms）。
+  探针：`SIC_GIF_OPT_TIMING=1` 输出 prepare / map / encode / quality / baseline 分阶段累计。
+  1 MP 分阶段（串行，累计 CPU）：prepare 83.1、map 122.7、encode 43.1、
+  quality 285.6（restore 36.5 + compare 249.1）、baseline 65.4 ms —— **compare 是单候选最大头（37%）**，
+  也是后续唯一还值得继续压的部分（4 通道块累加尚未向量化）。
+
 ### 修复
 - **GIF `--optimize`（跨格式转换）产物可能比不加 `--optimize` 的普通转换还大 1~4 倍**：
   优化器只搜「调色板颜色数」，抖动固定用 Floyd–Steinberg 全强度（`DitherStrength = 1.0`），

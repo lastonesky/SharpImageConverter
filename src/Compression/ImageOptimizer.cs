@@ -165,19 +165,45 @@ namespace SharpImageConverter.Compression
         /// </summary>
         /// <param name="result">量化结果</param>
         /// <param name="destination">输出缓冲区，长度 width*height*4</param>
+        /// <remarks>
+        /// 逐像素做「1 次 32 位查表 + 1 次 32 位写」，而不是 4 次字节查表 + 4 次字节写：
+        /// 该函数在 optimize 搜索期要按候选数重复执行（GIF 是每个候选一次全图、PNG 同理），
+        /// 143 MP 上省下的是两遍 4 通道随机访问的内存流量。
+        /// </remarks>
         internal static void RestoreRgba(QuantizeResult result, Span<byte> destination)
         {
             byte[] palette = result.PaletteRgb;
             byte[]? alpha = result.PaletteAlpha;
             byte[] indices = result.Indices;
+            int colors = Math.Min(palette.Length / 3, 256);
+
+            // 调色板展开成「索引 → RGBA32（小端 R,G,B,A）」的打包表
+            Span<uint> packed = stackalloc uint[256];
+            for (int i = 0; i < colors; i++)
+            {
+                uint a = alpha != null ? alpha[i] : 255u;
+                packed[i] = palette[i * 3]
+                    | ((uint)palette[i * 3 + 1] << 8)
+                    | ((uint)palette[i * 3 + 2] << 16)
+                    | (a << 24);
+            }
+
+            if (BitConverter.IsLittleEndian)
+            {
+                var target = System.Runtime.InteropServices.MemoryMarshal.Cast<byte, uint>(destination);
+                for (int p = 0; p < indices.Length; p++) target[p] = packed[indices[p]];
+                return;
+            }
+
+            // 大端平台回退（当前支持的 x64 / arm64 都是小端，保留以防移植）
             for (int p = 0; p < indices.Length; p++)
             {
-                int i = indices[p] * 3;
+                uint v = packed[indices[p]];
                 int o = p * 4;
-                destination[o] = palette[i];
-                destination[o + 1] = palette[i + 1];
-                destination[o + 2] = palette[i + 2];
-                destination[o + 3] = alpha != null ? alpha[indices[p]] : (byte)255;
+                destination[o] = (byte)v;
+                destination[o + 1] = (byte)(v >> 8);
+                destination[o + 2] = (byte)(v >> 16);
+                destination[o + 3] = (byte)(v >> 24);
             }
         }
 
