@@ -369,6 +369,44 @@ internal static class SimdJpegEncodePipeline
         }
     }
 
+    /// <summary>4:2:2，16x8 MCU RGB -&gt; 2 个 Y 块 + 1 个 Cb/Cr 块（水平 2 像素均值，去 128 偏置）。调用方需保证整块落在图像内。</summary>
+    internal static unsafe void RgbToYCbCr422(
+        byte[] rgb, int width, int baseX, int baseY,
+        Span<int> y0, Span<int> y1, Span<int> cb, Span<int> cr)
+    {
+        fixed (byte* p = rgb)
+        {
+            byte* basePtr = p + (long)baseY * width * 3 + (long)baseX * 3;
+            int stride = width * 3;
+            var one = Vector128.Create(1);
+
+            for (int r = 0; r < 8; r++)
+            {
+                byte* rowPtr = basePtr + (long)r * stride;
+                Convert8Pixels(rowPtr,
+                    out Vector128<int> yl, out Vector128<int> yh,
+                    out Vector128<int> cbl, out Vector128<int> cbh,
+                    out Vector128<int> crl, out Vector128<int> crh);
+                Store4(y0, r * 8, yl, yh);
+                Vector128<int> cbPairL = SimdCompat.HorizontalAddInt32(cbl, cbh);
+                Vector128<int> crPairL = SimdCompat.HorizontalAddInt32(crl, crh);
+
+                Convert8Pixels(rowPtr + 24,
+                    out yl, out yh,
+                    out cbl, out cbh,
+                    out crl, out crh);
+                Store4(y1, r * 8, yl, yh);
+                Vector128<int> cbPairR = SimdCompat.HorizontalAddInt32(cbl, cbh);
+                Vector128<int> crPairR = SimdCompat.HorizontalAddInt32(crl, crh);
+
+                (((cbPairL + one) >> 1) - CConst128).CopyTo(cb.Slice(r * 8, 4));
+                (((cbPairR + one) >> 1) - CConst128).CopyTo(cb.Slice(r * 8 + 4, 4));
+                (((crPairL + one) >> 1) - CConst128).CopyTo(cr.Slice(r * 8, 4));
+                (((crPairR + one) >> 1) - CConst128).CopyTo(cr.Slice(r * 8 + 4, 4));
+            }
+        }
+    }
+
     /// <summary>4:2:0，16x16 MCU RGB -&gt; 4 个 Y 块 + 1 个 Cb/Cr 块（2x2 均值，去 128 偏置）。调用方需保证整块落在图像内。</summary>
     internal static unsafe void RgbToYCbCr420(
         byte[] rgb, int width, int baseX, int baseY,

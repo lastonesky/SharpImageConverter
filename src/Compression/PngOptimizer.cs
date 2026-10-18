@@ -1,8 +1,9 @@
-using System;
+﻿using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.IO.Compression;
+using System.Linq;
 using System.Runtime.ExceptionServices;
 using System.Threading.Tasks;
 using SharpImageConverter.Core;
@@ -72,6 +73,8 @@ namespace SharpImageConverter.Compression
             byte[]? bestBytes = null;
             string? bestMethod = null;
             ImageQuality bestQuality = default;
+            int bestColors = 0;
+            bool bestDither = false;
 
             if (unique <= o.MaxColors)
             {
@@ -81,48 +84,82 @@ namespace SharpImageConverter.Compression
                 ImageOptimizer.RestoreRgba(q, restored);
                 bestQuality = QualityMetrics.Compare(rgba, restored, width, height, 4);
                 bestMethod = $"PNG 调色板 {q.ColorCount} 色（无损）";
+                bestColors = q.ColorCount;
+                bestDither = false;
                 o.Log?.Invoke($"  无损取色 {q.ColorCount} 色: {bestBytes.Length} 字节, {bestQuality}");
             }
 
             if (bestBytes == null)
             {
                 int[] ladder = ImageOptimizer.BuildColorLadder(o.MaxColors);
-                var candidates = new (byte[] Bytes, int ColorCount, ImageQuality Quality)?[ladder.Length];
+                // 抖动是独立的搜索维度：同一色数下抖动会打散索引熵，LZW/deflate 命中率下降，
+                // 体积可能差数倍（GIF 实测 92 KB vs 17 KB）。因此两个变体都参与画质判定与体积竞争。
+                int variantCount = o.EnableDithering ? 2 : 1;
+                bool[] variants = variantCount == 2 ? [true, false] : [false];
+                var candidates = new (byte[] Bytes, int ColorCount, ImageQuality Quality, bool Dither)?[ladder.Length, variantCount];
                 var pool = new ConcurrentQueue<byte[]>();
                 long restoredBytes = (long)pixels * 4;
-                int dop = ImageOptimizer.CandidateParallelism(ladder.Length, (long)pixels * 5 + (1L << 20));
+                int dop = ImageOptimizer.CandidateParallelism(ladder.Length * variantCount, (long)pixels * 5 + (1L << 20));
 
-                // 候选按需编码并缓存：同一下标只算一次
-                (byte[] Bytes, int ColorCount, ImageQuality Quality) Get(int index) =>
-                    candidates[index] ??= EvaluateCandidate(ladder[index], rgba, width, height, metadata, filter, level, o, pool, restoredBytes);
+                // 候选按需编码并缓存：同一 (色数, 抖动) 只算一次
+                (byte[] Bytes, int ColorCount, ImageQuality Quality, bool Dither) Get(int index, int variant) =>
+                    candidates[index, variant] ??= EvaluateCandidate(
+                        ladder[index], variants[variant], rgba, width, height, metadata, filter, level, o, pool, restoredBytes);
+
+                bool AcceptAt(int index)
+                {
+                    for (int v = 0; v < variantCount; v++)
+                    {
+                        if (o.Accept(Get(index, v).Quality)) return true;
+                    }
+                    return false;
+                }
 
                 // 二分的第一步永远是最高档，先只算它。它不达标时（照片在 45 dB 感知门槛下
                 // 几乎必然如此）整条阶梯都不会被访问 —— 原先「先并行铺满整条阶梯」在
                 // 143 MP 照片上要白算 7 个候选（8 次编码里只用了 1 个），单次 optimize 因此多花 20 s。
-                var top = Get(ladder.Length - 1);
-                if (o.Accept(top.Quality) && dop >= 2)
+                int topIndex = ladder.Length - 1;
+                for (int v = 0; v < variantCount; v++) Get(topIndex, v);
+                if (AcceptAt(topIndex))
                 {
-                    // 达标才需要继续二分：把其余候选一次波并行铺满，墙钟约等于「最慢一个候选」。
-                    // dop == 1 时留空，由 Get 在二分访问时惰性编码（与串行二分完全同序）。
+                    // 最高档达标：把整条固定网格全部评估一遍，再在所有达标候选里按体积取最小。
+                    // 这里**不再复刻二分访问序列**：二分只是定位手段，既然候选已经/即将被编码，
+                    // 多算出来的达标候选没有理由丢弃（体积与颜色数并不严格单调）。
+                    // 固定网格（整条阶梯 × 抖动变体）保证结果与核数无关、可重复。
+                    // 最高档不达标时仍然只算这一档：更低色数的画质只会更差。
                     for (int k = 0; k < dop; k++) pool.Enqueue(new byte[restoredBytes]);
-                    var rest = new int[ladder.Length - 1];
-                    for (int k = 0; k < rest.Length; k++) rest[k] = k;
-                    EvaluateCandidates(rest, ladder, candidates, rgba, width, height, metadata, filter, level, o, pool, restoredBytes, dop);
+                    var rest = new List<(int Index, int Variant)>(ladder.Length * variantCount);
+                    for (int i = 0; i < ladder.Length; i++)
+                    {
+                        for (int v = 0; v < variantCount; v++)
+                        {
+                            if (candidates[i, v] != null) continue;
+                            rest.Add((i, v));
+                        }
+                    }
+                    if (rest.Count > 0)
+                    {
+                        EvaluateCandidates(rest, ladder, variants, candidates, rgba, width, height, metadata, filter, level, o, pool, restoredBytes, dop);
+                    }
                     pool.Clear();
-                }
 
-                // 仍按二分**实际会访问的序列**来挑结果，产物与串行二分逐个相同。
-                foreach (int i in ImageOptimizer.ReplayLadderVisits(ladder.Length, i => o.Accept(Get(i).Quality)))
-                {
-                    var c = Get(i);
-                    o.Log?.Invoke($"  候选 {c.ColorCount} 色: {c.Bytes.Length} 字节, {c.Quality}");
-                    if (!o.Accept(c.Quality)) continue;
-                    // 体积并不严格随颜色数单调（中位切分的切法不同会有几个百分点的抖动），
-                    // 因此在所有达标候选里按体积取最小，而不是直接取颜色最少的那个。
-                    if (bestBytes != null && c.Bytes.Length >= bestBytes.Length) continue;
-                    bestBytes = c.Bytes;
-                    bestQuality = c.Quality;
-                    bestMethod = $"PNG 调色板 {c.ColorCount} 色" + (o.EnableDithering ? " + 抖动" : "");
+                    for (int i = 0; i < ladder.Length; i++)
+                    {
+                        for (int v = 0; v < variantCount; v++)
+                        {
+                            var c = Get(i, v);
+                            o.Log?.Invoke($"  候选 {c.ColorCount} 色{(c.Dither ? " + 抖动" : "")}: {c.Bytes.Length} 字节, {c.Quality}");
+                            if (!o.Accept(c.Quality)) continue;
+                            // 体积并不严格随颜色数单调（中位切分的切法不同会有几个百分点的抖动），
+                            // 因此在所有达标候选里按体积取最小；平局保留先出现的候选（固定顺序 ⇒ 确定）。
+                            if (bestBytes != null && c.Bytes.Length >= bestBytes.Length) continue;
+                            bestBytes = c.Bytes;
+                            bestQuality = c.Quality;
+                            bestMethod = $"PNG 调色板 {c.ColorCount} 色" + (c.Dither ? " + 抖动" : "");
+                            bestColors = c.ColorCount;
+                            bestDither = c.Dither;
+                        }
+                    }
                 }
             }
             // 量化收益不明显（或压根没达标）时，再试一次无损真彩色重写：
@@ -138,6 +175,104 @@ namespace SharpImageConverter.Compression
                         ? "PNG 无损重写（自适应滤波）"
                         : "PNG 无损重写（Up 滤波）";
                     bestQuality = new ImageQuality(ImageQuality.MaxPsnr, ImageQuality.MaxPsnr, 0);
+                    bestColors = 0;
+                }
+            }
+
+            // 赢家精修：按实际颜色数降到 1/2/4 位，并实测 None / Up / Adaptive 三种行滤波
+            // （PNG 规范不推荐对索引图做滤波，但实测各有胜场），最后再试一次调色板重排。
+            // 只对 ≤8 MP 或 ≤16 色的图做，避免大图多付几百毫秒~几秒的 deflate。
+            if (bestBytes != null && bestColors > 0
+                && ((long)width * height <= 8_000_000 || bestColors <= 16))
+            {
+                var winnerOptions = new QuantizeOptions { MaxColors = bestColors, EnableDithering = bestDither };
+                var winner = new PaletteQuantizer().QuantizeCore(rgba, width, height, winnerOptions);
+                byte minBits = winner.ColorCount <= 2 ? (byte)1 : winner.ColorCount <= 4 ? (byte)2 : winner.ColorCount <= 16 ? (byte)4 : (byte)8;
+                Span<byte> bitChoices = stackalloc byte[minBits < 8 ? 2 : 1];
+                bitChoices[0] = minBits;
+                if (minBits < 8) bitChoices[1] = 8;
+                PngFilterMode[] filters = o.AdaptiveFiltering
+                    ? [PngFilterMode.None, PngFilterMode.Up, PngFilterMode.Adaptive]
+                    : [PngFilterMode.None, PngFilterMode.Up];
+
+                byte bestBits = 8;
+                PngFilterMode bestFilter = filter;
+                byte[]? bestPacked = null;
+                foreach (byte bits in bitChoices)
+                {
+                    foreach (var f in filters)
+                    {
+                        using var ms = new MemoryStream();
+                        PngWriter.WritePalette(ms, width, height, winner.Indices, winner.PaletteRgb, winner.PaletteAlpha,
+                            metadata, f, level, bits);
+                        byte[] packed = ms.ToArray();
+                        if (bestPacked == null || packed.Length < bestPacked.Length)
+                        {
+                            bestPacked = packed;
+                            bestBits = bits;
+                            bestFilter = f;
+                        }
+                    }
+                }
+
+                if (bestPacked != null && bestPacked.Length < bestBytes.Length)
+                {
+                    o.Log?.Invoke($"  赢家精修: {bestBytes.Length} → {bestPacked.Length} 字节（{bestBits}-bit / {bestFilter}）");
+                    bestBytes = bestPacked;
+                    bestMethod += $"（{bestBits}-bit 索引, {bestFilter} 滤波）";
+                }
+
+                // 调色板重排：按使用频率降序排索引，常见色落到低位；对 deflate 通常有一点点收益。
+                if (bestPacked != null)
+                {
+                    var reordered = ReorderPalette(winner);
+                    using var ms = new MemoryStream();
+                    PngWriter.WritePalette(ms, width, height, reordered.Indices, reordered.PaletteRgb, reordered.PaletteAlpha,
+                        metadata, bestFilter, level, bestBits);
+                    byte[] reorderedBytes = ms.ToArray();
+                    if (reorderedBytes.Length < bestBytes.Length)
+                    {
+                        o.Log?.Invoke($"  调色板重排: {bestBytes.Length} → {reorderedBytes.Length} 字节");
+                        bestBytes = reorderedBytes;
+                        bestMethod += "（调色板重排）";
+                    }
+                }
+            }
+
+            // 搜索期的编码用的是 zlib 6（候选之间比体积够用），但赢家值得再压一遍：
+            // zlib 9 的成本约为 6 的 7~10 倍，只对最终产物付一次。大图默认跳过（见选项注释）。
+            if (bestBytes != null
+                && o.PngMaxDeflateOnWinner
+                && (long)width * height <= o.PngMaxDeflatePixelThreshold)
+            {
+                byte[] upgraded = PngWriter.RecompressIdat(bestBytes, CompressionLevel.SmallestSize);
+                if (upgraded.Length < bestBytes.Length)
+                {
+                    o.Log?.Invoke($"  产物重压缩 zlib 9: {bestBytes.Length} → {upgraded.Length} 字节");
+                    bestBytes = upgraded;
+                }
+            }
+
+            // 灰度源：颜色类型 0 比调色板少一个 PLTE，且不经过索引映射；只对不透明图尝试。
+            // 8-bit 灰度的唯一值最多 256 个，所以大多数情况下会先命中精确取色，这里再按体积竞争一次。
+            if (bestBytes != null && IsOpaqueGray(rgba, pixels, out byte[] gray))
+            {
+                using var ms = new MemoryStream();
+                PngWriter.WriteGray(ms, width, height, gray, metadata, PngFilterMode.Up, level);
+                byte[] grayBytes = ms.ToArray();
+                // 与调色板赢家同口径：都在 zlib 9 下比体积，否则灰色渐变会被 zlib 6 的差距误判。
+                if (o.PngMaxDeflateOnWinner && (long)width * height <= o.PngMaxDeflatePixelThreshold)
+                {
+                    byte[] upgraded = PngWriter.RecompressIdat(grayBytes, CompressionLevel.SmallestSize);
+                    if (upgraded.Length < grayBytes.Length) grayBytes = upgraded;
+                }
+                if (grayBytes.Length < bestBytes.Length)
+                {
+                    o.Log?.Invoke($"  灰度重写: {bestBytes.Length} → {grayBytes.Length} 字节");
+                    bestBytes = grayBytes;
+                    bestMethod = "PNG 灰度（无损）";
+                    bestQuality = new ImageQuality(ImageQuality.MaxPsnr, ImageQuality.MaxPsnr, 0);
+                    bestColors = 0;
                 }
             }
 
@@ -149,8 +284,9 @@ namespace SharpImageConverter.Compression
         /// <summary>
         /// 评估一个颜色数候选：量化 → 编码 PNG → 还原像素算画质。
         /// </summary>
-        private static (byte[] Bytes, int ColorCount, ImageQuality Quality) EvaluateCandidate(
+        private static (byte[] Bytes, int ColorCount, ImageQuality Quality, bool Dither) EvaluateCandidate(
             int colors,
+            bool dithering,
             byte[] rgba,
             int width,
             int height,
@@ -163,7 +299,7 @@ namespace SharpImageConverter.Compression
         {
             // 每个候选实例化自己的 PaletteQuantizer——它内部持有可变的装箱与 LUT 状态，不能跨候选共享。
             var quantizer = new PaletteQuantizer();
-            var quantizeOptions = new QuantizeOptions { EnableDithering = o.EnableDithering, MaxColors = colors };
+            var quantizeOptions = new QuantizeOptions { EnableDithering = dithering, MaxColors = colors };
             var q = quantizer.QuantizeCore(rgba, width, height, quantizeOptions);
 
             using var ms = new MemoryStream();
@@ -174,7 +310,7 @@ namespace SharpImageConverter.Compression
             ImageOptimizer.RestoreRgba(q, restored);
             var quality = QualityMetrics.Compare(rgba, restored, width, height, 4);
             pool.Enqueue(restored);
-            return (bytes, q.ColorCount, quality);
+            return (bytes, q.ColorCount, quality, dithering);
         }
 
         /// <summary>
@@ -185,9 +321,10 @@ namespace SharpImageConverter.Compression
         /// 换不了算法），所以候选并行是这条路径上唯一能吃到多核的杠杆。
         /// </remarks>
         private static void EvaluateCandidates(
-            int[] indices,
+            List<(int Index, int Variant)> items,
             int[] ladder,
-            (byte[] Bytes, int ColorCount, ImageQuality Quality)?[] results,
+            bool[] variants,
+            (byte[] Bytes, int ColorCount, ImageQuality Quality, bool Dither)?[,] results,
             byte[] rgba,
             int width,
             int height,
@@ -201,10 +338,11 @@ namespace SharpImageConverter.Compression
         {
             try
             {
-                Parallel.For(0, indices.Length, new ParallelOptions { MaxDegreeOfParallelism = dop }, k =>
+                // OOM 时自动退回串行重跑（见 ForEachCandidate 注释）。
+                ImageOptimizer.ForEachCandidate(items.Count, dop, k =>
                 {
-                    int i = indices[k];
-                    results[i] = EvaluateCandidate(ladder[i], rgba, width, height, metadata, filter, level, o, pool, restoredBytes);
+                    var (i, v) = items[k];
+                    results[i, v] = EvaluateCandidate(ladder[i], variants[v], rgba, width, height, metadata, filter, level, o, pool, restoredBytes);
                 });
             }
             catch (AggregateException ex) when (ex.InnerExceptions.Count == 1)
@@ -262,6 +400,69 @@ namespace SharpImageConverter.Compression
         /// alpha 全 255 时可以直接写 RGB（颜色类型 2），省掉每像素重复 4 次的 alpha 字节。
         /// </summary>
         private static bool IsOpaque(byte[] rgba) => SimdHelper.IsOpaqueRgba(rgba);
+
+        /// <summary>
+        /// 按索引使用频率降序重排调色板，并同步重映射索引。
+        /// </summary>
+        private static QuantizeResult ReorderPalette(QuantizeResult q)
+        {
+            int colors = q.ColorCount;
+            int[] freq = new int[colors];
+            foreach (byte index in q.Indices) freq[index]++;
+
+            int[] order = Enumerable.Range(0, colors)
+                .OrderByDescending(i => freq[i])
+                .ThenBy(i => i)
+                .ToArray();
+
+            bool identity = true;
+            for (int i = 0; i < colors; i++)
+            {
+                if (order[i] != i) { identity = false; break; }
+            }
+            if (identity) return q;
+
+            int[] map = new int[colors];
+            for (int i = 0; i < colors; i++) map[order[i]] = i;
+
+            byte[] indices = new byte[q.Indices.Length];
+            for (int p = 0; p < indices.Length; p++) indices[p] = (byte)map[q.Indices[p]];
+
+            byte[] palette = new byte[colors * 3];
+            byte[]? alpha = q.PaletteAlpha != null ? new byte[colors] : null;
+            for (int i = 0; i < colors; i++)
+            {
+                int src = order[i];
+                palette[i * 3] = q.PaletteRgb[src * 3];
+                palette[i * 3 + 1] = q.PaletteRgb[src * 3 + 1];
+                palette[i * 3 + 2] = q.PaletteRgb[src * 3 + 2];
+                if (alpha != null) alpha[i] = q.PaletteAlpha![src];
+            }
+
+            return new QuantizeResult
+            {
+                Indices = indices,
+                PaletteRgb = palette,
+                PaletteAlpha = alpha,
+                ColorCount = colors,
+            };
+        }
+
+        private static bool IsOpaqueGray(byte[] rgba, int pixels, out byte[] gray)
+        {
+            gray = [];
+            for (int i = 0, p = 0; p < pixels; p++, i += 4)
+            {
+                if (rgba[i + 3] != 255 || rgba[i] != rgba[i + 1] || rgba[i] != rgba[i + 2])
+                {
+                    return false;
+                }
+            }
+            // 先确认是灰度再分配：照片在第一个非灰像素就会退出，不该先付 pixels 字节的分配。
+            gray = new byte[pixels];
+            for (int i = 0, p = 0; p < pixels; p++, i += 4) gray[p] = rgba[i];
+            return true;
+        }
 
         private static byte[] PackRgb(byte[] rgba, int pixels)
         {

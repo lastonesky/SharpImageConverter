@@ -1,4 +1,4 @@
-using SharpImageConverter.Core;
+﻿using SharpImageConverter.Core;
 using System.Buffers;
 
 namespace SharpImageConverter.Formats.Jpeg;
@@ -96,6 +96,50 @@ internal sealed class ComponentState
 
                 int rowOffset = basePy * stride;
                 Span<byte> dest = output.Slice(rowOffset + basePx);
+
+                if (useFloatingPointIdct)
+                {
+                    FloatingPointIDCT.Transform(block, quantTable, dest, stride);
+                }
+                else
+                {
+                    FastIDCT.Transform(block, quantTable, dest, stride);
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// 只对指定块行区间做 IDCT，写入一个高度为 <paramref name="blockRowCount"/>×8 的窄带缓冲。
+    /// </summary>
+    /// <remarks>
+    /// 行级重建用：每次只物化一个 MCU 行对应的空间块，不再分配整幅组件平面。
+    /// 输出宽度仍是完整组件宽度（一行 MCU 的 H 个块），高度只有 V×8。
+    /// </remarks>
+    public void DecodeSpatialBand(
+        Span<byte> output,
+        int width,
+        int stride,
+        int startBlockRow,
+        int blockRowCount,
+        ushort[] quantTable,
+        bool useFloatingPointIdct)
+    {
+        if (_coeffBuffer == null) return;
+
+        for (int localBy = 0; localBy < blockRowCount; localBy++)
+        {
+            int by = startBlockRow + localBy;
+            if (by >= BlocksY) break;
+            int basePy = localBy * 8;
+            for (int bx = 0; bx < BlocksX; bx++)
+            {
+                int basePx = bx * 8;
+                if (basePx >= width) break;
+
+                int blockIdx = by * BlocksX + bx;
+                Span<short> block = GetBlockSpan(blockIdx);
+                Span<byte> dest = output.Slice(basePy * stride + basePx);
 
                 if (useFloatingPointIdct)
                 {

@@ -1,4 +1,4 @@
-using System.Buffers;
+﻿using System.Buffers;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -10,6 +10,25 @@ public static partial class JpegDecoder
     {
         var parser = new Parser(data, useFloatingPointIdct);
         return parser.Decode();
+    }
+
+    /// <summary>
+    /// 解析基线 JPEG 到系数（不重建像素），供无损 Huffman 重排使用。
+    /// 调用方必须在用完后调用 <see cref="JpegFrameState.DisposeResources"/>。
+    /// </summary>
+    internal static JpegFrameState ParseForTranscode(ReadOnlySpan<byte> data, out ScanHeader scan)
+    {
+        var parser = new Parser(data, useFloatingPointIdct: false);
+        return parser.ParseState(out scan);
+    }
+
+    /// <summary>
+    /// 只解析到第一个 SOS：返回帧状态、扫描头和熵数据偏移，供逐 MCU 行解码使用。
+    /// </summary>
+    internal static JpegFrameState ParseHeadersForRows(ReadOnlySpan<byte> data, out ScanHeader scan, out int entropyOffset)
+    {
+        var parser = new Parser(data, useFloatingPointIdct: false);
+        return parser.ParseHeadersForRows(out scan, out entropyOffset);
     }
 
     public static JpegImage Decode(Stream stream, bool useFloatingPointIdct = false)
@@ -115,60 +134,7 @@ public static partial class JpegDecoder
             JpegPerfProbe.Begin();
             try
             {
-                ReadMarkerExpected(JpegMarker.SOI);
-
-                while (offset < data.Length)
-                {
-                    JpegMarker marker = ReadMarker();
-                    if (marker == JpegMarker.EOI)
-                    {
-                        break;
-                    }
-
-                    switch (marker)
-                    {
-                        case JpegMarker.APP0:
-                            state.ParseApp0(ReadSegmentSpan());
-                            break;
-                        case JpegMarker.APP1:
-                            state.ParseApp1(ReadSegmentSpan());
-                            break;
-                        case JpegMarker.APP2:
-                            state.ParseApp2(ReadSegmentSpan());
-                            break;
-                        case JpegMarker.APP14:
-                            state.ParseApp14(ReadSegmentSpan());
-                            break;
-                        case JpegMarker.COM:
-                            SkipSegment();
-                            break;
-                        case JpegMarker.DQT:
-                            state.ParseDqt(ReadSegmentSpan());
-                            break;
-                        case JpegMarker.DHT:
-                            state.ParseDht(ReadSegmentSpan());
-                            break;
-                        case JpegMarker.DRI:
-                            state.ParseDri(ReadSegmentSpan());
-                            break;
-                        case JpegMarker.SOF0:
-                        case JpegMarker.SOF2:
-                            state.ParseSof(marker, ReadSegmentSpan());
-                            break;
-                        case JpegMarker.SOS:
-                            ParseSosAndDecodeScan();
-                            break;
-                        default:
-                            if (marker is >= JpegMarker.RST0 and <= JpegMarker.RST7)
-                            {
-                                ThrowHelper.ThrowInvalidData("Unexpected restart marker outside entropy-coded data.");
-                            }
-
-                            SkipSegment();
-                            break;
-                    }
-                }
-
+                ParseMarkers();
                 state.ValidateScansComplete();
                 return state.ReconstructImage();
             }
@@ -176,6 +142,137 @@ public static partial class JpegDecoder
             {
                 JpegPerfProbe.End(JpegPerfProbe.DecodeTotal);
                 state.DisposeResources();
+            }
+        }
+
+        /// <summary>
+        /// 只解析并熵解码到系数，不重建像素、不释放资源；调用方负责 DisposeResources。
+        /// 供无损 Huffman 重排使用。
+        /// </summary>
+        internal JpegFrameState ParseState(out ScanHeader scan)
+        {
+            ParseMarkers();
+            state.ValidateScansComplete();
+            scan = state.LastScan;
+            return state;
+        }
+
+        internal JpegFrameState ParseHeadersForRows(out ScanHeader scan, out int entropyOffset)
+        {
+            ReadMarkerExpected(JpegMarker.SOI);
+            while (offset < data.Length)
+            {
+                JpegMarker marker = ReadMarker();
+                if (marker == JpegMarker.EOI)
+                {
+                    break;
+                }
+
+                switch (marker)
+                {
+                    case JpegMarker.APP0:
+                        state.ParseApp0(ReadSegmentSpan());
+                        break;
+                    case JpegMarker.APP1:
+                        state.ParseApp1(ReadSegmentSpan());
+                        break;
+                    case JpegMarker.APP2:
+                        state.ParseApp2(ReadSegmentSpan());
+                        break;
+                    case JpegMarker.APP14:
+                        state.ParseApp14(ReadSegmentSpan());
+                        break;
+                    case JpegMarker.COM:
+                        SkipSegment();
+                        break;
+                    case JpegMarker.DQT:
+                        state.ParseDqt(ReadSegmentSpan());
+                        break;
+                    case JpegMarker.DHT:
+                        state.ParseDht(ReadSegmentSpan());
+                        break;
+                    case JpegMarker.DRI:
+                        state.ParseDri(ReadSegmentSpan());
+                        break;
+                    case JpegMarker.SOF0:
+                    case JpegMarker.SOF2:
+                        state.ParseSof(marker, ReadSegmentSpan());
+                        break;
+                    case JpegMarker.SOS:
+                    {
+                        ReadOnlySpan<byte> segment = ReadSegment(out int segmentStart, out int segmentLength);
+                        scan = state.ParseSosHeader(segment);
+                        entropyOffset = segmentStart + segmentLength;
+                        return state;
+                    }
+                    default:
+                        if (marker is >= JpegMarker.RST0 and <= JpegMarker.RST7)
+                        {
+                            ThrowHelper.ThrowInvalidData("Unexpected restart marker outside entropy-coded data.");
+                        }
+                        SkipSegment();
+                        break;
+                }
+            }
+
+            state.DisposeResources();
+            throw new InvalidDataException("JPEG has no SOS segment");
+        }
+
+        private void ParseMarkers()
+        {
+            ReadMarkerExpected(JpegMarker.SOI);
+
+            while (offset < data.Length)
+            {
+                JpegMarker marker = ReadMarker();
+                if (marker == JpegMarker.EOI)
+                {
+                    break;
+                }
+
+                switch (marker)
+                {
+                    case JpegMarker.APP0:
+                        state.ParseApp0(ReadSegmentSpan());
+                        break;
+                    case JpegMarker.APP1:
+                        state.ParseApp1(ReadSegmentSpan());
+                        break;
+                    case JpegMarker.APP2:
+                        state.ParseApp2(ReadSegmentSpan());
+                        break;
+                    case JpegMarker.APP14:
+                        state.ParseApp14(ReadSegmentSpan());
+                        break;
+                    case JpegMarker.COM:
+                        SkipSegment();
+                        break;
+                    case JpegMarker.DQT:
+                        state.ParseDqt(ReadSegmentSpan());
+                        break;
+                    case JpegMarker.DHT:
+                        state.ParseDht(ReadSegmentSpan());
+                        break;
+                    case JpegMarker.DRI:
+                        state.ParseDri(ReadSegmentSpan());
+                        break;
+                    case JpegMarker.SOF0:
+                    case JpegMarker.SOF2:
+                        state.ParseSof(marker, ReadSegmentSpan());
+                        break;
+                    case JpegMarker.SOS:
+                        ParseSosAndDecodeScan();
+                        break;
+                    default:
+                        if (marker is >= JpegMarker.RST0 and <= JpegMarker.RST7)
+                        {
+                            ThrowHelper.ThrowInvalidData("Unexpected restart marker outside entropy-coded data.");
+                        }
+
+                        SkipSegment();
+                        break;
+                }
             }
         }
 

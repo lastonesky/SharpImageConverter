@@ -328,7 +328,7 @@ public class PngDecoder
             throw new InvalidDataException("Unexpected EOF");
     }
 
-    private sealed class IdatStream : Stream
+    internal sealed class IdatStream : Stream
     {
         private static readonly byte[] IdatType = [(byte)'I', (byte)'D', (byte)'A', (byte)'T'];
         private static readonly byte[] IendType = [(byte)'I', (byte)'E', (byte)'N', (byte)'D'];
@@ -878,7 +878,7 @@ public class PngDecoder
     /// 上邻 b、左上邻 c 取自 prev，三者都不是 src。
     /// </para>
     /// </remarks>
-    private static void UnfilterScanline(byte filterType, ReadOnlySpan<byte> src, Span<byte> dst, ReadOnlySpan<byte> prev, int bpp)
+    internal static void UnfilterScanline(byte filterType, ReadOnlySpan<byte> src, Span<byte> dst, ReadOnlySpan<byte> prev, int bpp)
     {
         switch (filterType)
         {

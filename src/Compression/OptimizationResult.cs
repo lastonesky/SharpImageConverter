@@ -64,6 +64,13 @@ namespace SharpImageConverter.Compression
         /// </summary>
         public string? Reason { get; init; }
 
+        /// <summary>
+        /// 跨格式转换时的「更优目标格式」建议（可选）。例如目标是不支持 alpha 的 JPEG、
+        /// 源图却带透明通道，或照片类图像转成 PNG / GIF 时体积明显吃亏。
+        /// 同格式 optimize 时为 null。
+        /// </summary>
+        public string? Suggestion { get; init; }
+
         /// <inheritdoc />
         public override string ToString()
         {
@@ -77,7 +84,8 @@ namespace SharpImageConverter.Compression
             }
             if (Converted)
             {
-                return $"{InputPath} → {OutputPath}: {OriginalSize} → {OptimizedSize} 字节，{Method}，{Quality}";
+                string text = $"{InputPath} → {OutputPath}: {OriginalSize} → {OptimizedSize} 字节，{Method}，{Quality}";
+                return Suggestion == null ? text : text + $"（建议：{Suggestion}）";
             }
             return $"{InputPath}: {OriginalSize} → {OptimizedSize} 字节（省 {SavedRatio:P1}），{Method}，{Quality}";
         }

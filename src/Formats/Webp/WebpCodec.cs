@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Buffers;
 using System.IO;
 using System.Runtime.InteropServices;
@@ -30,6 +30,9 @@ namespace SharpImageConverter.Formats.Webp
         private static partial IntPtr WebPINewDecoder(IntPtr output_buffer);
         [LibraryImport("libwebpdecoder")]
         [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
+        private static partial IntPtr WebPINewRGB(int mode, IntPtr output_buffer, nuint output_buffer_size, int output_stride);
+        [LibraryImport("libwebpdecoder")]
+        [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
         private static partial void WebPIDelete(IntPtr idec);
         [LibraryImport("libwebpdecoder")]
         [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
@@ -40,6 +43,8 @@ namespace SharpImageConverter.Formats.Webp
         [LibraryImport("libwebp")]
         [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
         private static partial nuint WebPEncodeRGBA(ReadOnlySpan<byte> rgba, int width, int height, int stride, float quality_factor, out IntPtr output);
+        [LibraryImport("libwebp", EntryPoint = "WebPEncodeLosslessRGBA")]
+        private static partial nuint WebPEncodeLosslessRGBA(ReadOnlySpan<byte> rgba, int width, int height, int stride, out IntPtr output);
         [LibraryImport("libwebp")]
         [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
         private static partial nuint WebPEncodeRGB(ReadOnlySpan<byte> rgb, int width, int height, int stride, float quality_factor, out IntPtr output);
@@ -86,6 +91,19 @@ namespace SharpImageConverter.Formats.Webp
         [UnmanagedCallConv(CallConvs = [typeof(CallConvCdecl)])]
         private static partial WebPMuxError WebPMuxAssemble(IntPtr mux, ref WebPData assembled_data);
 
+        // ---- 增量解码（流式转换用）----
+        internal static IntPtr CreateIncrementalDecoder() => WebPINewDecoder(IntPtr.Zero);
+        internal static IntPtr CreateIncrementalRgbaDecoder(int width, int height, IntPtr output, int stride)
+            => WebPINewRGB(1 /* MODE_RGBA */, output, (nuint)((long)width * height * 4), stride);
+        internal static void DeleteIncrementalDecoder(IntPtr decoder)
+        {
+            if (decoder != IntPtr.Zero) WebPIDelete(decoder);
+        }
+        internal static VP8StatusCode AppendIncremental(IntPtr decoder, ReadOnlySpan<byte> data)
+            => WebPIAppend(decoder, data, (nuint)data.Length);
+        internal static IntPtr GetIncrementalRgba(IntPtr decoder, out int lastY, out int width, out int height, out int stride)
+            => WebPIDecGetRGB(decoder, out lastY, out width, out height, out stride);
+
         private static readonly int[] MuxAbiVersionsToTry = [0x0109, 0x0108, 0x0107, 0x0106, 0x0105, 0x0104, 0x0103, 0x0102, 0x0101, 0x0100];
         private static readonly int[] EncoderAbiVersionsToTry = [0x020F, 0x020E, 0x020D, 0x020C, 0x020B, 0x020A, 0x0209, 0x0208, 0x0207, 0x0206, 0x0205, 0x0204, 0x0203, 0x0202, 0x0201, 0x0200];
         private static readonly WebPWriterFunction WriterCallback = WriteToManagedStream;
@@ -102,7 +120,7 @@ namespace SharpImageConverter.Formats.Webp
             throw new InvalidOperationException("WebPNewInternal 创建失败（ABI 版本不匹配或库不兼容）");
         }
 
-        private static void InitConfig(ref WebPConfig config, float quality, int method = 3)
+        private static void InitConfig(ref WebPConfig config, float quality, int method = 3, bool lossless = false, bool exact = true, WebpEncoderOptions? tuning = null)
         {
             for (int i = 0; i < EncoderAbiVersionsToTry.Length; i++)
             {
@@ -110,6 +128,18 @@ namespace SharpImageConverter.Formats.Webp
                 {
                     config.quality = quality;
                     config.method = method;
+                    config.lossless = lossless ? 1 : 0;
+                    if (lossless) config.near_lossless = 0;
+                    config.exact = exact ? 1 : 0;
+                    // -1 表示保留 libwebp 预设的默认值；只有调用方显式调参时才覆盖。
+                    if (tuning is { } t)
+                    {
+                        if (t.AlphaQuality >= 0) config.alpha_quality = t.AlphaQuality;
+                        if (t.FilterStrength >= 0) config.filter_strength = t.FilterStrength;
+                        if (t.SnsStrength >= 0) config.sns_strength = t.SnsStrength;
+                        if (t.Segments >= 0) config.segments = t.Segments;
+                        if (t.Preprocessing >= 0) config.preprocessing = t.Preprocessing;
+                    }
                     if (WebPValidateConfig(ref config) == 0) throw new InvalidOperationException("WebP 编码参数无效");
                     return;
                 }
@@ -126,14 +156,14 @@ namespace SharpImageConverter.Formats.Webp
             throw new InvalidOperationException("WebPPictureInitInternal 创建失败（ABI 版本不匹配或库不兼容）");
         }
 
-        private static byte[] EncodeWithConfig(ReadOnlySpan<byte> pixels, int width, int height, int stride, bool hasAlpha, float quality, int method = 3)
+        private static byte[] EncodeWithConfig(ReadOnlySpan<byte> pixels, int width, int height, int stride, bool hasAlpha, float quality, int method = 3, bool lossless = false, bool exact = true, WebpEncoderOptions? tuning = null)
         {
             using var ms = new MemoryStream();
-            EncodeWithConfigToStream(ms, pixels, width, height, stride, hasAlpha, quality, method);
+            EncodeWithConfigToStream(ms, pixels, width, height, stride, hasAlpha, quality, method, lossless, exact, tuning);
             return ms.ToArray();
         }
 
-        private static void EncodeWithConfigToStream(Stream stream, ReadOnlySpan<byte> pixels, int width, int height, int stride, bool hasAlpha, float quality, int method = 3)
+        private static void EncodeWithConfigToStream(Stream stream, ReadOnlySpan<byte> pixels, int width, int height, int stride, bool hasAlpha, float quality, int method = 3, bool lossless = false, bool exact = true, WebpEncoderOptions? tuning = null)
         {
             WebPConfig config = default;
             WebPPicture picture = default;
@@ -141,7 +171,7 @@ namespace SharpImageConverter.Formats.Webp
             WebPWriterState? state = null;
             try
             {
-                InitConfig(ref config, quality, method);
+                InitConfig(ref config, quality, method, lossless, exact, tuning);
                 InitPicture(ref picture);
                 picture.width = width;
                 picture.height = height;
@@ -332,6 +362,25 @@ namespace SharpImageConverter.Formats.Webp
             }
         }
 
+        private static byte[] EncodeLosslessRgbaDirect(ReadOnlySpan<byte> rgba, int width, int height)
+        {
+            nuint size = WebPEncodeLosslessRGBA(rgba, width, height, width * 4, out IntPtr output);
+            if (size == 0 || output == IntPtr.Zero)
+            {
+                throw new InvalidOperationException("WebP 无损编码失败");
+            }
+            try
+            {
+                var result = new byte[(int)size];
+                Marshal.Copy(output, result, 0, result.Length);
+                return result;
+            }
+            finally
+            {
+                WebPFree(output);
+            }
+        }
+
         public static byte[] EncodeRgba(byte[] rgba, int width, int height, WebpEncoderOptions options)
         {
             try
@@ -339,7 +388,11 @@ namespace SharpImageConverter.Formats.Webp
                 byte[]? result = null;
                 ExecuteWithConcurrency(options.ConcurrencyStrategy, () =>
                 {
-                    result = EncodeWithConfig(rgba, width, height, width * 4, true, options.Quality, options.Method);
+                    // libwebp 的 config 路径在 lossless=1 时实测仍会做近无损预处理（像素差 1~5）。
+                    // 直接调用 WebPEncodeLosslessRGBA 走官方无损入口，像素严格可逆。
+                    result = options.Lossless
+                        ? EncodeLosslessRgbaDirect(rgba, width, height)
+                        : EncodeWithConfig(rgba, width, height, width * 4, true, options.Quality, options.Method, false, false, options);
                 });
                 return result!;
             }
@@ -360,7 +413,7 @@ namespace SharpImageConverter.Formats.Webp
                 byte[]? result = null;
                 ExecuteWithConcurrency(options.ConcurrencyStrategy, () =>
                 {
-                    result = EncodeWithConfig(rgb, width, height, width * 3, false, options.Quality, options.Method);
+                    result = EncodeWithConfig(rgb, width, height, width * 3, false, options.Quality, options.Method, options.Lossless, false, options);
                 });
                 return result!;
             }
@@ -422,15 +475,21 @@ namespace SharpImageConverter.Formats.Webp
             if (rgba.Length != checked(width * height * 4)) throw new ArgumentException("RGBA 像素长度不匹配", nameof(rgba));
             try
             {
+                if (options.Lossless)
+                {
+                    byte[] bytes = EncodeLosslessRgbaDirect(rgba, width, height);
+                    stream.Write(bytes, 0, bytes.Length);
+                    return;
+                }
                 if (options.ConcurrencyStrategy == WebpConcurrencyStrategy.Parallel)
                 {
-                    EncodeWithConfigToStream(stream, rgba, width, height, width * 4, true, options.Quality, options.Method);
+                    EncodeWithConfigToStream(stream, rgba, width, height, width * 4, true, options.Quality, options.Method, false, false, options);
                 }
                 else
                 {
                     lock (EncodeLock)
                     {
-                        EncodeWithConfigToStream(stream, rgba, width, height, width * 4, true, options.Quality, options.Method);
+                        EncodeWithConfigToStream(stream, rgba, width, height, width * 4, true, options.Quality, options.Method, false, false, options);
                     }
                 }
             }
@@ -452,13 +511,13 @@ namespace SharpImageConverter.Formats.Webp
             {
                 if (options.ConcurrencyStrategy == WebpConcurrencyStrategy.Parallel)
                 {
-                    EncodeWithConfigToStream(stream, rgb, width, height, width * 3, false, options.Quality, options.Method);
+                    EncodeWithConfigToStream(stream, rgb, width, height, width * 3, false, options.Quality, options.Method, options.Lossless, false, options);
                 }
                 else
                 {
                     lock (EncodeLock)
                     {
-                        EncodeWithConfigToStream(stream, rgb, width, height, width * 3, false, options.Quality, options.Method);
+                        EncodeWithConfigToStream(stream, rgb, width, height, width * 3, false, options.Quality, options.Method, options.Lossless, false, options);
                     }
                 }
             }

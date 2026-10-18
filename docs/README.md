@@ -9,6 +9,8 @@
 | [AuditVerification.md](AuditVerification.md) | 对外部「内存管理 / SIMD 利用率 / SIMD 有效率 / 死代码」审计报告的逐条取证复核，含修复项与实测数据 | 持续更新 |
 | [goal.md](goal.md) | 与同类成熟库对比后的差距清单（编码覆盖、并发验证、流式与内存策略、测试语料、发布稳定性、许可合规） | 长期跟踪 |
 | [Optimize.md](Optimize.md) | 智能有损压缩（TinyPNG 式）的设计说明：感知画质度量与阈值标定、PNG/JPEG/GIF 各格式策略、量化器实现取舍、API 与 CLI 用法 | 已实现 |
+| [OptimizeAudit.md](OptimizeAudit.md) | `--optimize` 方向性审计：画质判据、WebP 通道口径、GIF 动画、PNG 产出阶段等问题的取证与结论 | 审计完成，待改进 |
+| [OptimizePlan.md](OptimizePlan.md) | 依据审计结论制定的逐条改进计划（P0~P3），含验收标准与执行记录 | 执行中 |
 | [VnniResizeFindings.md](VnniResizeFindings.md) | AVX-VNNI 在 Resize 上落地的实验、实测（质量/速度）与「为何更慢、何种方式可能更快」的结论；代码已撤销 | 【实验完成，代码已撤销】 |
 | [Release.md](Release.md) | **发布流程约定**：版本号/tag/Release 资产/NuGet 自动发布（trusted publishing）的口径、执行清单与踩坑记录 | 已固化 |
 | [reference/](reference/) | 规范原文等参考资料（如 JPEG File Interchange Format 规范） | 只读存档 |

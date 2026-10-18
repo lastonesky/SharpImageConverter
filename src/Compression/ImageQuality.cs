@@ -1,6 +1,7 @@
-using System;
+﻿using System;
 using System.Runtime.InteropServices;
 using System.Threading.Tasks;
+using SharpImageConverter.Core;
 
 namespace SharpImageConverter.Compression
 {
@@ -21,11 +22,15 @@ namespace SharpImageConverter.Compression
         /// <param name="psnr">逐像素 PSNR（dB）</param>
         /// <param name="perceptualPsnr">块状平均后的 PSNR（dB）</param>
         /// <param name="meanError">平均绝对误差（0-255）</param>
-        public ImageQuality(double psnr, double perceptualPsnr, double meanError)
+        /// <param name="ssim">Y 通道 SSIM 均值（0-1）；1 表示未计算/完全一致</param>
+        /// <param name="worstSsim">最差 1% 块的 SSIM（0-1）</param>
+        public ImageQuality(double psnr, double perceptualPsnr, double meanError, double ssim = 1, double worstSsim = 1)
         {
             Psnr = psnr;
             PerceptualPsnr = perceptualPsnr;
             MeanError = meanError;
+            Ssim = ssim;
+            WorstSsim = worstSsim;
         }
 
         /// <summary>
@@ -44,6 +49,17 @@ namespace SharpImageConverter.Compression
         public double MeanError { get; }
 
         /// <summary>
+        /// Y 通道 SSIM 均值（0-1）。比块平均 PSNR 更接近结构相似度；
+        /// 1 表示未计算（或完全一致）。
+        /// </summary>
+        public double Ssim { get; }
+
+        /// <summary>
+        /// 最差 1% 块的 SSIM（0-1）。用于抓局部糊掉/块效应，而不是只看全图平均。
+        /// </summary>
+        public double WorstSsim { get; }
+
+        /// <summary>
         /// 是否与原始像素完全一致。
         /// </summary>
         public bool IsLossless => Psnr >= MaxPsnr;
@@ -58,12 +74,17 @@ namespace SharpImageConverter.Compression
         /// </summary>
         /// <param name="minPerceptualPsnr">感知 PSNR 下限（dB）</param>
         /// <param name="minRawPsnr">逐像素 PSNR 下限（dB），0 表示不限制</param>
-        public bool Meets(double minPerceptualPsnr, double minRawPsnr = 0)
-            => PerceptualPsnr >= minPerceptualPsnr && Psnr >= minRawPsnr;
+        /// <param name="minSsim">Y-SSIM 均值下限，0 表示不限制</param>
+        /// <param name="minWorstSsim">最差 1% 块 SSIM 下限，0 表示不限制</param>
+        public bool Meets(double minPerceptualPsnr, double minRawPsnr = 0, double minSsim = 0, double minWorstSsim = 0)
+            => PerceptualPsnr >= minPerceptualPsnr
+               && Psnr >= minRawPsnr
+               && Ssim >= minSsim
+               && WorstSsim >= minWorstSsim;
 
         /// <inheritdoc />
         public override string ToString()
-            => $"PSNR {Psnr:0.00}dB / 感知 {PerceptualPsnr:0.00}dB / 平均误差 {MeanError:0.00}";
+            => $"PSNR {Psnr:0.00}dB / 感知 {PerceptualPsnr:0.00}dB / SSIM {Ssim:0.000} / 最差1% {WorstSsim:0.000} / 平均误差 {MeanError:0.00}";
     }
 
     /// <summary>
@@ -71,6 +92,22 @@ namespace SharpImageConverter.Compression
     /// </summary>
     public static class QualityMetrics
     {
+        /// <summary>
+        /// 可选的外部画质度量后端（SSIMULACRA2 / Butteraugli 等）。设置后
+        /// <see cref="Compare(ReadOnlySpan{byte}, ReadOnlySpan{byte}, int, int, int, int)"/>
+        /// 会完全交给它，内置 PSNR/SSIM 不再计算。
+        /// </summary>
+        /// <remarks>
+        /// 这是进程级钩子，应在启动时设置一次；不要在并发调用中途切换。
+        /// 返回的 <see cref="ImageQuality"/> 直接用于 <see cref="OptimizeOptions.Accept"/>。
+        /// </remarks>
+        public delegate ImageQuality QualityMetricDelegate(
+            ReadOnlySpan<byte> reference, ReadOnlySpan<byte> test,
+            int width, int height, int bytesPerPixel);
+
+        /// <summary>外部度量后端；null 表示使用内置 PSNR + Y-SSIM。</summary>
+        public static QualityMetricDelegate? ExternalMetric { get; set; }
+
         /// <summary>
         /// 感知度量默认使用的块边长。
         /// </summary>
@@ -102,7 +139,14 @@ namespace SharpImageConverter.Compression
             int height,
             int bytesPerPixel,
             int blockSize = DefaultBlockSize)
-            => CompareCore(reference, test, width, height, bytesPerPixel, blockSize, null, null, true);
+        {
+            if (ExternalMetric is { } external)
+            {
+                return external(reference, test, width, height, bytesPerPixel);
+            }
+            return AddSsim(CompareCore(reference, test, width, height, bytesPerPixel, blockSize, null, null, true),
+                reference, test, width, height, bytesPerPixel);
+        }
 
         /// <summary>
         /// 数组重载：允许按带分片并行。
@@ -118,7 +162,14 @@ namespace SharpImageConverter.Compression
             int height,
             int bytesPerPixel,
             int blockSize = DefaultBlockSize)
-            => CompareCore(reference, test, width, height, bytesPerPixel, blockSize, reference, test, true);
+        {
+            if (ExternalMetric is { } external)
+            {
+                return external(reference, test, width, height, bytesPerPixel);
+            }
+            return AddSsim(CompareCore(reference, test, width, height, bytesPerPixel, blockSize, reference, test, true),
+                reference, test, width, height, bytesPerPixel);
+        }
 
         /// <summary>
         /// 数组重载（可关闭内层并行）。
@@ -136,7 +187,117 @@ namespace SharpImageConverter.Compression
             int bytesPerPixel,
             bool allowInnerParallel,
             int blockSize = DefaultBlockSize)
-            => CompareCore(reference, test, width, height, bytesPerPixel, blockSize, reference, test, allowInnerParallel);
+        {
+            if (ExternalMetric is { } external)
+            {
+                return external(reference, test, width, height, bytesPerPixel);
+            }
+            return AddSsim(CompareCore(reference, test, width, height, bytesPerPixel, blockSize, reference, test, allowInnerParallel),
+                reference, test, width, height, bytesPerPixel);
+        }
+
+        private static ImageQuality AddSsim(
+            ImageQuality q, ReadOnlySpan<byte> reference, ReadOnlySpan<byte> test,
+            int width, int height, int bytesPerPixel)
+        {
+            var (ssim, worst) = CompareSsim(reference, test, width, height, bytesPerPixel);
+            return new ImageQuality(q.Psnr, q.PerceptualPsnr, q.MeanError, ssim, worst);
+        }
+
+        /// <summary>
+        /// Y 通道 SSIM（均值 + 最差 1% 块）。块边长随像素数放大：大图按更接近观看尺寸的尺度评估。
+        /// </summary>
+        private static (double Ssim, double WorstSsim) CompareSsim(
+            ReadOnlySpan<byte> reference, ReadOnlySpan<byte> test,
+            int width, int height, int bytesPerPixel)
+        {
+            int expected = checked(width * height * bytesPerPixel);
+            if (reference.Length < expected || test.Length < expected) return (1, 1);
+            reference = reference.Slice(0, expected);
+            test = test.Slice(0, expected);
+
+            // 透明像素的 RGB 在显示上没有意义，V2 只对不透明图启用；带 alpha 时沿用旧口径。
+            if (bytesPerPixel == 4 && !SimdHelper.IsOpaqueRgba(reference)) return (1, 1);
+
+            int blockSize = ScaledBlockSize(width, height);
+            int rowBytes = width * bytesPerPixel;
+            int blockX = (width + blockSize - 1) / blockSize;
+            int blockY = (height + blockSize - 1) / blockSize;
+            var hist = new int[256];
+            double ssimSum = 0;
+            long pixelSum = 0;
+            long blockCount = 0;
+            const double C1 = 6.5025;    // (0.01*255)^2
+            const double C2 = 58.5225;   // (0.03*255)^2
+
+            for (int by = 0; by < blockY; by++)
+            {
+                int y0 = by * blockSize;
+                int y1 = Math.Min(y0 + blockSize, height);
+                for (int bx = 0; bx < blockX; bx++)
+                {
+                    int x0 = bx * blockSize;
+                    int x1 = Math.Min(x0 + blockSize, width);
+                    double sr = 0, st = 0, srr = 0, stt = 0, srt = 0;
+                    int n = 0;
+                    for (int y = y0; y < y1; y++)
+                    {
+                        int row = y * rowBytes;
+                        for (int x = x0; x < x1; x++)
+                        {
+                            int i = row + x * bytesPerPixel;
+                            double yr = (77 * reference[i] + 150 * reference[i + 1] + 29 * reference[i + 2]) / 256.0;
+                            double yt = (77 * test[i] + 150 * test[i + 1] + 29 * test[i + 2]) / 256.0;
+                            sr += yr; st += yt;
+                            srr += yr * yr; stt += yt * yt; srt += yr * yt;
+                            n++;
+                        }
+                    }
+                    if (n == 0) continue;
+                    double inv = 1.0 / n;
+                    double mr = sr * inv, mt = st * inv;
+                    double vr = Math.Max(0, srr * inv - mr * mr);
+                    double vt = Math.Max(0, stt * inv - mt * mt);
+                    double cov = srt * inv - mr * mt;
+                    double num = (2 * mr * mt + C1) * (2 * cov + C2);
+                    double den = (mr * mr + mt * mt + C1) * (vr + vt + C2);
+                    double ssim = den > 0 ? num / den : 1;
+                    if (ssim < 0) ssim = 0;
+                    else if (ssim > 1) ssim = 1;
+                    ssimSum += ssim * n;
+                    pixelSum += n;
+                    blockCount++;
+                    hist[(int)(ssim * 255.999)]++;
+                }
+            }
+
+            double mean = pixelSum > 0 ? ssimSum / pixelSum : 1;
+            double worst = 1;
+            if (blockCount > 0)
+            {
+                long target = Math.Max(1, (long)Math.Ceiling(blockCount * 0.01));
+                long seen = 0;
+                for (int i = 0; i < hist.Length; i++)
+                {
+                    seen += hist[i];
+                    if (seen >= target)
+                    {
+                        worst = i / 255.0;
+                        break;
+                    }
+                }
+            }
+            return (mean, worst);
+        }
+
+        /// <summary>
+        /// 尺寸感知的块边长：1 MP 用 4、12 MP 用 ~6、143 MP 用 16（夹在 4~16）。
+        /// </summary>
+        private static int ScaledBlockSize(int width, int height)
+        {
+            double side = Math.Sqrt((double)width * height) / 500.0;
+            return Math.Clamp((int)Math.Round(side), 4, 16);
+        }
 
         private static ImageQuality CompareCore(
             ReadOnlySpan<byte> reference,
@@ -197,10 +358,24 @@ namespace SharpImageConverter.Compression
                             {
                                 int i = rowStart + x * channels;
                                 n++;
+                                int alphaRef = channels == 4 ? refSpan[i + 3] : 255;
+                                int alphaTest = channels == 4 ? testSpan[i + 3] : 255;
                                 for (int c = 0; c < channels; c++)
                                 {
-                                    int rv = refSpan[i + c];
-                                    int tv = testSpan[i + c];
+                                    int rv;
+                                    int tv;
+                                    if (c < 3)
+                                    {
+                                        // 预乘 alpha：完全透明像素的 RGB 归零，半透明按 alpha 缩放；
+                                        // 透明区的不可见调色板颜色不再误伤画质。
+                                        rv = (refSpan[i + c] * alphaRef + 127) / 255;
+                                        tv = (testSpan[i + c] * alphaTest + 127) / 255;
+                                    }
+                                    else
+                                    {
+                                        rv = alphaRef;
+                                        tv = alphaTest;
+                                    }
                                     refSum[c] += rv;
                                     testSum[c] += tv;
                                     int d = rv - tv;

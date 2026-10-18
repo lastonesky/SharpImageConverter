@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
@@ -384,7 +384,8 @@ public class GifEncoder
         IReadOnlyList<int>? frameDurationsMs,
         int loopCount,
         Stream stream,
-        int transparentIndex = -1)
+        int transparentIndex = -1,
+        int disposalMode = -1)
     {
         ArgumentNullException.ThrowIfNull(paletteRgb);
         ArgumentNullException.ThrowIfNull(indexFrames);
@@ -426,8 +427,11 @@ public class GifEncoder
             {
                 delayCs = Math.Clamp((frameDurationsMs[i] + 5) / 10, 0, 65535);
             }
-            // 有透明色时用 disposal=2（恢复背景），与既有 rgba 动画路径保持一致
-            int disposal = transparentIndex >= 0 && animated ? 2 : 0;
+            // 默认：有透明色时 disposal=2（恢复背景），与既有 rgba 动画路径一致。
+            // 帧间差分需要 disposal=1（保留上一帧），由调用方显式传入。
+            int disposal = disposalMode >= 0
+                ? disposalMode
+                : (transparentIndex >= 0 && animated ? 2 : 0);
             WriteFrameHeader(stream, width, height, transparentIndex, delayCs, disposal);
 
             long tl0 = Now(timing);
@@ -445,6 +449,93 @@ public class GifEncoder
             timing.Label = animated ? "indexed(animation)" : "indexed";
         }
         FinishTiming(timing);
+    }
+
+    /// <summary>
+    /// 高级索引帧编码：支持每帧局部调色板、帧矩形（crop）与各自位深；globalPalette 为 null 时不写全局表。
+    /// </summary>
+    internal void EncodeIndexedFrames(
+        int canvasWidth,
+        int canvasHeight,
+        byte[]? globalPalette,
+        IReadOnlyList<byte[]> frames,
+        IReadOnlyList<(int X, int Y, int W, int H)> rects,
+        IReadOnlyList<byte[]?>? localPalettes,
+        IReadOnlyList<int>? frameDurationsMs,
+        int loopCount,
+        int transparentIndex,
+        int disposalMode,
+        Stream stream)
+    {
+        if (frames.Count == 0) return;
+        if (frames.Count != rects.Count) throw new ArgumentException("帧与矩形数量不一致");
+        if (localPalettes != null && localPalettes.Count != frames.Count) throw new ArgumentException("局部调色板数量不一致");
+
+        int globalDepth = 0;
+        byte[]? globalPadded = null;
+        if (globalPalette != null)
+        {
+            int colors = globalPalette.Length / 3;
+            globalDepth = GetColorDepth(colors);
+            int tableSize = 1 << (globalDepth + 1);
+            globalPadded = globalPalette.Length == tableSize * 3 ? globalPalette : PadPalette(globalPalette, tableSize);
+        }
+
+        int ptr = 0;
+        WriteAscii(_headerBuf, ref ptr, "GIF89a");
+        WriteShort(_headerBuf, ref ptr, canvasWidth);
+        WriteShort(_headerBuf, ref ptr, canvasHeight);
+        _headerBuf[ptr++] = globalPadded != null
+            ? (byte)(0x80 | (0x07 << 4) | globalDepth)
+            : (byte)0;
+        _headerBuf[ptr++] = 0;
+        _headerBuf[ptr++] = 0;
+        stream.Write(_headerBuf, 0, ptr);
+        if (globalPadded != null) stream.Write(globalPadded);
+
+        bool animated = frames.Count > 1;
+        if (animated) WriteNetscapeExtension(stream, loopCount);
+
+        using var lzw = new LzwEncoder(stream);
+        for (int i = 0; i < frames.Count; i++)
+        {
+            var rect = rects[i];
+            byte[]? local = localPalettes?[i];
+            byte[] palette = local ?? globalPalette ?? throw new ArgumentException("帧没有可用调色板");
+            int depth = GetColorDepth(palette.Length / 3);
+            int tableSize = 1 << (depth + 1);
+            byte[] padded = palette.Length == tableSize * 3 ? palette : PadPalette(palette, tableSize);
+            int delayCs = animated && frameDurationsMs != null && i < frameDurationsMs.Count
+                ? Math.Clamp((frameDurationsMs[i] + 5) / 10, 0, 65535)
+                : 0;
+
+            int hptr = 0;
+            if (transparentIndex >= 0 || delayCs > 0 || disposalMode != 0)
+            {
+                _headerBuf[hptr++] = 0x21;
+                _headerBuf[hptr++] = 0xF9;
+                _headerBuf[hptr++] = 4;
+                _headerBuf[hptr++] = (byte)(((disposalMode & 0x07) << 2) | (transparentIndex >= 0 ? 1 : 0));
+                WriteShort(_headerBuf, ref hptr, delayCs);
+                _headerBuf[hptr++] = (byte)(transparentIndex >= 0 ? transparentIndex : 0);
+                _headerBuf[hptr++] = 0;
+            }
+
+            _headerBuf[hptr++] = 0x2C;
+            WriteShort(_headerBuf, ref hptr, rect.X);
+            WriteShort(_headerBuf, ref hptr, rect.Y);
+            WriteShort(_headerBuf, ref hptr, rect.W);
+            WriteShort(_headerBuf, ref hptr, rect.H);
+            _headerBuf[hptr++] = local != null ? (byte)(0x80 | depth) : (byte)0;
+            stream.Write(_headerBuf, 0, hptr);
+            if (local != null) stream.Write(padded);
+
+            int expected = checked(rect.W * rect.H);
+            if (frames[i].Length < expected) throw new ArgumentException("帧索引缓冲区长度不足");
+            lzw.Encode(frames[i], rect.W, rect.H, Math.Max(2, depth + 1));
+        }
+
+        stream.WriteByte(0x3B);
     }
 
     private void WriteFrameHeader(Stream stream, int width, int height, int transparentIndex, int delayCs, int disposal)

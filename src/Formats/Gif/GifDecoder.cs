@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Buffers;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -16,11 +16,18 @@ namespace SharpImageConverter.Formats.Gif
         IReadOnlyList<Image<Rgb24>> frames,
         IReadOnlyList<int> frameDurationsMs,
         int loopCount,
-        bool compositeFullyOpaque = false)
+        bool compositeFullyOpaque = false,
+        IReadOnlyList<Image<Rgba32>>? rgbaFrames = null)
     {
         public IReadOnlyList<Image<Rgb24>> Frames { get; } = frames;
         public IReadOnlyList<int> FrameDurationsMs { get; } = frameDurationsMs;
         public int LoopCount { get; } = loopCount;
+
+        /// <summary>
+        /// 可选的逐帧 RGBA 解码结果（保留透明通道）。仅
+        /// <see cref="GifDecoder.DecodeAnimationRgba32(string)"/> 会填充。
+        /// </summary>
+        public IReadOnlyList<Image<Rgba32>>? RgbaFrames { get; } = rgbaFrames;
 
         /// <summary>
         /// 首帧合成结果是否**必然**全不透明（即每个像素的 alpha 都是 255）。
@@ -45,7 +52,7 @@ namespace SharpImageConverter.Formats.Gif
         private static readonly int[] InterlaceStart = { 0, 4, 2, 1 };
         private static readonly int[] InterlaceInc = { 8, 8, 4, 2 };
 
-        private enum DecodeMode { Rgb24, Rgba32, Animation }
+        private enum DecodeMode { Rgb24, Rgba32, Animation, AnimationRgba }
 
         /// <summary>
         /// 是否采集解码各阶段耗时并输出诊断日志，默认关闭。
@@ -79,6 +86,23 @@ namespace SharpImageConverter.Formats.Gif
             var context = new DecodeContext(stream, DecodeMode.Animation);
             ExecuteDecode(context);
             return new GifAnimation(context.RgbFrames!, context.Durations!, context.LoopCount, context.FirstFrameFullyOpaque);
+        }
+
+        /// <summary>
+        /// 解码全部帧为 RGBA（保留透明通道），同时提供 RGB 帧以兼容既有调用方。
+        /// </summary>
+        public GifAnimation DecodeAnimationRgba32(string path)
+        {
+            using var fs = File.OpenRead(path);
+            return DecodeAnimationRgba32(fs);
+        }
+
+        public GifAnimation DecodeAnimationRgba32(Stream stream)
+        {
+            var context = new DecodeContext(stream, DecodeMode.AnimationRgba);
+            ExecuteDecode(context);
+            return new GifAnimation(context.RgbFrames!, context.Durations!, context.LoopCount,
+                context.FirstFrameFullyOpaque, context.RgbaFrames);
         }
 
         public Image<Rgb24> DecodeRgb24(string path)
@@ -116,6 +140,7 @@ namespace SharpImageConverter.Formats.Gif
             public Stream Stream = stream;
             public DecodeMode Mode = mode;
             public List<Image<Rgb24>>? RgbFrames;
+            public List<Image<Rgba32>>? RgbaFrames;
             public List<int>? Durations;
             public Image<Rgba32>? RgbaFrame;
             public int LoopCount = 1;
@@ -180,7 +205,8 @@ namespace SharpImageConverter.Formats.Gif
             if (hasGct) ReadExact(stream, gct, 0, gctColors * 3);
 
             int pixelCount = width * height;
-            int components = ctx.Mode == DecodeMode.Rgba32 ? 4 : 3;
+            bool rgbaMode = ctx.Mode is DecodeMode.Rgba32 or DecodeMode.AnimationRgba;
+            int components = rgbaMode ? 4 : 3;
             byte[] canvas = new byte[pixelCount * components];
 
             if (timing is not null)
@@ -201,6 +227,10 @@ namespace SharpImageConverter.Formats.Gif
             {
                 ctx.RgbFrames = new List<Image<Rgb24>>();
                 ctx.Durations = new List<int>();
+            }
+            if (ctx.Mode == DecodeMode.AnimationRgba)
+            {
+                ctx.RgbaFrames = new List<Image<Rgba32>>();
             }
 
             int transIndex = -1;
@@ -301,7 +331,8 @@ namespace SharpImageConverter.Formats.Gif
                     }
                     long tb2 = Now(timing);
 
-                    RenderFrame(canvas, indices, width, height, ix, iy, iw, ih, interlace, transIndex, palette, palCount, ctx.Mode == DecodeMode.Rgba32, opaqueFullCover);
+                    RenderFrame(canvas, indices, width, height, ix, iy, iw, ih, interlace, transIndex, palette, palCount, rgbaMode, opaqueFullCover,
+                        compositeTransparent: ctx.Mode == DecodeMode.AnimationRgba);
                     long tr1 = Now(timing);
                     pool.Return(indices);
 
@@ -325,14 +356,24 @@ namespace SharpImageConverter.Formats.Gif
                         return;
                     }
 
-                    ctx.RgbFrames!.Add(new Image<Rgb24>(width, height, (byte[])canvas.Clone()));
+                    if (ctx.Mode == DecodeMode.AnimationRgba)
+                    {
+                        ctx.RgbaFrames!.Add(new Image<Rgba32>(width, height, (byte[])canvas.Clone()));
+                        var rgb = new byte[width * height * 3];
+                        SimdHelper.PackRgbaToRgb(canvas, rgb);
+                        ctx.RgbFrames!.Add(new Image<Rgb24>(width, height, rgb));
+                    }
+                    else
+                    {
+                        ctx.RgbFrames!.Add(new Image<Rgb24>(width, height, (byte[])canvas.Clone()));
+                    }
                     ctx.Durations!.Add(delayCs * 10 < 10 ? 10 : delayCs * 10);
 
                     // Post-processing disposal
                     long td0 = Now(timing);
                     if (disposal == 2) // Restore to background
                     {
-                        FillRect(canvas, width, height, ix, iy, iw, ih, ctx.Mode == DecodeMode.Rgba32, hasGct ? gct[bgIndex*3] : (byte)0, hasGct ? gct[bgIndex*3+1] : (byte)0, hasGct ? gct[bgIndex*3+2] : (byte)0);
+                        FillRect(canvas, width, height, ix, iy, iw, ih, rgbaMode, hasGct ? gct[bgIndex*3] : (byte)0, hasGct ? gct[bgIndex*3+1] : (byte)0, hasGct ? gct[bgIndex*3+2] : (byte)0);
                     }
                     else if (disposal == 3 && backBuffer != null) // Restore to previous
                     {
@@ -353,10 +394,24 @@ namespace SharpImageConverter.Formats.Gif
             long tf1 = Now(timing);
             if (timing is not null) timing.BackgroundTicks += tf1 - tf0;
 
-            if (ctx.RgbFrames?.Count == 0) ctx.RgbFrames.Add(new Image<Rgb24>(width, height, canvas));
+            if (ctx.RgbFrames?.Count == 0)
+            {
+                ctx.RgbFrames.Add(new Image<Rgb24>(width, height, rgbaMode ? PackRgba(canvas, pixelCount) : canvas));
+            }
+            if (ctx.Mode == DecodeMode.AnimationRgba && ctx.RgbaFrames?.Count == 0)
+            {
+                ctx.RgbaFrames.Add(new Image<Rgba32>(width, height, canvas));
+            }
         }
 
-        private void RenderFrame(byte[] canvas, byte[] indices, int w, int h, int ix, int iy, int iw, int ih, bool interlace, int trans, byte[] pal, int palColors, bool rgba, bool opaqueFullCover)
+        private static byte[] PackRgba(byte[] canvas, int pixels)
+        {
+            var rgb = new byte[pixels * 3];
+            SimdHelper.PackRgbaToRgb(canvas, rgb);
+            return rgb;
+        }
+
+        private void RenderFrame(byte[] canvas, byte[] indices, int w, int h, int ix, int iy, int iw, int ih, bool interlace, int trans, byte[] pal, int palColors, bool rgba, bool opaqueFullCover, bool compositeTransparent = false)
         {
             int comp = rgba ? 4 : 3;
             int stride = w * comp;
@@ -395,7 +450,7 @@ namespace SharpImageConverter.Formats.Gif
                                         canvas[dOff+2] = pal[pOff+2];
                                         if (rgba) canvas[dOff+3] = 255;
                                     }
-                                    else if (rgba && idx == trans)
+                                    else if (rgba && idx == trans && !compositeTransparent)
                                     {
                                         canvas[dOff+3] = 0;
                                     }
@@ -429,7 +484,7 @@ namespace SharpImageConverter.Formats.Gif
                                 canvas[dOff+2] = pal[pOff+2];
                                 if (rgba) canvas[dOff+3] = 255;
                             }
-                            else if (rgba && idx == trans)
+                            else if (rgba && idx == trans && !compositeTransparent)
                             {
                                 canvas[dOff+3] = 0;
                             }

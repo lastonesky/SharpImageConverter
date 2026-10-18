@@ -1,4 +1,4 @@
-using System.Diagnostics;
+﻿using System.Diagnostics;
 using SharpImageConverter.Compression;
 using SharpImageConverter.Core;
 using SharpImageConverter.Processing;
@@ -138,14 +138,15 @@ class Program
         Console.WriteLine("支持输入: .jpg/.jpeg/.png/.bmp/.webp/.gif");
         Console.WriteLine("支持输出: .jpg/.jpeg/.png/.bmp/.webp/.gif");
         Console.WriteLine("操作: resize:WxH | resizebilinear:WxH | resizefit:WxH | grayscale");
-        Console.WriteLine("参数: --quality N | --subsample 420/444 | --keep-metadata | --idct int/float | --stream | --jpeg-debug | --gif-frames | --gray | --dithering on/off");
-        Console.WriteLine("WebP 档位: --webp-method 0~6（默认 3；4 在 >140 MP 有 4 倍悬崖且体积不更小，6 最省体积最慢）");
+        Console.WriteLine("参数: --quality N | --subsample 420/422/444 | --jpeg-progressive | --keep-metadata | --idct int/float | --stream | --memory-limit N | --no-memory-guard | --jpeg-debug | --gif-frames | --gray | --dithering on/off");
+        Console.WriteLine("WebP 档位: --webp-method 0~6（默认 3；q>=75 时 method 4 自动降为 3（>140 MP 有 3~4 倍悬崖），6 最省体积最慢）");
+        Console.WriteLine("JPEG 编码: 默认 baseline；--jpeg-progressive 输出 progressive（SOF2）");
         Console.WriteLine("GIF 耗时统计: --gif-debug（分阶段耗时）| --gif-bench N（重复 N 次取最小/中位/平均，默认 5）");
         Console.WriteLine("JPEG 耗时统计: --jpeg-bench N（重复 N 次；配合环境变量 SIC_JPEG_STAGE_TIMING=1 输出分阶段耗时）");
         Console.WriteLine("GIF 量化器: --gif-quantizer octree(默认,八叉树+Bayer) | wu/legacy(原 Wu+Floyd–Steinberg)");
         Console.WriteLine("GIF 抖动幅度: --gif-dither N (默认 8 = 一个量化步长; 调大会放大颗粒与缩放摩尔纹)");
         Console.WriteLine($"文件夹选项: --recursive | --to bmp/png/jpg/webp/gif | --parallel N（默认 {DefaultDirectoryParallelism}） | --skip-existing");
-        Console.WriteLine("智能压缩: --optimize [--opt-quality N] [--max-colors N] [--no-dither] [--opt-verbose] [--min-saving 百分比]");
+        Console.WriteLine("智能压缩: --optimize [--opt-quality N] [--opt-webp-min N] [--opt-webp-large-min N] [--max-colors N] [--no-dither] [--opt-no-png-deflate9] [--opt-no-jpeg-progressive] [--opt-jpeg-trellis] [--opt-webp-params] [--opt-verbose] [--min-saving 百分比] [--opt-lossy-min-gain 百分比]");
         Console.WriteLine("  说明: 在画质基本不变的前提下把 JPG/PNG/GIF/WEBP/BMP 压到最小，默认输出 <原名>.min.<原扩展名>");
         Console.WriteLine("转换+压缩: --to <格式> --optimize   转成目标格式并直接输出该格式下最小体积（无需再 optimize 一遍）");
         Console.WriteLine("  示例: dotnet run -- photo.jpg --to webp --optimize   →  photo.webp（已是最小体积）");
@@ -325,11 +326,23 @@ class Program
         {
             StripMetadata = !options.KeepMetadata,
             EnableDithering = options.Dithering && !options.NoDither,
+            PngMaxDeflateOnWinner = !options.NoPngDeflate9,
+            JpegProgressive = !options.NoJpegProgressive,
+            JpegCompareSubsampling = !options.NoJpegSubsampleCompare,
+            JpegTrellisQuantization = options.JpegTrellis,
+            WebpParamSearch = options.WebpParamSearch,
+            MemoryLimitBytes = options.MemoryLimitMb is > 0 ? options.MemoryLimitMb.Value * 1024L * 1024L : 0,
+            DisableMemoryGuard = options.NoMemoryGuard,
             Log = options.OptimizeVerbose ? Console.WriteLine : null,
         };
         if (options.OptimizeQuality.HasValue) opt.TargetQuality = options.OptimizeQuality.Value;
+        if (options.OptimizeWebpMin.HasValue) opt.WebpMinQuality = options.OptimizeWebpMin.Value;
+        if (options.OptimizeWebpLargeMin.HasValue) opt.WebpLargeImageMinQuality = options.OptimizeWebpLargeMin.Value;
         if (options.MaxColors.HasValue) opt.MaxColors = options.MaxColors.Value;
         if (options.MinSaving.HasValue) opt.MinSavingRatio = options.MinSaving.Value / 100.0;
+        if (options.OptimizeLossyMinGain.HasValue) opt.MinLossyGainRatio = options.OptimizeLossyMinGain.Value / 100.0;
+        if (options.OptimizeMinSsim.HasValue) opt.MinSsim = options.OptimizeMinSsim.Value / 100.0;
+        if (options.OptimizeMinWorstSsim.HasValue) opt.MinWorstSsim = options.OptimizeMinWorstSsim.Value / 100.0;
         if (options.JpegQuality.HasValue) opt.JpegQuality = options.JpegQuality.Value;
         return OptimizeOptions.Normalize(opt);
     }
@@ -352,6 +365,10 @@ class Program
         if (result.Converted)
         {
             Console.WriteLine($"✅ {Path.GetFileName(result.InputPath)} → {Path.GetFileName(result.OutputPath)}: {FormatSize(result.OriginalSize)} → {FormatSize(result.OptimizedSize)} | {result.Method} | {result.Quality}");
+            if (!string.IsNullOrEmpty(result.Suggestion))
+            {
+                Console.WriteLine($"   💡 目标格式建议: {result.Suggestion}");
+            }
             return;
         }
         Console.WriteLine($"✅ {Path.GetFileName(result.InputPath)}: {FormatSize(result.OriginalSize)} → {FormatSize(result.OptimizedSize)}（省 {result.SavedRatio:P1}）| {result.Method} | {result.Quality}");
@@ -458,9 +475,74 @@ class Program
                 options.NoDither = true;
                 continue;
             }
+            if (string.Equals(a, "--opt-no-png-deflate9", StringComparison.OrdinalIgnoreCase))
+            {
+                options.NoPngDeflate9 = true;
+                continue;
+            }
+            if (string.Equals(a, "--jpeg-progressive", StringComparison.OrdinalIgnoreCase))
+            {
+                options.JpegProgressive = true;
+                continue;
+            }
+            if (string.Equals(a, "--opt-no-jpeg-progressive", StringComparison.OrdinalIgnoreCase))
+            {
+                options.NoJpegProgressive = true;
+                continue;
+            }
+            if (string.Equals(a, "--opt-no-jpeg-subsample-compare", StringComparison.OrdinalIgnoreCase))
+            {
+                options.NoJpegSubsampleCompare = true;
+                continue;
+            }
+            if (string.Equals(a, "--no-memory-guard", StringComparison.OrdinalIgnoreCase))
+            {
+                options.NoMemoryGuard = true;
+                continue;
+            }
+            if (TryParseNamedInt(args, ref i, "--memory-limit", out int? memoryLimit))
+            {
+                options.MemoryLimitMb = memoryLimit is > 0 ? memoryLimit : null;
+                continue;
+            }
+            if (string.Equals(a, "--opt-jpeg-trellis", StringComparison.OrdinalIgnoreCase))
+            {
+                options.JpegTrellis = true;
+                continue;
+            }
+            if (string.Equals(a, "--opt-webp-params", StringComparison.OrdinalIgnoreCase))
+            {
+                options.WebpParamSearch = true;
+                continue;
+            }
             if (TryParseNamedInt(args, ref i, "--opt-quality", out int? optQuality))
             {
                 options.OptimizeQuality = optQuality;
+                continue;
+            }
+            if (TryParseNamedInt(args, ref i, "--opt-webp-min", out int? optWebpMin))
+            {
+                options.OptimizeWebpMin = optWebpMin;
+                continue;
+            }
+            if (TryParseNamedInt(args, ref i, "--opt-webp-large-min", out int? optWebpLargeMin))
+            {
+                options.OptimizeWebpLargeMin = optWebpLargeMin;
+                continue;
+            }
+            if (TryParseNamedInt(args, ref i, "--opt-lossy-min-gain", out int? optLossyMinGain))
+            {
+                options.OptimizeLossyMinGain = optLossyMinGain;
+                continue;
+            }
+            if (TryParseNamedInt(args, ref i, "--opt-min-ssim", out int? optMinSsim))
+            {
+                options.OptimizeMinSsim = optMinSsim;
+                continue;
+            }
+            if (TryParseNamedInt(args, ref i, "--opt-min-worst-ssim", out int? optMinWorstSsim))
+            {
+                options.OptimizeMinWorstSsim = optMinWorstSsim;
                 continue;
             }
             if (TryParseNamedInt(args, ref i, "--max-colors", out int? maxColors))
@@ -537,9 +619,10 @@ class Program
                 else Console.Error.WriteLine($"⚠️ --webp-method 取值需为 0~6，已忽略: {webpMethod}");
                 continue;
             }
-            if (TryParseSubsample(args, ref i, out bool? subsample420))
+            if (TryParseSubsample(args, ref i, out JpegChromaSubsampling? subsampling))
             {
-                options.Subsample420 = subsample420;
+                options.JpegSubsampling = subsampling;
+                options.Subsample420 = subsampling == JpegChromaSubsampling.Yuv420;
                 continue;
             }
             if (TryParseIdct(args, ref i, out bool? useFloatIdct))
@@ -682,6 +765,7 @@ class Program
             OutputPath = outputFile,
             JpegQuality = src.JpegQuality,
             Subsample420 = src.Subsample420,
+            JpegSubsampling = src.JpegSubsampling,
             KeepMetadata = src.KeepMetadata,
             GifFrames = src.GifFrames,
             Dithering = src.Dithering,
@@ -694,8 +778,22 @@ class Program
             GifDitherStrength = src.GifDitherStrength,
             Optimize = src.Optimize,
             OptimizeQuality = src.OptimizeQuality,
+            OptimizeWebpMin = src.OptimizeWebpMin,
+            OptimizeWebpLargeMin = src.OptimizeWebpLargeMin,
+            OptimizeLossyMinGain = src.OptimizeLossyMinGain,
+            OptimizeMinSsim = src.OptimizeMinSsim,
+            OptimizeMinWorstSsim = src.OptimizeMinWorstSsim,
             MaxColors = src.MaxColors,
             NoDither = src.NoDither,
+            NoPngDeflate9 = src.NoPngDeflate9,
+            JpegProgressive = src.JpegProgressive,
+            NoJpegProgressive = src.NoJpegProgressive,
+            NoJpegSubsampleCompare = src.NoJpegSubsampleCompare,
+            JpegTrellis = src.JpegTrellis,
+            WebpParamSearch = src.WebpParamSearch,
+            MemoryLimitMb = src.MemoryLimitMb,
+            NoMemoryGuard = src.NoMemoryGuard,
+            ForceStreaming = src.ForceStreaming,
             OptimizeVerbose = src.OptimizeVerbose,
             MinSaving = src.MinSaving,
             ParallelWebpEncode = src.ParallelWebpEncode,
@@ -940,9 +1038,67 @@ class Program
         Console.WriteLine($"    {name.PadRight(15)} min={sorted[0],9:F3}ms  median={Median(sorted),9:F3}ms  avg={sorted.Average(),9:F3}ms  max={sorted[^1],9:F3}ms");
     }
 
+    /// <summary>
+    /// 非 optimize 路径的内存预检：预计会 OOM 时优先切到流式解码；
+    /// 流式后仍不足（或源格式没有流式管线）则拒绝处理，而不是等分配失败。
+    /// </summary>
+    static void EnsurePlainMemory(CliOptions options, string inExt)
+    {
+        if (options.NoMemoryGuard) return;
+
+        string targetExt = options.OutputExtension
+            ?? (options.OutputPath is not null ? Path.GetExtension(options.OutputPath) : null)
+            ?? (options.Operations.Count == 0 ? ".png" : ".bmp");
+        var source = ImageOptimizer.DetectFormat(options.InputPath);
+        var target = ImageOptimizer.DetectKindByExtension(targetExt);
+        if (target == ImageOptimizer.ImageKind.Unknown) return;
+
+        long explicitLimit = options.MemoryLimitMb is > 0 ? options.MemoryLimitMb.Value * 1024L * 1024L : 0;
+        var verdict = MemoryGuard.CheckPlain(source, target, options.InputPath, explicitLimit);
+        switch (verdict.Action)
+        {
+            case MemoryGuard.Action.Ok:
+                return;
+            case MemoryGuard.Action.UseStreaming:
+                if (options.Operations.Count == 0
+                    && !(options.Gray && target == ImageOptimizer.ImageKind.Jpeg)
+                    && StreamingConversion.IsSupported(source, target, options.InputPath))
+                {
+                    options.ForceStreaming = true;
+                    Console.WriteLine(
+                        $"🧠 预计峰值 {verdict.EstimateBytes / 1048576.0:F1} MB，超过预算 " +
+                        $"{verdict.BudgetBytes / 1048576.0:F1} MB；已切换到逐行流式转换（{source} → {target}）。");
+                    return;
+                }
+                if (source == ImageOptimizer.ImageKind.Jpeg)
+                {
+                    // 目标不支持逐行编码时，至少切到流式输入解码。
+                    options.UseStreamingDecoder = true;
+                    Console.WriteLine($"🧠 {verdict.Reason} 已改用流式解码。");
+                    return;
+                }
+                throw new InsufficientMemoryException(verdict.Reason);
+            default:
+                throw new InsufficientMemoryException(verdict.Reason);
+        }
+    }
+
     static bool Process(CliOptions options)
     {
         string inExt = Path.GetExtension(options.InputPath).ToLowerInvariant();
+        EnsurePlainMemory(options, inExt);
+
+        if (options.ForceStreaming)
+        {
+            options.OutputPath = EnsureOutputPath(options.InputPath, options.OutputPath, options.OutputExtension ?? ".png");
+            string output = options.OutputPath ?? throw new InvalidOperationException("输出路径为空");
+            var target = ImageOptimizer.DetectKindByExtension(Path.GetExtension(output));
+            StreamingConversion.Convert(
+                options.InputPath, output, target, options.Gray,
+                options.JpegQuality ?? 75, JpegSubsamplingOf(options), options.JpegProgressive);
+            Console.WriteLine($"✅ 流式转换完成: {output}");
+            return true;
+        }
 
         // GIF 动画帧导出为单张图片序列
         if (options.GifFrames && inExt == ".gif")
@@ -989,8 +1145,8 @@ class Program
         if (ext is ".jpg" or ".jpeg")
         {
             int q = options.JpegQuality ?? 75;
-            bool effectiveSubsample420 = options.Subsample420 ?? true;
-            new ImageFrame(frame.Width, frame.Height, frame.Buffer).SaveAsJpeg(path, q, effectiveSubsample420);
+            var optionsJpeg = new JpegEncoderOptions(q, JpegSubsamplingOf(options), keepMetadata: false, enableDiagnostics: false);
+            EncodeJpegWithOptions(frame, path, optionsJpeg, options.JpegProgressive);
             return;
         }
 
@@ -1165,34 +1321,49 @@ class Program
     {
         int q = options.JpegQuality ?? 75;
         bool isInputGray = IsGrayRgb(image);
-        bool effectiveSubsample420 = options.Subsample420 ?? true;
-        var encoderOptions = new JpegEncoderOptions(q, effectiveSubsample420, keepMetadata, options.JpegDebug);
+        var encoderOptions = new JpegEncoderOptions(q, JpegSubsamplingOf(options), keepMetadata, options.JpegDebug);
         if (options.Gray || isInputGray)
         {
             var grayImage = ToGray8(image);
-            JpegEncoder.Encode(grayImage, outputPath, encoderOptions);
+            EncodeJpegWithOptions(grayImage, outputPath, encoderOptions, options.JpegProgressive);
             return;
         }
 
-        JpegEncoder.Encode(image, outputPath, encoderOptions);
+        EncodeJpegWithOptions(image, outputPath, encoderOptions, options.JpegProgressive);
     }
 
     static void SaveJpegFromRgba(Image<Rgba32> rgbaImage, CliOptions options, string outputPath)
     {
         int q = options.JpegQuality ?? 75;
         bool isInputGray = IsGrayRgba(rgbaImage);
-        bool effectiveSubsample420 = options.Subsample420 ?? true;
-        var encoderOptions = new JpegEncoderOptions(q, effectiveSubsample420, keepMetadata: true, enableDiagnostics: options.JpegDebug);
+        var encoderOptions = new JpegEncoderOptions(q, JpegSubsamplingOf(options), keepMetadata: true, enableDiagnostics: options.JpegDebug);
         if (options.Gray || isInputGray)
         {
             var rgb = new Image<Rgb24>(rgbaImage.Width, rgbaImage.Height, RgbaToRgb(rgbaImage.Buffer), rgbaImage.Metadata);
             var grayImage = ToGray8(rgb);
-            JpegEncoder.Encode(grayImage, outputPath, encoderOptions);
+            EncodeJpegWithOptions(grayImage, outputPath, encoderOptions, options.JpegProgressive);
             return;
         }
 
         var rgbImage = new Image<Rgb24>(rgbaImage.Width, rgbaImage.Height, RgbaToRgb(rgbaImage.Buffer), rgbaImage.Metadata);
-        JpegEncoder.Encode(rgbImage, outputPath, encoderOptions);
+        EncodeJpegWithOptions(rgbImage, outputPath, encoderOptions, options.JpegProgressive);
+    }
+
+    static void EncodeJpegWithOptions<T>(Image<T> image, string outputPath, JpegEncoderOptions encoderOptions, bool progressive)
+        where T : struct, IPixel
+    {
+        if (!progressive)
+        {
+            JpegEncoder.Encode(image, outputPath, encoderOptions);
+            return;
+        }
+
+        using var ms = new MemoryStream();
+        JpegEncoder.Encode(image, ms, encoderOptions);
+        byte[] bytes = ms.ToArray();
+        byte[]? p = JpegProgressiveTranscoder.TryTranscode(bytes);
+        if (p != null) bytes = p;
+        File.WriteAllBytes(outputPath, bytes);
     }
 
     static void SaveRgbWithOptions(Image<Rgb24> image, string outputPath, CliOptions options)
@@ -1302,17 +1473,18 @@ class Program
         return false;
     }
 
-    static bool TryParseSubsample(string[] args, ref int index, out bool? subsample420)
+    static bool TryParseSubsample(string[] args, ref int index, out JpegChromaSubsampling? subsampling)
     {
-        subsample420 = null;
+        subsampling = null;
         string a = args[index];
         if (string.Equals(a, "--subsample", StringComparison.OrdinalIgnoreCase))
         {
             if (index + 1 < args.Length)
             {
                 string v = args[index + 1].Trim();
-                if (string.Equals(v, "420", StringComparison.OrdinalIgnoreCase)) subsample420 = true;
-                else if (string.Equals(v, "444", StringComparison.OrdinalIgnoreCase)) subsample420 = false;
+                if (v == "420") subsampling = JpegChromaSubsampling.Yuv420;
+                else if (v == "422") subsampling = JpegChromaSubsampling.Yuv422;
+                else if (v == "444") subsampling = JpegChromaSubsampling.Yuv444;
                 index++;
             }
             return true;
@@ -1320,12 +1492,16 @@ class Program
         if (a.StartsWith("--subsample=", StringComparison.OrdinalIgnoreCase))
         {
             string v = a["--subsample=".Length..].Trim();
-            if (string.Equals(v, "420", StringComparison.OrdinalIgnoreCase)) subsample420 = true;
-            else if (string.Equals(v, "444", StringComparison.OrdinalIgnoreCase)) subsample420 = false;
+            if (v == "420") subsampling = JpegChromaSubsampling.Yuv420;
+            else if (v == "422") subsampling = JpegChromaSubsampling.Yuv422;
+            else if (v == "444") subsampling = JpegChromaSubsampling.Yuv444;
             return true;
         }
         return false;
     }
+
+    static JpegChromaSubsampling JpegSubsamplingOf(CliOptions options)
+        => options.JpegSubsampling ?? (options.Subsample420 == false ? JpegChromaSubsampling.Yuv444 : JpegChromaSubsampling.Yuv420);
 
     static bool TryParseIdct(string[] args, ref int index, out bool? useFloatIdct)
     {
@@ -1533,6 +1709,7 @@ class Program
         public string? OutputPath { get; set; }
         public int? JpegQuality { get; set; }
         public bool? Subsample420 { get; set; }
+        public JpegChromaSubsampling? JpegSubsampling { get; set; }
         public bool KeepMetadata { get; set; }
         public bool GifFrames { get; set; }
         public bool Dithering { get; set; } = true;
@@ -1553,8 +1730,22 @@ class Program
         public bool SkipExisting { get; set; }
         public bool Optimize { get; set; }
         public int? OptimizeQuality { get; set; }
+        public int? OptimizeWebpMin { get; set; }
+        public int? OptimizeWebpLargeMin { get; set; }
+        public int? OptimizeLossyMinGain { get; set; }
+        public int? OptimizeMinSsim { get; set; }
+        public int? OptimizeMinWorstSsim { get; set; }
         public int? MaxColors { get; set; }
         public bool NoDither { get; set; }
+        public bool NoPngDeflate9 { get; set; }
+        public bool JpegProgressive { get; set; }
+        public bool NoJpegProgressive { get; set; }
+        public bool NoJpegSubsampleCompare { get; set; }
+        public bool JpegTrellis { get; set; }
+        public bool WebpParamSearch { get; set; }
+        public long? MemoryLimitMb { get; set; }
+        public bool NoMemoryGuard { get; set; }
+        public bool ForceStreaming { get; set; }
         public bool OptimizeVerbose { get; set; }
         public int? MinSaving { get; set; }
 

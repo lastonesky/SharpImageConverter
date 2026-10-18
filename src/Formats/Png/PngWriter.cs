@@ -1,5 +1,6 @@
-using System;
+﻿using System;
 using System.Buffers;
+using System.Buffers.Binary;
 using System.IO;
 using System.IO.Compression;
 using System.Numerics;
@@ -207,6 +208,7 @@ public static class PngWriter
     /// <param name="metadata">可选的元数据</param>
     /// <param name="filter">行滤波策略</param>
     /// <param name="level">Deflate 压缩级别</param>
+    /// <param name="bitDepth">索引位深：1/2/4/8，默认 8</param>
     public static void WritePalette(
         Stream stream,
         int width,
@@ -216,7 +218,8 @@ public static class PngWriter
         byte[]? paletteAlpha = null,
         ImageMetadata? metadata = null,
         PngFilterMode filter = PngFilterMode.Adaptive,
-        CompressionLevel level = CompressionLevel.Optimal)
+        CompressionLevel level = CompressionLevel.Optimal,
+        byte bitDepth = 8)
     {
         ArgumentNullException.ThrowIfNull(indices);
         ArgumentNullException.ThrowIfNull(paletteRgb);
@@ -225,6 +228,14 @@ public static class PngWriter
             throw new ArgumentException("调色板长度必须是 3 的倍数且不超过 768 字节", nameof(paletteRgb));
         }
         int colors = paletteRgb.Length / 3;
+        if (bitDepth is not (1 or 2 or 4 or 8))
+        {
+            throw new ArgumentOutOfRangeException(nameof(bitDepth), "调色板位深只支持 1/2/4/8");
+        }
+        if (colors > (1 << bitDepth))
+        {
+            throw new ArgumentException($"调色板颜色数 {colors} 超过 {bitDepth} 位索引上限 {1 << bitDepth}", nameof(paletteRgb));
+        }
         if (paletteAlpha != null && paletteAlpha.Length < colors)
         {
             throw new ArgumentException("alpha 表长度不得小于颜色数", nameof(paletteAlpha));
@@ -235,7 +246,7 @@ public static class PngWriter
         }
 
         stream.Write(PngSignature, 0, PngSignature.Length);
-        WriteChunk(stream, TypeIHDR, CreateIHDRPalette(width, height));
+        WriteChunk(stream, TypeIHDR, CreateIHDRPalette(width, height, bitDepth));
         WriteChunk(stream, TypePLTE, paletteRgb);
         if (paletteAlpha != null)
         {
@@ -243,8 +254,109 @@ public static class PngWriter
             if (trns.Length > 0) WriteChunk(stream, TypeTRNS, trns);
         }
         WriteMetadata(stream, metadata);
-        WriteIdat(stream, indices, width, height, 1, filter, level);
+        if (bitDepth == 8)
+        {
+            WriteIdat(stream, indices, width, height, 1, filter, level);
+        }
+        else
+        {
+            // 打包后每行 rowBytes 字节；对 PNG 滤波器而言 bpp = 1（位深 <8），
+            // 把 rowBytes 当作“宽度”传给 WriteIdat 即可复用现有滤波实现。
+            byte[] packed = PackIndices(indices, width, height, bitDepth);
+            int rowBytes = (width * bitDepth + 7) / 8;
+            WriteIdat(stream, packed, rowBytes, height, 1, filter, level);
+        }
         WriteChunk(stream, TypeIEND, []);
+    }
+
+    /// <summary>
+    /// 把每像素 1 字节的索引按 1/2/4 位打包成 PNG 扫描行（高位在前）。
+    /// </summary>
+    private static byte[] PackIndices(byte[] indices, int width, int height, int bitDepth)
+    {
+        int rowBytes = (width * bitDepth + 7) / 8;
+        byte[] packed = new byte[(long)rowBytes * height];
+        int mask = (1 << bitDepth) - 1;
+        for (int y = 0; y < height; y++)
+        {
+            int srcRow = y * width;
+            int dstRow = y * rowBytes;
+            for (int x = 0; x < width; x++)
+            {
+                int v = indices[srcRow + x];
+                if (v > mask) throw new ArgumentException($"索引 {v} 超出 {bitDepth} 位范围", nameof(indices));
+                int bit = x * bitDepth;
+                packed[dstRow + bit / 8] |= (byte)(v << (8 - bitDepth - bit % 8));
+            }
+        }
+        return packed;
+    }
+
+    /// <summary>
+    /// 只重压缩 IDAT（保持 IHDR/PLTE/tRNS/元数据与滤波后的扫描行不变），用于把
+    /// 搜索期用便宜档产出的赢家再按更高级别压一遍。
+    /// </summary>
+    /// <param name="png">完整 PNG 字节</param>
+    /// <param name="level">新的 deflate 级别</param>
+    /// <returns>重压缩后的 PNG；找不到 IDAT 时原样返回</returns>
+    /// <remarks>
+    /// 只做「解压 IDAT → 原样重压」，不重新滤波、不重新量化，因此像素逐字节不变。
+    /// 多个 IDAT 会被合并成一个；IDAT 之后的辅助块顺序保持不变。
+    /// </remarks>
+    internal static byte[] RecompressIdat(byte[] png, CompressionLevel level)
+    {
+        if (png.Length < 8) return png;
+
+        int firstIdat = -1;
+        int iendEnd = png.Length;
+        using var idat = new MemoryStream();
+        int pos = 8;
+        while (pos + 8 <= png.Length)
+        {
+            uint length = BinaryPrimitives.ReadUInt32BigEndian(png.AsSpan(pos, 4));
+            if (length > int.MaxValue - 12) return png;
+            int total = 12 + (int)length;
+            if (pos + total > png.Length) return png;
+
+            ReadOnlySpan<byte> type = png.AsSpan(pos + 4, 4);
+            if (type.SequenceEqual("IDAT"u8))
+            {
+                if (firstIdat < 0) firstIdat = pos;
+                idat.Write(png, pos + 8, (int)length);
+            }
+            if (type.SequenceEqual("IEND"u8))
+            {
+                iendEnd = pos + total;
+                break;
+            }
+            pos += total;
+        }
+        if (firstIdat < 0 || idat.Length == 0) return png;
+
+        byte[] raw = ZlibHelper.Decompress(idat.ToArray());
+        using var compressedStream = new MemoryStream((int)Math.Min(idat.Length + 64, int.MaxValue));
+        ZlibHelper.CompressRaw(s => s.Write(raw, 0, raw.Length), compressedStream, level);
+        byte[] compressed = compressedStream.ToArray();
+
+        using var output = new MemoryStream(png.Length);
+        output.Write(png, 0, firstIdat);
+        WriteChunk(output, TypeIDAT, compressed);
+
+        // 复制首个 IDAT 之后的块（跳过所有 IDAT，保持其他块原样与相对顺序）
+        pos = firstIdat;
+        while (pos + 8 <= iendEnd)
+        {
+            uint length = BinaryPrimitives.ReadUInt32BigEndian(png.AsSpan(pos, 4));
+            int total = 12 + (int)length;
+            if (pos + total > iendEnd) return png;
+            ReadOnlySpan<byte> type = png.AsSpan(pos + 4, 4);
+            if (!type.SequenceEqual("IDAT"u8))
+            {
+                output.Write(png, pos, total);
+            }
+            pos += total;
+        }
+        return output.ToArray();
     }
 
     /// <summary>
@@ -382,12 +494,12 @@ public static class PngWriter
         return data;
     }
 
-    private static byte[] CreateIHDRPalette(int width, int height)
+    private static byte[] CreateIHDRPalette(int width, int height, byte bitDepth = 8)
     {
         byte[] data = new byte[13];
         Array.Copy(ToBigEndian((uint)width), 0, data, 0, 4);
         Array.Copy(ToBigEndian((uint)height), 0, data, 4, 4);
-        data[8] = 8;
+        data[8] = bitDepth;
         data[9] = 3;
         data[10] = 0;
         data[11] = 0;

@@ -11,7 +11,7 @@ namespace SharpImageConverter.Formats.Jpeg;
 /// 并重建图像。内存解码（<c>Parser</c>）与流式解码（<c>StreamingParser</c>）共享此状态，
 /// 二者只负责提供 marker/segment 与熵数据来源。
 /// </summary>
-internal sealed class JpegFrameState
+internal sealed partial class JpegFrameState
 {
     private readonly QuantizationTable[] quantTables = new QuantizationTable[4];
     private readonly HuffmanDecodingTable[] dcTables = new HuffmanDecodingTable[4];
@@ -31,6 +31,7 @@ internal sealed class JpegFrameState
     private IccProfileCollector? iccCollector;
     private byte[]? exifRaw;
     private int exifOrientation = 1;
+    private ScanHeader lastScan;
     private readonly bool useFloatingPointIdct;
 
     /// <summary>原始 EXIF APP1 数据（仅第一个）。</summary>
@@ -38,6 +39,12 @@ internal sealed class JpegFrameState
 
     /// <summary>EXIF Orientation 标签（1-8，缺省 1）。</summary>
     public int ExifOrientation => exifOrientation;
+
+    internal bool IsProgressive => isProgressive;
+    internal FrameHeader Frame => frame;
+    internal ComponentState[] Components => components;
+    internal ushort RestartInterval => restartInterval;
+    internal ScanHeader LastScan => lastScan;
 
     public JpegFrameState(bool useFloatingPointIdct)
     {
@@ -359,6 +366,7 @@ internal sealed class JpegFrameState
 
     public void DecodeScan(in ScanHeader scan, ref JpegBitReader reader)
     {
+        lastScan = scan;
         long probeStart = JpegPerfProbe.Enabled ? Stopwatch.GetTimestamp() : 0;
         bool interleaved = scan.Components.Length > 1;
 

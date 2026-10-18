@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Buffers;
 using System.IO;
 using System.Numerics;
@@ -13,19 +13,34 @@ using SharpImageConverter.Formats.Jpeg;
 
 namespace SharpImageConverter;
 
+public enum JpegChromaSubsampling
+{
+    Yuv444 = 0,
+    Yuv422 = 1,
+    Yuv420 = 2,
+}
+
 public readonly struct JpegEncoderOptions
 {
-    public JpegEncoderOptions(int quality = 75, bool subsample420 = true, bool keepMetadata = true, bool enableDiagnostics = false, bool optimizeHuffman = false)
+    public JpegEncoderOptions(int quality = 75, bool subsample420 = true, bool keepMetadata = true, bool enableDiagnostics = false, bool optimizeHuffman = false, bool trellisQuantization = false)
+        : this(quality, subsample420 ? JpegChromaSubsampling.Yuv420 : JpegChromaSubsampling.Yuv444,
+            keepMetadata, enableDiagnostics, optimizeHuffman, trellisQuantization)
+    {
+    }
+
+    public JpegEncoderOptions(int quality, JpegChromaSubsampling subsampling, bool keepMetadata = true, bool enableDiagnostics = false, bool optimizeHuffman = false, bool trellisQuantization = false)
     {
         Quality = quality;
-        Subsample420 = subsample420;
+        Subsampling = subsampling;
         KeepMetadata = keepMetadata;
         EnableDiagnostics = enableDiagnostics;
         OptimizeHuffman = optimizeHuffman;
+        TrellisQuantization = trellisQuantization;
     }
 
     public int Quality { get; }
-    public bool Subsample420 { get; }
+    public JpegChromaSubsampling Subsampling { get; }
+    public bool Subsample420 => Subsampling == JpegChromaSubsampling.Yuv420;
     public bool KeepMetadata { get; }
     public bool EnableDiagnostics { get; }
 
@@ -42,6 +57,18 @@ public readonly struct JpegEncoderOptions
     /// 轮次间有漂移，143MP 未复测）。该比值由「像素管线 : 熵编码」的耗时占比决定，换图会变。
     /// </remarks>
     public bool OptimizeHuffman { get; }
+
+    /// <summary>
+    /// 是否启用 trellis 量化（RD 优化的量化系数选择，默认关闭）。
+    /// </summary>
+    /// <remarks>
+    /// 每个 AC 系数在 {0, 最近值, 最近值±1} 里用动态规划挑「失真 + λ×码率」最小的组合，
+    /// 码率用标准 Huffman 表的码长估计，失真用系数域误差（Parseval ⇒ 与像素 SSE 等价）。
+    /// 相比最近值量化，它能主动把「不值的」小系数归零并调整邻域取值。
+    /// 代价是按块的 DP（每块约 64×64 状态转移），只在离线评估/显式开启时使用。
+    /// 灰度编码路径（<c>WriteGray8</c>）暂不接入。
+    /// </remarks>
+    public bool TrellisQuantization { get; }
 }
 
 /// <summary>
@@ -57,7 +84,11 @@ public readonly struct JpegEncoderOptions
 internal interface IMcuCoefficientSink
 {
     /// <summary>编码开始前调用一次，交出本次编码的几何与量化表（自然顺序，每表 64 项）。</summary>
-    void Begin(int width, int height, bool subsample420, ReadOnlySpan<byte> lumaTable, ReadOnlySpan<byte> chromaTable);
+    void Begin(int width, int height, JpegChromaSubsampling subsampling, ReadOnlySpan<byte> lumaTable, ReadOnlySpan<byte> chromaTable);
+
+    /// <summary>兼容旧调用。</summary>
+    void Begin(int width, int height, bool subsample420, ReadOnlySpan<byte> lumaTable, ReadOnlySpan<byte> chromaTable)
+        => Begin(width, height, subsample420 ? JpegChromaSubsampling.Yuv420 : JpegChromaSubsampling.Yuv444, lumaTable, chromaTable);
 
     /// <param name="sequence">MCU 的光栅序号（0 起，与编码顺序一致）</param>
     /// <param name="blocks">量化后的系数，每个块 64 个 int 紧凑排列</param>
@@ -382,7 +413,23 @@ public static class JpegEncoder
     }
 
     private static readonly byte[] Order420 = [0, 0, 0, 0, 1, 2];
+    private static readonly byte[] Order422 = [0, 0, 1, 2];
     private static readonly byte[] Order444 = [0, 1, 2];
+
+    internal static byte SamplingH(JpegChromaSubsampling s) => s == JpegChromaSubsampling.Yuv444 ? (byte)1 : (byte)2;
+    internal static byte SamplingV(JpegChromaSubsampling s) => s == JpegChromaSubsampling.Yuv420 ? (byte)2 : (byte)1;
+    internal static byte[] OrderOf(JpegChromaSubsampling s) => s switch
+    {
+        JpegChromaSubsampling.Yuv420 => Order420,
+        JpegChromaSubsampling.Yuv422 => Order422,
+        _ => Order444,
+    };
+    internal static int BlockCountOf(JpegChromaSubsampling s) => s switch
+    {
+        JpegChromaSubsampling.Yuv420 => 6,
+        JpegChromaSubsampling.Yuv422 => 4,
+        _ => 3,
+    };
     private static readonly byte[] OrderGray = [0];
 
     private static readonly byte[] StdLumaQuant =
@@ -498,13 +545,13 @@ public static class JpegEncoder
     public static void Write(Stream stream, int width, int height, byte[] rgb24, JpegEncoderOptions options)
     {
         ValidateRgb24Input(stream, width, height, rgb24);
-        WriteInternal(stream, width, height, rgb24, NormalizeQuality(options.Quality), options.Subsample420, null, options.KeepMetadata, options.EnableDiagnostics, options.OptimizeHuffman);
+        WriteInternal(stream, width, height, rgb24, NormalizeQuality(options.Quality), options.Subsample420, null, options.KeepMetadata, options.EnableDiagnostics, options.OptimizeHuffman, null, options.TrellisQuantization);
     }
 
     public static void Write(Stream stream, int width, int height, byte[] rgb24, JpegEncoderOptions options, ImageMetadata? metadata)
     {
         ValidateRgb24Input(stream, width, height, rgb24);
-        WriteInternal(stream, width, height, rgb24, NormalizeQuality(options.Quality), options.Subsample420, metadata, options.KeepMetadata, options.EnableDiagnostics, options.OptimizeHuffman);
+        WriteInternal(stream, width, height, rgb24, NormalizeQuality(options.Quality), options.Subsample420, metadata, options.KeepMetadata, options.EnableDiagnostics, options.OptimizeHuffman, null, options.TrellisQuantization);
     }
 
     /// <summary>
@@ -517,9 +564,14 @@ public static class JpegEncoder
     /// 调用方拿到系数后直接重建，省掉「写位流 → 逐位读回」一个来回。
     /// 前置条件与真实编码相同（入参校验、采样方式、量化表都由同一个 quality 推导）。
     /// </remarks>
-    internal static void EncodeCoefficients(byte[] rgb24, int width, int height, int quality, bool subsample420, bool keepMetadata, ImageMetadata? metadata, IMcuCoefficientSink sink)
+    internal static void EncodeCoefficients(byte[] rgb24, int width, int height, int quality, bool subsample420, bool keepMetadata, ImageMetadata? metadata, IMcuCoefficientSink sink, bool trellisQuantization = false)
+        => EncodeCoefficients(rgb24, width, height, quality,
+            subsample420 ? JpegChromaSubsampling.Yuv420 : JpegChromaSubsampling.Yuv444,
+            keepMetadata, metadata, sink, trellisQuantization);
+
+    internal static void EncodeCoefficients(byte[] rgb24, int width, int height, int quality, JpegChromaSubsampling subsampling, bool keepMetadata, ImageMetadata? metadata, IMcuCoefficientSink sink, bool trellisQuantization = false)
     {
-        WriteInternal(Stream.Null, width, height, rgb24, NormalizeQuality(quality), subsample420, metadata, keepMetadata, false, false, sink);
+        WriteInternal(Stream.Null, width, height, rgb24, NormalizeQuality(quality), subsampling, metadata, keepMetadata, false, false, sink, trellisQuantization);
     }
 
     /// <summary>
@@ -536,19 +588,150 @@ public static class JpegEncoder
     /// <see cref="IMcuCoefficientSink.Accept"/> 落到组件平面。各线程写的 MCU 下标互不相交，
     /// <see cref="IMcuCoefficientSink.Begin"/> 也在并行区之外调用，因此无需同步。
     /// </remarks>
-    internal static void EncodeFromSamples(JpegSampleCache cache, int width, int height, bool subsample420, int quality, IMcuCoefficientSink sink)
+    /// <summary>
+    /// 从逐行像素源直接编码 JPEG：按 MCU 行读取 RGB 窄带，DCT/量化后立即熵编码。
+    /// </summary>
+    /// <remarks>
+    /// 仅使用标准 Annex K Huffman 表（不做两遍优化表），保证编码过程是单遍、内存有界的。
+    /// 目标格式转换的低内存路径使用；普通转换仍走 <see cref="Write(Stream,int,int,byte[],JpegEncoderOptions)"/>。
+    /// </remarks>
+    internal static void EncodeStreaming(
+        Stream stream,
+        IRowImageSource source,
+        int quality,
+        JpegChromaSubsampling subsampling,
+        bool keepMetadata,
+        ImageMetadata? metadata)
+    {
+        ArgumentNullException.ThrowIfNull(stream);
+        ArgumentNullException.ThrowIfNull(source);
+        int width = source.Width;
+        int height = source.Height;
+        if (width <= 0 || height <= 0) throw new ArgumentOutOfRangeException(nameof(source), "Invalid image size");
+
+        int normalized = NormalizeQuality(quality);
+        QuantTables luma = GetQuantTables(normalized, luma: true);
+        QuantTables chroma = GetQuantTables(normalized, luma: false);
+        int[] qYRecip = luma.Recip;
+        int[] qCRecip = chroma.Recip;
+        byte[] qY = luma.Table;
+        byte[] qC = chroma.Table;
+
+        WriteMarker(stream, 0xD8);
+        WriteApp0Jfif(stream);
+        if (keepMetadata && metadata != null) WriteMetadata(stream, metadata);
+        WriteDqt(stream, 0, qY);
+        WriteDqt(stream, 1, qC);
+        WriteSof0(stream, width, height, subsampling);
+        WriteDht(stream, 0, 0, DcLumaCounts, DcLumaSymbols);
+        WriteDht(stream, 1, 0, AcLumaCounts, AcLumaSymbols);
+        WriteDht(stream, 0, 1, DcChromaCounts, DcChromaSymbols);
+        WriteDht(stream, 1, 1, AcChromaCounts, AcChromaSymbols);
+        WriteSos(stream);
+
+        int mcuW = subsampling == JpegChromaSubsampling.Yuv444 ? 8 : 16;
+        int mcuH = subsampling == JpegChromaSubsampling.Yuv420 ? 16 : 8;
+        int mcuX = (width + mcuW - 1) / mcuW;
+        int mcuY = (height + mcuH - 1) / mcuH;
+        int blockCount = subsampling switch
+        {
+            JpegChromaSubsampling.Yuv420 => 6,
+            JpegChromaSubsampling.Yuv422 => 4,
+            _ => 3,
+        };
+        byte[] order = OrderOf(subsampling);
+        byte[] band = new byte[width * mcuH * 3];
+        byte[] sourceRow = new byte[width * source.Channels];
+
+        using var bw = new JpegBitWriter(stream);
+        int prevYdc = 0, prevCbdc = 0, prevCrdc = 0;
+
+        for (int my = 0; my < mcuY; my++)
+        {
+            int rows = Math.Min(mcuH, height - my * mcuH);
+            for (int y = 0; y < rows; y++)
+            {
+                if (!source.ReadRow(sourceRow)) throw new InvalidDataException("JPEG 逐行编码时源图行数不足");
+                int dst = y * width * 3;
+                if (source.Channels == 3)
+                {
+                    sourceRow.AsSpan(0, width * 3).CopyTo(band.AsSpan(dst, width * 3));
+                }
+                else
+                {
+                    for (int x = 0, s = 0; x < width; x++, s += 4)
+                    {
+                        band[dst++] = sourceRow[s];
+                        band[dst++] = sourceRow[s + 1];
+                        band[dst++] = sourceRow[s + 2];
+                    }
+                }
+            }
+
+            Span<int> blocks = stackalloc int[6 * 64];
+            for (int mx = 0; mx < mcuX; mx++)
+            {
+                if (subsampling == JpegChromaSubsampling.Yuv420)
+                {
+                    FillMcu420RgbToYCbCr(
+                        band, width, rows, mx * 16, 0,
+                        blocks[..64], blocks[64..128], blocks[128..192], blocks[192..256],
+                        blocks[256..320], blocks[320..384], null);
+                }
+                else if (subsampling == JpegChromaSubsampling.Yuv422)
+                {
+                    FillMcu422RgbToYCbCr(
+                        band, width, rows, mx * 16, 0,
+                        blocks[..64], blocks[64..128], blocks[128..192], blocks[192..256], null);
+                }
+                else
+                {
+                    FillBlockRgbToYCbCr444(
+                        band, width, rows, mx * 8, 0,
+                        blocks[..64], blocks[64..128], blocks[128..192], null);
+                }
+
+                for (int i = 0; i < blockCount; i++)
+                {
+                    bool isChroma = order[i] != 0;
+                    Span<int> block = blocks.Slice(i * 64, 64);
+                    DctQuantizeInPlace(block, isChroma ? qCRecip : qYRecip);
+                    int lastNz = ComputeLastNz(block);
+                    if (isChroma)
+                    {
+                        ref int predictor = ref (order[i] == 1 ? ref prevCbdc : ref prevCrdc);
+                        HuffmanWriteBlock(bw, block, lastNz, DcCHuffTable, AcCHuffTable, ref predictor);
+                    }
+                    else
+                    {
+                        HuffmanWriteBlock(bw, block, lastNz, DcYHuffTable, AcYHuffTable, ref prevYdc);
+                    }
+                }
+            }
+        }
+
+        bw.FlushFinal();
+        WriteMarker(stream, 0xD9);
+    }
+
+    internal static void EncodeFromSamples(JpegSampleCache cache, int width, int height, bool subsample420, int quality, IMcuCoefficientSink sink, bool trellisQuantization = false)
+        => EncodeFromSamples(cache, width, height,
+            subsample420 ? JpegChromaSubsampling.Yuv420 : JpegChromaSubsampling.Yuv444, quality, sink, trellisQuantization);
+
+    internal static void EncodeFromSamples(JpegSampleCache cache, int width, int height, JpegChromaSubsampling subsampling, int quality, IMcuCoefficientSink sink, bool trellisQuantization = false)
     {
         int normalized = NormalizeQuality(quality);
         QuantTables luma = GetQuantTables(normalized, luma: true);
         QuantTables chroma = GetQuantTables(normalized, luma: false);
         int[] qYRecip = luma.Recip;
         int[] qCRecip = chroma.Recip;
+        TrellisContext? trellis = trellisQuantization ? new TrellisContext(luma.Table, chroma.Table, normalized) : null;
 
         // 只有量化表随质量变化；几何与表都要先交给下游，重建方才能按同一套表反量化。
-        sink.Begin(width, height, subsample420, luma.Table, chroma.Table);
+        sink.Begin(width, height, subsampling, luma.Table, chroma.Table);
 
-        byte[] order = subsample420 ? Order420 : Order444;
-        int blockCount = subsample420 ? 6 : 3;
+        byte[] order = OrderOf(subsampling);
+        int blockCount = BlockCountOf(subsampling);
         int coefficients = blockCount * 64;
         int mcuX = cache.McuX;
 
@@ -566,7 +749,8 @@ public static class JpegEncoder
 
                 for (int i = 0; i < blockCount; i++)
                 {
-                    DctQuantizeInPlace(blocks.Slice(i * 64, 64), order[i] == 0 ? qYRecip : qCRecip);
+                    bool chroma = order[i] != 0;
+                    DctQuantizeInPlace(blocks.Slice(i * 64, 64), chroma ? qCRecip : qYRecip, trellis, chroma);
                 }
 
                 sink.Accept(sequence, blocks[..coefficients], blockCount, order);
@@ -688,14 +872,19 @@ public static class JpegEncoder
         }
     }
 
-    private static void WriteInternal(Stream stream, int width, int height, byte[] rgb24, int quality, bool subsample420, ImageMetadata? metadata, bool keepMetadata, bool enableDiagnostics, bool optimizeHuffman = false, IMcuCoefficientSink? coefficientSink = null)
+    private static void WriteInternal(Stream stream, int width, int height, byte[] rgb24, int quality, bool subsample420, ImageMetadata? metadata, bool keepMetadata, bool enableDiagnostics, bool optimizeHuffman = false, IMcuCoefficientSink? coefficientSink = null, bool trellisQuantization = false)
+        => WriteInternal(stream, width, height, rgb24, quality,
+            subsample420 ? JpegChromaSubsampling.Yuv420 : JpegChromaSubsampling.Yuv444,
+            metadata, keepMetadata, enableDiagnostics, optimizeHuffman, coefficientSink, trellisQuantization);
+
+    private static void WriteInternal(Stream stream, int width, int height, byte[] rgb24, int quality, JpegChromaSubsampling subsampling, ImageMetadata? metadata, bool keepMetadata, bool enableDiagnostics, bool optimizeHuffman = false, IMcuCoefficientSink? coefficientSink = null, bool trellisQuantization = false)
     {
         long totalStartTicks = Stopwatch.GetTimestamp();
         EncodeMetrics? metrics = enableDiagnostics ? new EncodeMetrics() : null;
 
         if (enableDiagnostics)
         {
-            Trace.WriteLine($"[jpeg] quality={quality} subsample={(subsample420 ? "420" : "444")}");
+            Trace.WriteLine($"[jpeg] quality={quality} subsample={subsampling}");
         }
 
         QuantTables lumaTables = GetQuantTables(quality, luma: true);
@@ -704,9 +893,10 @@ public static class JpegEncoder
         byte[] qC = chromaTables.Table;
         int[] qYRecip = lumaTables.Recip;
         int[] qCRecip = chromaTables.Recip;
+        TrellisContext? trellis = trellisQuantization ? new TrellisContext(qY, qC, quality) : null;
 
         // 系数旁路：先交出几何与量化表，重建方才能按同一套表反量化。
-        coefficientSink?.Begin(width, height, subsample420, qY, qC);
+        coefficientSink?.Begin(width, height, subsampling, qY, qC);
 
         // Huffman 表：默认用标准 Annex K 表；开启优化时先统计真实符号分布再生成最优表。
         byte[] dcYCounts = DcLumaCounts, acYCounts = AcLumaCounts, dcCCounts = DcChromaCounts, acCCounts = AcChromaCounts;
@@ -716,7 +906,7 @@ public static class JpegEncoder
         if (optimizeHuffman)
         {
             long optStart = enableDiagnostics ? Stopwatch.GetTimestamp() : 0;
-            HuffmanHistograms hist = CollectHuffmanHistograms(width, height, rgb24, subsample420, qYRecip, qCRecip);
+            HuffmanHistograms hist = CollectHuffmanHistograms(width, height, rgb24, subsampling, qYRecip, qCRecip, trellis);
             (dcYCounts, dcYSymbols) = BuildOptimalHuffmanTable(hist.DcY);
             (acYCounts, acYSymbols) = BuildOptimalHuffmanTable(hist.AcY);
             (dcCCounts, dcCSymbols) = BuildOptimalHuffmanTable(hist.DcC);
@@ -739,7 +929,7 @@ public static class JpegEncoder
         }
         WriteDqt(stream, 0, qY);
         WriteDqt(stream, 1, qC);
-        WriteSof0(stream, width, height, subsample420);
+        WriteSof0(stream, width, height, subsampling);
         WriteDht(stream, 0, 0, dcYCounts, dcYSymbols);
         WriteDht(stream, 1, 0, acYCounts, acYSymbols);
         WriteDht(stream, 0, 1, dcCCounts, dcCSymbols);
@@ -747,7 +937,7 @@ public static class JpegEncoder
         WriteSos(stream);
 
         using var bw = new JpegBitWriter(stream);
-        EncodeRgbPipeline(bw, width, height, rgb24, subsample420, qYRecip, qCRecip, dcY, acY, dcC, acC, metrics, coefficientSink);
+        EncodeRgbPipeline(bw, width, height, rgb24, subsampling, qYRecip, qCRecip, dcY, acY, dcC, acC, metrics, coefficientSink, trellis);
         if (coefficientSink == null)
         {
             bw.FlushFinal();
@@ -816,7 +1006,7 @@ public static class JpegEncoder
         int width,
         int height,
         byte[] rgb24,
-        bool subsample420,
+        JpegChromaSubsampling subsampling,
         int[] qYRecip,
         int[] qCRecip,
         HuffCode[] dcY,
@@ -824,7 +1014,8 @@ public static class JpegEncoder
         HuffCode[] dcC,
         HuffCode[] acC,
         EncodeMetrics? metrics,
-        IMcuCoefficientSink? coefficientSink = null)
+        IMcuCoefficientSink? coefficientSink = null,
+        TrellisContext? trellis = null)
     {
         int capacity = Math.Clamp(Environment.ProcessorCount, 2, 16);
         var sampleQueue = new PipeQueue<McuBatch>(capacity, JpegPerfProbe.ProduceWait, JpegPerfProbe.DctWait);
@@ -836,11 +1027,11 @@ public static class JpegEncoder
         using var cts = new CancellationTokenSource();
         CancellationToken token = cts.Token;
 
-        var t1 = Task.Run(() => RunStage(() => ProduceRgbSamples(sampleQueue, rgb24, width, height, subsample420, dctWorkers, McuBatchSize, token, metrics), cts), token);
+        var t1 = Task.Run(() => RunStage(() => ProduceRgbSamples(sampleQueue, rgb24, width, height, subsampling, dctWorkers, McuBatchSize, token, metrics), cts), token);
         Task[] dctTasks = new Task[dctWorkers];
         for (int i = 0; i < dctWorkers; i++)
         {
-            dctTasks[i] = Task.Run(() => RunStage(() => ProcessDct(sampleQueue, dctQueue, qYRecip, qCRecip, token), cts), token);
+            dctTasks[i] = Task.Run(() => RunStage(() => ProcessDct(sampleQueue, dctQueue, qYRecip, qCRecip, trellis, token), cts), token);
         }
         var t4 = Task.Run(() => RunStage(() => ProcessHuffmanOrdered(dctQueue, dctWorkers, bw, dcY, acY, dcC, acC, token, coefficientSink), cts), token);
 
@@ -911,7 +1102,7 @@ public static class JpegEncoder
         byte[] rgb24,
         int width,
         int height,
-        bool subsample420,
+        JpegChromaSubsampling subsampling,
         int completionCount,
         int batchSize,
         CancellationToken token,
@@ -922,7 +1113,7 @@ public static class JpegEncoder
         McuBatch? batch = null;
         try
         {
-            if (subsample420)
+            if (subsampling == JpegChromaSubsampling.Yuv420)
             {
                 int mcusX = (width + 15) / 16;
                 int mcusY = (height + 15) / 16;
@@ -954,6 +1145,38 @@ public static class JpegEncoder
                                 mcu.GetBlockSpan(4),
                                 mcu.GetBlockSpan(5),
                                 metrics);
+                            EnqueueSampledMcu(output, ref batch, mcu, batchSize, token);
+                        }
+                        catch
+                        {
+                            mcu.Free();
+                            throw;
+                        }
+                    }
+                }
+            }
+            else if (subsampling == JpegChromaSubsampling.Yuv422)
+            {
+                int mcusX = (width + 15) / 16;
+                int mcusY = (height + 7) / 8;
+                for (int my = 0; my < mcusY; my++)
+                {
+                    for (int mx = 0; mx < mcusX; mx++)
+                    {
+                        var mcu = new SampledMcuRef
+                        {
+                            BlockCount = 4,
+                            Sequence = sequence++,
+                            Order = Order422,
+                            BlockStride = 4,
+                            Buffer = ArrayPool<int>.Shared.Rent(4 * 64)
+                        };
+                        try
+                        {
+                            FillMcu422RgbToYCbCr(
+                                rgb24, width, height, mx * 16, my * 8,
+                                mcu.GetBlockSpan(0), mcu.GetBlockSpan(1),
+                                mcu.GetBlockSpan(2), mcu.GetBlockSpan(3), metrics);
                             EnqueueSampledMcu(output, ref batch, mcu, batchSize, token);
                         }
                         catch
@@ -1106,6 +1329,7 @@ public static class JpegEncoder
         PipeQueue<McuBatch> output,
         int[] qYRecip,
         int[] qCRecip,
+        TrellisContext? trellis,
         CancellationToken token)
     {
         long probeStart = JpegPerfProbe.Enabled ? Stopwatch.GetTimestamp() : 0;
@@ -1128,8 +1352,9 @@ public static class JpegEncoder
                         ulong packed = 0;
                         for (int i = 0; i < mcu.BlockCount; i++)
                         {
-                            int[] q = mcu.Order![i] == 0 ? qYRecip : qCRecip;
-                            int lastNz = DctQuantizeInPlace(mcu.GetBlockSpan(i), q);
+                            bool chroma = mcu.Order![i] != 0;
+                            int[] q = chroma ? qCRecip : qYRecip;
+                            int lastNz = DctQuantizeInPlace(mcu.GetBlockSpan(i), q, trellis, chroma);
                             packed |= (ulong)lastNz << (i * 6);
                         }
                         mcu.LastNzPacked = packed;
@@ -1453,9 +1678,10 @@ public static class JpegEncoder
         int width,
         int height,
         byte[] rgb24,
-        bool subsample420,
+        JpegChromaSubsampling subsampling,
         int[] qYRecip,
-        int[] qCRecip)
+        int[] qCRecip,
+        TrellisContext? trellis = null)
     {
         var hist = new HuffmanHistograms();
         int capacity = Math.Clamp(Environment.ProcessorCount, 2, 16);
@@ -1468,11 +1694,11 @@ public static class JpegEncoder
         using var cts = new CancellationTokenSource();
         CancellationToken token = cts.Token;
 
-        var t1 = Task.Run(() => RunStage(() => ProduceRgbSamples(sampleQueue, rgb24, width, height, subsample420, dctWorkers, McuBatchSize, token, null), cts), token);
+        var t1 = Task.Run(() => RunStage(() => ProduceRgbSamples(sampleQueue, rgb24, width, height, subsampling, dctWorkers, McuBatchSize, token, null), cts), token);
         Task[] dctTasks = new Task[dctWorkers];
         for (int i = 0; i < dctWorkers; i++)
         {
-            dctTasks[i] = Task.Run(() => RunStage(() => ProcessDct(sampleQueue, dctQueue, qYRecip, qCRecip, token), cts), token);
+            dctTasks[i] = Task.Run(() => RunStage(() => ProcessDct(sampleQueue, dctQueue, qYRecip, qCRecip, trellis, token), cts), token);
         }
         var t4 = Task.Run(() => RunStage(() => ProcessHuffmanCount(dctQueue, dctWorkers, hist, token), cts), token);
 
@@ -2092,6 +2318,18 @@ public static class JpegEncoder
     /// 原来档 2 还额外要求 <c>Sse2 || AdvSimd</c>，这与 <c>Vector.IsHardwareAccelerated</c> 语义重叠且
     /// 会误导读者以为这里依赖具体 ISA；<c>Vector&lt;T&gt;</c> 本身已经是可移植抽象，故删除。
     /// </summary>
+    private static int DctQuantizeInPlace(Span<int> block, int[] quantRecip, TrellisContext? trellis, bool chroma)
+    {
+        if (trellis != null)
+        {
+            // trellis 需要看到量化前的 DCT 系数；SIMD 融合路径会原地销毁它们，
+            // 因此这里退回标量 FDCT（该模式只为离线评估/显式 opt-in 服务）。
+            FDCT8x8IntInPlace(block);
+            return trellis.Quantize(block, quantRecip, chroma);
+        }
+        return DctQuantizeInPlace(block, quantRecip);
+    }
+
     private static int DctQuantizeInPlace(Span<int> block, int[] quantRecip)
     {
         if (SimdJpegEncodePipeline.FdctSupported)
@@ -2196,6 +2434,65 @@ public static class JpegEncoder
 
     // 只有整数 FDCT 实现：浮点 FDCT 已在早期版本中移除。整数版本在 x86/ARM 上结果一致，
     // 避免了跨平台浮点舍入差异，且与 libjpeg 的 islow 整数 FDCT 精度对齐。
+
+    internal static unsafe void FillMcu422RgbToYCbCr(
+        byte[] rgb,
+        int width,
+        int height,
+        int baseX,
+        int baseY,
+        Span<int> y0,
+        Span<int> y1,
+        Span<int> cb,
+        Span<int> cr,
+        EncodeMetrics? metrics)
+    {
+        long startTicks = metrics is not null ? Stopwatch.GetTimestamp() : 0;
+
+        if (SimdJpegEncodePipeline.ColorSupported && baseX + 16 <= width && baseY + 8 <= height)
+        {
+            SimdJpegEncodePipeline.RgbToYCbCr422(rgb, width, baseX, baseY, y0, y1, cb, cr);
+            if (metrics is not null) Interlocked.Add(ref metrics.TicksFillMcu420, Stopwatch.GetTimestamp() - startTicks);
+            return;
+        }
+
+        Span<int> cbAcc = stackalloc int[64];
+        Span<int> crAcc = stackalloc int[64];
+        for (int i = 0; i < 64; i++) { cbAcc[i] = 0; crAcc[i] = 0; }
+
+        fixed (byte* rgbPtr = rgb)
+        {
+            int stride = width * 3;
+            for (int yy = 0; yy < 8; yy++)
+            {
+                int sy = baseY + yy;
+                if (sy >= height) sy = height - 1;
+                int rowOffset = sy * stride;
+                for (int xx = 0; xx < 16; xx++)
+                {
+                    int sx = baseX + xx;
+                    if (sx >= width) sx = width - 1;
+                    byte* p = rgbPtr + rowOffset + sx * 3;
+                    int r = p[0], g = p[1], b = p[2];
+                    int y = (YR[r] + YG[g] + YB[b]) >> 8;
+                    int localX = xx & 7;
+                    if (xx < 8) y0[yy * 8 + localX] = y - 128;
+                    else y1[yy * 8 + localX] = y - 128;
+                    int cIndex = yy * 8 + (xx >> 1);
+                    cbAcc[cIndex] += ((CbR[r] + CbG[g] + CbB[b]) >> 8) + 128;
+                    crAcc[cIndex] += ((CrR[r] + CrG[g] + CrB[b]) >> 8) + 128;
+                }
+            }
+        }
+
+        for (int i = 0; i < 64; i++)
+        {
+            cb[i] = ((cbAcc[i] + 1) >> 1) - 128;
+            cr[i] = ((crAcc[i] + 1) >> 1) - 128;
+        }
+
+        if (metrics is not null) Interlocked.Add(ref metrics.TicksFillMcu420, Stopwatch.GetTimestamp() - startTicks);
+    }
 
     internal static unsafe void FillMcu420RgbToYCbCr(
         byte[] rgb,
@@ -2435,6 +2732,45 @@ public static class JpegEncoder
     /// 量化表 + 整数 DCT 用的 reciprocal 表。两者都只由 baseTable 和 quality 决定，
     /// 且下游只读，因此可以在多次编码之间共享同一份不可变实例。
     /// </summary>
+    /// <summary>
+    /// trellis 量化上下文：量化表 / 标准 AC Huffman 码长 / RD 乘子。
+    /// </summary>
+    private sealed class TrellisContext
+    {
+        private readonly byte[] _lumaQuant;
+        private readonly byte[] _chromaQuant;
+        private readonly byte[] _lumaAcBits;
+        private readonly byte[] _chromaAcBits;
+        private readonly double _lambda;
+
+        public TrellisContext(byte[] lumaQuant, byte[] chromaQuant, int quality)
+        {
+            _lumaQuant = lumaQuant;
+            _chromaQuant = chromaQuant;
+            _lumaAcBits = BuildAcCodeLengths(AcYHuffTable);
+            _chromaAcBits = BuildAcCodeLengths(AcCHuffTable);
+            _lambda = JpegTrellisQuantizer.LambdaForQuality(quality);
+        }
+
+        public int Quantize(Span<int> block, int[] quantRecip, bool chroma)
+            => JpegTrellisQuantizer.QuantizeInPlace(
+                block,
+                quantRecip,
+                chroma ? _chromaQuant : _lumaQuant,
+                chroma ? _chromaAcBits : _lumaAcBits,
+                _lambda);
+
+        private static byte[] BuildAcCodeLengths(HuffCode[] table)
+        {
+            var bits = new byte[256];
+            for (int i = 0; i < bits.Length; i++)
+            {
+                bits[i] = Math.Max((byte)1, table[i].Length);
+            }
+            return bits;
+        }
+    }
+
     private sealed class QuantTables
     {
         public readonly byte[] Table;
@@ -2781,7 +3117,7 @@ public static class JpegEncoder
         }
     }
 
-    private static void WriteSof0(Stream s, int width, int height, bool subsample420)
+    private static void WriteSof0(Stream s, int width, int height, JpegChromaSubsampling subsampling)
     {
         WriteMarker(s, 0xC0);
         WriteBe16(s, 17);
@@ -2791,7 +3127,7 @@ public static class JpegEncoder
         s.WriteByte(3);
 
         s.WriteByte(1);
-        s.WriteByte(subsample420 ? (byte)0x22 : (byte)0x11);
+        s.WriteByte((byte)((SamplingH(subsampling) << 4) | SamplingV(subsampling)));
         s.WriteByte(0);
 
         s.WriteByte(2);

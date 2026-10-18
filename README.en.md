@@ -1,4 +1,4 @@
-# SharpImageConverter
+﻿# SharpImageConverter
 
 English | [简体中文](README.md)
 
@@ -231,15 +231,29 @@ Special cases:
 - `--gif-frames` : Export animated GIF frames as individual images for inspection/debugging
 - `--gif-debug` : Print per-phase GIF encode/decode timings (quantize, LZW, pixel expand, ...) and throughput (Mpx/s)
 - `--gif-bench N` : Repeat GIF encode/decode N times (default 5) and report min/median/avg per phase, for comparing before/after optimizations; measurement only, writes no file
+- `--jpeg-progressive` : write progressive JPEG (SOF2) for normal conversion; default is baseline
+- `--subsample 420/422/444` : JPEG chroma subsampling (default 420)
 - `--gray` : Force grayscale output (applies to JPEG/PNG/BMP/WebP)
 - `--stream` : Use streaming decode for JPEG to reduce memory usage; other formats fall back to normal decode
 - `--idct int|float` : Choose JPEG IDCT implementation (integer/float), applies to JPEG decoding only
 
 ### Smart Compression Options (with `--optimize`)
 - `--opt-quality N` : target quality 0-100 (default 88). 95 ≈ conservative, 88 ≈ balanced, 75 ≈ aggressive
+- `--opt-webp-min N` : WebP search lower bound for small images (default 20; independent of JPEG)
+- `--opt-webp-large-min N` : WebP search lower bound for images >20 MP (default 40; 20 saves ~8% at a significant time cost)
 - `--max-colors N` : PNG/GIF palette size cap (default 256)
-- `--no-dither` : disable Floyd–Steinberg dithering (smaller, but gradients may band)
+- `--no-dither` : disable dithering (PNG compares dithered and non-dithered candidates by default)
+- `--opt-no-png-deflate9` : disable the final zlib 9 pass on the PNG winner (on by default for ≤8 MP)
+- `--opt-no-jpeg-progressive` : disable the progressive JPEG rewrite (on by default)
+- `--opt-no-jpeg-subsample-compare` : disable the extra 4:4:4 candidate comparison (on by default)
+- `--opt-jpeg-trellis` : enable JPEG trellis quantization (off by default; 4–24% smaller at 2–7× encode time)
+- `--memory-limit N` : memory budget in MB (default: derived from current free memory). Optimize refuses and keeps the original when over budget; plain BMP/PNG/GIF/WebP/JPEG → BMP/PNG/GIF/JPEG conversions switch to a row-streaming pipeline, otherwise fail with a clear message instead of OOM
+- `--no-memory-guard` : disable the pre-decode memory estimate
+- `--opt-webp-params` : enable the WebP 5-parameter grid search (off by default; 0–1.3% smaller at 2–4× search time)
+- `--opt-min-ssim N` / `--opt-min-worst-ssim N` : Y-SSIM mean / worst-1% floor in percent (default 95 / 75)
 - `--min-saving N` : only accept the result if it saves at least N%
+  (same-format JPEG/WebP also require 10% by default via `MinLossyGainRatio`, to avoid another lossy generation for tiny gains)
+- `--opt-lossy-min-gain N` : adjust that threshold (percent, default 10)
 - `--opt-verbose` : print size and quality of every candidate
 - `--keep-metadata` : keep metadata (by default EXIF is dropped, ICC is preserved)
 

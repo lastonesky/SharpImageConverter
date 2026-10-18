@@ -507,7 +507,7 @@ public static partial class JpegDecoder
         }
     }
 
-    private static void ComputeLinearSample(int dstIndex, int dstLength, int srcLength, int fullLength, out int index0, out int index1, out byte weight1)
+    internal static void ComputeLinearSample(int dstIndex, int dstLength, int srcLength, int fullLength, out int index0, out int index1, out byte weight1)
     {
         if (srcLength <= 1 || fullLength <= 0 || dstLength <= 1)
         {

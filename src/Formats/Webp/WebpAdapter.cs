@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using SharpImageConverter.Core;
 using SharpImageConverter;
 using System.IO;
@@ -15,6 +15,9 @@ namespace SharpImageConverter.Formats.Webp
 
     public readonly struct WebpEncoderOptions
     {
+        private static readonly bool AllowM4HighQuality =
+            Environment.GetEnvironmentVariable("SIC_WEBP_ALLOW_M4_HIGHQ") == "1";
+
         public float Quality { get; }
         public WebpConcurrencyStrategy ConcurrencyStrategy { get; }
 
@@ -25,23 +28,92 @@ namespace SharpImageConverter.Formats.Webp
         /// 2048²（4.19 MP）/ q80 实测单次编码：method 2 = 147.5 ms / 70,838 B、
         /// method 3 = 501.7 ms / 67,784 B、method 4 = 490.9 ms / 67,818 B、
         /// method 6 = 579.4 ms / 64,872 B。悬崖在 2→3 之间：≥3 才走完整 RD 优化。
-        /// 默认取 3（不取 4）的原因：libwebp 1.6.0 的 method 4 在 &gt;140 MP 有 4 倍悬崖
-        /// （143 MP 实测 m3 8.2 s / 1,597,784 B vs m4 32.3 s / 1,655,814 B，m4 更慢还更大），
-        /// 且在 7 个样本（1~143 MP，含真实照片）上 m3 体积均 ≤ m4。详见 docs 与 .perf/results。
+        /// 默认取 3（不取 4）的原因：libwebp 1.6.0 的 method 4 在 &gt;140 MP 且有质量相关悬崖
+        /// （143 MP 实测 q75：m3 7.8 s / 1,597,784 B vs m4 26.3 s / 1,655,814 B，m4 更慢还更大；
+        /// q40/q65 不触发），且在 7 个样本（1~143 MP，含真实照片）上 m3 体积均 ≤ m4。
+        /// 因此构造时强制：<b>quality ≥ 75 且 method == 4 时降为 3</b>，避免调用方误用。
+        /// 详见 docs 与 .perf/results。
         /// </remarks>
         public int Method { get; }
+
+        /// <summary>
+        /// 是否使用无损 WebP。无损路径直通 libwebp 的 <c>WebPEncodeLosslessRGBA</c>，
+        /// 此时 <see cref="Quality"/> / <see cref="Method"/> 不参与编码参数（仅保留给调用方读取）。
+        /// </summary>
+        public bool Lossless { get; }
+
+        /// <summary>
+        /// libwebp <c>config.alpha_quality</c>（0~100）；-1 表示使用 libwebp 默认值（100）。
+        /// 只影响带 alpha 的图；降低它可减小 alpha 平面体积。
+        /// </summary>
+        public int AlphaQuality { get; }
+
+        /// <summary>libwebp <c>config.filter_strength</c>（0~100）；-1 表示默认（60）。</summary>
+        public int FilterStrength { get; }
+
+        /// <summary>libwebp <c>config.sns_strength</c>（0~100）；-1 表示默认（50）。</summary>
+        public int SnsStrength { get; }
+
+        /// <summary>libwebp <c>config.segments</c>（1~4）；-1 表示默认（4）。</summary>
+        public int Segments { get; }
+
+        /// <summary>
+        /// libwebp <c>config.preprocessing</c>（0~2）：0 无、1 分段平滑、2 伪随机抖动；
+        /// -1 表示默认（0）。
+        /// </summary>
+        public int Preprocessing { get; }
 
         public WebpEncoderOptions(
             float quality,
             WebpConcurrencyStrategy concurrencyStrategy = WebpConcurrencyStrategy.Auto,
-            int method = 3)
+            int method = 3,
+            bool lossless = false,
+            int alphaQuality = -1,
+            int filterStrength = -1,
+            int snsStrength = -1,
+            int segments = -1,
+            int preprocessing = -1)
         {
             if (quality < 0f || quality > 100f) throw new ArgumentOutOfRangeException(nameof(quality));
             if (method is < 0 or > 6) throw new ArgumentOutOfRangeException(nameof(method));
+            if (alphaQuality is < -1 or > 100) throw new ArgumentOutOfRangeException(nameof(alphaQuality));
+            if (filterStrength is < -1 or > 100) throw new ArgumentOutOfRangeException(nameof(filterStrength));
+            if (snsStrength is < -1 or > 100) throw new ArgumentOutOfRangeException(nameof(snsStrength));
+            if (segments is < -1 or > 4) throw new ArgumentOutOfRangeException(nameof(segments));
+            if (segments == 0) throw new ArgumentOutOfRangeException(nameof(segments));
+            if (preprocessing is < -1 or > 2) throw new ArgumentOutOfRangeException(nameof(preprocessing));
+            // 实测 m4 在 143 MP / q75 有 3.4 倍悬崖且体积更大；高质量档直接降回 m3。
+            // 无损模式下 quality 是“压缩努力”而非画质档，但 m4 的悬崖是 libwebp 内部实现问题，
+            // 同样避开更稳妥。SIC_WEBP_ALLOW_M4_HIGHQ=1 仅用于复现/诊断。
+            if (method == 4 && quality >= 75f && !AllowM4HighQuality) method = 3;
             Quality = quality;
             ConcurrencyStrategy = concurrencyStrategy;
             Method = method;
+            Lossless = lossless;
+            AlphaQuality = alphaQuality;
+            FilterStrength = filterStrength;
+            SnsStrength = snsStrength;
+            Segments = segments;
+            Preprocessing = preprocessing;
         }
+
+        /// <summary>返回替换了调参字段的副本（用于 optimize 的参数搜索）。</summary>
+        public WebpEncoderOptions WithTuning(
+            int? alphaQuality = null,
+            int? filterStrength = null,
+            int? snsStrength = null,
+            int? segments = null,
+            int? preprocessing = null)
+            => new(
+                Quality,
+                ConcurrencyStrategy,
+                Method,
+                Lossless,
+                alphaQuality ?? AlphaQuality,
+                filterStrength ?? FilterStrength,
+                snsStrength ?? SnsStrength,
+                segments ?? Segments,
+                preprocessing ?? Preprocessing);
 
         public static WebpEncoderOptions Default => new(75f, WebpConcurrencyStrategy.Auto);
     }

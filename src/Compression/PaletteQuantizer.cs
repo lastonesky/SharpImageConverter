@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 
 namespace SharpImageConverter.Compression
@@ -28,6 +28,11 @@ namespace SharpImageConverter.Compression
         /// 且不参与量化，把调色板预算全部留给不透明像素。默认 0（关闭，alpha 正常参与量化）。
         /// </summary>
         public int TransparentAlphaThreshold { get; set; }
+
+        /// <summary>
+        /// 中位切分后是否做 Lloyd/k-means 精修。默认开启（1 轮）。
+        /// </summary>
+        public bool EnableKMeansRefinement { get; set; } = true;
     }
 
     /// <summary>
@@ -206,6 +211,7 @@ namespace SharpImageConverter.Compression
             BuildHistogram(rgba, pixels, reserveTransparent ? options.TransparentAlphaThreshold : 0);
             BuildBins();
             BuildPalette(opaqueBudget);
+            if (options.EnableKMeansRefinement) RefinePalette();
             BuildSearchStructures();
         }
 
@@ -348,7 +354,30 @@ namespace SharpImageConverter.Compression
                     continue;
                 }
                 uint key = ((uint)rgba[i] << 24) | ((uint)rgba[i + 1] << 16) | ((uint)rgba[i + 2] << 8) | a;
-                indices[p] = (byte)(map[key] + offset);
+                if (map.TryGetValue(key, out int exact))
+                {
+                    indices[p] = (byte)(exact + offset);
+                    continue;
+                }
+
+                // 动画可以只用采样帧建精确调色板，非采样帧里可能出现采样中不存在的颜色。
+                // 此时退回最近色，而不是抛 KeyNotFoundException（会直接让整次 optimize 失败）。
+                int best = offset;
+                long bestD = long.MaxValue;
+                for (int k = offset; k < offset + _palCount; k++)
+                {
+                    long dr = rgba[i] - _palR![k];
+                    long dg = rgba[i + 1] - _palG![k];
+                    long db = rgba[i + 2] - _palB![k];
+                    long da = a - _palA![k];
+                    long d = (3 * dr * dr) + (5 * dg * dg) + (2 * db * db) + (4 * da * da);
+                    if (d < bestD)
+                    {
+                        bestD = d;
+                        best = k;
+                    }
+                }
+                indices[p] = (byte)best;
             }
         }
 
@@ -551,6 +580,67 @@ namespace SharpImageConverter.Compression
             if (gg >= rr && gg >= bb && gg >= aa) return 1;
             if (aa >= rr && aa >= bb) return 3;
             return rr >= bb ? 0 : 2;
+        }
+
+        /// <summary>
+        /// 对中位切分的调色板做一轮 Lloyd 迭代：按桶权重把每个直方图桶归到最近色，
+        /// 再用桶加权均值更新调色板。只调整颜色、不增加数量，同色数下降低量化误差。
+        /// </summary>
+        private void RefinePalette()
+        {
+            int k = _palCount;
+            if (k == 0 || _usedBins == null || _usedBinCount == 0) return;
+
+            int[] counts = _counts!;
+            int[] sr = _sumR!, sg = _sumG!, sb = _sumB!, sa = _sumA!;
+            var weight = new long[k];
+            var accR = new long[k];
+            var accG = new long[k];
+            var accB = new long[k];
+            var accA = new long[k];
+
+            for (int u = 0; u < _usedBinCount; u++)
+            {
+                int bin = _usedBins[u];
+                int c = counts[bin];
+                if (c <= 0) continue;
+                int r = (sr[bin] + (c >> 1)) / c;
+                int g = (sg[bin] + (c >> 1)) / c;
+                int b = (sb[bin] + (c >> 1)) / c;
+                int a = (sa[bin] + (c >> 1)) / c;
+
+                int best = 0;
+                long bestD = long.MaxValue;
+                for (int i = 0; i < k; i++)
+                {
+                    long dr = r - _palR![i];
+                    long dg = g - _palG![i];
+                    long db = b - _palB![i];
+                    long da = a - _palA![i];
+                    long d = (3 * dr * dr) + (5 * dg * dg) + (2 * db * db) + (4 * da * da);
+                    if (d < bestD)
+                    {
+                        bestD = d;
+                        best = i;
+                    }
+                }
+
+                weight[best] += c;
+                accR[best] += (long)r * c;
+                accG[best] += (long)g * c;
+                accB[best] += (long)b * c;
+                accA[best] += (long)a * c;
+            }
+
+            for (int i = 0; i < k; i++)
+            {
+                long w = weight[i];
+                if (w <= 0) continue;
+                _palR![i] = (byte)((accR[i] + (w >> 1)) / w);
+                _palG![i] = (byte)((accG[i] + (w >> 1)) / w);
+                _palB![i] = (byte)((accB[i] + (w >> 1)) / w);
+                _palA![i] = (byte)((accA[i] + (w >> 1)) / w);
+            }
         }
 
         /// <summary>
@@ -780,6 +870,8 @@ namespace SharpImageConverter.Compression
         private QuantizeResult Assemble(byte[] indices, bool reserveTransparent)
         {
             int offset = reserveTransparent ? 1 : 0;
+            // 精确取色把颜色存在 [offset..]，中位切分存在 [0..]；这里统一取源下标。
+            int srcOffset = _exactMap != null ? _exactOffset : 0;
             int count = _palCount + offset;
             byte[] rgb = new byte[count * 3];
             byte[] alpha = new byte[count];
@@ -789,11 +881,12 @@ namespace SharpImageConverter.Compression
             for (int i = 0; i < _palCount; i++)
             {
                 int dst = i + offset;
-                rgb[dst * 3] = _palR![i];
-                rgb[dst * 3 + 1] = _palG![i];
-                rgb[dst * 3 + 2] = _palB![i];
-                alpha[dst] = _palA![i];
-                if (_palA![i] != 255) opaque = false;
+                int src = i + srcOffset;
+                rgb[dst * 3] = _palR![src];
+                rgb[dst * 3 + 1] = _palG![src];
+                rgb[dst * 3 + 2] = _palB![src];
+                alpha[dst] = _palA![src];
+                if (_palA![src] != 255) opaque = false;
             }
 
             return new QuantizeResult

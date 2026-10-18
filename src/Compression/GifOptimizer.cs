@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -13,8 +13,8 @@ namespace SharpImageConverter.Compression
     /// 颜色越少，LZW 的字典命中率越高，体积下降明显。
     /// </summary>
     /// <remarks>
-    /// 动画 GIF 目前只支持不透明素材：解码器只暴露 RGB24 帧序列，
-    /// 带透明通道的动画若重编码会丢失透明度，因此直接保留原图。
+    /// 不透明动画做帧间差分 + disposal=1；带透明通道的动画走整帧 + 全局调色板 + 二值透明
+    /// （disposal=2），不做帧间差分（单个透明索引无法同时表达“与上一帧相同”和“透明”）。
     /// </remarks>
     internal static class GifOptimizer
     {
@@ -53,23 +53,20 @@ namespace SharpImageConverter.Compression
         internal static OptimizationResult Run(string input, string output, long originalSize, OptimizeOptions o)
         {
             var decoder = new GifDecoder();
-            var animation = decoder.DecodeAnimationRgb24(input);
+            var animation = decoder.DecodeAnimationRgba32(input);
             if (animation.Frames.Count == 0)
             {
                 return ImageOptimizer.Finish(input, output, originalSize, null, null, default, o, "GIF 中没有可用帧");
             }
 
-            byte[]? rgba = null;
-            bool hasTransparency = false;
-            if (!animation.CompositeFullyOpaque)
-            {
-                // 首帧合成不可能全不透明时才需要真的解一次 RGBA 来探测：
-                // 该解码只解首帧就返回，实测 2048² 约 20 ms（动/静帧同价）。
-                rgba = decoder.DecodeRgba32(input).Buffer;
-                hasTransparency = HasTransparency(rgba);
-            }
+            animation = MergeIdenticalFrames(animation);
 
-            var artifact = Produce(animation, hasTransparency, hasTransparency ? rgba : null, o);
+            bool hasTransparency = HasAnyTransparency(animation.RgbaFrames);
+            byte[]? rgba = animation.Frames.Count == 1 && hasTransparency
+                ? animation.RgbaFrames![0].Buffer
+                : null;
+
+            var artifact = Produce(animation, hasTransparency, rgba, o);
             if (artifact.Bytes == null || !artifact.MeetsBar)
             {
                 return ImageOptimizer.Finish(input, output, originalSize, null, null, default, o, artifact.Reason);
@@ -119,11 +116,6 @@ namespace SharpImageConverter.Compression
             int framePixels = width * height;
             bool animated = animation.Frames.Count > 1;
 
-            if (animated && hasTransparency)
-            {
-                return OptimizeArtifact.Unsupported("带透明通道的动画 GIF 暂不支持有损优化");
-            }
-
             // 单帧走 RGBA（保留透明），多帧用 RGB24 采样帧拼成一张大图建调色板
             bool reserveTransparent = hasTransparency;
             int sampleFrames = animated
@@ -135,7 +127,11 @@ namespace SharpImageConverter.Compression
             byte[]? sharedFrameRgba = null;
             if (!animated)
             {
-                if (reserveTransparent && singleFrameRgba != null)
+                if (animation.RgbaFrames != null)
+                {
+                    sharedFrameRgba = animation.RgbaFrames[0].Buffer;
+                }
+                else if (reserveTransparent && singleFrameRgba != null)
                 {
                     sharedFrameRgba = singleFrameRgba;
                 }
@@ -201,17 +197,20 @@ namespace SharpImageConverter.Compression
                 if (StageTiming) _evaluations++;
                 long mark = StageTiming ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
 
+                // 不透明动画要给帧间差分预留 1 个透明索引，因此实际量化颜色数少 1。
+                // 透明动画的透明槽由 TransparentAlphaThreshold 在量化器内部预留，不额外减。
+                int quantColors = animated && !reserveTransparent ? Math.Max(2, colors - 1) : colors;
                 var quantizeOptions = new QuantizeOptions
                 {
-                    MaxColors = colors,
+                    MaxColors = quantColors,
                     EnableDithering = dithering,
                     TransparentAlphaThreshold = transparentThreshold,
                 };
 
-                if (preparedColors != colors)
+                if (preparedColors != quantColors)
                 {
                     quantizer.Prepare(sample, width, sampleRows, quantizeOptions);
-                    preparedColors = colors;
+                    preparedColors = quantColors;
                 }
                 else
                 {
@@ -241,8 +240,15 @@ namespace SharpImageConverter.Compression
                     fullFrames = new List<byte[]>(animation.Frames.Count);
                     for (int i = 0; i < animation.Frames.Count; i++)
                     {
-                        ToRgba(animation.Frames[i].Buffer, frameRgbaBuffer!);
-                        fullFrames.Add(quantizer.Map(frameRgbaBuffer!, width, height, quantizeOptions));
+                        if (animation.RgbaFrames != null)
+                        {
+                            fullFrames.Add(quantizer.Map(animation.RgbaFrames[i].Buffer, width, height, quantizeOptions));
+                        }
+                        else
+                        {
+                            ToRgba(animation.Frames[i].Buffer, frameRgbaBuffer!);
+                            fullFrames.Add(quantizer.Map(frameRgbaBuffer!, width, height, quantizeOptions));
+                        }
                     }
                     searchIndices = BuildSampleIndices(fullFrames, sampleFrames, framePixels);
                 }
@@ -254,6 +260,15 @@ namespace SharpImageConverter.Compression
                 }
 
                 var palette = quantizer.AssemblePalette(searchIndices, reserveTransparent);
+                int fp = width * height;
+                int animationTransparentIndex = animated && !reserveTransparent ? palette.ColorCount : -1;
+                byte[] encodePalette = palette.PaletteRgb;
+                if (animated && !reserveTransparent)
+                {
+                    // 不透明动画的帧间差分：追加一个透明槽（颜色值不会被显示，只用于表示“与上一帧相同”）。
+                    encodePalette = new byte[(palette.ColorCount + 1) * 3];
+                    Buffer.BlockCopy(palette.PaletteRgb, 0, encodePalette, 0, palette.ColorCount * 3);
+                }
                 var sampled = new QuantizeResult
                 {
                     PaletteRgb = palette.PaletteRgb,
@@ -294,13 +309,37 @@ namespace SharpImageConverter.Compression
                     // 立刻编码并只把结果装进 Lazy：不能让闭包捕获索引流，否则候选并行时
                     // 16 份全图索引会一直活到方法结束（5 MP 实测因此慢 8%）。
                     long encodeMark = StageTiming ? System.Diagnostics.Stopwatch.GetTimestamp() : 0;
-                    byte[] encoded = EncodeIndices(
-                        width, height,
-                        fullFrames ?? [searchIndices],
-                        palette.PaletteRgb,
-                        animated ? animation.FrameDurationsMs : null,
-                        animation.LoopCount,
-                        transparentThreshold);
+                    byte[] encoded;
+                    if (animated && reserveTransparent)
+                    {
+                        // 透明动画：整帧写入透明索引 0，disposal=2 每帧恢复背景；不做帧间差分。
+                        encoded = EncodeIndices(
+                            width, height, fullFrames!,
+                            palette.PaletteRgb,
+                            animation.FrameDurationsMs, animation.LoopCount,
+                            0, disposalMode: 2);
+                    }
+                    else if (animated)
+                    {
+                        // 不透明动画：帧间差分，与上一帧索引相同的像素写透明索引，disposal=1 保留上一帧。
+                        var (diffFrames, rects) = BuildDiffFrames(fullFrames!, width, height, animationTransparentIndex);
+                        using var ms = new MemoryStream();
+                        new GifEncoder().EncodeIndexedFrames(
+                            width, height, encodePalette, diffFrames, rects, localPalettes: null,
+                            animation.FrameDurationsMs, animation.LoopCount,
+                            animationTransparentIndex, disposalMode: 1, ms);
+                        encoded = ms.ToArray();
+                    }
+                    else
+                    {
+                        encoded = EncodeIndices(
+                            width, height,
+                            fullFrames ?? [searchIndices],
+                            palette.PaletteRgb,
+                            null,
+                            0,
+                            transparentThreshold > 0 ? 0 : -1);
+                    }
                     if (StageTiming) _ticksEncode += System.Diagnostics.Stopwatch.GetTimestamp() - encodeMark;
                     bytes = new Lazy<byte[]>(() => encoded);
                 }
@@ -347,6 +386,18 @@ namespace SharpImageConverter.Compression
                 }
 
                 hit = ImageOptimizer.SearchLadder(ladder, EvaluateBest, o.Accept);
+
+                // 与并行分支保持同一「固定网格全候选」语义：最高档达标时把整条阶梯都评估一遍，
+                // 再在所有达标候选里按体积取最小。否则低内存机器（degree=1）会得到与多核机器
+                // 不同的候选集。最高档不达标时仍只算最高档。
+                if (hit >= 0)
+                {
+                    for (int i = 0; i < ladder.Length; i++)
+                    {
+                        if (o.EnableDithering) EvaluateCached(ladder[i], true);
+                        EvaluateCached(ladder[i], false);
+                    }
+                }
             }
             else
             {
@@ -365,7 +416,7 @@ namespace SharpImageConverter.Compression
                 void EvaluateBatch(List<(int Colors, bool Dither)> batch, int dop)
                 {
                     var results = new ((Lazy<byte[]> Bytes, ImageQuality Quality) Result, bool Exact)[batch.Count];
-                    Parallel.For(0, batch.Count, new ParallelOptions { MaxDegreeOfParallelism = dop }, i =>
+                    ImageOptimizer.ForEachCandidate(batch.Count, dop, i =>
                     {
                         var key = batch[i];
                         var quantizer = new PaletteQuantizer();
@@ -418,22 +469,16 @@ namespace SharpImageConverter.Compression
                     rest.RemoveAll(k => evaluated.ContainsKey(k));
                     if (rest.Count > 0) EvaluateBatch(rest, degree);
 
-                    // 串行语义回放：二分用的画质固定取「抖动变体」（!EnableDithering 时就是唯一变体）
-                    bool AcceptAt(int colors) => o.Accept(evaluated[(colors, o.EnableDithering)].Quality);
-                    var visits = ImageOptimizer.ReplayLadderVisits(ladder.Length, i => AcceptAt(ladder[i]));
+                    // 二分只用来判断「是否存在达标候选」；挑选阶段看全部已评估候选。
+                    // 画质固定取「抖动变体」（!EnableDithering 时就是唯一变体）。
                     hit = ImageOptimizer.SearchLadder(ladder, c => evaluated[(c, o.EnableDithering)].Quality, o.Accept);
 
-                    // 只保留串行路径会产出的那些 key（含 exact 时「两变体同产物、只记抖动那一份」的规则）
-                    var keep = new HashSet<(int Colors, bool Dither)>();
-                    foreach (int index in visits)
-                    {
-                        int colors = ladder[index];
-                        keep.Add((colors, o.EnableDithering));
-                        if (o.EnableDithering && !exactKeys.Contains((colors, true))) keep.Add((colors, false));
-                    }
+                    // 全部已评估候选都进入体积竞争（不再只保留二分访问序列）。
+                    // exact 调色板下两变体产物相同，只保留抖动那一份，避免重复持有缓冲。
                     foreach (var pair in evaluated)
                     {
-                        if (keep.Contains(pair.Key)) produced[pair.Key] = pair.Value;
+                        if (!pair.Key.Dither && exactKeys.Contains((pair.Key.Colors, true))) continue;
+                        produced[pair.Key] = pair.Value;
                     }
                 }
             }
@@ -531,6 +576,22 @@ namespace SharpImageConverter.Compression
                 }
             }
 
+            // 动画：在全局调色板候选之外再试一次「每帧局部调色板」，按体积取小。
+            // 局部表通常画质更好，但无法与帧间差分共存（不同帧索引语义不同），所以是独立候选。
+            bool localPaletteUsed = false;
+            if (animated && o.GifLocalPalettes && bestColors > 0 && bestBytes != null)
+            {
+                byte[]? localBytes = TryLocalPaletteVariant(
+                    animation, width, height, reserveTransparent, bestColors, bestDither, sampleFrames, o, out var localQuality);
+                if (localBytes != null && localBytes.Length < bestBytes.Length)
+                {
+                    bestBytes = localBytes;
+                    bestQuality = localQuality;
+                    localPaletteUsed = true;
+                    o.Log?.Invoke($"  局部调色板: {localBytes.Length} 字节，优于全局候选");
+                }
+            }
+
             // 单帧时补一条「常规编码」基线（Octree + Bayer8、256 色，与不加 --optimize 的转换完全同参）：
             // 任何候选若不比它小就是负收益 —— 用户加 --optimize 却得到更大的文件是不可接受的，直接退回基线。
             // 多帧动画不需要：同格式路径有 KeepOriginalWhenNoGain 兜底，不会写出更大的文件。
@@ -554,7 +615,8 @@ namespace SharpImageConverter.Compression
 
             if (bestBytes == null) return OptimizeArtifact.Unsupported("GIF 量化未产出可用候选");
 
-            string method = $"GIF 调色板 {bestColors} 色" + (bestDither ? " + 抖动" : "") + (animated ? $"（{animation.Frames.Count} 帧）" : "");
+            string method = $"GIF 调色板 {bestColors} 色" + (bestDither ? " + 抖动" : "") + (animated ? $"（{animation.Frames.Count} 帧）" : "")
+                + (localPaletteUsed ? "（局部调色板）" : "");
             if (hit < 0) method += "（未达画质下限，取最高画质档）";
             return new OptimizeArtifact(bestBytes, method, bestQuality, hit >= 0);
         }
@@ -593,11 +655,150 @@ namespace SharpImageConverter.Compression
                 true);
         }
 
+        private static byte[]? TryLocalPaletteVariant(
+            GifAnimation animation, int width, int height, bool reserveTransparent,
+            int colors, bool dithering, int sampleFrames, OptimizeOptions o, out ImageQuality quality)
+        {
+            quality = default;
+            int frameCount = animation.Frames.Count;
+            var results = new List<QuantizeResult>(frameCount);
+            var localPalettes = new List<byte[]?>(frameCount);
+            var localFrames = new List<byte[]>(frameCount);
+            var rects = new List<(int X, int Y, int W, int H)>(frameCount);
+            var rgbaBuffer = animation.RgbaFrames == null ? new byte[(long)width * height * 4] : null;
+
+            for (int i = 0; i < frameCount; i++)
+            {
+                byte[] src;
+                if (animation.RgbaFrames != null)
+                {
+                    src = animation.RgbaFrames[i].Buffer;
+                }
+                else
+                {
+                    ToRgba(animation.Frames[i].Buffer, rgbaBuffer!);
+                    src = rgbaBuffer!;
+                }
+
+                var quantizer = new PaletteQuantizer();
+                var options = new QuantizeOptions
+                {
+                    MaxColors = colors,
+                    EnableDithering = dithering,
+                    TransparentAlphaThreshold = reserveTransparent ? 128 : 0,
+                };
+                quantizer.Prepare(src, width, height, options);
+                var indices = quantizer.Map(src, width, height, options);
+                var palette = quantizer.AssemblePalette(indices, reserveTransparent);
+                var result = new QuantizeResult
+                {
+                    Indices = indices,
+                    PaletteRgb = palette.PaletteRgb,
+                    PaletteAlpha = palette.PaletteAlpha,
+                    ColorCount = palette.ColorCount,
+                };
+                results.Add(result);
+                localPalettes.Add(result.PaletteRgb);
+                localFrames.Add(indices);
+                rects.Add((0, 0, width, height));
+            }
+
+            // 画质：至少检查采样帧，取各项指标的最差值，避免局部表反而更差。
+            int sampled = Math.Min(frameCount, Math.Max(1, sampleFrames));
+            ImageQuality worst = new(ImageQuality.MaxPsnr, ImageQuality.MaxPsnr, 0);
+            var restored = new byte[(long)width * height * 4];
+            for (int s = 0; s < sampled; s++)
+            {
+                int frameIndex = sampled == 1 ? 0 : (int)((long)s * frameCount / sampled);
+                byte[] src = animation.RgbaFrames != null
+                    ? animation.RgbaFrames[frameIndex].Buffer
+                    : ToRgbaCopy(animation.Frames[frameIndex].Buffer, width, height, rgbaBuffer!);
+                ImageOptimizer.RestoreRgba(results[frameIndex], restored);
+                var q = QualityMetrics.Compare(src, restored, width, height, 4);
+                worst = new ImageQuality(
+                    Math.Min(worst.Psnr, q.Psnr),
+                    Math.Min(worst.PerceptualPsnr, q.PerceptualPsnr),
+                    Math.Max(worst.MeanError, q.MeanError),
+                    Math.Min(worst.Ssim, q.Ssim),
+                    Math.Min(worst.WorstSsim, q.WorstSsim));
+            }
+            if (!o.Accept(worst)) return null;
+            quality = worst;
+
+            using var ms = new MemoryStream();
+            new GifEncoder().EncodeIndexedFrames(
+                width, height, globalPalette: null, localFrames, rects, localPalettes,
+                animation.FrameDurationsMs, animation.LoopCount,
+                transparentIndex: reserveTransparent ? 0 : -1,
+                disposalMode: reserveTransparent ? 2 : 0,
+                ms);
+            return ms.ToArray();
+        }
+
+        private static byte[] ToRgbaCopy(byte[] rgb, int width, int height, byte[] rgba)
+        {
+            ToRgba(rgb, rgba);
+            return rgba;
+        }
+
+        /// <summary>
+        /// 合并连续完全相同的帧（时长相加）。纯无损，不改变播放效果。
+        /// </summary>
+        private static GifAnimation MergeIdenticalFrames(GifAnimation animation)
+        {
+            int count = animation.Frames.Count;
+            if (count < 2) return animation;
+
+            var rgba = animation.RgbaFrames;
+            var rgb = animation.Frames;
+            var durations = animation.FrameDurationsMs;
+            var keep = new List<int>(count) { 0 };
+            var mergedDurations = new List<int>(count) { durations.Count > 0 ? durations[0] : 0 };
+
+            for (int i = 1; i < count; i++)
+            {
+                int last = keep[^1];
+                bool same = rgba != null
+                    ? rgba[i].Buffer.AsSpan().SequenceEqual(rgba[last].Buffer)
+                    : rgb[i].Buffer.AsSpan().SequenceEqual(rgb[last].Buffer);
+                if (same)
+                {
+                    mergedDurations[^1] += durations.Count > i ? durations[i] : 0;
+                }
+                else
+                {
+                    keep.Add(i);
+                    mergedDurations.Add(durations.Count > i ? durations[i] : 0);
+                }
+            }
+
+            if (keep.Count == count) return animation;
+
+            var newRgb = new List<Image<Rgb24>>(keep.Count);
+            var newRgba = rgba != null ? new List<Image<Rgba32>>(keep.Count) : null;
+            foreach (int i in keep)
+            {
+                newRgb.Add(rgb[i]);
+                newRgba?.Add(rgba![i]);
+            }
+            return new GifAnimation(newRgb, mergedDurations, animation.LoopCount, animation.CompositeFullyOpaque, newRgba);
+        }
+
         private static bool HasTransparency(byte[] rgba)
         {
             for (int i = 3; i < rgba.Length; i += 4)
             {
                 if (rgba[i] != 255) return true;
+            }
+            return false;
+        }
+
+        private static bool HasAnyTransparency(IReadOnlyList<Image<Rgba32>>? frames)
+        {
+            if (frames == null) return false;
+            foreach (var frame in frames)
+            {
+                if (!SimdHelper.IsOpaqueRgba(frame.Buffer)) return true;
             }
             return false;
         }
@@ -643,14 +844,70 @@ namespace SharpImageConverter.Compression
             byte[] paletteRgb,
             IReadOnlyList<int>? frameDurationsMs,
             int loopCount,
-            int transparentThreshold)
+            int transparentIndex,
+            int disposalMode = -1)
         {
             using var ms = new MemoryStream();
             new GifEncoder().EncodeIndexed(
                 width, height, paletteRgb, frames,
                 frameDurationsMs, loopCount, ms,
-                transparentThreshold > 0 ? 0 : -1);
+                transparentIndex, disposalMode);
             return ms.ToArray();
+        }
+
+        /// <summary>
+        /// 把整帧索引转成帧间差分：与上一帧相同的像素写成透明索引。
+        /// 首帧保持完整；配合 disposal=1，透明像素显示上一帧。
+        /// </summary>
+        private static (List<byte[]> Frames, List<(int X, int Y, int W, int H)> Rects) BuildDiffFrames(
+            IReadOnlyList<byte[]> fullFrames, int width, int height, int transparentIndex)
+        {
+            var frames = new List<byte[]>(fullFrames.Count) { fullFrames[0] };
+            var rects = new List<(int X, int Y, int W, int H)>(fullFrames.Count) { (0, 0, width, height) };
+
+            for (int i = 1; i < fullFrames.Count; i++)
+            {
+                byte[] cur = fullFrames[i];
+                byte[] prev = fullFrames[i - 1];
+                int minX = width, minY = height, maxX = -1, maxY = -1;
+                for (int y = 0; y < height; y++)
+                {
+                    int row = y * width;
+                    for (int x = 0; x < width; x++)
+                    {
+                        if (cur[row + x] == prev[row + x]) continue;
+                        if (x < minX) minX = x;
+                        if (x > maxX) maxX = x;
+                        if (y < minY) minY = y;
+                        if (y > maxY) maxY = y;
+                    }
+                }
+
+                if (maxX < 0)
+                {
+                    // 整帧没有变化：1×1 透明像素 + disposal=1，保留上一帧。
+                    frames.Add([(byte)transparentIndex]);
+                    rects.Add((0, 0, 1, 1));
+                    continue;
+                }
+
+                int w = maxX - minX + 1;
+                int h = maxY - minY + 1;
+                var frame = new byte[w * h];
+                for (int y = 0; y < h; y++)
+                {
+                    int src = (minY + y) * width + minX;
+                    int dst = y * w;
+                    for (int x = 0; x < w; x++)
+                    {
+                        byte value = cur[src + x];
+                        frame[dst + x] = value == prev[src + x] ? (byte)transparentIndex : value;
+                    }
+                }
+                frames.Add(frame);
+                rects.Add((minX, minY, w, h));
+            }
+            return (frames, rects);
         }
 
         /// <summary>
@@ -701,7 +958,7 @@ namespace SharpImageConverter.Compression
             return EncodeIndices(
                 width, height, frames, paletteRgb,
                 animated ? animation.FrameDurationsMs : null,
-                animation.LoopCount, transparentThreshold);
+                animation.LoopCount, transparentThreshold > 0 ? 0 : -1);
         }
 
         private static byte[] BuildSample(
@@ -713,6 +970,16 @@ namespace SharpImageConverter.Compression
         {
             int framePixels = width * height;
             byte[] sample = new byte[(long)framePixels * sampleFrames * 4];
+
+            if (animation.RgbaFrames != null)
+            {
+                for (int s = 0; s < sampleFrames; s++)
+                {
+                    int frameIndex = sampleFrames == 1 ? 0 : (int)((long)s * animation.Frames.Count / sampleFrames);
+                    Buffer.BlockCopy(animation.RgbaFrames[frameIndex].Buffer, 0, sample, s * framePixels * 4, framePixels * 4);
+                }
+                return sample;
+            }
 
             if (providedRgba == null)
             {

@@ -1,4 +1,5 @@
-using System;
+﻿using System;
+using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.IO;
 using System.IO.Compression;
@@ -47,11 +48,33 @@ namespace SharpImageConverter.Compression
 
             var sourceKind = DetectFormat(inputPath);
             var targetKind = DetectKindByExtension(output);
+            var traits = DetectSourceTraits(inputPath, sourceKind);
+
+            // 内存预检：在解码/搜索之前按文件头宽高估算峰值。optimize 超预算直接拒绝，
+            // 避免进入分配阶段后 OOM。跨格式转换没有“保留原格式”的退路，因此抛出明确异常
+            // （CLI 会按文件捕获并继续处理其余文件）。
+            var memory = MemoryGuard.CheckOptimize(sourceKind, inputPath, o);
 
             // 目标扩展名能识别、且与源格式不同 → 一步完成「转换 + 智能压缩」
             if (targetKind != ImageKind.Unknown && targetKind != sourceKind)
             {
-                return OptimizeConverted(inputPath, output, targetKind, originalSize, o);
+                if (memory.Action == MemoryGuard.Action.Refuse)
+                {
+                    throw new InsufficientMemoryException(memory.Reason);
+                }
+                return OptimizeConverted(inputPath, output, targetKind, originalSize, o, traits.ConvertNote);
+            }
+
+            // 16-bit / 动画输入：同格式 optimize 会把位深截断或只保留首帧，
+            // 这属于静默丢数据，宁可保留原图并把原因写清楚。
+            if (traits.SameFormatReason is { } reason)
+            {
+                return Finish(inputPath, output, originalSize, null, null, default, o, reason);
+            }
+
+            if (memory.Action == MemoryGuard.Action.Refuse)
+            {
+                return Finish(inputPath, output, originalSize, null, null, default, o, memory.Reason);
             }
 
             switch (sourceKind)
@@ -140,6 +163,155 @@ namespace SharpImageConverter.Compression
             ".bmp" => ImageKind.Bmp,
             _ => ImageKind.Unknown,
         };
+
+        /// <summary>
+        /// 源文件在解码时会丢失、但 optimize 无法无损保留的特征（16-bit、动画）。
+        /// </summary>
+        internal readonly record struct SourceTraits(bool Is16Bit, bool IsAnimated)
+        {
+            /// <summary>同格式 optimize 是否应直接放弃（避免静默降级）。</summary>
+            public bool BlocksSameFormat => Is16Bit || IsAnimated;
+
+            /// <summary>同格式 optimize 放弃时给出的原因。</summary>
+            public string? SameFormatReason => this switch
+            {
+                { IsAnimated: true } => "源为动画（APNG / 动画 WebP），重编码会只保留首帧，已保留原图",
+                { Is16Bit: true } => "源为 16-bit PNG，重编码会降为 8-bit，已保留原图",
+                _ => null,
+            };
+
+            /// <summary>跨格式转换时追加到方案描述里的提示。</summary>
+            public string? ConvertNote => this switch
+            {
+                { IsAnimated: true } => "（源为动画，输出仅保留首帧）",
+                { Is16Bit: true } => "（源为 16-bit，输出已降为 8-bit）",
+                _ => null,
+            };
+        }
+
+        /// <summary>
+        /// 读取文件头/关键块，判断源文件是否有 16-bit 或动画特征。
+        /// </summary>
+        /// <remarks>
+        /// 只读块头、按长度跳过块数据，不会把整个 PNG 读进内存；
+        /// APNG 的 <c>acTL</c> 规范要求出现在第一个 <c>IDAT</c> 之前，扫到 IDAT 即可停。
+        /// WebP 的动画标志在 <c>VP8X</c> 的 flags 字节 bit1，另有 <c>ANIM</c>/<c>ANMF</c> 块可兜底。
+        /// </remarks>
+        internal static SourceTraits DetectSourceTraits(string path, ImageKind kind)
+        {
+            try
+            {
+                using var fs = File.OpenRead(path);
+                return kind switch
+                {
+                    ImageKind.Png => DetectPngTraits(fs),
+                    ImageKind.Webp => DetectWebpTraits(fs),
+                    _ => default,
+                };
+            }
+            catch
+            {
+                // 读不到就当作普通文件，后续解码会给出更准确的错误
+                return default;
+            }
+        }
+
+        private static SourceTraits DetectPngTraits(Stream stream)
+        {
+            Span<byte> head = stackalloc byte[8];
+            stream.ReadExactly(head);
+            if (head[0] != 0x89 || head[1] != 0x50 || head[2] != 0x4E || head[3] != 0x47)
+            {
+                return default;
+            }
+
+            bool is16Bit = false;
+            Span<byte> chunkHeader = stackalloc byte[8];
+            while (TryReadExactly(stream, chunkHeader))
+            {
+                uint length = BinaryPrimitives.ReadUInt32BigEndian(chunkHeader);
+                ReadOnlySpan<byte> type = chunkHeader.Slice(4, 4);
+
+                if (type.SequenceEqual("IHDR"u8))
+                {
+                    Span<byte> ihdr = stackalloc byte[13];
+                    stream.ReadExactly(ihdr);
+                    is16Bit = ihdr[8] == 16;
+                    // IHDR 数据后还有 4 字节 CRC
+                    if (!Skip(stream, 4)) return new SourceTraits(is16Bit, false);
+                }
+                else if (type.SequenceEqual("acTL"u8))
+                {
+                    return new SourceTraits(is16Bit, true);
+                }
+                else if (type.SequenceEqual("IDAT"u8) || type.SequenceEqual("IEND"u8))
+                {
+                    return new SourceTraits(is16Bit, false);
+                }
+                else if (!Skip(stream, (long)length + 4))
+                {
+                    return new SourceTraits(is16Bit, false);
+                }
+            }
+            return new SourceTraits(is16Bit, false);
+        }
+
+        private static SourceTraits DetectWebpTraits(Stream stream)
+        {
+            Span<byte> head = stackalloc byte[12];
+            stream.ReadExactly(head);
+            if (head[0] != (byte)'R' || head[1] != (byte)'I' || head[2] != (byte)'F' || head[3] != (byte)'F'
+                || head[8] != (byte)'W' || head[9] != (byte)'E' || head[10] != (byte)'B' || head[11] != (byte)'P')
+            {
+                return default;
+            }
+
+            Span<byte> chunk = stackalloc byte[8];
+            while (TryReadExactly(stream, chunk))
+            {
+                ReadOnlySpan<byte> fourCc = chunk.Slice(0, 4);
+                uint size = BinaryPrimitives.ReadUInt32LittleEndian(chunk.Slice(4, 4));
+                if (fourCc.SequenceEqual("VP8X"u8) && size >= 10)
+                {
+                    Span<byte> data = stackalloc byte[10];
+                    stream.ReadExactly(data);
+                    bool animated = (data[0] & 0x02) != 0;
+                    return new SourceTraits(false, animated);
+                }
+                if (fourCc.SequenceEqual("ANIM"u8) || fourCc.SequenceEqual("ANMF"u8))
+                {
+                    return new SourceTraits(false, true);
+                }
+                // 普通 VP8/VP8L 已确定不是动画；仍继续跳块只为稳妥地找到 VP8X
+                if (!Skip(stream, (long)size + (size & 1) + 4))
+                {
+                    return default;
+                }
+            }
+            return default;
+        }
+
+        private static bool TryReadExactly(Stream stream, Span<byte> buffer)
+        {
+            try
+            {
+                stream.ReadExactly(buffer);
+                return true;
+            }
+            catch (EndOfStreamException)
+            {
+                return false;
+            }
+        }
+
+        private static bool Skip(Stream stream, long bytes)
+        {
+            if (bytes < 0 || !stream.CanSeek) return false;
+            long remaining = stream.Length - stream.Position;
+            if (bytes > remaining) return false;
+            stream.Seek(bytes, SeekOrigin.Current);
+            return true;
+        }
 
         /// <summary>
         /// 按选项处理元数据：默认只丢弃 EXIF，保留 ICC（影响色彩呈现）。
@@ -318,23 +490,66 @@ namespace SharpImageConverter.Compression
         }
 
         /// <summary>
-        /// 候选并行的默认内存预算：取运行时可用内存的 1/4，夹在 384 MB ~ 8 GB。
+        /// 候选并行的默认内存预算：取「当前可用内存」的 1/4，夹在 64 MB ~ 8 GB。
         /// </summary>
         /// <remarks>
         /// 原先固定 512 MB。大图上的单候选峰值是「索引 1 B/px + 还原缓冲 4 B/px」≈ 5 B/px，
         /// 143 MP 时约 716 MB ⇒ 512 MB / 716 MB = 0 被夹成 1，**并行度静默塌成 1、退化为串行**，
         /// 而调用方仍以为在并行（这就是 143 MP 照片 optimize 要 31 s 的另一半原因）。
-        /// 改成跟着真实可用内存走：63.5 GB 的机器上 8 个候选全并行，
-        /// 8 GB 的小机器上自动退到 1~2。
+        /// 之后改成「进程总量 / 4」，但 `TotalAvailableMemoryBytes` 是 GC 可用的**总量**
+        /// （容器限额或物理内存），不是当前空闲量：目录批量同时处理多张图、或进程自己已占用
+        /// 一两 GB 时，这个预算仍会高估可用内存并触发 OOM。
+        /// 现在按「GC 可用总量 − 已提交给托管堆的部分」推导，且下界从 384 MB 降到 64 MB
+        /// （小容器里 384 MB 的预算本身就可能超过真实空闲内存）。
+        /// 仍然夹了 8 GB 上限，避免 64 GB 机器上 16 个候选同时铺开把 L3 打爆。
         /// </remarks>
         private static long AutoCandidateMemoryBudget
         {
             get
             {
-                long available = GC.GetGCMemoryInfo().TotalAvailableMemoryBytes;
-                if (available <= 0) available = 2L << 30;
-                return Math.Clamp(available / 4, 384L << 20, 8L << 30);
+                var info = GC.GetGCMemoryInfo();
+                long total = info.TotalAvailableMemoryBytes;
+                if (total <= 0) total = 2L << 30;
+                long used = GC.GetTotalMemory(forceFullCollection: false);
+                long free = total > used ? total - used : 0;
+                return Math.Clamp(free / 4, 64L << 20, 8L << 30);
             }
+        }
+
+        /// <summary>
+        /// 并行评估候选；遇到内存不足时自动退回串行重跑，避免整个 optimize 失败。
+        /// </summary>
+        /// <remarks>
+        /// 候选并行是「按内存预算夹并行度」的第二道保险：预算基于瞬时可用内存，
+        /// 而目录批量、外层并行度、以及原生缓冲（不进 GC 堆）都可能让真实峰值超出估算。
+        /// 真 OOM 时把并行度降到 1 重跑同一批候选——每个候选的写区互不相交，重复计算是幂等的。
+        /// </remarks>
+        internal static void ForEachCandidate(int count, int degree, Action<int> body)
+        {
+            if (count <= 0) return;
+            try
+            {
+                Parallel.For(0, count, new ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, degree) }, body);
+            }
+            catch (Exception ex) when (IsOutOfMemory(ex))
+            {
+                GC.Collect(GC.MaxGeneration, GCCollectionMode.Forced, blocking: true, compacting: true);
+                GC.WaitForPendingFinalizers();
+                Parallel.For(0, count, new ParallelOptions { MaxDegreeOfParallelism = 1 }, body);
+            }
+        }
+
+        private static bool IsOutOfMemory(Exception ex)
+        {
+            if (ex is OutOfMemoryException) return true;
+            if (ex is AggregateException aggregate)
+            {
+                foreach (var inner in aggregate.InnerExceptions)
+                {
+                    if (inner is OutOfMemoryException) return true;
+                }
+            }
+            return false;
         }
 
         /// <summary>
@@ -365,6 +580,16 @@ namespace SharpImageConverter.Compression
             int lo = Math.Max(1, minQuality);
             int hi = Math.Min(100, maxQuality);
             if (!accept(Eval(hi))) return (hi, cache[hi]);
+
+            // 边界多看 1~2 档：画质与体积都不是严格单调（量化表整数取整、Huffman 表切换），
+            // 「最低达标 q」下面一档有时仍然达标且体积更小。评估成本很低（系数直通，不写比特流），
+            // 命中就采用更低的 q。
+            int probe = hi;
+            for (int step = 1; step <= 2 && probe - 1 >= lo; step++)
+            {
+                probe--;
+                if (accept(Eval(probe))) hi = probe;
+            }
 
             while (lo < hi)
             {
@@ -397,6 +622,7 @@ namespace SharpImageConverter.Compression
         /// <param name="accept">达标判定</param>
         /// <param name="log">日志委托</param>
         /// <param name="degree">并行度</param>
+        /// <param name="bytesPerPixel">参考/解码像素的通道数：RGB 传 3，RGBA 传 4</param>
         internal static (int Quality, byte[] Bytes, ImageQuality Score) SearchQualityParallel(
             Func<int, byte[]> encode,
             Func<byte[], byte[]> decode,
@@ -407,11 +633,12 @@ namespace SharpImageConverter.Compression
             int maxQuality,
             Func<ImageQuality, bool> accept,
             Action<string>? log,
-            int degree)
+            int degree,
+            int bytesPerPixel = 3)
         {
             if (degree <= 1)
             {
-                return SearchQuality(encode, decode, reference, width, height, minQuality, maxQuality, accept, log);
+                return SearchQuality(encode, decode, reference, width, height, minQuality, maxQuality, accept, log, bytesPerPixel);
             }
 
             int lo = Math.Max(1, minQuality);
@@ -430,9 +657,9 @@ namespace SharpImageConverter.Compression
                         int q = qs[i];
                         byte[] bytes = encode(q);
                         byte[] decoded = decode(bytes);
-                        // 与 SearchQuality 保持同一口径：这里历史上就按 3 通道比较（WebP 传进来的是 RGBA），
-                        // 改成 4 会改变可选的 q，属产品行为变化，本函数不擅自改。
-                        var quality = QualityMetrics.Compare(reference, decoded, width, height, 3);
+                        // 通道数必须与缓冲布局一致：WebP 解码出 RGBA，按 3 读会漏掉后 1/4、
+                        // 且 RGB 权重落在错位的字节上（感知 PSNR 系统性虚高约 8 dB）。
+                        var quality = QualityMetrics.Compare(reference, decoded, width, height, bytesPerPixel);
                         batch[i] = (q, bytes, quality);
                     });
                 }
@@ -537,6 +764,111 @@ namespace SharpImageConverter.Compression
             return (qStar, results[qStar].Bytes, results[qStar].Quality);
         }
 
+        /// <summary>
+        /// 以某个“锚点质量”为起点搜索最低达标质量：先探锚点，再在需要的那一侧做小网格 + 二分。
+        /// </summary>
+        /// <remarks>
+        /// WebP 的 q=40 是历史上的默认下界，绝大多数照片在 q40 已达标；从 q40 起步比从小下界
+        /// （20）起步少走很多弯路，也不会因为 40 以下/以上的非单调点漏掉明显更优的档位。
+        /// 锚点达标时只在 (min, anchor] 里找；锚点不达标时才看最高档，并在 (anchor, max] 里找。
+        /// 小网格用于吃多核，二分用于把候选数压到 log2，避免 143 MP 上铺 19 个候选。
+        /// </remarks>
+        /// <param name="evaluate">按质量评估画质（内部会缓存，重复 q 不重复编码）</param>
+        /// <param name="minQuality">质量下界</param>
+        /// <param name="maxQuality">质量上界</param>
+        /// <param name="anchorQuality">锚点质量（clamp 到 [min,max]）</param>
+        /// <param name="accept">达标判定</param>
+        /// <param name="degree">小网格的并行度</param>
+        /// <param name="log">日志委托</param>
+        internal static (int Quality, ImageQuality Score) SearchQualityAnchored(
+            Func<int, ImageQuality> evaluate,
+            int minQuality,
+            int maxQuality,
+            int anchorQuality,
+            Func<ImageQuality, bool> accept,
+            int degree,
+            Action<int, ImageQuality>? log = null)
+        {
+            int lo = Math.Max(1, minQuality);
+            int hi = Math.Min(100, maxQuality);
+            if (lo >= hi) return (lo, evaluate(lo));
+
+            var cache = new Dictionary<int, ImageQuality>(16);
+            var sync = new object();
+            ImageQuality Eval(int q)
+            {
+                lock (sync)
+                {
+                    if (cache.TryGetValue(q, out var cached)) return cached;
+                }
+                var score = evaluate(q);
+                log?.Invoke(q, score);
+                lock (sync) cache[q] = score;
+                return score;
+            }
+
+            int anchor = Math.Clamp(anchorQuality, lo, hi);
+            if (accept(Eval(anchor)))
+            {
+                // 锚点已达标：答案在 [lo, anchor]；先确认下界，不达标就得到左边界。
+                if (anchor == lo || accept(Eval(lo))) return (lo, Eval(lo));
+                hi = anchor;
+            }
+            else
+            {
+                // 锚点不达标：只有最高档可能达标。
+                if (anchor == hi || !accept(Eval(hi))) return (hi, Eval(hi));
+                lo = anchor;
+            }
+
+            // 小网格（不含两端）先并行扫一遍，把区间压到相邻两点之间。
+            int interior = Math.Min(4, hi - lo - 1);
+            if (interior > 0)
+            {
+                var probes = new int[interior];
+                for (int i = 0; i < interior; i++)
+                {
+                    probes[i] = lo + (int)Math.Round((double)(hi - lo) * (i + 1) / (interior + 1));
+                }
+                try
+                {
+                    ForEachCandidate(probes.Length, degree, i => Eval(probes[i]));
+                }
+                catch (AggregateException ex) when (ex.InnerExceptions.Count == 1)
+                {
+                    ExceptionDispatchInfo.Capture(ex.InnerExceptions[0]).Throw();
+                }
+
+                for (int i = 0; i < probes.Length; i++)
+                {
+                    int q = probes[i];
+                    if (q <= lo || q >= hi) continue;
+                    if (accept(Eval(q)))
+                    {
+                        hi = q;
+                        break;
+                    }
+                    lo = q;
+                }
+            }
+
+            // 二分收敛到最低达标 q（lo 已知不达标、hi 已知达标）。
+            while (lo + 1 < hi)
+            {
+                int mid = (lo + hi) >> 1;
+                if (accept(Eval(mid))) hi = mid;
+                else lo = mid;
+            }
+
+            // 边界多看 1~2 档（与 SearchQualityByScore 同一理由）：低一档偶尔仍达标且体积更小。
+            for (int step = 1; step <= 2 && hi - 1 > lo; step++)
+            {
+                if (accept(Eval(hi - 1))) hi--;
+                else break;
+            }
+            return (hi, Eval(hi));
+        }
+
         /// <summary>并行评估后补日志：按质量升序输出，保证多次运行的日志稳定可比。</summary>
         private static void EmitLog(Action<string>? log, Dictionary<int, (byte[] Bytes, ImageQuality Quality)> results)
         {
@@ -559,6 +891,7 @@ namespace SharpImageConverter.Compression
         /// <param name="maxQuality">质量上界</param>
         /// <param name="accept">达标判定</param>
         /// <param name="log">日志委托</param>
+        /// <param name="bytesPerPixel">参考/解码像素的通道数：RGB 传 3，RGBA 传 4</param>
         internal static (int Quality, byte[] Bytes, ImageQuality Score) SearchQuality(
             Func<int, byte[]> encode,
             Func<byte[], byte[]> decode,
@@ -568,7 +901,8 @@ namespace SharpImageConverter.Compression
             int minQuality,
             int maxQuality,
             Func<ImageQuality, bool> accept,
-            Action<string>? log)
+            Action<string>? log,
+            int bytesPerPixel = 3)
         {
             var cache = new Dictionary<int, (byte[] Bytes, ImageQuality Quality)>(8);
             (byte[] Bytes, ImageQuality Quality) Eval(int q)
@@ -576,7 +910,7 @@ namespace SharpImageConverter.Compression
                 if (cache.TryGetValue(q, out var cached)) return cached;
                 byte[] bytes = encode(q);
                 byte[] decoded = decode(bytes);
-                var quality = QualityMetrics.Compare(reference, decoded, width, height, 3);
+                var quality = QualityMetrics.Compare(reference, decoded, width, height, bytesPerPixel);
                 log?.Invoke($"  候选质量 {q}: {bytes.Length} 字节, {quality}");
                 var result = (bytes, quality);
                 cache[q] = result;
@@ -634,7 +968,8 @@ namespace SharpImageConverter.Compression
             string? method,
             ImageQuality quality,
             OptimizeOptions options,
-            string? reason = null)
+            string? reason = null,
+            double minGainRatio = 0)
         {
             bool samePath = string.Equals(Path.GetFullPath(inputPath), Path.GetFullPath(outputPath), StringComparison.OrdinalIgnoreCase);
 
@@ -653,9 +988,13 @@ namespace SharpImageConverter.Compression
             }
 
             double ratio = (double)(originalSize - bestBytes.Length) / Math.Max(1, originalSize);
-            if (options.KeepOriginalWhenNoGain && ratio < options.MinSavingRatio)
+            double required = Math.Max(options.MinSavingRatio, minGainRatio);
+            if (options.KeepOriginalWhenNoGain && ratio < required)
             {
                 if (!samePath) File.Copy(inputPath, outputPath, true);
+                string? keepReason = minGainRatio > options.MinSavingRatio && ratio >= options.MinSavingRatio
+                    ? $"仅节省 {ratio:P1}，低于有损再压缩的最低收益 {minGainRatio:P0}，已保留原图"
+                    : null;
                 return new OptimizationResult
                 {
                     InputPath = inputPath,
@@ -663,7 +1002,7 @@ namespace SharpImageConverter.Compression
                     OriginalSize = originalSize,
                     OptimizedSize = originalSize,
                     KeptOriginal = true,
-                    Reason = null,
+                    Reason = keepReason,
                 };
             }
 
@@ -683,23 +1022,115 @@ namespace SharpImageConverter.Compression
         /// 跨格式优化：源格式与目标格式不同，直接按目标格式产出最小体积文件。
         /// 因为用户显式要求转换，无论目标体积是否小于源文件都会写出目标格式。
         /// </summary>
-        private static OptimizationResult OptimizeConverted(string input, string output, ImageKind target, long originalSize, OptimizeOptions o)
+        private static OptimizationResult OptimizeConverted(string input, string output, ImageKind target, long originalSize, OptimizeOptions o, string? note = null)
         {
-            switch (target)
+            // 解码一次，所有目标格式共用同一份像素；同时收集「更优目标格式」建议所需的统计。
+            var rgba = Configuration.Default.LoadRgba32(input);
+            bool hadAlpha = !SimdHelper.IsOpaqueRgba(rgba.Buffer);
+            int uniqueColors = PaletteQuantizer.CountUniqueColors(rgba.Buffer, 4097);
+            string? suggestion = SuggestTarget(target, rgba.Width, rgba.Height, hadAlpha, uniqueColors);
+            string? alphaNote = hadAlpha && target is ImageKind.Jpeg or ImageKind.Bmp ? MatteNote(o) : null;
+
+            OptimizationResult result = target switch
             {
-                case ImageKind.Jpeg:
-                    return JpegOptimizer.RunFromImage(Configuration.Default.LoadRgb24(input), input, output, originalSize, o);
-                case ImageKind.Png:
-                    return PngOptimizer.RunFromImage(Configuration.Default.LoadRgba32(input), input, output, originalSize, o);
-                case ImageKind.Webp:
-                    return WebpOptimizer.RunFromImage(Configuration.Default.LoadRgba32(input), input, output, originalSize, o);
-                case ImageKind.Gif:
-                    return GifOptimizer.RunFromImage(Configuration.Default.LoadRgba32(input), input, output, originalSize, o);
-                case ImageKind.Bmp:
-                    return FinishConverted(input, output, originalSize, ProduceBmp(Configuration.Default.LoadRgba32(input)), o);
-                default:
-                    throw new NotSupportedException($"不支持转换到 {target} 格式");
+                ImageKind.Jpeg => JpegOptimizer.RunFromImage(ComposeRgb24(rgba, o, hadAlpha), input, output, originalSize, o),
+                ImageKind.Png => PngOptimizer.RunFromImage(rgba, input, output, originalSize, o),
+                ImageKind.Webp => WebpOptimizer.RunFromImage(rgba, input, output, originalSize, o),
+                // GIF 支持单帧二值透明，交给 GifOptimizer 保留，不做背景合成。
+                ImageKind.Gif => GifOptimizer.RunFromImage(rgba, input, output, originalSize, o),
+                ImageKind.Bmp => FinishConverted(input, output, originalSize, ProduceBmp(ComposeRgb24(rgba, o, hadAlpha)), o),
+                _ => throw new NotSupportedException($"不支持转换到 {target} 格式"),
+            };
+            return WithNote(result, note + alphaNote, suggestion);
+        }
+
+        /// <summary>
+        /// 按 <see cref="OptimizeOptions.MatteColor"/> 把 alpha 合成到 RGB，
+        /// 供 JPEG / BMP 这类不支持透明通道的目标格式使用。
+        /// </summary>
+        private static Image<Rgb24> LoadCompositedRgb24(string input, OptimizeOptions o, out bool hadAlpha)
+        {
+            var rgba = Configuration.Default.LoadRgba32(input);
+            hadAlpha = !SimdHelper.IsOpaqueRgba(rgba.Buffer);
+            return ComposeRgb24(rgba, o, hadAlpha);
+        }
+
+        private static Image<Rgb24> ComposeRgb24(Image<Rgba32> rgba, OptimizeOptions o, bool hadAlpha)
+        {
+            var rgb = new byte[(long)rgba.Width * rgba.Height * 3];
+            if (hadAlpha) CompositeOnMatte(rgba.Buffer, rgb, o.MatteColor);
+            else SimdHelper.PackRgbaToRgb(rgba.Buffer, rgb);
+            return new Image<Rgb24>(rgba.Width, rgba.Height, rgb, rgba.Metadata);
+        }
+
+        /// <summary>
+        /// 跨格式转换后的目标格式建议（启发式，不额外编码）。
+        /// </summary>
+        /// <remarks>
+        /// 只提「方向明确」的建议，不确定时返回 null：
+        /// 目标不支持 alpha 而源带透明；照片类内容转 PNG/GIF；颜色很少却转有损 JPEG；
+        /// BMP 本身无压缩。建议文案里写清理由，避免变成“再猜一次格式”的噪声。
+        /// 唯一色数用 4097 截断（照片很快命中上限，成本可忽略）。
+        /// </remarks>
+        private static string? SuggestTarget(ImageKind target, int width, int height, bool hadAlpha, int uniqueColors)
+        {
+            bool photoLike = uniqueColors > 4096;
+            return target switch
+            {
+                ImageKind.Webp => null,
+                ImageKind.Jpeg when hadAlpha => "WebP 或 PNG（JPEG 不支持透明通道，当前已把 alpha 合成到背景）",
+                ImageKind.Bmp when hadAlpha => "PNG 或 WebP（BMP 无压缩且不支持透明，当前已合成背景）",
+                ImageKind.Bmp => "PNG（无损且体积通常只有 BMP 的 1/5~1/2）",
+                ImageKind.Gif when photoLike => "WebP（照片类图像 GIF 仅 256 色，有损 WebP 通常再小 30%~60%）",
+                ImageKind.Jpeg when !photoLike => "PNG 或 WebP（颜色数少、图形类内容，有损 JPEG 常常反而更大）",
+                ImageKind.Jpeg => "WebP（照片类图像通常比 JPEG 再小 25%~35%）",
+                ImageKind.Png when photoLike => "WebP（照片类图像有损 WebP 通常比 PNG 调色板小 30%~50%）",
+                _ => null,
+            };
+        }
+
+        private static void CompositeOnMatte(ReadOnlySpan<byte> rgba, Span<byte> rgb, (byte R, byte G, byte B) matte)
+        {
+            int pixels = rgba.Length / 4;
+            for (int p = 0, i = 0, j = 0; p < pixels; p++, i += 4, j += 3)
+            {
+                int a = rgba[i + 3];
+                if (a == 255)
+                {
+                    rgb[j] = rgba[i];
+                    rgb[j + 1] = rgba[i + 1];
+                    rgb[j + 2] = rgba[i + 2];
+                    continue;
+                }
+                int ia = 255 - a;
+                rgb[j] = (byte)((rgba[i] * a + matte.R * ia + 127) / 255);
+                rgb[j + 1] = (byte)((rgba[i + 1] * a + matte.G * ia + 127) / 255);
+                rgb[j + 2] = (byte)((rgba[i + 2] * a + matte.B * ia + 127) / 255);
             }
+        }
+
+        private static string MatteNote(OptimizeOptions o)
+            => $"（透明通道已合成到背景 #{o.MatteColor.R:X2}{o.MatteColor.G:X2}{o.MatteColor.B:X2}）";
+
+        /// <summary>
+        /// 给跨格式结果追加“源特征已降级”的提示（16-bit / 动画）。
+        /// </summary>
+        private static OptimizationResult WithNote(OptimizationResult result, string? note, string? suggestion = null)
+        {
+            if (string.IsNullOrEmpty(note) && string.IsNullOrEmpty(suggestion)) return result;
+            return new OptimizationResult
+            {
+                InputPath = result.InputPath,
+                OutputPath = result.OutputPath,
+                OriginalSize = result.OriginalSize,
+                OptimizedSize = result.OptimizedSize,
+                Method = string.IsNullOrEmpty(note) ? result.Method : result.Method + note,
+                Quality = result.Quality,
+                KeptOriginal = result.KeptOriginal,
+                Converted = result.Converted,
+                Reason = result.Reason,
+                Suggestion = suggestion ?? result.Suggestion,
+            };
         }
 
         /// <summary>
@@ -712,7 +1143,7 @@ namespace SharpImageConverter.Compression
             OptimizeArtifact artifact,
             OptimizeOptions options)
         {
-            byte[] bytes = artifact.Bytes ?? EncodePlain(inputPath, outputPath);
+            byte[] bytes = artifact.Bytes ?? EncodePlain(inputPath, outputPath, options);
             File.WriteAllBytes(outputPath, bytes);
 
             // 跨格式时「无收益保留原图」没有意义（原格式 ≠ 目标格式），
@@ -735,12 +1166,10 @@ namespace SharpImageConverter.Compression
         /// <summary>
         /// BMP 无压缩：跨格式输出时按无损真彩色直写，没有进一步压缩空间。
         /// </summary>
-        private static OptimizeArtifact ProduceBmp(Image<Rgba32> image)
+        private static OptimizeArtifact ProduceBmp(Image<Rgb24> image)
         {
-            var rgb = new byte[image.Width * image.Height * 3];
-            SimdHelper.PackRgbaToRgb(image.Buffer, rgb);
             using var ms = new MemoryStream();
-            BmpWriter.Write24(ms, image.Width, image.Height, rgb);
+            BmpWriter.Write24(ms, image.Width, image.Height, image.Buffer);
             return new OptimizeArtifact(
                 ms.ToArray(),
                 "BMP 无损（该格式无压缩）",
@@ -751,14 +1180,14 @@ namespace SharpImageConverter.Compression
         /// <summary>
         /// 兜底：按目标格式做一次普通编码（不做质量搜索），保证输出文件始终存在且可用。
         /// </summary>
-        private static byte[] EncodePlain(string inputPath, string outputPath)
+        private static byte[] EncodePlain(string inputPath, string outputPath, OptimizeOptions options)
         {
             string ext = Path.GetExtension(outputPath).ToLowerInvariant();
             using var ms = new MemoryStream();
             switch (ext)
             {
                 case ".jpg" or ".jpeg":
-                    JpegEncoder.Encode(Configuration.Default.LoadRgb24(inputPath), ms,
+                    JpegEncoder.Encode(LoadCompositedRgb24(inputPath, options, out _), ms,
                         new JpegEncoderOptions(90, subsample420: true, keepMetadata: false, enableDiagnostics: false));
                     break;
                 case ".png":
@@ -784,10 +1213,8 @@ namespace SharpImageConverter.Compression
                     break;
                 case ".bmp":
                 {
-                    var img = Configuration.Default.LoadRgba32(inputPath);
-                    var rgb = new byte[img.Width * img.Height * 3];
-                    SimdHelper.PackRgbaToRgb(img.Buffer, rgb);
-                    BmpWriter.Write24(ms, img.Width, img.Height, rgb);
+                    var rgb = LoadCompositedRgb24(inputPath, options, out _);
+                    BmpWriter.Write24(ms, rgb.Width, rgb.Height, rgb.Buffer);
                     break;
                 }
                 default:

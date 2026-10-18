@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Runtime.InteropServices;
 using System.Threading.Tasks;
 
@@ -24,7 +24,7 @@ internal sealed class JpegSampleCache : IDisposable
     private byte[]? data;
     private int width;
     private int height;
-    private bool subsample420;
+    private JpegChromaSubsampling subsampling;
     private int mcuX;
     private int mcuY;
     private int blockCount;
@@ -39,23 +39,30 @@ internal sealed class JpegSampleCache : IDisposable
 
     /// <summary>缓存是否已经按这组几何采样过。</summary>
     public bool Matches(int w, int h, bool use420)
-        => filled && width == w && height == h && subsample420 == use420;
+        => Matches(w, h, use420 ? JpegChromaSubsampling.Yuv420 : JpegChromaSubsampling.Yuv444);
+
+    public bool Matches(int w, int h, JpegChromaSubsampling useSubsampling)
+        => filled && width == w && height == h && subsampling == useSubsampling;
 
     /// <summary>
     /// 采样整幅图并写入缓存。几何变化时重新分配；否则覆盖写。
     /// </summary>
     public void Capture(byte[] rgb24, int w, int h, bool use420)
+        => Capture(rgb24, w, h, use420 ? JpegChromaSubsampling.Yuv420 : JpegChromaSubsampling.Yuv444);
+
+    public void Capture(byte[] rgb24, int w, int h, JpegChromaSubsampling useSubsampling)
     {
-        if (data is null || width != w || height != h || subsample420 != use420)
+        if (data is null || width != w || height != h || subsampling != useSubsampling)
         {
             filled = false;
             width = w;
             height = h;
-            subsample420 = use420;
-            int mcuSize = use420 ? 16 : 8;
-            mcuX = (w + mcuSize - 1) / mcuSize;
-            mcuY = (h + mcuSize - 1) / mcuSize;
-            blockCount = use420 ? 6 : 3;
+            subsampling = useSubsampling;
+            int mcuSizeX = 8 * JpegEncoder.SamplingH(useSubsampling);
+            int mcuSizeY = 8 * JpegEncoder.SamplingV(useSubsampling);
+            mcuX = (w + mcuSizeX - 1) / mcuSizeX;
+            mcuY = (h + mcuSizeY - 1) / mcuSizeY;
+            blockCount = JpegEncoder.BlockCountOf(useSubsampling);
             // 每个字节都会被下面覆写，不必清零（215 MB 的清零是 10 ms 量级的白付）。
             data = GC.AllocateUninitializedArray<byte>(checked(mcuX * mcuY * blockCount * 64));
         }
@@ -78,13 +85,20 @@ internal sealed class JpegSampleCache : IDisposable
         int stride = blockCount * 64;
         for (int mx = 0; mx < mcuX; mx++)
         {
-            if (subsample420)
+            if (subsampling == JpegChromaSubsampling.Yuv420)
             {
                 // 与 ProduceRgbSamples 的调用完全一致（含边界复制），保证样本逐位相同。
                 JpegEncoder.FillMcu420RgbToYCbCr(
                     rgb24, width, height, mx * 16, my * 16,
                     samples[..64], samples.Slice(64, 64), samples.Slice(128, 64),
                     samples.Slice(192, 64), samples.Slice(256, 64), samples.Slice(320, 64),
+                    null);
+            }
+            else if (subsampling == JpegChromaSubsampling.Yuv422)
+            {
+                JpegEncoder.FillMcu422RgbToYCbCr(
+                    rgb24, width, height, mx * 16, my * 8,
+                    samples[..64], samples.Slice(64, 64), samples.Slice(128, 64), samples.Slice(192, 64),
                     null);
             }
             else

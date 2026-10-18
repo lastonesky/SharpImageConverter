@@ -1,5 +1,111 @@
 ## 未发布
 
+### 修复
+- **WebP method 4 高质量悬崖保护**：`WebpEncoderOptions` 在 `quality >= 75` 时把
+  `method 4` 强制降为 `method 3`。143 MP 实测 q75：m4 26.3 s / 1,655,814 B，
+  m3 7.8 s / 1,597,784 B；q40/q65 不触发悬崖。CLI 显式 `--webp-method 4 --quality 75`
+  现在也走 m3。
+- **有损格式再压缩的最小收益门槛**：同格式 JPEG/WebP optimize 新增 `MinLossyGainRatio`
+  （默认 10%）。收益不足时保留原图，避免为 1%~5% 体积再损失一代画质；跨格式不受影响。
+- **WebP optimize 画质口径错误**：搜索期曾把 RGBA 缓冲按 `bytesPerPixel = 3` 比较，
+  只读前 3/4 数据且 RGB 权重错位，感知 PSNR 系统性虚高约 8 dB，导致大量图片在 q=40
+  被误判达标。现统一为 4 通道；固定质量分支改用产出档 `method 3`；产出后重新解码最终字节
+  复评画质（不再用搜索期 m2 的结果冒充最终画质）。语料中 `5_star_base.jpg` 因此从 q52
+  （实际感知 41.18 dB，未达标）改为 q81 / 感知 45.84 dB，体积 +69%——这是修正误判的代价。
+
+### 新增
+- **JPEG trellis 量化（默认关闭）**：新增 `JpegTrellisQuantizer`（块内 DP，候选
+  `{0, 最近值, 最近值±1}`，λ 随量化步长 Q² 缩放）与 `OptimizeOptions.JpegTrellisQuantization` /
+  CLI `--opt-jpeg-trellis`。实测体积 −4.1%~−24.2%，代价是 2~7 倍编码时间、最差 1% SSIM
+  下降，因此默认不启用（详见 `docs/Optimize.md` §2）。
+- **WebP 参数搜索（默认关闭）**：`WebpEncoderOptions` 暴露 `AlphaQuality` / `FilterStrength` /
+  `SnsStrength` / `Segments` / `Preprocessing`，`OptimizeOptions.WebpParamSearch` 对 ≤1.5 MP
+  小图做单参数消融 + 组合 + 坐标下降；CLI `--opt-webp-params`。语料实测收益 0%~1.3%、
+  耗时 2~4 倍，故默认关闭。
+- **内存预检**：新增 `MemoryGuard`（文件头宽高探测 + 格式经验峰值估算 + 准入判定）
+  与 `OptimizeOptions.MemoryLimitBytes` / `DisableMemoryGuard`、CLI `--memory-limit` /
+  `--no-memory-guard`。optimize 预估超预算时拒绝并保留原图（跨格式抛
+  `InsufficientMemoryException`）；非 optimize 转换超预算时，BMP/PNG/GIF/WebP → BMP/PNG
+  自动切换逐行流式转换（新增 BMP/PNG 行编解码、PNG 逐行 zlib、GIF 首帧/单帧缓冲、
+  WebP 增量解码、JPEG 基线 MCU 行熵解码 + SIMD IDCT/行级编码）；目标 WebP 仍需整帧，
+  流式后不足则明确报错。143 MP 基线 JPEG→BMP 峰值从 854 MB 降到 65 MB、耗时 +21%；
+  progressive 回退整幅系数时从 854 MB 降到 458 MB、耗时 +51%，两者像素与常规路径一致。
+  流式 BMP 目标改为 top-down（负高度）顺序写，去掉逐行 seek。
+- **跨格式目标格式建议**：`OptimizationResult.Suggestion` 按 alpha / 唯一色数 / 目标格式
+  给出建议（BMP→PNG、照片转 PNG/GIF→WebP、带透明转 JPEG→WebP/PNG 等），CLI 打印提示。
+- **搜索策略：全候选取最小 + 边界多看 1~2 档**：PNG/GIF 不再只比较二分访问过的候选，
+  最高档达标时评估整条固定网格并在全部达标候选中按体积取最小；JPEG/WebP 在最低达标 q
+  附近再向下看 1~2 档。`CandidateParallelism` 改为按「当前可用内存」推导，并新增 OOM
+  串行回退（PNG/GIF/WebP 均接入）。
+- **JPEG 4:2:2 编码**：新增 `JpegChromaSubsampling` 枚举，编码器支持 4:2:2（16×8 MCU、
+  2Y+1Cb+1Cr，SIMD + 标量回退）；优化器同时搜索 4:2:0/4:2:2/4:4:4 按体积取小；
+  CLI 支持 `--subsample 420/422/444`。`large.jpg` 选择 4:2:2 q46 / 364.7 KB（感知 46.02 dB）。
+- **GIF 动画局部调色板 / crop / 帧去重**：新增 `GifEncoder.EncodeIndexedFrames`
+  （每帧局部表、帧矩形、无全局表）；差分帧只编码变化区域包围盒，连续相同帧合并时长。
+  实测 `large.gif` −11.5%、`final.gif` −24.5%；修复动画 RGBA 透明像素应保留上一帧的合成语义。
+- **CLI `--jpeg-progressive`**：普通 JPEG 转换（`--to jpg` / 输出 `.jpg`）可选择 progressive（SOF2），
+  默认仍是 baseline。实现方式是先 baseline 编码再无损转写，像素与 baseline 完全一致；
+  实测 `car.png` 8,474 → 5,419 B（−36%）。
+- **调色板 k-means 精修**：中位切分后增加 1 轮 Lloyd 迭代（`EnableKMeansRefinement` 默认开启），
+  同色数下降低量化误差。实测 `Amish.png` −0.06%、`final.gif` −0.72%，画质不降。
+- **JPEG 4:2:0 vs 4:4:4 全候选比较**：4:2:0 达标后仍搜索 4:4:4，按体积取小。
+  实测 `large.jpg` 463,598 → 373,443 B（−19.5%），感知 45.43 → 46.49 dB。
+  新增 `JpegCompareSubsampling`（默认 true）与 CLI `--opt-no-jpeg-subsample-compare`。
+- **画质度量外部后端 + 预乘 alpha**：`QualityMetrics.ExternalMetric` 可接入
+  SSIMULACRA2 / Butteraugli 等原生实现（内置不捆绑）；RGBA PSNR 改为预乘 alpha，
+  透明区不可见 RGB 不再误伤画质。新增 2 个单测。
+- **GIF 透明动画支持**：新增 `GifDecoder.DecodeAnimationRgba32` 与 `GifAnimation.RgbaFrames`，
+  透明动画按「整帧 + 全局调色板 + 二值透明 + disposal=2」重编码；不透明动画继续帧间差分。
+  实测 `large.gif` 2.42 MB → 2.14 MB（−11.5%）。同时修复精确调色板 `Assemble` 的 offset 错位、
+  以及画质比较对双方全透明像素 RGB 的误判。
+- **画质判据 V2（Y-SSIM + 最差 1% 块）**：`ImageQuality` 新增 `Ssim` / `WorstSsim`，
+  块边长按像素数放大（4~16），`OptimizeOptions.MinSsim=0.95` / `MinWorstSsim=0.75` 默认生效；
+  CLI 可用 `--opt-min-ssim` / `--opt-min-worst-ssim` 调整。旧 4×4 块平均 PSNR 会被
+  「块内结构被抹平」的候选骗过（棋盘格案例 54 dB），SSIM 仅 0.004。
+- **GIF 动画帧间差分**：动画候选预留透明索引，首帧完整、后续帧只写变化像素，disposal=1 保留上一帧。
+  实测 `final.gif` 23.39 MB → 17.78 MB（−24.0%）；`large.gif` −3.3%。
+  同时修复精确调色板对非采样色抛 `KeyNotFoundException` 的问题。
+  透明动画（源图带 alpha）仍保留原图，局部调色板/crop 尚未实现。
+- **JPEG progressive 编码**：新增 `JpegProgressiveTranscoder`，复用 baseline 系数重写为 SOF2
+  （DC 扫描 + 每分量 AC 扫描 + EOBRUN），不重新量化，像素逐字节一致。同 q 实测
+  large.jpg −5.4%、medium.jpg −4.7%、Amish q42 −6.9%；`JpegProgressive` 默认开启，
+  CLI 可 `--opt-no-jpeg-progressive` 关闭。
+- **JPEG 无损 Huffman 表重排**：新增 `JpegHuffmanOptimizer`，对基线单扫描 JPEG 复用解码器系数、
+  按实际符号频率重建最优 Huffman 表并重写熵编码段；兼容 restart 标记与元数据剥离。
+  `large.jpg` 626,239 → 565,492 B（−9.7%），像素逐字节一致；渐进式自动回退到只去元数据。
+- **JPEG 无损重封装（阶段 1）**：新增 `JpegLosslessOptimizer`，删除 APP1（EXIF/XMP）、APP13、COM，
+  保留 ICC 与熵编码数据，不碰系数；Orientation≠1 时保留 APP1。同格式 optimize 在
+  「原图 / 无损产物 / 有损重编码」间按 10% 收益门槛选择，避免为微小体积再损失一代画质。
+  新增 CLI `--opt-lossy-min-gain`。
+- **PNG 赢家精修**：调色板图实测 None/Up/Adaptive 三种滤波 + 最小位深 + 按使用频率重排调色板；
+  `Amish-Noka-Dresser.png` 111,025 → 85,867 B（−22.6%）。顺带修复灰度候选与 zlib 9 的比较口径。
+- **WebP 按尺寸选 method + 无损候选**：≤20 MP 产出档改为 `method 6`（体积更小），
+  >20 MP 保持 `method 3`；低色数不透明图额外尝试无损 WebP（走 `WebPEncodeLosslessRGBA` 直通，
+  `WebPConfig.lossless` 路径实测并非真无损）。实测 `car.png` −19.0%、`5_star_base` −3.0%、
+  `video-001` −3.1%，256² 低色数图无损 814 B/162 B。
+- **WebP 大图搜索改为 q40 锚点 + 小网格 + 二分**：143 MP 候选数 19 → 8；默认大图下界保持 40， 
+  小图默认 20。显式 `--opt-webp-min 20 --opt-webp-large-min 20` 可在 143 MP 上再省 7.8%（代价是搜索更慢）。
+- **PNG 调色板位深 1/2/4 + 灰度颜色类型**：`PngWriter.WritePalette` 支持位深打包，
+  optimize 对 ≤16 色的赢家自动降到最小位深；不透明灰度图尝试颜色类型 0。
+  实测 16 色 256² 图形 1,214 → 343 B（−71.7%），32 级灰度 1,001 → 583 B（−41.8%）。
+- **PNG 抖动/不抖动双候选**：同色数下两个变体都参与画质判定与体积竞争（GIF 早已如此）。
+  抖动会打散索引熵、让 deflate 命中率下降，部分图不抖动反而小一个数量级。
+  实测 `Amish-Noka-Dresser.png` −19.2%、12.6 MP `large.png` −63.0%，`car.png`（精确取色）不变。
+- **PNG 赢家补压 zlib 9**：搜索期仍用 zlib 6 排序，选出赢家后用新增的
+  `PngWriter.RecompressIdat` 只重压 IDAT（不重新滤波/量化，像素不变）。默认只对 ≤8 MP 生效
+  （`PngMaxDeflatePixelThreshold`，避免大图多花几十秒），CLI 可用 `--opt-no-png-deflate9` 关闭。
+  实测 `car.png` −9.9%、`Amish-Noka-Dresser.png` −2.3%。
+- **跨格式透明合成**：透明图转 JPEG / BMP 时不再把 alpha 直接丢掉（透明区会变黑），
+  而是按新增的 `OptimizeOptions.MatteColor`（默认白）合成到背景，并在 `Method` 里标注背景色。
+  目标为 PNG / WebP / 单帧 GIF 时仍保留透明。
+- **16-bit / 动画输入保护**：`ImageOptimizer` 在 optimize 前识别 16-bit PNG、APNG 与动画 WebP。
+  同格式 optimize 直接保留原图并给出原因（重编码会截断为 8-bit / 只保留首帧）；
+  跨格式转换照常执行，但会在方案描述里标注降级。新增 `SourceTraits` 与 3 个单测。
+- **`OptimizeOptions.WebpMinQuality` / CLI `--opt-webp-min`**：WebP 搜索下界独立于 JPEG，
+  默认仍为 40；显式设 20 可再省约 7.8%（143 MP），但现有搜索会从 1 个候选涨到 19 个
+  （11.3 s → 27.0 s），待搜索策略改造后再下调默认值。
+- 审计与改进计划文档：[docs/OptimizeAudit.md](docs/OptimizeAudit.md)、[docs/OptimizePlan.md](docs/OptimizePlan.md)。
+
 ## 1.1.0（相对 v1.0）
 ### 规则
 - **废止性能准入门槛**。项目此前设有「性能提升不足一定比例即视为无效提升，不保留、不提交」的硬性门槛，

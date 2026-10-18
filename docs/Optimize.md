@@ -22,8 +22,10 @@ TinyPNG 式的「丢进去就能小很多、肉眼几乎看不出差别」能力
 
 | 指标 | 含义 | 用途 |
 |---|---|---|
-| `PerceptualPsnr` | 先做 4×4 块平均再算 PSNR | **主判据**：抹平抖动颗粒，代表「看不看得出来」 |
+| `PerceptualPsnr` | 先做 4×4 块平均再算 PSNR | **快速预筛**：抹平抖动颗粒 |
 | `Psnr` | 逐像素 PSNR | **副判据**：拦住「高频细节被抹掉 / 抖动过头」，下限 `MinRawPsnr`（默认 30 dB） |
+| `Ssim` | Y 通道 SSIM 均值（块边长随像素数放大） | **V2 主判据**：结构相似度，默认下限 0.95 |
+| `WorstSsim` | 最差 1% 块的 SSIM | **V2 副判据**：抓局部糊掉/块效应，默认下限 0.75 |
 
 实测（900×600 合成图）：
 
@@ -36,6 +38,16 @@ TinyPNG 式的「丢进去就能小很多、肉眼几乎看不出差别」能力
 
 可以看到：抖动让感知分提升近 20 dB（这正是我们要的效果），
 而「块平均」对**纯噪点被抹平**这类损伤不敏感，所以再叠一条逐像素下限兜底。
+
+V2 的块边长按 `clamp(round(sqrt(w*h)/500), 4, 16)` 取：1 MP 用 4、12 MP 约 6、143 MP 用 16，
+避免大图仍按 4 px 尺度评估。人工 4×4 棋盘格在旧指标下感知 PSNR 仍有 54 dB（块平均恰好抹平），
+但 Y-SSIM 只有 0.004，会被 `MinSsim` 拦下。
+
+RGBA 比较使用**预乘 alpha**：`RGB * A / 255`，透明区的不可见 RGB 不参与计分。
+带 alpha 的图暂不跑 Y-SSIM（仍用预乘后的 PSNR）。
+
+需要 SSIMULACRA2 / Butteraugli 时，可设置 `QualityMetrics.ExternalMetric` 委托接入原生实现；
+内置不捆绑这些算法。
 
 ### 1.2 画质下限怎么定
 
@@ -56,12 +68,17 @@ MinPerceptualPsnr = 33 + 0.14 * TargetQuality
 颜色数、JPEG 质量都满足「越激进 → 体积越小、画质越差」的单调关系，因此用二分搜索：
 8 档颜色阶梯只需 3~4 次评估，质量区间 40~95 只需 6~7 次编码 + 解码。
 
-**搜索期的编码用低一级的 deflate**：二分的判定完全来自画质（纯像素比较），体积只用于
-「在达标候选里挑一个最小的」；而候选之间的体积差距有 10%~40%，远大于压低 deflate 级别
-带来的 2.6%~6.6% 偏差，因此 PNG 搜索期统一用 `CompressionLevel.Optimal`（zlib 6）
-而不是 `SmallestSize`（zlib 9，见 `ImageOptimizer.OptimizePngDeflateLevel`）。
+**搜索期用低一级的 deflate，产出期再给赢家补最高档**：二分的判定完全来自画质（纯像素比较），
+体积只用于「在达标候选里挑一个最小的」；而候选之间的体积差距有 10%~40%，远大于压低 deflate
+级别带来的 2.6%~6.6% 偏差，因此 PNG 搜索期统一用 `CompressionLevel.Optimal`（zlib 6）。
 4.19 MP 实测：调色板单候选编码 682.0 → 91.7 ms（7.4 倍），PNG `--optimize` 全流程
-4161 → ~1210 ms，代价是产物 +3.90%（922,581 → 958,558 B）。
+4161 → ~1210 ms。
+
+赢家确定后再用 `PngWriter.RecompressIdat` 按 `SmallestSize`（zlib 9）重压一次 ——
+只解压 IDAT 后原样重压，不重新滤波/量化，像素逐字节不变。成本是 7~10 倍 deflate，
+故默认只对 ≤8 MP 生效（`OptimizeOptions.PngMaxDeflatePixelThreshold`）；
+需要极限压缩可调大阈值或直接设 `PngMaxDeflateOnWinner`。同二进制 A/B：
+`car.png` 60,521 → 54,549 B（−9.9%）、`Amish-Noka-Dresser.png` 140,614 → 137,402 B（−2.3%）。
 该级别**只影响 `--optimize`**，普通 `--to png` 走 `PngWriter` 自己的默认值，不受影响。
 
 #### 1.3.1 候选评估并行化（PNG / WebP）
@@ -97,9 +114,13 @@ PNG 的阶梯只有 8 档，按 `ImageOptimizer.ReplayLadderVisits` **复刻二�
 
 `ImageOptimizer.CandidateParallelism(候选数, 单候选峰值字节, 内存预算)` 同时按
 CPU 核数和内存预算夹上限，避免目录批量时与外层并行度叠加爆内存。
-内存预算缺省按 `GC.GetGCMemoryInfo().TotalAvailableMemoryBytes / 4` 推导（夹在 384 MB ~ 8 GB）：
-单候选峰值是「索引 1 B/px + 还原缓冲 4 B/px」≈ 5 B/px，原先固定 512 MB 在 143 MP 上会被夹成
-`dop = 1` 并**静默退化为串行**。
+内存预算缺省按「当前可用内存」推导：`(TotalAvailableMemoryBytes − GC.GetTotalMemory()) / 4`，
+夹在 64 MB ~ 8 GB。单候选峰值是「索引 1 B/px + 还原缓冲 4 B/px」≈ 5 B/px；
+原先固定 512 MB 在 143 MP 上会被夹成 `dop = 1` 并**静默退化为串行**。
+单纯用 `TotalAvailableMemoryBytes / 4`（GC 可用的**总量**）仍会在进程已占用一两 GB 或
+小容器里高估空闲内存，因此改为扣掉当前托管堆占用。
+候选并行统一走 `ImageOptimizer.ForEachCandidate`：真遇到 `OutOfMemoryException` 时
+GC 一次后以并行度 1 重跑同一批候选，避免整个 optimize 因内存峰值直接失败。
 
 #### 1.3.2 搜索期不经过比特流（JPEG）
 
@@ -164,6 +185,59 @@ DCT+量化，省掉 MCU 批的池化租借、队列同步与 `LastNzPacked`（�
 
 4.19 MP 的 PNG `--optimize` 全流程约 0.75~1.1 s（最高档候选 + 达标后的并行阶梯 + 必要时无损重写）。
 
+#### 1.3.3 全候选取最小 + 边界多看 1~2 档
+
+搜索的**定位**与**挑选**分开：
+
+- 定位仍可用二分/锚点，但挑选阶段不再复刻二分访问序列。PNG / GIF 在最高档达标时
+  把整条固定网格（颜色数阶梯 × 抖动变体）评估完，在**所有达标候选**里按体积取最小；
+  最高档不达标时仍只算最高档（更低色数画质只会更差）。固定网格保证结果与核数/内存无关。
+- JPEG / WebP 在收敛到最低达标 q 后，再向下看 1~2 档：质量-体积不严格单调
+  （量化表整数取整、Huffman 表切换会造成局部反转），低一档偶尔仍达标且更小。
+  WebP 还会在**所有已评估**候选（锚点/网格/二分/边界）里按搜索档 m2 体积取最小。
+- 这些候选都已在搜索期付过编码成本，多出来的达标候选没有理由丢弃；产物仍经过
+  最终产出档重编与复评，`Quality` / `MeetsBar` 以最终字节为准。
+
+#### 1.3.4 内存预检（optimize 拒绝 / 转换流式降级）
+
+解码前只读文件头拿宽高（JPEG SOF、PNG IHDR、GIF LSD、WebP VP8X/VP8/VP8L、BMP DIB），
+按格式经验系数估算峰值，与预算比较：
+
+```
+预算 = 显式上限（--memory-limit / SIC_MEMORY_LIMIT_MB / OptimizeOptions.MemoryLimitBytes）
+      或 (GC 可用总量 − 进程工作集) × 0.75，下限 64 MB
+```
+
+- **optimize**：估算超过预算时直接拒绝，同格式保留原图并写入 `Reason`；
+  跨格式 optimize 没有“保留原格式”的退路，抛 `InsufficientMemoryException`，CLI 按文件捕获。
+- **非 optimize 转换**：超预算时按「源格式 × 目标格式」决定：
+  - 源 BMP/PNG/GIF/WebP/JPEG → 目标 BMP/PNG/GIF/JPEG：走 `StreamingConversion` 管线
+    （BMP/PNG 两端逐行；GIF 首帧解码后逐行；WebP 用 libwebp 增量解码逐行；
+    JPEG 基线单扫描按 MCU 行熵解码 + SIMD IDCT、progressive 回退到整幅系数 + SIMD 行带重建；
+    目标 JPEG 按 MCU 行读入并立即熵编码；目标 GIF 做单帧缓冲后编码）。
+    流式 BMP 目标写 **top-down（负高度）**，按行顺序写，不再逐行 seek。
+  - 目标 WebP：libwebp 编码器只接受整幅输入，仍只能拒绝或走常规路径。
+- **已知限制**：GIF 编码必须对整帧建调色板，因此只是“单帧缓冲”而不是逐行；
+  WebP 编码只接受整幅输入。JPEG **基线单扫描** 已做到逐 MCU 行熵解码 + SIMD IDCT，
+  不再保留整幅量化系数；**progressive/非交错/4:2:2** 回退到整幅系数 + SIMD MCU 行带重建
+  （仍约 3 B/px + 压缩文件），但不再分配整幅 RGB。JPEG 行级编码只使用标准 Huffman 表
+  （不做两遍优化表，`--jpeg-progressive` 会在写完后用现有转码器再转一次），
+  且暂不支持 EXIF Orientation≠1（会退回常规解码/拒绝）。
+
+  **143 MP 实测（JPEG → BMP，同机）**：
+
+  | 输入 | 路径 | 峰值工作集 | 耗时 | 像素 |
+  |---|---|---:|---:|---|
+  | 基线 4:2:0 | 常规 | 854 MB | 641 ms | 基准 |
+  | 基线 4:2:0 | 流式（MCU 行熵解码 + SIMD） | **65 MB** | 775 ms | 与常规逐像素一致 |
+  | progressive | 常规 | 854 MB | 690 ms | 基准 |
+  | progressive | 流式（整幅系数 + SIMD 行带） | **458 MB** | 1039 ms | 与常规逐像素一致 |
+
+  ⇒ 基线流式内存约为常规的 **7.6%**，耗时仅 +21%；progressive 内存约减半，耗时 +51%。
+- 估算使用保守系数（见 `src/Compression/MemoryGuard.cs`），不是精确模型；
+  读不到宽高时放行，避免探测失败误伤正常文件。
+- `--no-memory-guard` / `OptimizeOptions.DisableMemoryGuard` 可关闭预检（回到 OOM 回退行为）。
+
 搜索是这条链路的主要开销：每次候选 = 一次量化与重建（开启 `OptimizeHuffman` 时赢家再走两遍
 完整编码：先统计符号分布再编码）+ 一次画质评估。1.57 MP 的 PNG→JPEG 实测
 （1254×1254，Release）：单次普通编码 0.17 s、单次带优化 Huffman 的候选 0.32 s、
@@ -179,22 +253,45 @@ DCT+量化，省掉 MCU 批的池化租借、队列同步与 `LastNzPacked`（�
 
 ### PNG（收益最大）
 
+0. **16-bit PNG / APNG 同格式 optimize 直接保留原图**：解码器只保留高字节 / 首帧，
+   重编码会造成静默降级；跨格式转换会照常执行，并在方案描述里标注“源为 16-bit/动画”。
 1. 颜色数 ≤ 上限时直接**精确取色**（无损），不再做有损尝试。
-2. 否则量化到调色板（颜色类型 3，每像素 1 字节而非 3~4 字节）+ Floyd–Steinberg 抖动。
-3. 量化不达标时回退**无损真彩色重写**：真彩色（非调色板）编码，对渐变类图像尤其有效
+2. 否则量化到调色板（颜色类型 3）。索引按实际颜色数使用 1/2/4/8 位：
+   ≤2→1、≤4→2、≤16→4，其余 8 位；16 色图形的原始 IDAT 因此只有 8 位索引的 1/4。
+   **抖动是搜索维度**：
+   同色数下「抖动 / 不抖动」两个变体都参与画质判定与体积竞争；抖动会打散索引熵、显著增大 deflate
+   体积（GIF 实测同图 92 KB vs 17 KB），因此不能预设「抖动画质更好就该选它」。
+3. 赢家精修：实测 `None` / `Up` / `Adaptive` 三种行滤波、最小位深与 8-bit，
+   再按索引使用频率重排调色板；只对 ≤8 MP 或 ≤16 色的图做。
+   实测 `Amish-Noka-Dresser.png` 从 111,025 → 85,867 B（−22.6%）。
+4. 不透明且 R=G=B 的灰度图额外尝试**颜色类型 0**（8-bit 灰度），
+   比调色板少一个 PLTE，也不必经过索引映射。
+5. 量化不达标时回退**无损真彩色重写**：真彩色（非调色板）编码，对渐变类图像尤其有效
    （实测抖动后索引近乎随机，调色板反而会比真彩色大 19 倍）。
    行滤波在 **Up 与逐行自适应之间实测取小**——自适应是 MSAD 启发式（最小化滤波后字节的 L1 范数），
    而 deflate 吃的是跨行重复：整列统一 Up 时相邻行差分高度相似，LZ77 能跨行匹配整行，
    逐行换滤波器会打断这条链。143 MP 照片实测 Up 29,469,583 B vs 自适应 35,142,122 B（**自适应大 19.2%**，
    且慢 2.4 倍），而 1000×1000 16 色调色板产物则是自适应小 3.2% ⇒ 不能按启发式定，只能实测。
-4. 量化收益不足 10% 时也会额外算一次无损重写做对比。
+6. 量化收益不足 10% 时也会额外算一次无损重写做对比。
 
 > 实测：照片类 845 KB → 451 KB（-46.7%）；全色域渐变 13.6 KB → 8.3 KB（-38.8%，无损）；
+> 抖动维度加入后：`Amish-Noka-Dresser.png` 137,402 → 111,025 B（−19.2%），
+> 12.6 MP 的 `large.png` 7,334,753 → 2,716,630 B（−63.0%）；
 > 6 色图形 3.3 KB → 1.4 KB（-57.4%，无损）。
 
 ### JPEG
 
-1. 解码 → 以 4:2:0 重编码，二分搜索「刚好达标」的最低质量。
+1. **先做无损重封装**：`JpegLosslessOptimizer` 删除 APP1（EXIF/XMP）、APP13（IPTC）、COM，
+   保留 ICC；基线单扫描图再用 `JpegHuffmanOptimizer` 统计实际系数频率、重写最优 Huffman 表
+   与熵编码段（jpegtran -optimize 等价）。两条路径都不碰量化系数，像素逐字节不变；
+   EXIF Orientation ≠ 1 时保留 APP1。无损产物比原图小且无需再压时直接采用（零代际损失）。
+2. 有损路径：解码 → 以 4:2:0 重编码，二分搜索「刚好达标」的最低质量。
+3. **progressive 产出**：baseline 编好后，`JpegProgressiveTranscoder` 复用同一批系数重写成 SOF2
+   （DC 扫描 + 每分量 AC 扫描 + EOBRUN），与 baseline 按体积取小；不做 successive approximation。
+   实测同 q 下 −4.7%~−6.9%，像素逐字节一致；`JpegProgressive` 默认开启，
+   CLI 可用 `--opt-no-jpeg-progressive` 关闭。
+   有损结果必须比 `min(原图, 无损产物)` 再小至少 `MinLossyGainRatio`（默认 10%）且达标，
+   才值得再损失一代画质；否则采用无损产物或保留原图。
    搜索期不经过比特流（系数直通 + 并行画质评估），见 [1.3.2](#132-搜索期不经过比特流jpeg)。
 2. 若 4:2:0 始终不达标（彩色文字、色度高频丰富的图），自动退回 4:4:4 再搜一轮。
 3. **按图优化的 Huffman 表**（`JpegEncoderOptions.OptimizeHuffman`，默认开启）：
@@ -214,9 +311,32 @@ DCT+量化，省掉 MCU 批的池化租借、队列同步与 `LastNzPacked`（�
 > 实测：q100 的 352 KB 照片 → 68 KB（-80.6%）；大留白扫描图 2.95 MB → 2.60 MB（-12.0%）；
 > 已经是高质量编码的普通照片可能仍判定「无收益」并保留原图。
 
-**与 TinyPNG 的剩余差距**：TinyPNG 产物是 progressive（SOF2）编码，同画质下比 baseline 再小
-5%~10%；我们的编码器目前只支持 baseline（`WriteSof0`）。要进一步追平需要实现 progressive 编码
-（多扫描、频谱选择、逐次逼近、EOB 游程），是一项独立的大改动。
+**progressive**：已实现 spectral selection 版 progressive（DC + 每分量 AC + EOBRUN），
+同 q 下比 baseline 小 4.7%~6.9%。尚未做 successive approximation（Ah/Al）与更细的频谱分段，
+那部分还能再追 2%~5%。
+
+### JPEG trellis（opt-in，默认关闭，P3-1c）
+
+`JpegTrellisQuantizer` 把每个 AC 系数的量化从「唯一最近值」改成块内动态规划：
+候选 `{0, 最近值, 最近值±1}`，目标函数 `Σ误差² + 64λ×码率`（系数域误差，Parseval ⇒ 像素 SSE），
+码率用标准 Huffman 表的 (run,size) 码长 + ZRL/EOB 估计；λ 随量化步长 `Q²` 缩放
+（`λ ≈ 60·(scale/100)²`，`scale` 与 `BuildQuantTable` 同式，可用 `SIC_JPEG_TRELLIS_LAMBDA` 覆盖）。
+因为要看到量化前的 DCT 系数，trellis 路径使用标量 FDCT，不走 SIMD 融合量化。
+
+开关：`OptimizeOptions.JpegTrellisQuantization` / CLI `--opt-jpeg-trellis`（默认 false）。
+同机实测（PNG→JPEG，`--optimize`）：
+
+| 样本 | 基线 | trellis | 体积 | 感知 PSNR | 最差 1% SSIM | 耗时 |
+|---|---:|---:|---:|---|---|---:|
+| `small.png` 0.48 MP | 29,111 B | 27,920 B | −4.1% | 45.47 → 45.71 | 0.753 → 0.757 | 0.6 → 1.3 s |
+| `medium.png` 1.57 MP | 82,724 B | 68,755 B | −16.9% | 45.39 → 45.40 | 0.812 → 0.761 | 1.4 → 4.2 s |
+| `Amish-Noka-Dresser.png` 1.0 MP | 27,399 B | 21,382 B | −22.0% | 45.37 → 45.43 | 0.835 → 0.800 | 0.9 → 2.5 s |
+| `car.png` 0.27 MP | 3,901 B | 3,005 B | −23.0% | 46.25 → 46.10 | 0.871 → 0.780 | 0.4 → 1.2 s |
+| `large.png` 12.6 MP | 377,105 B | 285,690 B | −24.2% | 45.45 → 45.35 | 0.937 → 0.890 | 3.2 → 23.0 s |
+
+结论：收益显著（4%~24%），但代价是 2~7 倍编码时间，并且最差 1% 块 SSIM 明显下降
+（逼近 0.75 门槛）——它是在画质门槛内**重新分配误差**，不是无代价的同质量压缩。
+因此默认不启用；需要极限体积且能接受该权衡时再显式打开。
 
 ### GIF
 
@@ -224,19 +344,66 @@ DCT+量化，省掉 MCU 批的池化租借、队列同步与 `LastNzPacked`（�
 2. 二分搜索最少颜色数：颜色越少，LZW 字典命中率越高。
 3. 用新增的 `GifEncoder.EncodeIndexed` 直接写「调色板 + 索引」，跳过编码器内部的二次量化，
    否则量化两次会导致画质不可控。
-4. 单帧 GIF 保留透明通道（索引 0 预留）；**带透明通道的动画**目前只解码得到 RGB24 帧序列，
-   重编码会丢失透明度，因此直接保留原图并给出原因。
+4. **帧间差分（不透明动画）**：动画候选预留 1 个透明索引；首帧完整，后续帧与上一帧索引相同的
+   像素写透明索引，disposal=1 保留上一帧。差分帧只编码**变化区域包围盒**（crop），
+   无变化帧写成 1×1 透明像素。实测 `final.gif` 23.39 MB → 17.65 MB（−24.5%）。
+5. **局部调色板**：在全局表候选之外，对赢家再做一次「每帧独立量化 + 局部表 + 整帧」候选，
+   按体积取小；`GifLocalPalettes` 默认开启。局部表与帧间差分互斥，因此是独立候选。
+6. **帧去重**：连续完全相同的帧合并为一条，时长相加（无损）。
+7. 透明动画走整帧 + 二值透明 + disposal=2，`large.gif` 2.42 MB → 2.14 MB（−11.5%）。
+5. 单帧 GIF 保留透明通道（索引 0 预留）；透明动画现在会解码为 RGBA 帧序列，
+   走「整帧 + 全局调色板 + 二值透明 + disposal=2」重编码，保留透明通道。
+   透明动画暂不做帧间差分（单个透明索引无法同时表达“与上一帧相同”和“透明”）。
 
 > 实测：照片类 GIF 380 KB → 300 KB（-21.1%，64 色 + 抖动）。
 
 ### WebP / BMP
 
-- WebP：同样做质量搜索，下界取 `JpegMinQuality`（默认 40）。
+- **动画 WebP 同格式 optimize 直接保留原图**（解码只取首帧），跨格式转换会在方案里标注。
+- WebP：同样做质量搜索。当前策略（2026-10-17）：
+  - **产出档按尺寸**：≤20 MP 用 `method 6`（实测体积小于 m3，耗时 +5%~14%），
+    >20 MP 用 `method 3`（143 MP 上 m6 反而更大）。
+  - **搜索用 q40 锚点 + 4 点小网格 + 二分**（`SearchQualityAnchored`）：锚点达标只在 (min,40] 找，
+    不达标才进 (40,95]。143 MP 的候选数从 19 压到 8。
+  - **下界**：小图 `WebpMinQuality=20`；>20 MP 默认 `WebpLargeImageMinQuality=40`
+    （143 MP 从 q40 降到 q34 只省 7.8% 却多花 ~15 s）。需要极限体积时显式
+    `--opt-webp-min 20 --opt-webp-large-min 20`。
+  - **参数搜索（默认关闭）**：`WebpParamSearch` / CLI `--opt-webp-params` 对
+    `alpha_quality` / `filter_strength` / `sns_strength` / `segments` / `preprocessing`
+    做小图（≤ `WebpParamSearchMaxPixels`，默认 1.5 MP）消融 + 组合 + 一轮坐标下降，
+    只接受仍达标且更小的组合，产出期用胜出参数 + OutputMethod 重编。离线消融（q=60/m2）
+    与端到端实测见下表：收益 0%~1.3%，耗时 2~4 倍，且 sns/segments 的激进取值普遍把
+    最差 1% SSIM 压到 0.75 以下被拒。因此默认关闭，仅保留给离线调参/特定素材。
+
+    | 样本（q=60） | 基线 | 单参数最优 | 贪心组合 |
+    |---|---:|---:|---:|
+    | `small.png` | 17,664 B（未达标） | 0% | 0% |
+    | `car.png` | 2,278 B | −0.4%（filter=0） | **−1.1%**（filter=0 + sns=75 + segments=3） |
+    | `Amish-Noka-Dresser.png` | 13,892 B | −3.5%（sns=100） | −3.0% |
+
+    离线消融可用 `tools/perf/WebpParamProbe` 复跑：
+    `dotnet run -c Release --project tools/perf/WebpParamProbe -- <image...> 60`。
+
+  - **无损候选**：不透明、≤20 MP、唯一色数 ≤4096 时编码一次无损 WebP 与有损结果比体积。
+    无损必须走 `WebPEncodeLosslessRGBA` 直通；`WebPConfig.lossless=1` 的配置路径实测仍有
+    1~5 的像素误差（ffmpeg 解码同样如此），不是真无损。
+  - m6 与 m2/m3 画质不完全一致：边界上 m6 不达标时先同 q 退回 m3，再升 q。
+  - `WebpMinQuality`（默认 20，可用 `--opt-webp-min` 调整）。
   搜索期用 libwebp 的便宜档 `method 2`（比 `method 3` 便宜约一个数量级），赢家再按 `method 3` 补编一次 ——
   2048² 实测 1769 → 1191 ms / 1125 → 1076 ms / 1407 → 1208 ms，三张图产物与全程 `method 3` **逐字节一致**
   （补编用的是原始像素，与搜索期编码无关）。
-  产出档从 `method 4` 改成 `method 3` 的原因见下一节：libwebp 1.6.0 的 m4 在 >140 MP 有 4 倍悬崖，
-  且 7 个样本（1~143 MP）上 m3 体积全部 ≤ m4。
+  产出档从 `method 4` 改成 `method 3` 的原因见下一节：libwebp 1.6.0 的 m4 在 >140 MP
+  且质量较高时有 4 倍悬崖，且 7 个样本（1~143 MP）上 m3 体积全部 ≤ m4。
+  （2026-10-17 复现：143 MP 图上 m4 在 q40/q65 都是 ~7.8 s、无悬崖；**q75 时 7.8 s → 26.3 s**，
+  体积 1,597,784 → 1,655,814 B（更大）。m5/m6 在 q75 无悬崖（8.4/8.7 s），但体积也都不比 m3 小。）
+  ⇒ `WebpEncoderOptions` 构造时强制：**quality ≥ 75 且 method == 4 → 降为 3**。
+  调用方显式传 `--webp-method 4 --quality 75` 也只会走 m3（实测 7.8 s / 1,597,784 B）。
+  复现/诊断可设 `SIC_WEBP_ALLOW_M4_HIGHQ=1` 绕过保护。
+  追加实验：阈值是 q≥75（q74.9 无悬崖，q75/76/80 均 26~35 s）；同样 143 MP 尺寸下，
+  把原图重编码或模糊后 q75 m4 只有 ~9.7 s，141 MP 裁剪图 ~7.6 s ⇒ **内容 + 质量**共同决定，
+  不是单纯像素数。源码上 m4 是 `RD_OPT_BASIC + full-SNS`、没有 m3 的 fast-probe；
+  `frame_enc.c` 在 partition0 超限时会减半 header 预算并**重跑整幅分析 pass**，
+  与 3 倍耗时吻合。m3 无 SNS、m5/m6 走 trellis，均不触发。
   历史上这里把下界硬抬到 65，理由是「低质量区间省不了多少体积却明显变糊」；
   实测 q=65 时画质已达标并被选中，说明 40~64 从未被试过。放开后 4.19 MP 照片类图
   44,554 → 30,234 B（−32%），PSNR 46.22 → 43.68 dB、感知 50.05 → 47.52 dB（正确 4 通道口径）。
@@ -265,28 +432,31 @@ DCT+量化，省掉 MCU 批的池化租借、队列同步与 `LastNzPacked`（�
     （同进程 143 MP：m3 7593 vs 8247 ms、m2 2242 vs 2435 ms，md5 相同），但要多持一份 packed RGB
     （143 MP +429 MB ≈ +33% 峰值内存）换 ~0.6 s，性价比不划算；
   - 直接按产出档编下界候选、达标就复用（省掉搜索的那次 m2 编码）：只在「下界一定达标」时成立，
-    下界不达标的图要多付一次 m3 编码（143 MP +8.4 s）。实测样本里 q=40 达标率约 50%（5_star 选到 q52），
+    下界不达标的图要多付一次 m3 编码（143 MP +8.4 s）。4 通道口径下 q=40 实测达标率 3/5，
     低于 76% 的盈亏平衡点，不做。
-- **已知口径问题（未修，会改变选中的 q）**：搜索期的画质比较对 **RGBA 缓冲按 `bytesPerPixel = 3`** 调用
-  （`QualityMetrics.Compare(reference, decoded, w, h, 3)`），即把 RGBA 字节流当 RGB 三元组读：
-  只覆盖前 3/4 的数据、RGB 权重落在 RGBA 的交错字节上、4×4 块几何也错位。
-  后果是感知 PSNR 系统性虚高 —— 同一张 143 MP 图 q=40：3 通道口径 53.71 dB，4 通道口径 45.74 dB
+- **画质口径已修正（2026-10-17，会改变选中的 q）**：搜索期的画质比较曾对 **RGBA 缓冲按
+  `bytesPerPixel = 3`** 调用（`QualityMetrics.Compare(reference, decoded, w, h, 3)`），即把 RGBA
+  字节流当 RGB 三元组读：只覆盖前 3/4 的数据、RGB 权重落在 RGBA 的交错字节上、4×4 块几何也错位。
+  感知 PSNR 因此系统性虚高 —— 同一张 143 MP 图 q=40：3 通道口径 53.71 dB，4 通道口径 45.74 dB
   （差 8 dB，而达标线是 45.3 dB）。固定质量分支（`o.JpegQuality`）用的又是 4 通道，两条路径口径不一致。
-  修正它会让所有 WebP optimize 的选档变化，属产品行为变更，需先跑语料评估。
-  **q=40 在两套口径下的达标情况（5 个样本，达标线 感知 45.32 dB / 像素 30 dB）**：
+  现已统一为 4 通道，并让固定质量分支走产出档 `method 3`；产出后会对最终字节重新解码、复评画质，
+  `Quality` / `MeetsBar` 不再来自搜索期的 m2 编码。**代价是选档变化，属产品行为变更。**
+  **实测（5 个样本，达标线 感知 45.32 dB / 像素 30 dB，下界 40）**：
 
-  | 样本 | MP | 3 通道口径（现用） | 4 通道口径（正确） | 4 通道下最低达标 q |
+  | 样本 | MP | 旧口径 q / 体积 | 新口径 q / 体积 | 4 通道实测画质 |
   |---|---|---|---|---|
-  | `progressive.jpg` | 143 | 53.91 达标 | 46.60 达标（+1.28） | ≈30（45.75，体积 −13.5%） |
-  | `Amish-Noka-Dresser.jpg` | 1.0 | 52.02 达标 | 45.31 **不达标**（−0.01） | 45 |
-  | `car.png` | 0.3 | 53.29 达标 | 47.18 达标（+1.86） | ≈21 |
-  | `5_star_base.jpg` | 1.2 | 44.64 不达标 | 41.18 不达标 | 无（q=75 仅 44.28） |
-  | `video-001.rgb.jpeg` | 0.02 | 41.13 不达标 | 37.79 不达标 | 无（q=75 仅 41.0） |
+  | `progressive.jpg` | 143 | 40 / 1,080,478 B | 40 / 1,080,478 B | 感知 46.60（+1.28） |
+  | `Amish-Noka-Dresser.png` | 1.0 | 40 / 9,864 B | 40 / 9,864 B | 感知 45.31（+0.00） |
+  | `car.png` | 0.3 | 40 / 1,720 B | 40 / 1,720 B | 感知 47.18（+1.86） |
+  | `5_star_base.jpg` | 1.2 | 52 / 121,164 B | **81 / 205,192 B** | 感知 45.84（旧产物实际只有 41.18） |
+  | `video-001.rgb.jpg` | 0.02 | 95 / 5,934 B | **91 / 4,718 B** | 感知 45.37（−20.5% 体积） |
 
-  ⇒ 现用口径把「大图照片」的余量抬到 7~9 dB，等于**几乎每张大图都在下界 q=40 收工**（搜索只值 1 个候选，
-  这是上一条优化的前提）；换成正确口径后余量只剩 1.3~1.9 dB，且下界会把体积卡在比目标多 13.5% 的位置
-  （143 MP：q40 1,080,478 B vs q30 934,528 B）。要真正吃到这部分收益，得**同时**修正口径与下调下界，
-  单独下调下界等于盲目压画质。
+  ⇒ 旧口径把「大图照片」的余量抬到 7~9 dB，等于**几乎每张大图都在下界 q=40 收工**（搜索只值 1 个候选，
+  这是上一条优化的前提）。换成正确口径后，q=40 仍有 3/5 样本达标（余量 0.00~1.86 dB），
+  其余样本必须向上搜索；`5_star_base` 的产物因此增大 69%，这是「以前其实没达标」的如实代价。
+  把下界降到 20 还能再省（143 MP：q34 / 996,350 B，−7.8%），但现有网格+窗口搜索会从 1 个候选
+  涨到 19 个、端到端 11.3 s → 27.0 s，故默认仍保持 40，等 WebP 搜索改成小扇出策略后再下调
+  （见 `OptimizePlan.md` P1-6）。
 - BMP：无法压缩，统一输出 PNG。
 
 ---
@@ -299,12 +469,17 @@ DCT+量化，省掉 MCU 批的池化租借、队列同步与 `LastNzPacked`（�
 | `src/Compression/PngOptimizer.cs` | 调色板量化 + 无损重写回退 |
 | `src/Compression/JpegOptimizer.cs` | 质量搜索 + 4:2:0/4:4:4 回退 |
 | `src/Compression/GifOptimizer.cs` | 跨帧共享调色板 + 降色 |
-| `src/Compression/WebpOptimizer.cs` | WebP 质量搜索（RGBA，保留 alpha） |
+| `src/Compression/WebpOptimizer.cs` | WebP 质量搜索（RGBA，保留 alpha）+ 可选参数搜索 |
+| `src/Formats/Jpeg/JpegTrellisQuantizer.cs` | 块内 DP 的 trellis 量化（opt-in） |
 | `src/Compression/OptimizeArtifact.cs` | 「纯计算产物」中间结构，供同格式/跨格式两条路径复用 |
 | `src/Compression/PaletteQuantizer.cs` | RGBA 中位切分量化器 |
 | `src/Compression/ImageQuality.cs` | 感知 / 逐像素画质度量 |
 | `src/Compression/OptimizeOptions.cs` | 选项与画质档位 |
-| `src/Compression/OptimizationResult.cs` | 结果（体积、方案、画质、是否跨格式转换） |
+| `src/Compression/OptimizationResult.cs` | 结果（体积、方案、画质、是否跨格式转换、目标格式建议） |
+| `src/Compression/MemoryGuard.cs` | 文件头宽高探测 + 峰值内存估算 + 准入判定（optimize/转换） |
+| `src/Processing/StreamingConversion.cs` | 低内存逐行转换调度（BMP/PNG/GIF/WebP → BMP/PNG/GIF） |
+| `src/Formats/*/*Row*.cs` | BMP/PNG 行编解码、GIF 首帧/单帧缓冲、WebP 增量解码、JPEG MCU 行 IDCT 行源 |
+| `src/Formats/Jpeg/JpegFrameState.RowSource.cs` | JPEG 按 MCU 行反量化/IDCT/上采样/色彩转换 |
 
 配套改动：
 
@@ -317,6 +492,8 @@ DCT+量化，省掉 MCU 批的池化租借、队列同步与 `LastNzPacked`（�
 - **精确取色优先**：颜色数不超预算时建无损调色板，走 `Dictionary<uint,int>` 并在超预算时提前退出。
 - **直方图**：5 bit/通道 + alpha 5 bit（不透明图只需 32 K 桶），大图抽样，桶只清零用过的部分。
 - **中位切分**：按「像素数 × 最大通道跨度」选盒、按累计像素中位数切开；盒的调色板色取加权均值。
+- **Lloyd 精修**：中位切分后按 5-bit 直方图桶权重做 1 轮 k-means（归桶 → 加权均值更新），
+  同色数下降低量化误差；`QuantizeOptions.EnableKMeansRefinement` 默认开启。
 - **最近色查找**：逐像素扫 256 色太慢，用「5 bit RGB 粗查表定种子 + 每色 16 近邻短表精修」，
   再叠一层 20 bit 键的结果缓存，实际降到常数级。
 - **抖动**：Floyd–Steinberg 只扩散 RGB。alpha 抖动会在半透明区域产生可见噪点，故 alpha 取最近值。
@@ -343,14 +520,29 @@ if (result.KeptOriginal) { /* 无收益，输出是原图副本 */ }
 | `TargetQuality` | 88 | 目标画质 0-100，映射到感知 PSNR 下限 |
 | `MinPerceptualPsnr` | 由 `TargetQuality` 推导 | 感知 PSNR 下限（dB） |
 | `MinRawPsnr` | 30 | 逐像素 PSNR 下限（dB） |
+| `MinSsim` | 0.95 | Y-SSIM 均值下限（0-1，0 表示不限制） |
+| `MinWorstSsim` | 0.75 | 最差 1% 块 SSIM 下限（0-1，0 表示不限制） |
 | `MaxColors` | 256 | PNG/GIF 调色板上限 |
 | `EnableDithering` | true | Floyd–Steinberg 抖动 |
 | `StripMetadata` | true | 丢 EXIF，保留 ICC |
 | `JpegQuality` | null | 指定后不做搜索 |
-| `JpegMinQuality` | 40 | 搜索下界 |
+| `JpegMinQuality` | 40 | JPEG 搜索下界 |
+| `WebpMinQuality` | 20 | WebP 小图搜索下界（独立于 JPEG） |
+| `WebpLargeImageMinQuality` | 40 | >20 MP 的 WebP 搜索下界（大图默认保速度） |
+| `WebpTryLossless` | true | 低色数不透明图是否尝试无损 WebP |
+| `WebpLosslessMaxUniqueColors` | 4096 | 无损候选的唯一色数上限 |
+| `WebpLosslessMaxPixels` | 20 MP | 无损候选的像素上限 |
+| `PngMaxDeflateOnWinner` | true | PNG 赢家是否再用 zlib 9 重压一次 |
+| `PngMaxDeflatePixelThreshold` | 8 MP | 上述重压的像素上限（大图跳过，避免十几秒开销） |
 | `AdaptiveFiltering` | true | PNG 无损重写在 Up / 逐行自适应之间实测取小（关闭则只试 Up） |
 | `KeepOriginalWhenNoGain` | true | 变大就保留原图 |
 | `MinSavingRatio` | 0 | 至少省该比例才采用 |
+| `MinLossyGainRatio` | 0.10 | 同格式 JPEG/WebP 再压缩的最低收益，低于此值保留原图（避免为 1%~5% 再损失一代） |
+| `JpegTrellisQuantization` | false | JPEG trellis 量化（4%~24% 体积 / 2~7 倍耗时，见 §2） |
+| `MemoryLimitBytes` | 0（自动） | 内存预检预算（字节）；超过时 optimize 拒绝、转换尝试流式/拒绝 |
+| `DisableMemoryGuard` | false | 关闭内存预检 |
+| `WebpParamSearch` | false | WebP 五参数小网格搜索（收益 0~1.3%、耗时 2~4 倍） |
+| `WebpParamSearchMaxPixels` | 1.5 MP | WebP 参数搜索的像素上限 |
 | `Log` | null | 打印每个候选的体积与画质 |
 
 预设：`OptimizeOptions.Conservative` / `Balanced` / `Aggressive`。
@@ -359,6 +551,11 @@ if (result.KeptOriginal) { /* 无收益，输出是原图副本 */ }
 
 ```bash
 dotnet run -- photo.png --optimize
+dotnet run -- photo.png --optimize --memory-limit 4096         # 4 GB 内存预算（MB）
+dotnet run -- photo.png --optimize --no-memory-guard           # 关闭内存预检
+dotnet run -- photo.png --optimize --opt-jpeg-trellis          # trellis 量化（默认关闭）
+dotnet run -- photo.png --to webp --optimize --opt-webp-params # WebP 参数搜索（默认关闭）
+dotnet run -- photo.png photo.progressive.jpg --to jpg --jpeg-progressive
 dotnet run -- photo.jpg photo.small.jpg --optimize --opt-quality 75 --opt-verbose
 dotnet run -- d:\site d:\site-min --optimize --recursive --parallel 8
 ```
@@ -389,6 +586,11 @@ dotnet run -- d:\site d:\site-min --optimize --recursive --parallel 8
 （「无收益保留原图」在跨格式场景没有意义——原格式 ≠ 目标格式），
 `SavedRatio` 是两种格式的体积对比，仅供参考。
 
+跨格式结果还可带 `Suggestion`（更优目标格式建议，启发式、不额外编码）：
+目标不支持 alpha 却带透明 → 建议 WebP/PNG；照片类内容转 PNG/GIF → 建议 WebP；
+颜色很少却转有损 JPEG → 建议 PNG/WebP；目标 BMP → 建议 PNG。CLI 会打印
+`💡 目标格式建议: ...`。同格式 optimize 不产生建议。
+
 CLI 路由条件：显式给了 `--to`，或输出路径带一个与源格式不同的可识别扩展名（`.jpg/.jpeg/.png/.bmp/.webp/.gif`）。
 目标扩展名与源一致时仍走同格式压缩，避免误覆盖源文件。
 
@@ -396,7 +598,7 @@ CLI 路由条件：显式给了 `--to`，或输出路径带一个与源格式不
 
 | 目标 | 做法 | 备注 |
 |---|---|---|
-| `.jpg` / `.jpeg` | 质量二分搜索（4:2:0 → 4:4:4 回退）+ 按图优化 Huffman 表 | alpha 被丢弃（JPEG 不支持） |
+| `.jpg` / `.jpeg` | 质量二分搜索（4:2:0 → 4:4:4 回退）+ 按图优化 Huffman 表 | alpha 按 `OptimizeOptions.MatteColor`（默认白）合成到背景 |
 | `.png` | 调色板量化二分搜索，必要时回退无损真彩色重写 | 保留 alpha |
 | `.webp` | 质量搜索，下界 40；搜索期 `method 2`、赢家补 `method 3` | 保留 alpha（此前同格式优化只走 RGB） |
 | `.gif` | 单帧调色板降色搜索 | 静态图；透明像素保留（索引 0 预留） |
@@ -434,6 +636,8 @@ dotnet run -- photo.png --to jpg --optimize --opt-quality 75 --opt-verbose
 
 ## 6. 已知边界
 
+- **16-bit PNG / APNG / 动画 WebP** 的同格式 optimize 会直接保留原图（重编码会截断位深或只留首帧）；
+  跨格式转换会在方案描述里标注降级。详见 §2。
 - **带透明通道的动画 GIF** 不做有损优化（解码器只暴露 RGB24 帧序列），会保留原图并说明原因。
 - 半透明 PNG 的 alpha 不参与抖动，极平滑的 alpha 渐变可能出现轻微色带（5 bit 桶精度上限）。
 - 感知度量基于 4×4 块平均，对「纯噪点纹理被抹平」不敏感，靠 `MinRawPsnr` 兜底；

@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using SharpImageConverter.Formats.Jpeg;
 
 namespace SharpImageConverter.Compression;
@@ -25,10 +25,10 @@ internal sealed class JpegCoefficientSink : IMcuCoefficientSink, IDisposable
     private int mcuX;
     private int width;
     private int height;
-    private bool subsample420;
+    private JpegChromaSubsampling subsampling;
     private bool ready;
 
-    public void Begin(int width, int height, bool subsample420, ReadOnlySpan<byte> lumaTable, ReadOnlySpan<byte> chromaTable)
+    public void Begin(int width, int height, JpegChromaSubsampling subsampling, ReadOnlySpan<byte> lumaTable, ReadOnlySpan<byte> chromaTable)
     {
         // 量化表每个候选都不同，必须每次刷新；它只有 64 项，成本可忽略。
         for (int i = 0; i < 64; i++)
@@ -37,7 +37,7 @@ internal sealed class JpegCoefficientSink : IMcuCoefficientSink, IDisposable
             tables[1].Table[i] = chromaTable[i];
         }
 
-        if (ready && this.width == width && this.height == height && this.subsample420 == subsample420)
+        if (ready && this.width == width && this.height == height && this.subsampling == subsampling)
         {
             // 几何未变：系数缓冲原样复用，只重新贴上本轮的量化表。
             state.AdoptCoefficients(frame, components, tables);
@@ -48,12 +48,13 @@ internal sealed class JpegCoefficientSink : IMcuCoefficientSink, IDisposable
 
         this.width = width;
         this.height = height;
-        this.subsample420 = subsample420;
-        int mcuSize = subsample420 ? 16 : 8;
-        mcuX = (width + mcuSize - 1) / mcuSize;
-        int mcuY = (height + mcuSize - 1) / mcuSize;
-        byte h = subsample420 ? (byte)2 : (byte)1;
-        byte v = subsample420 ? (byte)2 : (byte)1;
+        this.subsampling = subsampling;
+        byte h = JpegEncoder.SamplingH(subsampling);
+        byte v = JpegEncoder.SamplingV(subsampling);
+        int mcuSizeX = 8 * h;
+        int mcuSizeY = 8 * v;
+        mcuX = (width + mcuSizeX - 1) / mcuSizeX;
+        int mcuY = (height + mcuSizeY - 1) / mcuSizeY;
 
         components =
         [
