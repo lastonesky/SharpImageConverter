@@ -1,5 +1,7 @@
 ## 未发布
 
+## 1.2.0（相对 v1.1.0）
+
 ### 修复
 - **WebP method 4 高质量悬崖保护**：`WebpEncoderOptions` 在 `quality >= 75` 时把
   `method 4` 强制降为 `method 3`。143 MP 实测 q75：m4 26.3 s / 1,655,814 B，
