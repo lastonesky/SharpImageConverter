@@ -18,8 +18,13 @@ internal sealed partial class JpegFrameState
     }
 
     /// <summary>
-    /// 为逐 MCU 行基线解码做准备：校验扫描/表并绑定 Huffman 表，但**不分配整幅系数缓冲**。
+    /// 校验扫描参数与所用表都已定义，并返回按扫描顺序排列的分量数组；**不绑定表、不重置预测器**。
     /// </summary>
+    /// <remarks>
+    /// 与 <see cref="BindBaselineRowScanTables"/> 分开，是为了让逐行解码器能把「绑表」固定在
+    /// 扫描起点一次完成，之后的每行只需重置 DC 预测器。两者合一时只能整体重跑，
+    /// 重跑会把 <see cref="ComponentState.DcTableId"/> 之类改回未绑定态，于是第二行必然误解析。
+    /// </remarks>
     internal ComponentState[] PrepareBaselineRowScan(in ScanHeader scan)
     {
         if (isProgressive)
@@ -52,11 +57,18 @@ internal sealed partial class JpegFrameState
             {
                 ThrowHelper.ThrowInvalidData("Missing AC Huffman table.");
             }
-            comp.AssignTables(sc.DcTableId, sc.AcTableId);
-            comp.ResetPredictors();
             result[i] = comp;
         }
         return result;
+    }
+
+    /// <summary>把扫描里声明的 Huffman 表编号绑到各分量上（逐行解码开始时做一次）。</summary>
+    internal static void BindBaselineRowScanTables(in ScanHeader scan, ComponentState[] scanComponents)
+    {
+        for (int i = 0; i < scanComponents.Length; i++)
+        {
+            scanComponents[i].AssignTables(scan.Components[i].DcTableId, scan.Components[i].AcTableId);
+        }
     }
 
     /// <summary>

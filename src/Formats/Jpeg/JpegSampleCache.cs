@@ -68,7 +68,16 @@ internal sealed class JpegSampleCache : IDisposable
         }
 
         byte[] target = data;
-        Parallel.For(0, mcuY, my => CaptureRow(rgb24, target, my));
+        // 按行并行：每行只写自己的连续区间（my * mcuX 起），互不相交。串行只是把同样的循环
+        // 放在当前线程跑——没有进度依赖，所以两条路径逐字节等价。
+        if (JpegExecutionMode.IsSequential)
+        {
+            for (int my = 0; my < mcuY; my++) CaptureRow(rgb24, target, my);
+        }
+        else
+        {
+            Parallel.For(0, mcuY, my => CaptureRow(rgb24, target, my));
+        }
         filled = true;
     }
 

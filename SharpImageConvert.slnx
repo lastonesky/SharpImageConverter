@@ -2,7 +2,9 @@
   <Project Path="SharpImageConverter.Tests/SharpImageConverter.Tests.csproj" />
   <Project Path="src/SharpImageConverter.csproj" />
   <Folder Name="/src/" />
-  <Folder Name="/tools/" />
+  <Folder Name="/tools/">
+    <Project Path="tools/benchjpeg/benchjpeg.csproj" />
+  </Folder>
   <Folder Name="/tools/perf/">
     <Project Path="tools/perf/SicBench/SicBench.csproj" />
   </Folder>

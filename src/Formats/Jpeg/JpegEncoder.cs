@@ -555,6 +555,29 @@ public static class JpegEncoder
     }
 
     /// <summary>
+    /// 仅供测试：显式指定走串行管线还是并行管线，产物必须逐字节相同。
+    /// </summary>
+    /// <param name="forceSequential"><c>true</c> 走串行，<c>false</c> 走并行，<c>null</c> 按运行时决定</param>
+    /// <remarks>
+    /// 公开是因为回归测试在另一个程序集里，而串行路径在普通桌面机器上默认不可达——
+    /// 只用环境变量控制的话，一个进程只能跑其中一条路径，没法在一次运行里对拍。
+    /// </remarks>
+    public static void Write(Stream stream, int width, int height, byte[] rgb24, JpegEncoderOptions options, bool? forceSequential)
+    {
+        ValidateRgb24Input(stream, width, height, rgb24);
+        WriteInternal(stream, width, height, rgb24, NormalizeQuality(options.Quality), options.Subsample420, null, options.KeepMetadata, options.EnableDiagnostics, options.OptimizeHuffman, null, options.TrellisQuantization, forceSequential);
+    }
+
+    /// <summary>
+    /// 仅供测试：显式指定走串行管线还是并行管线（灰度编码）。
+    /// </summary>
+    public static void WriteGray8(Stream stream, int width, int height, byte[] gray8, int quality, bool? forceSequential)
+    {
+        ValidateGray8Input(stream, width, height, gray8);
+        WriteInternalGray(stream, width, height, gray8, NormalizeQuality(quality), null, false, false, forceSequential);
+    }
+
+    /// <summary>
     /// 只跑到量化为止：把每个 MCU 的量化系数交给 <paramref name="sink"/>，不产生任何字节流。
     /// </summary>
     /// <remarks>
@@ -719,6 +742,10 @@ public static class JpegEncoder
             subsample420 ? JpegChromaSubsampling.Yuv420 : JpegChromaSubsampling.Yuv444, quality, sink, trellisQuantization);
 
     internal static void EncodeFromSamples(JpegSampleCache cache, int width, int height, JpegChromaSubsampling subsampling, int quality, IMcuCoefficientSink sink, bool trellisQuantization = false)
+        => EncodeFromSamples(cache, width, height, subsampling, quality, sink, trellisQuantization, null);
+
+    /// <param name="forceSequential">仅供测试：<c>true</c> 时按行串行量化，<c>null</c> 按运行时决定</param>
+    internal static void EncodeFromSamples(JpegSampleCache cache, int width, int height, JpegChromaSubsampling subsampling, int quality, IMcuCoefficientSink sink, bool trellisQuantization, bool? forceSequential)
     {
         int normalized = NormalizeQuality(quality);
         QuantTables luma = GetQuantTables(normalized, luma: true);
@@ -734,8 +761,9 @@ public static class JpegEncoder
         int blockCount = BlockCountOf(subsampling);
         int coefficients = blockCount * 64;
         int mcuX = cache.McuX;
+        int mcuY = cache.McuY;
 
-        Parallel.For(0, cache.McuY, my =>
+        void QuantizeMcuRow(int my)
         {
             Span<int> blocks = stackalloc int[6 * 64];
             for (int mx = 0; mx < mcuX; mx++)
@@ -755,7 +783,16 @@ public static class JpegEncoder
 
                 sink.Accept(sequence, blocks[..coefficients], blockCount, order);
             }
-        });
+        }
+
+        if (JpegExecutionMode.IsSequentialFor(forceSequential))
+        {
+            for (int my = 0; my < mcuY; my++) QuantizeMcuRow(my);
+        }
+        else
+        {
+            Parallel.For(0, mcuY, QuantizeMcuRow);
+        }
     }
 
     public static void WriteGray8(string path, int width, int height, byte[] gray8, int quality = 75)
@@ -872,12 +909,16 @@ public static class JpegEncoder
         }
     }
 
-    private static void WriteInternal(Stream stream, int width, int height, byte[] rgb24, int quality, bool subsample420, ImageMetadata? metadata, bool keepMetadata, bool enableDiagnostics, bool optimizeHuffman = false, IMcuCoefficientSink? coefficientSink = null, bool trellisQuantization = false)
+    private static void WriteInternal(Stream stream, int width, int height, byte[] rgb24, int quality, bool subsample420, ImageMetadata? metadata, bool keepMetadata, bool enableDiagnostics, bool optimizeHuffman = false, IMcuCoefficientSink? coefficientSink = null, bool trellisQuantization = false, bool? forceSequential = null)
         => WriteInternal(stream, width, height, rgb24, quality,
             subsample420 ? JpegChromaSubsampling.Yuv420 : JpegChromaSubsampling.Yuv444,
-            metadata, keepMetadata, enableDiagnostics, optimizeHuffman, coefficientSink, trellisQuantization);
+            metadata, keepMetadata, enableDiagnostics, optimizeHuffman, coefficientSink, trellisQuantization, forceSequential);
 
-    private static void WriteInternal(Stream stream, int width, int height, byte[] rgb24, int quality, JpegChromaSubsampling subsampling, ImageMetadata? metadata, bool keepMetadata, bool enableDiagnostics, bool optimizeHuffman = false, IMcuCoefficientSink? coefficientSink = null, bool trellisQuantization = false)
+    /// <param name="forceSequential">
+    /// 仅供测试：显式指定串行 / 并行管线。只在「产比特流」模式下有意义——只交系数（带
+    /// <paramref name="coefficientSink"/>）时根本不跑编码管线，那是 <c>EncodeFromSamples</c> 的活。
+    /// </param>
+    private static void WriteInternal(Stream stream, int width, int height, byte[] rgb24, int quality, JpegChromaSubsampling subsampling, ImageMetadata? metadata, bool keepMetadata, bool enableDiagnostics, bool optimizeHuffman = false, IMcuCoefficientSink? coefficientSink = null, bool trellisQuantization = false, bool? forceSequential = null)
     {
         long totalStartTicks = Stopwatch.GetTimestamp();
         EncodeMetrics? metrics = enableDiagnostics ? new EncodeMetrics() : null;
@@ -937,7 +978,14 @@ public static class JpegEncoder
         WriteSos(stream);
 
         using var bw = new JpegBitWriter(stream);
-        EncodeRgbPipeline(bw, width, height, rgb24, subsampling, qYRecip, qCRecip, dcY, acY, dcC, acC, metrics, coefficientSink, trellis);
+        if (coefficientSink == null && JpegExecutionMode.IsSequentialFor(forceSequential))
+        {
+            EncodeRgbSequential(bw, width, height, rgb24, subsampling, qYRecip, qCRecip, dcY, acY, dcC, acC, metrics, trellis);
+        }
+        else
+        {
+            EncodeRgbPipeline(bw, width, height, rgb24, subsampling, qYRecip, qCRecip, dcY, acY, dcC, acC, metrics, coefficientSink, trellis);
+        }
         if (coefficientSink == null)
         {
             bw.FlushFinal();
@@ -961,7 +1009,7 @@ public static class JpegEncoder
         }
     }
 
-    private static void WriteInternalGray(Stream stream, int width, int height, byte[] gray8, int quality, ImageMetadata? metadata, bool keepMetadata, bool enableDiagnostics)
+    private static void WriteInternalGray(Stream stream, int width, int height, byte[] gray8, int quality, ImageMetadata? metadata, bool keepMetadata, bool enableDiagnostics, bool? forceSequential = null)
     {
         long totalStartTicks = Stopwatch.GetTimestamp();
 
@@ -987,7 +1035,14 @@ public static class JpegEncoder
         WriteSosGray(stream);
 
         using var bw = new JpegBitWriter(stream);
-        EncodeGrayPipeline(bw, width, height, gray8, qYRecip, DcYHuffTable, AcYHuffTable);
+        if (JpegExecutionMode.IsSequentialFor(forceSequential))
+        {
+            EncodeGraySequential(bw, width, height, gray8, qYRecip, DcYHuffTable, AcYHuffTable);
+        }
+        else
+        {
+            EncodeGrayPipeline(bw, width, height, gray8, qYRecip, DcYHuffTable, AcYHuffTable);
+        }
         bw.FlushFinal();
         WriteMarker(stream, 0xD9);
 
@@ -1085,6 +1140,169 @@ public static class JpegEncoder
         {
             cts.Cancel();
             throw;
+        }
+    }
+
+    // ---------- 串行编码管线（JpegExecutionMode.IsSequential） ----------
+    // 放在一个循环里做「fill → DCT 量化 → Huffman 写 / 统计」，不用 PipeQueue、SemaphoreSlim、
+    // Task.Run、lock，也不需要 ArrayPool：缓冲全在栈上（6*64 int = 1.5 KB）。
+    // 产物与并行管线逐字节一致——并行管线割裂流水线是为了吞吐，不改变任何一步的算术。
+
+    /// <summary>
+    /// 串行版 RGB 编码管线：按 MCU 光栅顺序 fill → DCT 量化 → Huffman 写。
+    /// </summary>
+    /// <remarks>
+    /// 这里**没有**系数旁路（<see cref="IMcuCoefficientSink"/>）分支：带 sink 的编码只在
+    /// <c>WriteInternal</c> 里用 <c>optimizeHuffman == false</c> 走到，而 optimize 的系数搜索期走的是
+    /// <c>EncodeFromSamples</c>（先 <c>JpegSampleCache.Capture</c> 一次，再按质量档回放）；
+    /// <c>optimizeHuffman == true</c> 的两遍编码则走 <see cref="CollectHuffmanHistograms"/> + 本方法，
+    /// 两遍都不交系数。所以 sink 在这条路径上恒为 <c>null</c>，写成分支只会是死代码。
+    /// </remarks>
+    private static void EncodeRgbSequential(
+        JpegBitWriter bw,
+        int width,
+        int height,
+        byte[] rgb24,
+        JpegChromaSubsampling subsampling,
+        int[] qYRecip,
+        int[] qCRecip,
+        HuffCode[] dcY,
+        HuffCode[] acY,
+        HuffCode[] dcC,
+        HuffCode[] acC,
+        EncodeMetrics? metrics,
+        TrellisContext? trellis)
+    {
+        int mcuW = subsampling == JpegChromaSubsampling.Yuv444 ? 8 : 16;
+        int mcuH = subsampling == JpegChromaSubsampling.Yuv420 ? 16 : 8;
+        int mcuX = (width + mcuW - 1) / mcuW;
+        int mcuY = (height + mcuH - 1) / mcuH;
+        byte[] order = OrderOf(subsampling);
+        int blockCount = BlockCountOf(subsampling);
+        Span<int> blocks = stackalloc int[6 * 64];
+
+        int prevYdc = 0, prevCbdc = 0, prevCrdc = 0;
+        for (int my = 0; my < mcuY; my++)
+        for (int mx = 0; mx < mcuX; mx++)
+        {
+            FillMcuBlocks(subsampling, rgb24, width, height, mx * mcuW, my * mcuH, blocks, metrics);
+            for (int i = 0; i < blockCount; i++)
+            {
+                bool chroma = order[i] != 0;
+                Span<int> block = blocks.Slice(i * 64, 64);
+                int lastNz = DctQuantizeInPlace(block, chroma ? qCRecip : qYRecip, trellis, chroma);
+                if (chroma)
+                {
+                    ref int predictor = ref (order[i] == 1 ? ref prevCbdc : ref prevCrdc);
+                    HuffmanWriteBlock(bw, block, lastNz, dcC, acC, ref predictor);
+                }
+                else
+                {
+                    HuffmanWriteBlock(bw, block, lastNz, dcY, acY, ref prevYdc);
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// 串行版灰度编码管线：FillBlockGray8ToY → DCT 量化 → Huffman 写。
+    /// </summary>
+    private static void EncodeGraySequential(
+        JpegBitWriter bw,
+        int width,
+        int height,
+        byte[] gray8,
+        int[] qYRecip,
+        HuffCode[] dcY,
+        HuffCode[] acY)
+    {
+        int blocksX = (width + 7) / 8;
+        int blocksY = (height + 7) / 8;
+        Span<int> block = stackalloc int[64];
+        int prevYdc = 0;
+
+        for (int by = 0; by < blocksY; by++)
+        for (int bx = 0; bx < blocksX; bx++)
+        {
+            FillBlockGray8ToY(gray8, width, height, bx * 8, by * 8, block);
+            int lastNz = DctQuantizeInPlace(block, qYRecip);
+            HuffmanWriteBlock(bw, block, lastNz, dcY, acY, ref prevYdc);
+        }
+    }
+
+    /// <summary>
+    /// 串行版 Huffman 直方图收集：Fill → DCT 量化 → HuffmanCountBlock，不走任何队列。
+    /// </summary>
+    private static HuffmanHistograms CollectHuffmanHistogramsSequential(
+        int width,
+        int height,
+        byte[] rgb24,
+        JpegChromaSubsampling subsampling,
+        int[] qYRecip,
+        int[] qCRecip,
+        TrellisContext? trellis)
+    {
+        var hist = new HuffmanHistograms();
+        int mcuW = subsampling == JpegChromaSubsampling.Yuv444 ? 8 : 16;
+        int mcuH = subsampling == JpegChromaSubsampling.Yuv420 ? 16 : 8;
+        int mcuX = (width + mcuW - 1) / mcuW;
+        int mcuY = (height + mcuH - 1) / mcuH;
+        byte[] order = OrderOf(subsampling);
+        int blockCount = BlockCountOf(subsampling);
+        Span<int> blocks = stackalloc int[6 * 64];
+        int prevYdc = 0, prevCbdc = 0, prevCrdc = 0;
+
+        for (int my = 0; my < mcuY; my++)
+        for (int mx = 0; mx < mcuX; mx++)
+        {
+            FillMcuBlocks(subsampling, rgb24, width, height, mx * mcuW, my * mcuH, blocks, null);
+            for (int i = 0; i < blockCount; i++)
+            {
+                bool chroma = order[i] != 0;
+                Span<int> block = blocks.Slice(i * 64, 64);
+                int lastNz = DctQuantizeInPlace(block, chroma ? qCRecip : qYRecip, trellis, chroma);
+                if (chroma)
+                {
+                    ref int predictor = ref (order[i] == 1 ? ref prevCbdc : ref prevCrdc);
+                    HuffmanCountBlock(block, lastNz, ref predictor, hist.DcC, hist.AcC);
+                }
+                else
+                {
+                    HuffmanCountBlock(block, lastNz, ref prevYdc, hist.DcY, hist.AcY);
+                }
+            }
+        }
+        return hist;
+    }
+
+    /// <summary>按采样方式把一个 MCU 的 RGB→YCbCr 样本填入 blocks 缓冲（6*64 int）。</summary>
+    private static void FillMcuBlocks(
+        JpegChromaSubsampling subsampling,
+        byte[] rgb24, int width, int height, int baseX, int baseY,
+        Span<int> blocks, EncodeMetrics? metrics)
+    {
+        if (subsampling == JpegChromaSubsampling.Yuv420)
+        {
+            FillMcu420RgbToYCbCr(
+                rgb24, width, height, baseX, baseY,
+                blocks[..64], blocks.Slice(64, 64), blocks.Slice(128, 64),
+                blocks.Slice(192, 64), blocks.Slice(256, 64), blocks.Slice(320, 64),
+                metrics);
+        }
+        else if (subsampling == JpegChromaSubsampling.Yuv422)
+        {
+            FillMcu422RgbToYCbCr(
+                rgb24, width, height, baseX, baseY,
+                blocks[..64], blocks.Slice(64, 64),
+                blocks.Slice(128, 64), blocks.Slice(192, 64),
+                metrics);
+        }
+        else
+        {
+            FillBlockRgbToYCbCr444(
+                rgb24, width, height, baseX, baseY,
+                blocks[..64], blocks.Slice(64, 64), blocks.Slice(128, 64),
+                metrics);
         }
     }
 
@@ -1683,6 +1901,11 @@ public static class JpegEncoder
         int[] qCRecip,
         TrellisContext? trellis = null)
     {
+        if (JpegExecutionMode.IsSequential)
+        {
+            return CollectHuffmanHistogramsSequential(width, height, rgb24, subsampling, qYRecip, qCRecip, trellis);
+        }
+
         var hist = new HuffmanHistograms();
         int capacity = Math.Clamp(Environment.ProcessorCount, 2, 16);
         var sampleQueue = new PipeQueue<McuBatch>(capacity, JpegPerfProbe.ProduceWait, JpegPerfProbe.DctWait);

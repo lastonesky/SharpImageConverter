@@ -31,7 +31,7 @@ namespace SharpImageConverter.Formats.Jpeg
             {
                 ComponentState[] components = headerState.PrepareBaselineRowScan(scan);
                 bool is420 = components[0].H == 2 && components[0].V == 2;
-                _rows = new JpegBaselineFusedRowSource(headerState, data, scan, entropyOffset, components, is420);
+                _rows = new JpegBaselineFusedRowSource(headerState, data, entropyOffset, scan, components, is420);
                 _state = null;
             }
             else

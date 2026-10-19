@@ -54,6 +54,40 @@ internal ref struct JpegBitReader
         this.cancellationToken = cancellationToken;
     }
 
+    /// <summary>
+    /// 从外部保存的标量重建内存源位读器。专供「需要跨越多次调用、但类字段装不下 ref struct」
+    /// 的逐行解码使用（见 <see cref="JpegBaselineFusedRowSource"/>）：调用方把
+    /// <see cref="Offset"/> / <see cref="BytesConsumed"/> / <see cref="BitBufferRaw"/> /
+    /// <see cref="BitCount"/> / <see cref="PendingMarker"/> / <see cref="PadByteCount"/> /
+    /// <see cref="ReachedEndOfData"/> 逐个存下来，下次原样喂回即可无缝续读。
+    /// </summary>
+    /// <remarks>
+    /// <see cref="BitBufferRaw"/> 返回的是内部位缓冲原文（低位对齐），
+    /// 因此「残位个数（<see cref="BitCount"/>）+ 残位原文」就能无损还原位流位置；
+    /// 只存字节偏移是不够的，而 MCU 行边界并不是字节边界。
+    /// </remarks>
+    public JpegBitReader(
+        ReadOnlySpan<byte> entropyData,
+        int offset,
+        int bytesConsumed,
+        uint bitBufferRaw,
+        int bitCount,
+        int pendingMarker,
+        int padByteCount,
+        bool reachedEndOfData)
+    {
+        data = entropyData;
+        this.offset = offset;
+        this.bytesConsumed = bytesConsumed;
+        bitBuffer = bitBufferRaw;
+        this.bitCount = bitCount;
+        this.pendingMarker = pendingMarker;
+        this.padByteCount = padByteCount;
+        this.reachedEndOfData = reachedEndOfData;
+        streamInput = null;
+        cancellationToken = default;
+    }
+
     public readonly bool HasPendingMarker => pendingMarker >= 0;
 
     /// <summary>
@@ -78,6 +112,27 @@ internal ref struct JpegBitReader
     {
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         get => bitCount;
+    }
+
+    /// <summary>数据源内的字节偏移（不含 <see cref="BytesConsumed"/> 的累计语义）。</summary>
+    public readonly int Offset
+    {
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        get => offset;
+    }
+
+    /// <summary>位缓冲原文（低位对齐，仅高 <see cref="BitCount"/> 位有效），用于外部快照。</summary>
+    public readonly uint BitBufferRaw
+    {
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        get => bitBuffer;
+    }
+
+    /// <summary>EOI 之后已伪造的 0xFF 填充字节数，用于外部快照。</summary>
+    public readonly int PadByteCount
+    {
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        get => padByteCount;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
