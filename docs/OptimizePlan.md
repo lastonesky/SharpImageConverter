@@ -53,7 +53,7 @@
 | P3-1a | JPEG 4:2:0 vs 4:4:4 全候选比较 | P3 | 体积 | [x] 已完成 | 2026-10-17 |
 | P3-1b | JPEG 4:2:2 编码支持 | P3 | 体积 | [x] 已完成 | 2026-10-17 |
 | P3-1c | JPEG trellis 量化评估 | P3 | 体积 | [x] 已完成（默认关闭） | 2026-10-18 |
-| P3-2 | WebP 参数搜索（alpha_quality / filter / sns / segments / preprocessing） | P3 | 体积 | [x] 已完成（默认关闭） | 2026-10-18 |
+| P3-2 | WebP 参数搜索（alpha_quality / filter / sns / segments / preprocessing） | P3 | 体积 | [x] 已完成后移除（收益不足） | 2026-10-18 |
 | P3-3 | 调色板量化 k-means/Lloyd 精修 | P3 | 体积/画质 | [x] 已完成 | 2026-10-17 |
 
 ---
@@ -486,33 +486,13 @@ trellis 需要量化前 DCT 系数，因此走标量 FDCT（默认 SIMD 融合�
 不是无代价的同质量压缩。保留 opt-in（`--opt-jpeg-trellis`）用于离线评估与特殊素材，
 不进入默认 optimize。完整数据见 docs/Optimize.md §2「JPEG trellis」。
 
-### P3-2 WebP 参数搜索（已完成，默认关闭）
+### P3-2 WebP 参数搜索（已移除）
 
-**实现**：`WebpEncoderOptions` 新增 `AlphaQuality` / `FilterStrength` / `SnsStrength` /
-`Segments` / `Preprocessing`（-1 = libwebp 默认）与 `WithTuning`；`WebpOptimizer` 在小图
-（≤ `WebpParamSearchMaxPixels`，默认 1.5 MP）上做「单参数消融 → 组合实测 → 一轮坐标下降」，
-只接受仍达标且体积更小的组合；产出期用胜出参数 + OutputMethod 重编。
-`OptimizeOptions.WebpParamSearch` 默认 **false**，CLI `--opt-webp-params` 打开。
-
-**离线消融（q=60 / method 2，达标线感知 45.32 dB、最差 1% SSIM 0.75）**：
-
-| 样本 | 基线 | 单参数最优 | 贪心组合 | 说明 |
-|---|---:|---:|---:|---|
-| `small.png` | 17,664 B（未达标） | 0% | 0% | 基线最差 1% 0.690，全部参数无解 |
-| `car.png` | 2,278 B | −0.4%（filter=0） | **−1.1%** | filter=0 + sns=75 + segments=3 |
-| `Amish.png` | 13,892 B | −3.5%（sns=100） | −3.0% | 组合被最差 1% 门槛卡住 |
-
-端到端（真实 optimize）：`car.png` 1,668 → 1,648 B（−1.2%）、`5_star_base.jpg`
-199,036 → 196,388 B（−1.3%）、`small.png` / `Amish.png` / `video-001` 体积不变；
-耗时 +0.3~2.9 s（2~4 倍）。sns/segments/filter 的激进取值普遍把最差 1% SSIM 压到
-0.75 以下，被 V2 判据拒绝——这正是该判据的作用。
-
-**决定：默认关闭。** 收益 0~1.3% 换 2~4 倍搜索时间，不划算；保留 `--opt-webp-params`
-与 `WebpParamSearchMaxPixels` 用于离线和特定素材。消融数据与完整参数表见
-`docs/Optimize.md` §2「WebP 参数搜索」。
-
-**验收结果**：消融表已给出；组合收益仅在 `car.png` 上大于单参数（−1.1% vs −0.4%），
-其余样本被 V2 门槛限制；因此不以「组合收益 > 单参数」作为默认开启的理由。
+曾实现 `WebpEncoderOptions` 的 5 个调参字段 + `WebpOptimizer` 小图坐标下降，
+语料实测只有 **0~1.3%** 体积收益，代价是 **2~4 倍**搜索时间（`car.png` −1.2%、
+`5_star_base.jpg` −1.3%，其余样本 0%）。判定「不划算」后已从代码库整体删除
+（`WebpParamSearch` / `WebpParamSearchMaxPixels` / `--opt-webp-params` /
+`tools/perf/WebpParamProbe`），不再保留 opt-in。
 
 ### P3-3 调色板 k-means 精修（已完成）
 
@@ -573,9 +553,9 @@ trellis 需要量化前 DCT 系数，因此走标量 FDCT（默认 SIMD 融合�
   JPEG/WebP 边界多看 1~2 档；`CandidateParallelism` 改用当前可用内存（下界 64 MB）
   并加 OOM 串行回退；新增跨格式 `Suggestion` 建议。验证：全套 317/317；
   small.png PNG 292 ms / medium.png 568 ms / large.gif 1279 ms，无静默退化。
-- 2026-10-18 · P3-2 · **完成（默认关闭）**：WebP 五参数小网格搜索 + 单参数消融/组合/坐标下降，
-  `WebpParamSearch` 默认 false，CLI `--opt-webp-params`。car.png −1.2%、5_star −1.3%、
-  其余 0；耗时 2~4 倍。消融表见 §5。
+- 2026-10-18 · P3-2 · **完成后移除**：WebP 五参数小网格搜索 + 单参数消融/组合/坐标下降
+  （car.png −1.2%、5_star −1.3%、其余 0；耗时 2~4 倍）。因收益过小，相关代码与
+  `--opt-webp-params` / `WebpParamSearch` / `tools/perf/WebpParamProbe` 已删除。
 - 2026-10-18 · P3-1c · **完成（默认关闭）**：新增 `JpegTrellisQuantizer`（块内 DP，λ 随 Q² 缩放）
   与 `--opt-jpeg-trellis`。small −4.1%、medium −16.9%、Amish −22.0%、car −23.0%、
   large −24.2%，耗时 2~7 倍，最差 1% SSIM 下降；默认不启用。

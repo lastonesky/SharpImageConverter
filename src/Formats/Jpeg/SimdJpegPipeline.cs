@@ -250,6 +250,31 @@ internal static class SimdJpegPipeline
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static unsafe void TransformAndConvertYCbCr422(
+    ReadOnlySpan<short> yLeftCoef, ReadOnlySpan<short> yRightCoef, ushort[] yQuant,
+    ReadOnlySpan<short> cbCoef, ushort[] cbQuant,
+    ReadOnlySpan<short> crCoef, ushort[] crQuant,
+    Span<byte> dest, int stride)
+    {
+        Block8x8Vectors vy0 = Idct8x8ToVectors(yLeftCoef, yQuant);
+        Block8x8Vectors vy1 = Idct8x8ToVectors(yRightCoef, yQuant);
+        Block8x8Vectors vcb = Idct8x8ToVectors(cbCoef, cbQuant);
+        Block8x8Vectors vcr = Idct8x8ToVectors(crCoef, crQuant);
+
+        byte* pDestBase = (byte*)Unsafe.AsPointer(ref MemoryMarshal.GetReference(dest));
+
+        // 4:2:2 = 水平 2 倍下采样、垂直与亮度同密度，故每行色度只服务一行 Y（不做垂直上采样）。
+        UpsampleAndConvert(vy0.V0, vy1.V0, vcb.V0, vcr.V0, pDestBase + 0 * stride);
+        UpsampleAndConvert(vy0.V1, vy1.V1, vcb.V1, vcr.V1, pDestBase + 1 * stride);
+        UpsampleAndConvert(vy0.V2, vy1.V2, vcb.V2, vcr.V2, pDestBase + 2 * stride);
+        UpsampleAndConvert(vy0.V3, vy1.V3, vcb.V3, vcr.V3, pDestBase + 3 * stride);
+        UpsampleAndConvert(vy0.V4, vy1.V4, vcb.V4, vcr.V4, pDestBase + 4 * stride);
+        UpsampleAndConvert(vy0.V5, vy1.V5, vcb.V5, vcr.V5, pDestBase + 5 * stride);
+        UpsampleAndConvert(vy0.V6, vy1.V6, vcb.V6, vcr.V6, pDestBase + 6 * stride);
+        UpsampleAndConvert(vy0.V7, vy1.V7, vcb.V7, vcr.V7, pDestBase + 7 * stride);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static unsafe void UpsampleAndConvert(Vector128<short> yL, Vector128<short> yR, Vector128<short> cbRow, Vector128<short> crRow, byte* pRowDest)
     {
         // 水平上采样：用 Unpack 完美将 8 个像素拉伸为两组包含 8 个像素的 128位 向量

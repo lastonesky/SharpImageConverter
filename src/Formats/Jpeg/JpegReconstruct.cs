@@ -101,14 +101,31 @@ public static partial class JpegDecoder
 
         bool is444 = yComp.H == 1 && yComp.V == 1 && cbComp.H == 1 && cbComp.V == 1 && crComp.H == 1 && crComp.V == 1;
         bool is420 = yComp.H == 2 && yComp.V == 2 && cbComp.H == 1 && cbComp.V == 1 && crComp.H == 1 && crComp.V == 1;
+        bool is422 = yComp.H == 2 && yComp.V == 1 && cbComp.H == 1 && cbComp.V == 1 && crComp.H == 1 && crComp.V == 1;
 
-        if (!is444 && !is420) return false;
+        if (!is444 && !is420 && !is422) return false;
 
         int mcuX = frame.McuX;
         int mcuY = frame.McuY;
         ushort[] yQuant = quantTables[yComp.QuantTableId].Table;
         ushort[] cbQuant = quantTables[cbComp.QuantTableId].Table;
         ushort[] crQuant = quantTables[crComp.QuantTableId].Table;
+
+        void DecodeMcu(int mx, int my)
+        {
+            if (is444)
+            {
+                DecodeMcu444Simd(mx, my, yComp, cbComp, crComp, yQuant, cbQuant, crQuant, output, width, height);
+            }
+            else if (is420)
+            {
+                DecodeMcu420Simd(mx, my, yComp, cbComp, crComp, yQuant, cbQuant, crQuant, output, width, height);
+            }
+            else
+            {
+                DecodeMcu422Simd(mx, my, yComp, cbComp, crComp, yQuant, cbQuant, crQuant, output, width, height);
+            }
+        }
 
         // 按 MCU 行并行：每个 my 只写 output 的 [my*blockH, (my+1)*blockH) 行区间，互不相交；
         // 系数缓冲在熵解码结束后只读，量化表共享只读 ⇒ 线程安全。
@@ -121,14 +138,7 @@ public static partial class JpegDecoder
             {
                 for (int mx = 0; mx < mcuX; mx++)
                 {
-                    if (is444)
-                    {
-                        DecodeMcu444Simd(mx, my, yComp, cbComp, crComp, yQuant, cbQuant, crQuant, output, width, height);
-                    }
-                    else
-                    {
-                        DecodeMcu420Simd(mx, my, yComp, cbComp, crComp, yQuant, cbQuant, crQuant, output, width, height);
-                    }
+                    DecodeMcu(mx, my);
                 }
             });
             return true;
@@ -138,14 +148,7 @@ public static partial class JpegDecoder
         {
             for (int mx = 0; mx < mcuX; mx++)
             {
-                if (is444)
-                {
-                    DecodeMcu444Simd(mx, my, yComp, cbComp, crComp, yQuant, cbQuant, crQuant, output, width, height);
-                }
-                else if (is420)
-                {
-                    DecodeMcu420Simd(mx, my, yComp, cbComp, crComp, yQuant, cbQuant, crQuant, output, width, height);
-                }
+                DecodeMcu(mx, my);
             }
         }
 
@@ -177,6 +180,38 @@ public static partial class JpegDecoder
         for (int y = 0; y < copyH; y++)
         {
             int src = y * 8 * 3;
+            int dst = (py + y) * stride + px * 3;
+            temp.Slice(src, copyW * 3).CopyTo(output.AsSpan(dst));
+        }
+    }
+
+    private static void DecodeMcu422Simd(int mx, int my, ComponentState yComp, ComponentState cbComp, ComponentState crComp,
+        ushort[] yQuant, ushort[] cbQuant, ushort[] crQuant, byte[] output, int width, int height)
+    {
+        int px = mx * 16;
+        int py = my * 8;
+        if (px >= width || py >= height) return;
+
+        int blocksX = yComp.BlocksX;
+        ReadOnlySpan<short> y0 = yComp.GetBlockSpan(my * blocksX + (mx * 2 + 0));
+        ReadOnlySpan<short> y1 = yComp.GetBlockSpan(my * blocksX + (mx * 2 + 1));
+        ReadOnlySpan<short> cb = cbComp.GetBlockSpan(my * cbComp.BlocksX + mx);
+        ReadOnlySpan<short> cr = crComp.GetBlockSpan(my * crComp.BlocksX + mx);
+
+        int stride = width * 3;
+        if (px + 16 <= width && py + 8 <= height)
+        {
+            SimdJpegPipeline.TransformAndConvertYCbCr422(y0, y1, yQuant, cb, cbQuant, cr, crQuant, output.AsSpan(py * stride + px * 3), stride);
+            return;
+        }
+
+        Span<byte> temp = stackalloc byte[16 * 8 * 3];
+        SimdJpegPipeline.TransformAndConvertYCbCr422(y0, y1, yQuant, cb, cbQuant, cr, crQuant, temp, 16 * 3);
+        int copyW = Math.Min(16, width - px);
+        int copyH = Math.Min(8, height - py);
+        for (int y = 0; y < copyH; y++)
+        {
+            int src = y * 16 * 3;
             int dst = (py + y) * stride + px * 3;
             temp.Slice(src, copyW * 3).CopyTo(output.AsSpan(dst));
         }

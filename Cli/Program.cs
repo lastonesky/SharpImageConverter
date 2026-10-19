@@ -146,7 +146,7 @@ class Program
         Console.WriteLine("GIF 量化器: --gif-quantizer octree(默认,八叉树+Bayer) | wu/legacy(原 Wu+Floyd–Steinberg)");
         Console.WriteLine("GIF 抖动幅度: --gif-dither N (默认 8 = 一个量化步长; 调大会放大颗粒与缩放摩尔纹)");
         Console.WriteLine($"文件夹选项: --recursive | --to bmp/png/jpg/webp/gif | --parallel N（默认 {DefaultDirectoryParallelism}） | --skip-existing");
-        Console.WriteLine("智能压缩: --optimize [--opt-quality N] [--opt-webp-min N] [--opt-webp-large-min N] [--max-colors N] [--no-dither] [--opt-no-png-deflate9] [--opt-no-jpeg-progressive] [--opt-jpeg-trellis] [--opt-webp-params] [--opt-verbose] [--min-saving 百分比] [--opt-lossy-min-gain 百分比]");
+        Console.WriteLine("智能压缩: --optimize [--opt-quality N] [--opt-webp-min N] [--opt-webp-large-min N] [--max-colors N] [--no-dither] [--opt-no-png-deflate9] [--opt-no-jpeg-progressive] [--opt-jpeg-subsample-compare] [--opt-jpeg-trellis] [--opt-verbose] [--min-saving 百分比] [--opt-lossy-min-gain 百分比]");
         Console.WriteLine("  说明: 在画质基本不变的前提下把 JPG/PNG/GIF/WEBP/BMP 压到最小，默认输出 <原名>.min.<原扩展名>");
         Console.WriteLine("转换+压缩: --to <格式> --optimize   转成目标格式并直接输出该格式下最小体积（无需再 optimize 一遍）");
         Console.WriteLine("  示例: dotnet run -- photo.jpg --to webp --optimize   →  photo.webp（已是最小体积）");
@@ -328,9 +328,8 @@ class Program
             EnableDithering = options.Dithering && !options.NoDither,
             PngMaxDeflateOnWinner = !options.NoPngDeflate9,
             JpegProgressive = !options.NoJpegProgressive,
-            JpegCompareSubsampling = !options.NoJpegSubsampleCompare,
+            JpegCompareSubsampling = options.JpegSubsampleCompare && !options.NoJpegSubsampleCompare,
             JpegTrellisQuantization = options.JpegTrellis,
-            WebpParamSearch = options.WebpParamSearch,
             MemoryLimitBytes = options.MemoryLimitMb is > 0 ? options.MemoryLimitMb.Value * 1024L * 1024L : 0,
             DisableMemoryGuard = options.NoMemoryGuard,
             Log = options.OptimizeVerbose ? Console.WriteLine : null,
@@ -490,6 +489,11 @@ class Program
                 options.NoJpegProgressive = true;
                 continue;
             }
+            if (string.Equals(a, "--opt-jpeg-subsample-compare", StringComparison.OrdinalIgnoreCase))
+            {
+                options.JpegSubsampleCompare = true;
+                continue;
+            }
             if (string.Equals(a, "--opt-no-jpeg-subsample-compare", StringComparison.OrdinalIgnoreCase))
             {
                 options.NoJpegSubsampleCompare = true;
@@ -505,14 +509,15 @@ class Program
                 options.MemoryLimitMb = memoryLimit is > 0 ? memoryLimit : null;
                 continue;
             }
+            if (string.Equals(a, "--opt-webp-params", StringComparison.OrdinalIgnoreCase))
+            {
+                // 已移除：语料实测只有 0~1.3% 体积收益，却要多花 2~4 倍搜索时间。
+                Console.Error.WriteLine("⚠️ --opt-webp-params 已移除（收益 0~1.3%、耗时 2~4 倍），本次忽略");
+                continue;
+            }
             if (string.Equals(a, "--opt-jpeg-trellis", StringComparison.OrdinalIgnoreCase))
             {
                 options.JpegTrellis = true;
-                continue;
-            }
-            if (string.Equals(a, "--opt-webp-params", StringComparison.OrdinalIgnoreCase))
-            {
-                options.WebpParamSearch = true;
                 continue;
             }
             if (TryParseNamedInt(args, ref i, "--opt-quality", out int? optQuality))
@@ -794,9 +799,9 @@ class Program
             NoPngDeflate9 = src.NoPngDeflate9,
             JpegProgressive = src.JpegProgressive,
             NoJpegProgressive = src.NoJpegProgressive,
+            JpegSubsampleCompare = src.JpegSubsampleCompare,
             NoJpegSubsampleCompare = src.NoJpegSubsampleCompare,
             JpegTrellis = src.JpegTrellis,
-            WebpParamSearch = src.WebpParamSearch,
             MemoryLimitMb = src.MemoryLimitMb,
             NoMemoryGuard = src.NoMemoryGuard,
             ForceStreaming = src.ForceStreaming,
@@ -1747,9 +1752,9 @@ class Program
         public bool NoPngDeflate9 { get; set; }
         public bool JpegProgressive { get; set; }
         public bool NoJpegProgressive { get; set; }
+        public bool JpegSubsampleCompare { get; set; }
         public bool NoJpegSubsampleCompare { get; set; }
         public bool JpegTrellis { get; set; }
-        public bool WebpParamSearch { get; set; }
         public long? MemoryLimitMb { get; set; }
         public bool NoMemoryGuard { get; set; }
         public bool ForceStreaming { get; set; }

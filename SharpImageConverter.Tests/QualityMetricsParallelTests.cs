@@ -49,5 +49,24 @@ public class QualityMetricsParallelTests
         Assert.Equal(serial.Psnr, parallel.Psnr, 6);
         Assert.Equal(serial.PerceptualPsnr, parallel.PerceptualPsnr, 6);
         Assert.Equal(serial.MeanError, parallel.MeanError, 9);
+        // SSIM 也是按块行分片并行的，同样必须与串行同解。
+        Assert.Equal(serial.Ssim, parallel.Ssim, 9);
+        Assert.Equal(serial.WorstSsim, parallel.WorstSsim, 9);
+    }
+
+    [Theory]
+    [InlineData(2048, 2048)]
+    [InlineData(3001, 1999)]
+    public void ParallelSsim_IgnoresInnerParallelismWhenCandidateParallel(int width, int height)
+    {
+        var (reference, test) = MakePair(width, height);
+
+        var serial = QualityMetrics.Compare(reference.AsSpan(), test.AsSpan(), width, height, 3, blockSize: 4);
+        // PNG/GIF/WebP 的搜索期已经在按候选并行，内层必须是串行（结果仍应与串行路径一致）。
+        var innerOff = QualityMetrics.Compare(reference, test, width, height, 3, allowInnerParallel: false);
+
+        Assert.Equal(serial.Ssim, innerOff.Ssim, 9);
+        Assert.Equal(serial.WorstSsim, innerOff.WorstSsim, 9);
+        Assert.Equal(serial.Psnr, innerOff.Psnr, 6);
     }
 }

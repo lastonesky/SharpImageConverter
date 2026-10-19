@@ -1,6 +1,5 @@
 ﻿using System;
 using System.Collections.Concurrent;
-using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
@@ -73,9 +72,8 @@ namespace SharpImageConverter.Compression
             long searchEncodeTicks = 0, searchDecodeTicks = 0, finalEncodeTicks = 0;
             int searchCandidates = 0;
 
-            byte[] EncodeCore(byte[] source, int sw, int sh, int q, int method, bool isFinal, bool lossless, WebpTuning? tuningValue = null)
+            byte[] EncodeCore(byte[] source, int sw, int sh, int q, int method, bool isFinal, bool lossless)
             {
-                WebpTuning tuning = tuningValue ?? WebpTuning.Default;
                 using var ms = new MemoryStream();
                 // 搜索期多个候选会并发进入 libwebp。WebpCodec 默认走 EncodeLock（针对「线程安全未知」的
                 // 保守闸门），那把锁会把候选并行**完全串行化**（实测 2405 → 2407 ms，×1.00，等于白并行），
@@ -83,10 +81,7 @@ namespace SharpImageConverter.Compression
                 // 验证通过后才启用。
                 var encoder = new WebpEncoderAdapterRgba
                 {
-                    Options = tuning.IsDefault
-                        ? new WebpEncoderOptions(q, WebpConcurrencyStrategy.Parallel, method, lossless)
-                        : new WebpEncoderOptions(q, WebpConcurrencyStrategy.Parallel, method, lossless,
-                            tuning.AlphaQuality, tuning.FilterStrength, tuning.SnsStrength, tuning.Segments, tuning.Preprocessing),
+                    Options = new WebpEncoderOptions(q, WebpConcurrencyStrategy.Parallel, method, lossless),
                 };
                 long t0 = TimingEnabled ? Stopwatch.GetTimestamp() : 0;
                 encoder.EncodeRgba32(ms, new Image<Rgba32>(sw, sh, source, meta));
@@ -170,104 +165,10 @@ namespace SharpImageConverter.Compression
 
             long searchTicks = TimingEnabled ? Stopwatch.GetTimestamp() - searchStart : 0;
 
-            // 小图参数搜索：在已选质量上做单参数消融 → 独立最优组合 → 一轮坐标下降。
-            // 网格/顺序固定，因此结果与核数无关；只接受仍达标且更小的组合。
-            WebpTuning tuning = WebpTuning.Default;
-            if (o.WebpParamSearch && pixels <= o.WebpParamSearchMaxPixels)
-            {
-                int baselineSize = searchResults.TryGetValue(quality, out var baseline) ? baseline.Bytes : int.MaxValue;
-                bool hasAlpha = !SimdHelper.IsOpaqueRgba(rgba);
-
-                (byte[] Bytes, ImageQuality Score) EvaluateTuning(WebpTuning trial)
-                {
-                    byte[] bytes = EncodeCore(rgba, w, h, quality, SearchMethod, isFinal: false, lossless: false, trial);
-                    return (bytes, QualityMetrics.Compare(rgba, Decode(bytes), w, h, 4));
-                }
-
-                // 阶段一：每个参数独立消融（其余参数保持默认），记录「单参数最优」。
-                // 阶段二：把各参数的独立最优组合起来实测一次——组合收益必须真的大于单参数才采用。
-                WebpTuning combined = WebpTuning.Default;
-                void Ablate(int[] values, Func<WebpTuning, int, WebpTuning> with)
-                {
-                    int bestValue = -1;
-                    int bestSize = baselineSize;
-                    foreach (int v in values)
-                    {
-                        var trial = with(WebpTuning.Default, v);
-                        var (bytes, score) = EvaluateTuning(trial);
-                        o.Log?.Invoke($"  参数 {trial.Describe()}: {bytes.Length} 字节, {score}");
-                        if (o.Accept(score) && bytes.Length < bestSize)
-                        {
-                            bestSize = bytes.Length;
-                            bestValue = v;
-                        }
-                    }
-                    if (bestValue >= 0) combined = with(combined, bestValue);
-                }
-
-                if (hasAlpha) Ablate([50, 75], (t, v) => t.With(alphaQuality: v));
-                Ablate([0, 20, 30, 40, 50, 80], (t, v) => t.With(filterStrength: v));
-                Ablate([0, 25, 40, 60, 75, 100], (t, v) => t.With(snsStrength: v));
-                Ablate([1, 2, 3], (t, v) => t.With(segments: v));
-                Ablate([1, 2], (t, v) => t.With(preprocessing: v));
-
-                if (!combined.IsDefault)
-                {
-                    var (bytes, score) = EvaluateTuning(combined);
-                    o.Log?.Invoke($"  参数组合 {combined.Describe()}: {bytes.Length} 字节, {score}");
-                    if (o.Accept(score) && bytes.Length < baselineSize)
-                    {
-                        tuning = combined;
-                        baselineSize = bytes.Length;
-                    }
-                }
-
-                // 阶段三：从组合出发再做一轮坐标下降，吸收组合之后才显现的交互收益。
-                void TryTuning(WebpTuning trial)
-                {
-                    var (bytes, score) = EvaluateTuning(trial);
-                    o.Log?.Invoke($"  参数 {trial.Describe()}: {bytes.Length} 字节, {score}");
-                    if (o.Accept(score) && bytes.Length < baselineSize)
-                    {
-                        baselineSize = bytes.Length;
-                        tuning = trial;
-                    }
-                }
-
-                if (hasAlpha)
-                {
-                    foreach (int v in new[] { 50, 75 })
-                    {
-                        if (v == tuning.AlphaQuality) continue;
-                        TryTuning(tuning.With(alphaQuality: v));
-                    }
-                }
-                foreach (int v in new[] { 0, 20, 30, 40, 50, 80 })
-                {
-                    if (v == tuning.FilterStrength) continue;
-                    TryTuning(tuning.With(filterStrength: v));
-                }
-                foreach (int v in new[] { 0, 25, 40, 60, 75, 100 })
-                {
-                    if (v == tuning.SnsStrength) continue;
-                    TryTuning(tuning.With(snsStrength: v));
-                }
-                foreach (int v in new[] { 1, 2, 3 })
-                {
-                    if (v == tuning.Segments) continue;
-                    TryTuning(tuning.With(segments: v));
-                }
-                foreach (int v in new[] { 1, 2 })
-                {
-                    if (v == tuning.Preprocessing) continue;
-                    TryTuning(tuning.With(preprocessing: v));
-                }
-            }
-
             // 产出档与搜索档不同（m2 → m3/m6），用最终产物重新解码复评；不达标时 +2 重试。
             long finalStart = TimingEnabled ? Stopwatch.GetTimestamp() : 0;
             int usedMethod = outputMethod;
-            byte[] best = EncodeCore(rgba, w, h, quality, usedMethod, isFinal: true, lossless: false, tuning);
+            byte[] best = EncodeCore(rgba, w, h, quality, usedMethod, isFinal: true, lossless: false);
             var finalScore = QualityMetrics.Compare(rgba, Decode(best), w, h, 4);
 
             // m6 与 m2/m3 的画质不完全一致：边界上可能出现「搜索 q 达标、m6 产物不达标」。
@@ -275,7 +176,7 @@ namespace SharpImageConverter.Compression
             if (!o.Accept(finalScore) && usedMethod != 3)
             {
                 usedMethod = 3;
-                byte[] alt = EncodeCore(rgba, w, h, quality, usedMethod, isFinal: true, lossless: false, tuning);
+                byte[] alt = EncodeCore(rgba, w, h, quality, usedMethod, isFinal: true, lossless: false);
                 var altScore = QualityMetrics.Compare(rgba, Decode(alt), w, h, 4);
                 if (o.Accept(altScore) || alt.Length < best.Length)
                 {
@@ -288,7 +189,7 @@ namespace SharpImageConverter.Compression
             while (!o.Accept(finalScore) && quality < 95 && retries < 4)
             {
                 quality = Math.Min(95, quality + 2);
-                best = EncodeCore(rgba, w, h, quality, usedMethod, isFinal: true, lossless: false, tuning);
+                best = EncodeCore(rgba, w, h, quality, usedMethod, isFinal: true, lossless: false);
                 finalScore = QualityMetrics.Compare(rgba, Decode(best), w, h, 4);
                 retries++;
             }
@@ -320,9 +221,7 @@ namespace SharpImageConverter.Compression
                     lossless ? outputMethod : usedMethod, lossless, retries);
             }
 
-            string method = lossless
-                ? "WebP 无损"
-                : $"WebP 质量 {quality}" + (tuning.IsDefault ? string.Empty : $"（{tuning.Describe()}）");
+            string method = lossless ? "WebP 无损" : $"WebP 质量 {quality}";
             return new OptimizeArtifact(best, method, finalScore, o.Accept(finalScore));
         }
 
@@ -346,44 +245,6 @@ namespace SharpImageConverter.Compression
                 }
             }
             return bestQ;
-        }
-
-        /// <summary>WebP 调参组合；-1 表示使用 libwebp 默认值。</summary>
-        private readonly record struct WebpTuning(
-            int AlphaQuality,
-            int FilterStrength,
-            int SnsStrength,
-            int Segments,
-            int Preprocessing)
-        {
-            public static WebpTuning Default => new(-1, -1, -1, -1, -1);
-
-            public bool IsDefault => AlphaQuality < 0 && FilterStrength < 0 && SnsStrength < 0
-                && Segments < 0 && Preprocessing < 0;
-
-            public WebpTuning With(
-                int? alphaQuality = null,
-                int? filterStrength = null,
-                int? snsStrength = null,
-                int? segments = null,
-                int? preprocessing = null)
-                => new(
-                    alphaQuality ?? AlphaQuality,
-                    filterStrength ?? FilterStrength,
-                    snsStrength ?? SnsStrength,
-                    segments ?? Segments,
-                    preprocessing ?? Preprocessing);
-
-            public string Describe()
-            {
-                var parts = new List<string>(5);
-                if (AlphaQuality >= 0) parts.Add($"alpha={AlphaQuality}");
-                if (FilterStrength >= 0) parts.Add($"filter={FilterStrength}");
-                if (SnsStrength >= 0) parts.Add($"sns={SnsStrength}");
-                if (Segments >= 0) parts.Add($"segments={Segments}");
-                if (Preprocessing >= 0) parts.Add($"preprocess={Preprocessing}");
-                return string.Join(", ", parts);
-            }
         }
 
         /// <summary>分阶段耗时探针开关：<c>SIC_WEBP_OPT_TIMING=1</c>（与 <c>SIC_JPEG_STAGE_TIMING</c> 同一约定）。</summary>

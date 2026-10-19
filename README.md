@@ -263,11 +263,10 @@ dotnet run -- <输入文件或文件夹路径> [输出文件或文件夹路径] 
   - `--no-dither`：关闭 Floyd–Steinberg 抖动（默认 PNG 会同时比较抖动/不抖动两个候选）。
   - `--opt-no-png-deflate9`：关闭 PNG 赢家的 zlib 9 补压（默认对 ≤8 MP 图开启）。
   - `--opt-no-jpeg-progressive`：关闭 JPEG 产出阶段的 progressive 重写（默认开启）。
-  - `--opt-no-jpeg-subsample-compare`：关闭 4:2:0 达标后继续比较 4:4:4（默认开启，可省一次搜索）。
+  - `--opt-jpeg-subsample-compare`：4:2:0 达标后仍比较 4:2:2 / 4:4:4 并取最小（默认关闭，开启会多两轮搜索）。
   - `--opt-jpeg-trellis`：启用 JPEG trellis 量化（默认关闭；体积 −4%~−24%，耗时 2~7 倍）。
   - `--memory-limit N`：内存预算（MB，默认按当前可用内存自动推导）。optimize 超预算会拒绝并保留原图；普通转换超预算时，BMP/PNG/GIF/WebP/JPEG → BMP/PNG/GIF/JPEG 自动走逐行流式处理，仍不足则明确报错而不是 OOM。
   - `--no-memory-guard`：关闭解码前的内存预检。
-  - `--opt-webp-params`：启用 WebP 五参数小网格搜索（默认关闭；收益 0~1.3%，耗时 2~4 倍）。
   - `--opt-min-ssim N` / `--opt-min-worst-ssim N`：Y-SSIM 均值 / 最差 1% 块下限（百分比，默认 95 / 75）。
   - `--min-saving N`：至少省 N%（如 `--min-saving 10`）才采用，否则保留原图（仅同格式压缩生效）。
     同格式 JPEG/WebP 另有默认 10% 的有损再压缩门槛（`MinLossyGainRatio`），避免为微小收益再损失一代画质。

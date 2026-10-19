@@ -545,13 +545,13 @@ public static class JpegEncoder
     public static void Write(Stream stream, int width, int height, byte[] rgb24, JpegEncoderOptions options)
     {
         ValidateRgb24Input(stream, width, height, rgb24);
-        WriteInternal(stream, width, height, rgb24, NormalizeQuality(options.Quality), options.Subsample420, null, options.KeepMetadata, options.EnableDiagnostics, options.OptimizeHuffman, null, options.TrellisQuantization);
+        WriteInternal(stream, width, height, rgb24, NormalizeQuality(options.Quality), options.Subsampling, null, options.KeepMetadata, options.EnableDiagnostics, options.OptimizeHuffman, null, options.TrellisQuantization);
     }
 
     public static void Write(Stream stream, int width, int height, byte[] rgb24, JpegEncoderOptions options, ImageMetadata? metadata)
     {
         ValidateRgb24Input(stream, width, height, rgb24);
-        WriteInternal(stream, width, height, rgb24, NormalizeQuality(options.Quality), options.Subsample420, metadata, options.KeepMetadata, options.EnableDiagnostics, options.OptimizeHuffman, null, options.TrellisQuantization);
+        WriteInternal(stream, width, height, rgb24, NormalizeQuality(options.Quality), options.Subsampling, metadata, options.KeepMetadata, options.EnableDiagnostics, options.OptimizeHuffman, null, options.TrellisQuantization);
     }
 
     /// <summary>

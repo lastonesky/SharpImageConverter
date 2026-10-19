@@ -250,11 +250,10 @@ Special cases:
 - `--no-dither` : disable dithering (PNG compares dithered and non-dithered candidates by default)
 - `--opt-no-png-deflate9` : disable the final zlib 9 pass on the PNG winner (on by default for ≤8 MP)
 - `--opt-no-jpeg-progressive` : disable the progressive JPEG rewrite (on by default)
-- `--opt-no-jpeg-subsample-compare` : disable the extra 4:4:4 candidate comparison (on by default)
+- `--opt-jpeg-subsample-compare` : also search 4:2:2 / 4:4:4 after 4:2:0 meets the bar and keep the smallest (off by default; adds two full searches)
 - `--opt-jpeg-trellis` : enable JPEG trellis quantization (off by default; 4–24% smaller at 2–7× encode time)
 - `--memory-limit N` : memory budget in MB (default: derived from current free memory). Optimize refuses and keeps the original when over budget; plain BMP/PNG/GIF/WebP/JPEG → BMP/PNG/GIF/JPEG conversions switch to a row-streaming pipeline, otherwise fail with a clear message instead of OOM
 - `--no-memory-guard` : disable the pre-decode memory estimate
-- `--opt-webp-params` : enable the WebP 5-parameter grid search (off by default; 0–1.3% smaller at 2–4× search time)
 - `--opt-min-ssim N` / `--opt-min-worst-ssim N` : Y-SSIM mean / worst-1% floor in percent (default 95 / 75)
 - `--min-saving N` : only accept the result if it saves at least N%
   (same-format JPEG/WebP also require 10% by default via `MinLossyGainRatio`, to avoid another lossy generation for tiny gains)

@@ -42,46 +42,14 @@ namespace SharpImageConverter.Formats.Webp
         /// </summary>
         public bool Lossless { get; }
 
-        /// <summary>
-        /// libwebp <c>config.alpha_quality</c>（0~100）；-1 表示使用 libwebp 默认值（100）。
-        /// 只影响带 alpha 的图；降低它可减小 alpha 平面体积。
-        /// </summary>
-        public int AlphaQuality { get; }
-
-        /// <summary>libwebp <c>config.filter_strength</c>（0~100）；-1 表示默认（60）。</summary>
-        public int FilterStrength { get; }
-
-        /// <summary>libwebp <c>config.sns_strength</c>（0~100）；-1 表示默认（50）。</summary>
-        public int SnsStrength { get; }
-
-        /// <summary>libwebp <c>config.segments</c>（1~4）；-1 表示默认（4）。</summary>
-        public int Segments { get; }
-
-        /// <summary>
-        /// libwebp <c>config.preprocessing</c>（0~2）：0 无、1 分段平滑、2 伪随机抖动；
-        /// -1 表示默认（0）。
-        /// </summary>
-        public int Preprocessing { get; }
-
         public WebpEncoderOptions(
             float quality,
             WebpConcurrencyStrategy concurrencyStrategy = WebpConcurrencyStrategy.Auto,
             int method = 3,
-            bool lossless = false,
-            int alphaQuality = -1,
-            int filterStrength = -1,
-            int snsStrength = -1,
-            int segments = -1,
-            int preprocessing = -1)
+            bool lossless = false)
         {
             if (quality < 0f || quality > 100f) throw new ArgumentOutOfRangeException(nameof(quality));
             if (method is < 0 or > 6) throw new ArgumentOutOfRangeException(nameof(method));
-            if (alphaQuality is < -1 or > 100) throw new ArgumentOutOfRangeException(nameof(alphaQuality));
-            if (filterStrength is < -1 or > 100) throw new ArgumentOutOfRangeException(nameof(filterStrength));
-            if (snsStrength is < -1 or > 100) throw new ArgumentOutOfRangeException(nameof(snsStrength));
-            if (segments is < -1 or > 4) throw new ArgumentOutOfRangeException(nameof(segments));
-            if (segments == 0) throw new ArgumentOutOfRangeException(nameof(segments));
-            if (preprocessing is < -1 or > 2) throw new ArgumentOutOfRangeException(nameof(preprocessing));
             // 实测 m4 在 143 MP / q75 有 3.4 倍悬崖且体积更大；高质量档直接降回 m3。
             // 无损模式下 quality 是“压缩努力”而非画质档，但 m4 的悬崖是 libwebp 内部实现问题，
             // 同样避开更稳妥。SIC_WEBP_ALLOW_M4_HIGHQ=1 仅用于复现/诊断。
@@ -90,30 +58,7 @@ namespace SharpImageConverter.Formats.Webp
             ConcurrencyStrategy = concurrencyStrategy;
             Method = method;
             Lossless = lossless;
-            AlphaQuality = alphaQuality;
-            FilterStrength = filterStrength;
-            SnsStrength = snsStrength;
-            Segments = segments;
-            Preprocessing = preprocessing;
         }
-
-        /// <summary>返回替换了调参字段的副本（用于 optimize 的参数搜索）。</summary>
-        public WebpEncoderOptions WithTuning(
-            int? alphaQuality = null,
-            int? filterStrength = null,
-            int? snsStrength = null,
-            int? segments = null,
-            int? preprocessing = null)
-            => new(
-                Quality,
-                ConcurrencyStrategy,
-                Method,
-                Lossless,
-                alphaQuality ?? AlphaQuality,
-                filterStrength ?? FilterStrength,
-                snsStrength ?? SnsStrength,
-                segments ?? Segments,
-                preprocessing ?? Preprocessing);
 
         public static WebpEncoderOptions Default => new(75f, WebpConcurrencyStrategy.Auto);
     }

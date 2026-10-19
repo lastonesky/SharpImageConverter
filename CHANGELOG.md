@@ -1,5 +1,46 @@
 ## 未发布
 
+### 性能
+- **JPEG optimize 大图 28.6 s → 3.45 s（143 MP `examples/progressive.jpg`）**，三个独立原因：
+  - **4:2:2 解码补上 SIMD 快速路径**：`TryDecodeInterleavedYCbCrSimd` 此前只认 Y=1×1 / 2×2，
+    2×1 直接回退到「三块整幅平面 + 标量双线性交织」，单次重建 **1267 ms**（4:2:0 为 18 ms）。
+    新增 2×1 MCU 分支（水平上采样与 4:2:0 共用 `UpsampleAndConvert`），降到 **~30 ms**。
+    影响的不只是 optimize：任何 4:2:2 JPEG 的正常解码此前都走慢路径。
+  - **Y-SSIM 按块行并行**：原实现是整幅单线程标量扫描（143 MP 242 ms/候选），比并行后的
+    PSNR/感知段还贵。分片合并按分片下标，结果确定；候选已并行时（PNG/GIF/WebP 搜索期）
+    传 `allowInnerParallel: false` 保持串行，避免超订。
+  - **`JpegCompareSubsampling` 默认关闭**：4:2:0 达标后不再强制多跑 4:2:2 + 4:4:4 两轮完整搜索。
+    新增 CLI `--opt-jpeg-subsample-compare` 显式开启；开了以后本例产物从 2.36 MB 降到 2.13 MB
+    （q42 4:2:2），代价 +4.4 s。
+
+### 移除
+- **WebP 五参数搜索（`--opt-webp-params` / `WebpParamSearch`）整体删除**：语料实测只有
+  0~1.3% 体积收益，却要多花 2~4 倍搜索时间。连带删除 `WebpEncoderOptions` 的
+  `AlphaQuality` / `FilterStrength` / `SnsStrength` / `Segments` / `Preprocessing` /
+  `WithTuning`、`WebpParamSearchMaxPixels`、`tools/perf/WebpParamProbe` 与相关文档/测试。
+- 1.2.0 条目中该功能的记录保留为历史。
+
+- **JPEG trellis 的 DP 重写（单块 28.9 µs → 3.3 µs，8.5x）**：
+  零转移改成一次向量移位（`next[r] = dp[r-1] + coef²`），回溯表从 64×64 int 缩成每位置
+  一对 `(prevRun, value)`；码率按 `run = 16q + s` 展开，`min_r` 化为
+  `min_s(G[s] + λ·len[s,cat])`，用 `Vector<int>` 一次算 16 个 run 状态；
+  候选 category 用 `BitOperations.Log2` 并复用同 category 的码率项。
+  端到端：143 MP `progressive.jpg` 44.9 s → 9.7 s、`Amish-Noka-Dresser.png` 730 → 417 ms，
+  产物 md5 与旧实现逐字节相同（新增 `VectorizedDp_MatchesLegacyCost` 逐块比对）。
+  λ 被 `SIC_JPEG_TRELLIS_LAMBDA` 推到极端时自动回落旧 long 实现。
+
+### 修复
+- **4:2:2 编码被静默降级成 4:4:4**：`JpegEncoder.Write(..., JpegEncoderOptions)` 把参数压成
+  `options.Subsample420`（bool），`Yuv422` 因此走 4:4:4 分支。optimize 用真正的 4:2:2 系数
+  评估画质，却写出与 4:4:4 逐字节相同的字节流（两份产物 md5 相同），CLI `--subsample 422` 同病。
+  现改为传 `options.Subsampling`。
+- **SSIM 与 PSNR 的并行一致性**：新增 `QualityMetricsParallelTests` 对 SSIM/WorstSsim 的
+  串行/并行断言。
+
+### 测试
+- 新增 `Jpeg422Tests`：SOF0 采样因子 2×1、4:2:2 产物小于 4:4:4、SIMD 重建与通用（浮点 IDCT）
+  路径像素一致（含 97×61 / 33×17 边界 MCU）、系数直通与比特流解码逐字节相同。
+
 ### 文档
 - **`docs/` 整理：13 份 Markdown 合并为 7 份**，删除已完成使命的过期文档。
   - 新增 `docs/ArmFindings.md`：合并 `ArmPerfBaseline.md` + `ArmExclusiveSimd.md`

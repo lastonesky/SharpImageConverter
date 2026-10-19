@@ -168,7 +168,7 @@ namespace SharpImageConverter.Compression
                 return external(reference, test, width, height, bytesPerPixel);
             }
             return AddSsim(CompareCore(reference, test, width, height, bytesPerPixel, blockSize, reference, test, true),
-                reference, test, width, height, bytesPerPixel);
+                reference, test, width, height, bytesPerPixel, allowInnerParallel: true);
         }
 
         /// <summary>
@@ -193,7 +193,7 @@ namespace SharpImageConverter.Compression
                 return external(reference, test, width, height, bytesPerPixel);
             }
             return AddSsim(CompareCore(reference, test, width, height, bytesPerPixel, blockSize, reference, test, allowInnerParallel),
-                reference, test, width, height, bytesPerPixel);
+                reference, test, width, height, bytesPerPixel, allowInnerParallel);
         }
 
         private static ImageQuality AddSsim(
@@ -204,12 +204,43 @@ namespace SharpImageConverter.Compression
             return new ImageQuality(q.Psnr, q.PerceptualPsnr, q.MeanError, ssim, worst);
         }
 
+        private static ImageQuality AddSsim(
+            ImageQuality q, byte[] reference, byte[] test,
+            int width, int height, int bytesPerPixel, bool allowInnerParallel)
+        {
+            var (ssim, worst) = CompareSsim(reference, test, width, height, bytesPerPixel, allowInnerParallel);
+            return new ImageQuality(q.Psnr, q.PerceptualPsnr, q.MeanError, ssim, worst);
+        }
+
         /// <summary>
         /// Y 通道 SSIM（均值 + 最差 1% 块）。块边长随像素数放大：大图按更接近观看尺寸的尺度评估。
         /// </summary>
         private static (double Ssim, double WorstSsim) CompareSsim(
             ReadOnlySpan<byte> reference, ReadOnlySpan<byte> test,
             int width, int height, int bytesPerPixel)
+            => CompareSsimCore(reference, test, width, height, bytesPerPixel, null, null, allowParallel: false);
+
+        /// <summary>
+        /// 数组重载：与 <see cref="CompareCore"/> 一样按块行分片并行。
+        /// </summary>
+        /// <remarks>
+        /// SSIM 块之间互不重叠、各自独立，因此分片只改变浮点累加的合并顺序（合并始终按分片下标，
+        /// 结果确定），误差在 1e-9 量级。143 MP 上这段标量扫描原本是单候选的头号开销（~250 ms，
+        /// 比并行后的 PSNR/感知段还大），并行后与后者同级。
+        /// <para>
+        /// <paramref name="allowParallel"/> 为 false 时保持串行 —— 调用方已经在按候选并行时
+        /// （PNG/GIF/WebP 搜索期）不该再叠一层「核数²」的线程。
+        /// </para>
+        /// </remarks>
+        private static (double Ssim, double WorstSsim) CompareSsim(
+            byte[] reference, byte[] test,
+            int width, int height, int bytesPerPixel, bool allowParallel)
+            => CompareSsimCore(reference, test, width, height, bytesPerPixel, reference, test, allowParallel);
+
+        private static (double Ssim, double WorstSsim) CompareSsimCore(
+            ReadOnlySpan<byte> reference, ReadOnlySpan<byte> test,
+            int width, int height, int bytesPerPixel,
+            byte[]? refArray, byte[]? testArray, bool allowParallel)
         {
             int expected = checked(width * height * bytesPerPixel);
             if (reference.Length < expected || test.Length < expected) return (1, 1);
@@ -223,52 +254,105 @@ namespace SharpImageConverter.Compression
             int rowBytes = width * bytesPerPixel;
             int blockX = (width + blockSize - 1) / blockSize;
             int blockY = (height + blockSize - 1) / blockSize;
-            var hist = new int[256];
-            double ssimSum = 0;
-            long pixelSum = 0;
-            long blockCount = 0;
             const double C1 = 6.5025;    // (0.01*255)^2
             const double C2 = 58.5225;   // (0.03*255)^2
 
-            for (int by = 0; by < blockY; by++)
+            // 块行是天然的并行单元：SSIM 块互不重叠，没有跨块的滑动窗口。
+            void Accumulate(
+                ReadOnlySpan<byte> refSpan, ReadOnlySpan<byte> testSpan,
+                int blockRowStart, int blockRowEnd,
+                ref double ssimSum, ref long pixelSum, ref long blockCount, int[] hist)
             {
-                int y0 = by * blockSize;
-                int y1 = Math.Min(y0 + blockSize, height);
-                for (int bx = 0; bx < blockX; bx++)
+                for (int by = blockRowStart; by < blockRowEnd; by++)
                 {
-                    int x0 = bx * blockSize;
-                    int x1 = Math.Min(x0 + blockSize, width);
-                    double sr = 0, st = 0, srr = 0, stt = 0, srt = 0;
-                    int n = 0;
-                    for (int y = y0; y < y1; y++)
+                    int y0 = by * blockSize;
+                    int y1 = Math.Min(y0 + blockSize, height);
+                    for (int bx = 0; bx < blockX; bx++)
                     {
-                        int row = y * rowBytes;
-                        for (int x = x0; x < x1; x++)
+                        int x0 = bx * blockSize;
+                        int x1 = Math.Min(x0 + blockSize, width);
+                        double sr = 0, st = 0, srr = 0, stt = 0, srt = 0;
+                        int n = 0;
+                        for (int y = y0; y < y1; y++)
                         {
-                            int i = row + x * bytesPerPixel;
-                            double yr = (77 * reference[i] + 150 * reference[i + 1] + 29 * reference[i + 2]) / 256.0;
-                            double yt = (77 * test[i] + 150 * test[i + 1] + 29 * test[i + 2]) / 256.0;
-                            sr += yr; st += yt;
-                            srr += yr * yr; stt += yt * yt; srt += yr * yt;
-                            n++;
+                            int row = y * rowBytes;
+                            for (int x = x0; x < x1; x++)
+                            {
+                                int i = row + x * bytesPerPixel;
+                                double yr = (77 * refSpan[i] + 150 * refSpan[i + 1] + 29 * refSpan[i + 2]) / 256.0;
+                                double yt = (77 * testSpan[i] + 150 * testSpan[i + 1] + 29 * testSpan[i + 2]) / 256.0;
+                                sr += yr; st += yt;
+                                srr += yr * yr; stt += yt * yt; srt += yr * yt;
+                                n++;
+                            }
                         }
+                        if (n == 0) continue;
+                        double inv = 1.0 / n;
+                        double mr = sr * inv, mt = st * inv;
+                        double vr = Math.Max(0, srr * inv - mr * mr);
+                        double vt = Math.Max(0, stt * inv - mt * mt);
+                        double cov = srt * inv - mr * mt;
+                        double num = (2 * mr * mt + C1) * (2 * cov + C2);
+                        double den = (mr * mr + mt * mt + C1) * (vr + vt + C2);
+                        double ssim = den > 0 ? num / den : 1;
+                        if (ssim < 0) ssim = 0;
+                        else if (ssim > 1) ssim = 1;
+                        ssimSum += ssim * n;
+                        pixelSum += n;
+                        blockCount++;
+                        hist[(int)(ssim * 255.999)]++;
                     }
-                    if (n == 0) continue;
-                    double inv = 1.0 / n;
-                    double mr = sr * inv, mt = st * inv;
-                    double vr = Math.Max(0, srr * inv - mr * mr);
-                    double vt = Math.Max(0, stt * inv - mt * mt);
-                    double cov = srt * inv - mr * mt;
-                    double num = (2 * mr * mt + C1) * (2 * cov + C2);
-                    double den = (mr * mr + mt * mt + C1) * (vr + vt + C2);
-                    double ssim = den > 0 ? num / den : 1;
-                    if (ssim < 0) ssim = 0;
-                    else if (ssim > 1) ssim = 1;
-                    ssimSum += ssim * n;
-                    pixelSum += n;
-                    blockCount++;
-                    hist[(int)(ssim * 255.999)]++;
                 }
+            }
+
+            double ssimSum = 0;
+            long pixelSum = 0;
+            long blockCount = 0;
+            int[] histogram = new int[256];
+
+            if (allowParallel
+                && blockY >= 2
+                && (long)width * height >= ParallelPixelThreshold
+                && Environment.ProcessorCount > 1
+                && refArray is not null
+                && testArray is not null)
+            {
+                byte[] refBuffer = refArray;
+                byte[] testBuffer = testArray;
+                int dop = Math.Min(Environment.ProcessorCount, blockY);
+                int blockRowsPerChunk = (blockY + dop - 1) / dop;
+                var partialSums = new double[dop];
+                var partialPixels = new long[dop];
+                var partialBlocks = new long[dop];
+                var partialHists = new int[dop][];
+                for (int d = 0; d < dop; d++) partialHists[d] = new int[256];
+
+                Parallel.For(0, dop, d =>
+                {
+                    int from = d * blockRowsPerChunk;
+                    int to = Math.Min(from + blockRowsPerChunk, blockY);
+                    ReadOnlySpan<byte> localReference = refBuffer.AsSpan(0, expected);
+                    ReadOnlySpan<byte> localTest = testBuffer.AsSpan(0, expected);
+                    double s = 0;
+                    long p = 0, c = 0;
+                    Accumulate(localReference, localTest, from, to, ref s, ref p, ref c, partialHists[d]);
+                    partialSums[d] = s;
+                    partialPixels[d] = p;
+                    partialBlocks[d] = c;
+                });
+
+                for (int d = 0; d < dop; d++)
+                {
+                    ssimSum += partialSums[d];
+                    pixelSum += partialPixels[d];
+                    blockCount += partialBlocks[d];
+                    int[] hist = partialHists[d];
+                    for (int i = 0; i < hist.Length; i++) histogram[i] += hist[i];
+                }
+            }
+            else
+            {
+                Accumulate(reference, test, 0, blockY, ref ssimSum, ref pixelSum, ref blockCount, histogram);
             }
 
             double mean = pixelSum > 0 ? ssimSum / pixelSum : 1;
@@ -277,9 +361,9 @@ namespace SharpImageConverter.Compression
             {
                 long target = Math.Max(1, (long)Math.Ceiling(blockCount * 0.01));
                 long seen = 0;
-                for (int i = 0; i < hist.Length; i++)
+                for (int i = 0; i < histogram.Length; i++)
                 {
-                    seen += hist[i];
+                    seen += histogram[i];
                     if (seen >= target)
                     {
                         worst = i / 255.0;

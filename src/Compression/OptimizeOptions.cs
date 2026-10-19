@@ -152,24 +152,6 @@ namespace SharpImageConverter.Compression
         /// </remarks>
         public bool GifLocalPalettes { get; set; } = true;
 
-        /// <summary>
-        /// 是否对 WebP 做小范围编码参数搜索（<c>alpha_quality</c> / <c>filter_strength</c> /
-        /// <c>sns_strength</c> / <c>segments</c> / <c>preprocessing</c>）。**默认关闭**，
-        /// 只对 ≤ <see cref="WebpParamSearchMaxPixels"/> 的小图生效。
-        /// </summary>
-        /// <remarks>
-        /// 搜索期在已选出的质量上用便宜档 <c>method 2</c> 做坐标下降（每个参数只试给定网格），
-        /// 只接受「仍达标且体积更小」的组合；赢家参数再交给产出档重编。
-        /// 参数搜索的候选数较多，大图上每个候选都要几秒，故默认只服务小图。
-        /// 2026-10 语料实测：收益 0%~1.3%，耗时 +0.3~2.9 s（2~4 倍），且多数激进参数
-        /// （sns / segments）会把最差 1% 块 SSIM 压到 0.75 以下而被 V2 判据拒绝，
-        /// 因此默认关闭，仅保留给显式调参/离线消融。可用 <c>--opt-webp-params</c> 打开。
-        /// </remarks>
-        public bool WebpParamSearch { get; set; } = false;
-
-        /// <summary>WebP 参数搜索的像素数上限。默认 1.5 MP。</summary>
-        public long WebpParamSearchMaxPixels { get; set; } = 1_500_000;
-
         /// <summary>尝试无损 WebP 的唯一颜色数上限（默认 4096）。</summary>
         public int WebpLosslessMaxUniqueColors { get; set; } = 4096;
 
@@ -183,13 +165,15 @@ namespace SharpImageConverter.Compression
         public bool JpegOptimizeHuffman { get; set; } = true;
 
         /// <summary>
-        /// JPEG 是否在 4:2:0 达标后仍然搜索 4:4:4，并按体积取小。默认开启。
+        /// JPEG 是否在 4:2:0 达标后仍然搜索 4:2:2 / 4:4:4，并按体积取小。默认关闭。
         /// </summary>
         /// <remarks>
-        /// 4:4:4 通常更大，但色度高频丰富的图可能在更低 q 下反而更小、观感更好；
-        /// 关闭后恢复旧行为（4:2:0 不达标时才回退 4:4:4），可省一次完整搜索。
+        /// 4:4:4 通常更大，但色度高频丰富的图可能在更低 q 下反而更小、观感更好。
+        /// 代价是每个色度采样布局都要再跑一整轮二分（143 MP 实测 +2.2 s/轮），
+        /// 而 4:2:0 达标的图绝大多数仍是 4:2:0 最小，所以默认关闭：
+        /// 只有 4:2:0 不达标时才回退 4:2:2 / 4:4:4。
         /// </remarks>
-        public bool JpegCompareSubsampling { get; set; } = true;
+        public bool JpegCompareSubsampling { get; set; }
 
         /// <summary>
         /// JPEG 是否启用 trellis 量化（RD 优化的量化系数选择）。默认关闭（P3-1c 离线评估后决定）。
@@ -293,7 +277,6 @@ namespace SharpImageConverter.Compression
             o.WebpLargeImageMinQuality = Math.Clamp(o.WebpLargeImageMinQuality, 1, 95);
             o.WebpLosslessMaxUniqueColors = Math.Clamp(o.WebpLosslessMaxUniqueColors, 1, 1_000_000);
             o.WebpLosslessMaxPixels = Math.Max(0, o.WebpLosslessMaxPixels);
-            o.WebpParamSearchMaxPixels = Math.Max(0, o.WebpParamSearchMaxPixels);
             if (o.JpegQuality.HasValue) o.JpegQuality = Math.Clamp(o.JpegQuality.Value, 1, 100);
             o.MinSavingRatio = Math.Clamp(o.MinSavingRatio, 0, 0.99);
             o.MinLossyGainRatio = Math.Clamp(o.MinLossyGainRatio, 0, 0.99);

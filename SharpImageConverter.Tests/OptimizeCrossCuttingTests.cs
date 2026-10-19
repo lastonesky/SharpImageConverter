@@ -128,29 +128,5 @@ namespace Jpeg2Bmp.Tests
             var score = QualityMetrics.Compare(rgb, decoded.Buffer, w, h, 3);
             Assert.True(score.Psnr > 20, $"trellis 产物画质异常: {score}");
         }
-
-        [Fact]
-        public void WebpEncoderOptions_AppliesTuningFields()
-        {
-            int w = 128, h = 96;
-            byte[] rgba = GradientRgba(w, h);
-
-            byte[] Encode(WebpEncoderOptions options)
-            {
-                using var ms = new MemoryStream();
-                new WebpEncoderAdapterRgba { Options = options }.EncodeRgba32(ms, new Image<Rgba32>(w, h, rgba));
-                return ms.ToArray();
-            }
-
-            var defaults = new WebpEncoderOptions(60f, WebpConcurrencyStrategy.Parallel, method: 2);
-            var tuned = defaults.WithTuning(snsStrength: 100, segments: 2, filterStrength: 0, preprocessing: 2);
-            byte[] a = Encode(defaults);
-            byte[] b = Encode(tuned);
-
-            Assert.NotEqual(a.Length, b.Length);
-            var decoded = new WebpDecoderAdapterRgba().DecodeRgba32(new MemoryStream(b));
-            Assert.Equal(w, decoded.Width);
-            Assert.Equal(h, decoded.Height);
-        }
     }
 }
