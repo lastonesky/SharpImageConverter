@@ -348,7 +348,7 @@ public sealed class ImageFrame
         return LoadJpeg(stream, useStreamingDecoder: false, useFloatingPointIdct: false);
     }
 
-    public static ImageFrame LoadJpeg(Stream stream, bool useStreamingDecoder, bool useFloatingPointIdct = false)
+    public static ImageFrame LoadJpeg(Stream stream, bool useStreamingDecoder, bool useFloatingPointIdct = false, bool requireEoi = false)
     {
         if (!useStreamingDecoder)
         {
@@ -365,7 +365,11 @@ public sealed class ImageFrame
             return new ImageFrame(img.Width, img.Height, rgb, metadata: img.Metadata);
         }
 
-        var streaming = JpegDecoder.DecodeFromStreamAsync(stream, cancellationToken: default, useFloatingPointIdct: useFloatingPointIdct).GetAwaiter().GetResult();
+        var streaming = JpegDecoder.DecodeFromStreamAsync(
+            stream,
+            cancellationToken: default,
+            useFloatingPointIdct: useFloatingPointIdct,
+            requireEoi: requireEoi).GetAwaiter().GetResult();
         var jpeg = streaming.Image;
         byte[] rgbStream = jpeg.ToRgb24();
         int streamOrientation = streaming.ExifOrientation;

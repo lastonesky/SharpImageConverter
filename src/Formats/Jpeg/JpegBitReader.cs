@@ -24,6 +24,7 @@ internal ref struct JpegBitReader
     private int bitCount;
     private int pendingMarker;
     private int padByteCount;
+    private bool reachedEndOfData;
     private readonly JpegStreamInput? streamInput;
     private readonly CancellationToken cancellationToken;
 
@@ -54,6 +55,12 @@ internal ref struct JpegBitReader
     }
 
     public readonly bool HasPendingMarker => pendingMarker >= 0;
+
+    /// <summary>
+    /// 数据源已被读尽（未遇到真实 marker 就到达末尾）。流式解码时它意味着传输被截断：
+    /// 后续 EOI 是 <see cref="FillBitBuffer"/> 用 0xFF 伪造的，不能当作「文件完整」的证据。
+    /// </summary>
+    public readonly bool ReachedEndOfData => reachedEndOfData;
 
     public readonly int PendingMarker
     {
@@ -112,12 +119,14 @@ internal ref struct JpegBitReader
                 return true;
             }
 
+            reachedEndOfData = true;
             value = 0;
             return false;
         }
 
         if ((uint)offset >= (uint)data.Length)
         {
+            reachedEndOfData = true;
             value = 0;
             return false;
         }

@@ -46,11 +46,20 @@ public static partial class JpegDecoder
     /// 如需完全异步且内存有界，可自行先异步读入数据后调用
     /// <see cref="Decode(ReadOnlySpan{byte}, bool)"/>。
     /// </summary>
-    public static async Task<StreamingDecodeResult> DecodeFromStreamAsync(Stream stream, CancellationToken cancellationToken = default, bool useFloatingPointIdct = false)
+    /// <param name="requireEoi">
+    /// 严格模式：要求数据源里出现真实的 EOI 标记。默认关闭时，传输在扫描边界被截断会被
+    /// 当作「文件结束」并返回部分扫描重建出的图像（渐进式 JPEG 上表现为严重失真但不报错）；
+    /// 打开后这类截断一律抛 <see cref="InvalidDataException"/>。网络传输建议开启。
+    /// </param>
+    public static async Task<StreamingDecodeResult> DecodeFromStreamAsync(
+        Stream stream,
+        CancellationToken cancellationToken = default,
+        bool useFloatingPointIdct = false,
+        bool requireEoi = false)
     {
         ArgumentNullException.ThrowIfNull(stream);
         await using var input = new JpegStreamInput(stream);
-        var parser = new StreamingParser(input, useFloatingPointIdct);
+        var parser = new StreamingParser(input, useFloatingPointIdct, requireEoi);
         return await parser.DecodeAsync(cancellationToken).ConfigureAwait(false);
     }
 
@@ -386,12 +395,15 @@ public static partial class JpegDecoder
     private sealed class StreamingParser
     {
         private readonly JpegStreamInput input;
+        private readonly bool requireEoi;
+        private bool endedWithoutTerminator;
         private int queuedMarker = -1;
         private readonly JpegFrameState state;
 
-        public StreamingParser(JpegStreamInput input, bool useFloatingPointIdct)
+        public StreamingParser(JpegStreamInput input, bool useFloatingPointIdct, bool requireEoi = false)
         {
             this.input = input;
+            this.requireEoi = requireEoi;
             state = new JpegFrameState(useFloatingPointIdct);
         }
 
@@ -478,6 +490,14 @@ public static partial class JpegDecoder
                 }
 
                 state.ValidateScansComplete();
+
+                // 扫描在数据耗尽处收尾时，后续的 EOI 是位读取器用 0xFF 补出来的，
+                // 不代表传输完整。严格模式下这种「扫描边界截断」必须报错，不能返回部分图像。
+                if (requireEoi && endedWithoutTerminator)
+                {
+                    ThrowHelper.ThrowInvalidData("Unexpected end of JPEG stream: EOI marker is missing (truncated transfer?).");
+                }
+
                 var img = state.ReconstructImage();
                 return new StreamingDecodeResult(img, state.ExifRaw, state.ExifOrientation);
             }
@@ -498,6 +518,11 @@ public static partial class JpegDecoder
             reader.AlignToByte();
             reader.DiscardBufferedBits();
             _ = reader.PeekBits(1);
+            if (reader.ReachedEndOfData)
+            {
+                endedWithoutTerminator = true;
+            }
+
             if (reader.HasPendingMarker)
             {
                 queuedMarker = reader.PendingMarker;

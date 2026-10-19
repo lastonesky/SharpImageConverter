@@ -10,6 +10,10 @@
     <ProjectReference Include="..\\src\\SharpImageConverter.csproj" />
   </ItemGroup>
   <ItemGroup>
+    <!-- 网络仿真流与 tools/streamnet 共用同一份源码，避免测试台与回归测试行为漂移。 -->
+    <Compile Include="..\\tools\\streamnet\\NetworkSim.cs" Link="Helpers\\NetworkSim.cs" />
+  </ItemGroup>
+  <ItemGroup>
     <None Include="..\\src\\runtimes\\**\\*.*">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>

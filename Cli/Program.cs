@@ -138,7 +138,7 @@ class Program
         Console.WriteLine("支持输入: .jpg/.jpeg/.png/.bmp/.webp/.gif");
         Console.WriteLine("支持输出: .jpg/.jpeg/.png/.bmp/.webp/.gif");
         Console.WriteLine("操作: resize:WxH | resizebilinear:WxH | resizefit:WxH | grayscale");
-        Console.WriteLine("参数: --quality N | --subsample 420/422/444 | --jpeg-progressive | --keep-metadata | --idct int/float | --stream | --memory-limit N | --no-memory-guard | --jpeg-debug | --gif-frames | --gray | --dithering on/off");
+        Console.WriteLine("参数: --quality N | --subsample 420/422/444 | --jpeg-progressive | --keep-metadata | --idct int/float | --stream | --stream-strict | --memory-limit N | --no-memory-guard | --jpeg-debug | --gif-frames | --gray | --dithering on/off");
         Console.WriteLine("WebP 档位: --webp-method 0~6（默认 3；q>=75 时 method 4 自动降为 3（>140 MP 有 3~4 倍悬崖），6 最省体积最慢）");
         Console.WriteLine("JPEG 编码: 默认 baseline；--jpeg-progressive 输出 progressive（SOF2）");
         Console.WriteLine("GIF 耗时统计: --gif-debug（分阶段耗时）| --gif-bench N（重复 N 次取最小/中位/平均，默认 5）");
@@ -565,6 +565,12 @@ class Program
                 options.UseStreamingDecoder = true;
                 continue;
             }
+            if (string.Equals(a, "--stream-strict", StringComparison.OrdinalIgnoreCase))
+            {
+                options.UseStreamingDecoder = true;
+                options.RequireEoi = true;
+                continue;
+            }
             if (string.Equals(a, "--keep-metadata", StringComparison.OrdinalIgnoreCase))
             {
                 options.KeepMetadata = true;
@@ -864,7 +870,7 @@ class Program
             PrintBenchSummary("decode", decodeTimings);
         }
 
-        rgb ??= LoadRgb24(options.InputPath, options.UseFloatIdct, options.UseStreamingDecoder);
+        rgb ??= LoadRgb24(options.InputPath, options.UseFloatIdct, options.UseStreamingDecoder, options.RequireEoi);
 
         var encodeTimings = new List<GifTiming>(iterations);
         for (int i = 0; i < iterations; i++)
@@ -956,7 +962,7 @@ class Program
             PrintJpegBenchSummary("decode", runs, totals, dctWorkers: 0);
         }
 
-        Image<Rgb24> rgb = LoadRgb24(options.InputPath, options.UseFloatIdct, options.UseStreamingDecoder);
+        Image<Rgb24> rgb = LoadRgb24(options.InputPath, options.UseFloatIdct, options.UseStreamingDecoder, options.RequireEoi);
         var encoderOptions = new JpegEncoderOptions(quality, subsample420, keepMetadata: false, enableDiagnostics: false);
         var encRuns = new List<double[]>();
         var encTotals = new List<double>();
@@ -1177,7 +1183,7 @@ class Program
         if (inExt is ".jpg" or ".jpeg" && outExt == ".bmp")
         {
             var swDecode = Stopwatch.StartNew();
-            var image = LoadRgb24(options.InputPath, options.UseFloatIdct, options.UseStreamingDecoder);
+            var image = LoadRgb24(options.InputPath, options.UseFloatIdct, options.UseStreamingDecoder, options.RequireEoi);
             swDecode.Stop();
             Console.WriteLine($"解码耗时: {swDecode.ElapsedMilliseconds} ms");
             SaveRgbOrGray(image, outputPath, outExt, options.Gray);
@@ -1187,14 +1193,14 @@ class Program
         if (inExt is ".jpg" or ".jpeg" && (outExt is ".jpg" or ".jpeg"))
         {
             var swDecode = Stopwatch.StartNew();
-            var image = LoadRgb24(options.InputPath, options.UseFloatIdct, options.UseStreamingDecoder);
+            var image = LoadRgb24(options.InputPath, options.UseFloatIdct, options.UseStreamingDecoder, options.RequireEoi);
             swDecode.Stop();
             Console.WriteLine($"解码耗时: {swDecode.ElapsedMilliseconds} ms");
             SaveJpegFromRgb(image, options, outputPath, keepMetadata: true);
             return;
         }
 
-        var rgbaImage = LoadRgba32(options.InputPath, options.UseFloatIdct, options.UseStreamingDecoder);
+        var rgbaImage = LoadRgba32(options.InputPath, options.UseFloatIdct, options.UseStreamingDecoder, options.RequireEoi);
         if (outExt is ".jpg" or ".jpeg")
         {
             SaveJpegFromRgba(rgbaImage, options, outputPath);
@@ -1227,7 +1233,7 @@ class Program
             return;
         }
 
-        var image = LoadRgb24(options.InputPath, options.UseFloatIdct, options.UseStreamingDecoder);
+        var image = LoadRgb24(options.InputPath, options.UseFloatIdct, options.UseStreamingDecoder, options.RequireEoi);
         bool isInputGray = IsGrayRgb(image);
 
         ImageExtensions.Mutate(image, ctx =>
@@ -1630,7 +1636,7 @@ class Program
         return new Image<Gray8>(image.Width, image.Height, gray, image.Metadata);
     }
 
-    static Image<Rgb24> LoadRgb24(string path, bool useFloatIdct, bool useStreamingDecoder)
+    static Image<Rgb24> LoadRgb24(string path, bool useFloatIdct, bool useStreamingDecoder, bool requireEoi = false)
     {
         string ext = Path.GetExtension(path);
         bool isJpeg = ext.Equals(".jpg", StringComparison.OrdinalIgnoreCase) || ext.Equals(".jpeg", StringComparison.OrdinalIgnoreCase);
@@ -1647,7 +1653,7 @@ class Program
                 Console.WriteLine($"[stream] 开始解码: {Path.GetFileName(path)} ({fileLength} bytes)");
                 using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 20, FileOptions.SequentialScan);
                 var sw = Stopwatch.StartNew();
-                var frame = ImageFrame.LoadJpeg(fs, useStreamingDecoder: true, useFloatingPointIdct: useFloatIdct);
+                var frame = ImageFrame.LoadJpeg(fs, useStreamingDecoder: true, useFloatingPointIdct: useFloatIdct, requireEoi: requireEoi);
                 sw.Stop();
                 Console.WriteLine($"[stream] 解码完成: {sw.ElapsedMilliseconds} ms");
                 return new Image<Rgb24>(frame.Width, frame.Height, frame.Pixels, frame.Metadata);
@@ -1663,18 +1669,18 @@ class Program
         return new Image<Rgb24>(frame2.Width, frame2.Height, frame2.Pixels, frame2.Metadata);
     }
 
-    static Image<Rgba32> LoadRgba32(string path, bool useFloatIdct, bool useStreamingDecoder)
+    static Image<Rgba32> LoadRgba32(string path, bool useFloatIdct, bool useStreamingDecoder, bool requireEoi = false)
     {
         string ext = Path.GetExtension(path);
         bool isJpeg = ext.Equals(".jpg", StringComparison.OrdinalIgnoreCase) || ext.Equals(".jpeg", StringComparison.OrdinalIgnoreCase);
         if (useStreamingDecoder && isJpeg)
         {
-            var rgb = LoadRgb24(path, useFloatIdct, true);
+            var rgb = LoadRgb24(path, useFloatIdct, true, requireEoi);
             return ToRgba32(rgb);
         }
         if (!useFloatIdct) return Image.LoadRgba32(path);
         if (!isJpeg) return Image.LoadRgba32(path);
-        var rgb2 = LoadRgb24(path, true, useStreamingDecoder);
+        var rgb2 = LoadRgb24(path, true, useStreamingDecoder, requireEoi);
         return ToRgba32(rgb2);
     }
 
@@ -1715,6 +1721,7 @@ class Program
         public bool Dithering { get; set; } = true;
         public bool UseFloatIdct { get; set; }
         public bool UseStreamingDecoder { get; set; }
+        public bool RequireEoi { get; set; }
         public bool Gray { get; set; }
         public bool JpegDebug { get; set; }
         public bool GifDebug { get; set; }

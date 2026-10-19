@@ -3,6 +3,7 @@ using System.Buffers;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Runtime.CompilerServices;
+using System.Runtime.ExceptionServices;
 
 namespace SharpImageConverter.Formats.Webp
 {
@@ -183,8 +184,17 @@ namespace SharpImageConverter.Formats.Webp
                     ? WebPPictureImportRGBA(ref picture, pixels, stride)
                     : WebPPictureImportRGB(ref picture, pixels, stride);
                 if (ok == 0) throw new InvalidOperationException("WebP 图像导入失败");
-                if (WebPEncode(ref config, ref picture) == 0) throw new InvalidOperationException($"WebP 编码失败: {(WebPEncodingError)picture.error_code}");
-                if (state.Error != null) throw new InvalidOperationException($"WebP 写入失败: {state.Error.GetType().Name}: {state.Error.Message}", state.Error);
+
+                // libwebp 在写出回调失败时也会返回 0，因此先看回调异常，避免把「传输中断」
+                // 误报成「编码失败」。写出侧（网络流）的异常必须原样抛出，包成
+                // InvalidOperationException 会让调用方无法用 catch (IOException) 区分两者。
+                int encodeOk = WebPEncode(ref config, ref picture);
+                if (state.Error is { } writeError)
+                {
+                    ExceptionDispatchInfo.Capture(writeError).Throw();
+                }
+
+                if (encodeOk == 0) throw new InvalidOperationException($"WebP 编码失败: {(WebPEncodingError)picture.error_code}");
             }
             finally
             {
@@ -246,12 +256,12 @@ namespace SharpImageConverter.Formats.Webp
             try
             {
                 if (WebPGetInfo(data, (nuint)data.Length, out width, out height) == 0)
-                    throw new InvalidOperationException("WebP 解析失败");
+                    throw new InvalidDataException("WebP 数据无法解析（头部损坏或不是 WebP）");
 
                 int bufferLength = checked(width * height * 4);
                 var buffer = new byte[bufferLength];
                 IntPtr res = WebPDecodeRGBAInto(data, (nuint)data.Length, buffer, buffer.Length, width * 4);
-                if (res == IntPtr.Zero) throw new InvalidOperationException("WebP 解码失败");
+                if (res == IntPtr.Zero) throw new InvalidDataException("WebP 解码失败（数据被截断或损坏）");
                 return buffer;
             }
             catch (DllNotFoundException ex)
