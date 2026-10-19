@@ -1,10 +1,11 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using SharpImageConverter;
+using SharpImageConverter.Formats.Gif;
 using SharpImageConverter.Formats.Jpeg;
 using SharpImageConverter.Formats.Webp;
 using StreamNet;
@@ -152,6 +153,114 @@ namespace Tests
 
             Assert.Throws<NotSupportedException>(() =>
                 JpegDecoder.DecodeFromStreamAsync(stream).GetAwaiter().GetResult());
+        }
+
+        // ---------------------------------------------------------------- GIF
+
+        private static byte[] EncodeGif(int width = 64, int height = 48)
+        {
+            var pixels = TestImageFactory.CreateGradient(width, height);
+            var frame = new ImageFrame(width, height, pixels.Buffer);
+            using var memory = new MemoryStream();
+            new GifEncoder().Encode(frame, memory);
+            return memory.ToArray();
+        }
+
+        [Fact]
+        public void Gif_CompleteFile_StrictModeDecodesIdentically()
+        {
+            byte[] data = EncodeGif();
+            byte[] reference = new GifDecoder().DecodeRgb24(new MemoryStream(data)).Buffer;
+
+            using var stream = new SimulatedNetworkStream(data, new NetworkProfile { ChunkBytes = 7 });
+            byte[] strict = new GifDecoder().DecodeRgb24(stream, requireComplete: true).Buffer;
+
+            Assert.Equal(reference, strict);
+        }
+
+        /// <summary>
+        /// 找一个「宽松模式能解出图像、严格模式应当报错」的截断点。
+        /// GIF 的 LZW 数据按 255 字节分块，落在块内部的截断会直接抛 EndOfStream，
+        /// 只有落在块边界上的截断才会被宽松模式当成「数据结束」静默接受，所以按小步长扫。
+        /// </summary>
+        private static bool TryFindBlockBoundaryCut(byte[] data, bool requireDifferentPixels,
+            out int offset, out byte[] lenientPixels)
+        {
+            byte[] full = new GifDecoder().DecodeRgb24(new MemoryStream(data)).Buffer;
+            for (int cut = data.Length * 20 / 100; cut < data.Length; cut += 7)
+            {
+                byte[] probe = data[..cut];
+                try
+                {
+                    using var stream = new SimulatedNetworkStream(probe, EofProfile(probe.Length));
+                    byte[] pixels = new GifDecoder().DecodeRgb24(stream).Buffer;
+                    if (!requireDifferentPixels || !pixels.AsSpan().SequenceEqual(full))
+                    {
+                        offset = cut;
+                        lenientPixels = pixels;
+                        return true;
+                    }
+                }
+                catch (Exception)
+                {
+                    // 落在数据块内部：抛 EndOfStream，继续找
+                }
+            }
+
+            offset = -1;
+            lenientPixels = [];
+            return false;
+        }
+
+        [Fact]
+        public void Gif_TruncatedInsideFrameData_StrictModeThrows_LenientReturnsPartial()
+        {
+            // LZW 在数据块边界遇到 EOF 时会「尽力返回已解出的像素」，宽松模式因此给出残缺图像；
+            // requireComplete 打开后同一份数据必须报错。两个断言一起写，避免将来把宽松语义
+            // 改成报错、或把严格语义退化回静默。
+            byte[] data = EncodeGif();
+
+            Assert.True(TryFindBlockBoundaryCut(data, requireDifferentPixels: true, out int cut, out byte[] partial),
+                "没有找到会被宽松模式静默接受的截断点，测试前提已变化");
+            Assert.Equal(64 * 48 * 3, partial.Length);
+
+            byte[] truncated = data[..cut];
+            using var strictStream = new SimulatedNetworkStream(truncated, EofProfile(truncated.Length));
+            Assert.Throws<InvalidDataException>(() =>
+                new GifDecoder().DecodeRgb24(strictStream, requireComplete: true));
+        }
+
+        [Fact]
+        public void Gif_TruncatedBeforeFirstImageBlock_StrictModeThrows()
+        {
+            byte[] data = EncodeGif();
+            int packed = data[10];
+            int header = 13 + ((packed & 0x80) != 0 ? 3 * (1 << ((packed & 7) + 1)) : 0);
+            byte[] truncated = data[..header];
+
+            using var lenientStream = new SimulatedNetworkStream(truncated, EofProfile(truncated.Length));
+            var canvas = new GifDecoder().DecodeRgb24(lenientStream);
+            Assert.Equal(64 * 48 * 3, canvas.Buffer.Length);
+
+            using var strictStream = new SimulatedNetworkStream(truncated, EofProfile(truncated.Length));
+            Assert.Throws<InvalidDataException>(() =>
+                new GifDecoder().DecodeRgb24(strictStream, requireComplete: true));
+        }
+
+        [Fact]
+        public void ImageFrame_Load_RequireComplete_RejectsTruncatedGif()
+        {
+            byte[] data = EncodeGif();
+
+            Assert.True(TryFindBlockBoundaryCut(data, requireDifferentPixels: false, out int cut, out _),
+                "没有找到宽松模式可接受的截断点");
+
+            byte[] truncated = data[..cut];
+            using var lenientStream = new SimulatedNetworkStream(truncated, EofProfile(truncated.Length));
+            _ = ImageFrame.Load(lenientStream); // 宽松模式照旧返回图像（可能残缺）
+
+            using var strictStream = new SimulatedNetworkStream(truncated, EofProfile(truncated.Length));
+            Assert.Throws<InvalidDataException>(() => ImageFrame.Load(strictStream, requireComplete: true));
         }
 
         [Fact]

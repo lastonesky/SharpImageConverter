@@ -81,9 +81,9 @@ namespace SharpImageConverter.Formats.Gif
             return DecodeAnimationRgb24(fs);
         }
 
-        public GifAnimation DecodeAnimationRgb24(Stream stream)
+        public GifAnimation DecodeAnimationRgb24(Stream stream, bool requireComplete = false)
         {
-            var context = new DecodeContext(stream, DecodeMode.Animation);
+            var context = new DecodeContext(stream, DecodeMode.Animation) { RequireComplete = requireComplete };
             ExecuteDecode(context);
             return new GifAnimation(context.RgbFrames!, context.Durations!, context.LoopCount, context.FirstFrameFullyOpaque);
         }
@@ -97,9 +97,9 @@ namespace SharpImageConverter.Formats.Gif
             return DecodeAnimationRgba32(fs);
         }
 
-        public GifAnimation DecodeAnimationRgba32(Stream stream)
+        public GifAnimation DecodeAnimationRgba32(Stream stream, bool requireComplete = false)
         {
-            var context = new DecodeContext(stream, DecodeMode.AnimationRgba);
+            var context = new DecodeContext(stream, DecodeMode.AnimationRgba) { RequireComplete = requireComplete };
             ExecuteDecode(context);
             return new GifAnimation(context.RgbFrames!, context.Durations!, context.LoopCount,
                 context.FirstFrameFullyOpaque, context.RgbaFrames);
@@ -111,12 +111,19 @@ namespace SharpImageConverter.Formats.Gif
             return DecodeRgb24(fs);
         }
 
-        public Image<Rgb24> DecodeRgb24(Stream stream)
+        /// <param name="requireComplete">
+        /// 严格模式：帧内 LZW 数据在像素解完前结束（传输被截断）时抛 <see cref="InvalidDataException"/>，
+        /// 而不是返回一张残缺图像。网络输入建议开启。
+        /// </param>
+        public Image<Rgb24> DecodeRgb24(Stream stream, bool requireComplete = false)
         {
-            var context = new DecodeContext(stream, DecodeMode.Rgb24);
+            var context = new DecodeContext(stream, DecodeMode.Rgb24) { RequireComplete = requireComplete };
             ExecuteDecode(context);
             return context.RgbFrames![0];
         }
+
+        // 可选参数会让签名与接口成员不匹配，这里显式实现接口（等同 requireComplete: false）。
+        Image<Rgb24> IImageDecoder.DecodeRgb24(Stream stream) => DecodeRgb24(stream, requireComplete: false);
 
         public Image<Rgba32> DecodeRgba32(string path)
         {
@@ -124,9 +131,9 @@ namespace SharpImageConverter.Formats.Gif
             return DecodeRgba32(fs);
         }
 
-        public Image<Rgba32> DecodeRgba32(Stream stream)
+        public Image<Rgba32> DecodeRgba32(Stream stream, bool requireComplete = false)
         {
-            var context = new DecodeContext(stream, DecodeMode.Rgba32);
+            var context = new DecodeContext(stream, DecodeMode.Rgba32) { RequireComplete = requireComplete };
             ExecuteDecode(context);
             return context.RgbaFrame!;
         }
@@ -144,6 +151,7 @@ namespace SharpImageConverter.Formats.Gif
             public List<int>? Durations;
             public Image<Rgba32>? RgbaFrame;
             public int LoopCount = 1;
+            public bool RequireComplete;
 
             /// <summary>
             /// 首帧合成后是否每个像素都被写过（因而 RGBA 下 alpha 恒为 255）。
@@ -299,7 +307,7 @@ namespace SharpImageConverter.Formats.Gif
                     int lzwMin = stream.ReadByte();
                     byte[] indices = pool.Rent(iw * ih);
                     long tl0 = Now(timing);
-                    lzwDecoder.Decode(indices.AsSpan(0, iw * ih), iw, ih, lzwMin);
+                    lzwDecoder.Decode(indices.AsSpan(0, iw * ih), iw, ih, lzwMin, ctx.RequireComplete);
                     long tl1 = Now(timing);
 
                     long tb0 = Now(timing);
@@ -386,6 +394,20 @@ namespace SharpImageConverter.Formats.Gif
                     if (ctx.Mode == DecodeMode.Rgb24) return;
                 }
             }
+            // 走到这里说明主循环是靠 EOF / trailer 退出的：Rgb24 与 Rgba32 模式在解出首帧时会
+            // 直接 return，所以此时还没帧就意味着「流在首个图像块之前就结束了」——
+            // 宽松模式会返回一张纯背景色画布，严格模式必须报错。
+            bool noFrame = ctx.Mode switch
+            {
+                DecodeMode.Rgb24 => (ctx.RgbFrames?.Count ?? 0) == 0,
+                DecodeMode.Rgba32 => ctx.RgbaFrame is null,
+                _ => false,
+            };
+            if (ctx.RequireComplete && noFrame)
+            {
+                throw new InvalidDataException("GIF 数据不完整：流在首个图像块之前结束");
+            }
+
             long tf0 = Now(timing);
             if (!canvasReady && hasBgColor)
             {

@@ -137,8 +137,13 @@ public sealed class ImageFrame
     /// 从流加载图像（自动根据文件头识别格式，支持不可 Seek 的流，仅缓存头部用于嗅探）
     /// </summary>
     /// <param name="stream">输入数据流</param>
+    /// <param name="requireComplete">
+    /// 严格模式：要求数据完整（JPEG 需要真实的 EOI、GIF 需要帧数据解满）。
+    /// 默认关闭时，传输在扫描/数据块边界被截断会被当作「文件结束」，返回一张残缺图像而不报错；
+    /// 网络输入建议开启。PNG/BMP/WebP 无论开关都会拒绝截断数据。
+    /// </param>
     /// <returns>加载后的图像帧</returns>
-    public static ImageFrame Load(Stream stream)
+    public static ImageFrame Load(Stream stream, bool requireComplete = false)
     {
         ArgumentNullException.ThrowIfNull(stream);
         const int headerSize = 12;
@@ -161,7 +166,7 @@ public sealed class ImageFrame
 
         // Magic Number Detection
         if (header[0] == 0xFF && header[1] == 0xD8)
-            return LoadJpeg(decodeStream);
+            return LoadJpeg(decodeStream, useStreamingDecoder: requireComplete, requireEoi: requireComplete);
         
         if (read >= 8 &&
             header[0] == 0x89 && header[1] == 0x50 && header[2] == 0x4E && header[3] == 0x47 &&
@@ -172,7 +177,7 @@ public sealed class ImageFrame
             return LoadBmp(decodeStream);
             
         if (read >= 3 && header[0] == 'G' && header[1] == 'I' && header[2] == 'F')
-            return LoadGif(decodeStream);
+            return LoadGif(decodeStream, requireComplete);
 
         if (read >= 12 &&
             header[0] == (byte)'R' && header[1] == (byte)'I' && header[2] == (byte)'F' && header[3] == (byte)'F' &&
@@ -444,10 +449,10 @@ public sealed class ImageFrame
     /// </summary>
     /// <param name="stream">GIF 数据流</param>
     /// <returns>图像帧</returns>
-    public static ImageFrame LoadGif(Stream stream)
+    public static ImageFrame LoadGif(Stream stream, bool requireComplete = false)
     {
         var dec = new Formats.Gif.GifDecoder();
-        var img = dec.DecodeRgb24(stream);
+        var img = dec.DecodeRgb24(stream, requireComplete);
         return new ImageFrame(img.Width, img.Height, img.Buffer);
     }
 

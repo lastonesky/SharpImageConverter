@@ -22,7 +22,19 @@ namespace SharpImageConverter.Formats.Gif
         private readonly NativeBufferOwner<byte> _suffix = NativeBufferOwner<byte>.Allocate(4096);
         private readonly NativeBufferOwner<byte> _pixelStack = NativeBufferOwner<byte>.Allocate(4097);
 
-        public void Decode(Span<byte> pixels, int width, int height, int dataSize)
+        /// <summary>
+        /// 解码一帧 LZW 数据。
+        /// </summary>
+        /// <param name="pixels">输出索引缓冲（长度须 ≥ width*height）</param>
+        /// <param name="width">帧宽</param>
+        /// <param name="height">帧高</param>
+        /// <param name="dataSize">LZW 最小码长</param>
+        /// <param name="requireComplete">
+        /// 严格模式：数据在像素解完之前结束（流被截断或提前出现终止块）时抛
+        /// <see cref="InvalidDataException"/>。默认关闭，保持历史行为——尽力返回已解出的像素，
+        /// 未解出的部分留在调用方的画布缓冲里（网络输入下这会表现为「不报错但图像残缺」）。
+        /// </param>
+        public void Decode(Span<byte> pixels, int width, int height, int dataSize, bool requireComplete = false)
         {
             Span<int> prefix = _prefix.Span;
             Span<byte> suffix = _suffix.Span;
@@ -58,7 +70,19 @@ namespace SharpImageConverter.Formats.Gif
                         int len = _stream.ReadByte();
                         if (len <= 0)
                         {
-                            // Unexpected end of data, but let's break and return what we have
+                            // len == 0 是数据块终止符（其后像素仍未解完说明数据短了），
+                            // len == -1 是流被截断。历史行为是「尽力返回已解出的像素」，
+                            // 但网络输入下这会静默产出一张残缺图像，故严格模式直接拒绝。
+                            if (requireComplete)
+                            {
+                                throw new InvalidDataException(
+                                    $"GIF 图像数据不完整：数据块在像素解完前结束（已解 {pixelIndex}/{pixelCount}）");
+                            }
+
+                            // 未解出的部分必须清零：调用方的索引缓冲来自 ArrayPool，
+                            // 残留的是上一个使用者（可能是别的图片/别的请求）的数据，
+                            // 不清零等于把无关内存渲染进输出，且结果随池内容变化而不确定。
+                            pixels[pixelIndex..pixelCount].Clear();
                             return;
                         }
                         _blockLength = len;
@@ -92,7 +116,18 @@ namespace SharpImageConverter.Formats.Gif
                 }
 
                 // Handle end code
-                if (code == endCode) break;
+                if (code == endCode)
+                {
+                    // 循环条件是 pixelIndex < pixelCount，所以这里出现 endCode 就意味着像素没解完。
+                    if (requireComplete)
+                    {
+                        throw new InvalidDataException(
+                            $"GIF 图像数据不完整：提前遇到结束码（已解 {pixelIndex}/{pixelCount}）");
+                    }
+
+                    pixels[pixelIndex..pixelCount].Clear();
+                    break;
+                }
 
                 // First code case
                 if (oldCode == -1)

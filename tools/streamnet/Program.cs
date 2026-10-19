@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -22,7 +22,7 @@ namespace StreamNet;
 /// 覆盖：分片交付一致性、截断（FIN）、连接重置（RST）、取消、限速、内存、
 /// 并发、写出侧断链、仅异步流、头部尺寸炸弹、非 JPEG 格式。
 /// </summary>
-internal static class Program
+internal static partial class Program
 {
     private static string repoRoot = ".";
     private static readonly StringBuilder body = new();
@@ -33,6 +33,11 @@ internal static class Program
         if (args.Length >= 2 && args[0] == "--bomb-child")
         {
             return BombChild(args[1]);
+        }
+
+        if (args.Length >= 2 && args[0] == "--gif-repeat")
+        {
+            return EncodeRepeatChild(int.Parse(args[1]));
         }
 
         repoRoot = FindRepoRoot();
@@ -57,7 +62,7 @@ internal static class Program
         if (Wants(8)) RunWritePath();
         if (Wants(9)) RunAsyncOnly();
         if (Wants(10)) RunHeaderBomb();
-        if (Wants(11)) RunOtherFormats();
+        if (Wants(11)) RunAllFormats();
 
         string report = Compose();
         string outPath = Path.Combine(repoRoot, "docs", "NetworkStreaming.md");
@@ -714,71 +719,6 @@ internal static class Program
 
     // ---------------------------------------------------------------- 场景 11
 
-    private static void RunOtherFormats()
-    {
-        Section("11. 非 JPEG 格式经网络流加载",
-            "`ImageFrame.Load(Stream)` 对不可 Seek 流先缓存 12 字节头再拼接尾部。" +
-            "验证分片一致性，以及 50% / 仅差 1 字节截断时的行为。");
-
-        ImageFrame frame = ImageFrame.Load(ExamplePath("Amish-Noka-Dresser.jpg"));
-        var table = new Table("格式", "字节", "分片一致", "截断 50%", "截断 -1B");
-
-        var payloads = new List<(string Name, byte[] Data)>();
-        using (var ms = new MemoryStream()) { PngWriter.Write(ms, frame.Width, frame.Height, frame.Pixels); payloads.Add(("PNG", ms.ToArray())); }
-        using (var ms = new MemoryStream()) { new GifEncoder().Encode(frame, ms); payloads.Add(("GIF", ms.ToArray())); }
-        using (var ms = new MemoryStream()) { new WebpEncoderAdapter().EncodeRgb24(ms, new Image<Rgb24>(frame.Width, frame.Height, frame.Pixels)); payloads.Add(("WebP", ms.ToArray())); }
-        using (var ms = new MemoryStream()) { BmpWriter.Write24(ms, frame.Width, frame.Height, frame.Pixels); payloads.Add(("BMP", ms.ToArray())); }
-
-        foreach ((string name, byte[] data) in payloads)
-        {
-            byte[] referencePixels = ImageFrame.Load(data).Pixels;
-
-            using var chunked = new SimulatedNetworkStream(data, new NetworkProfile { ChunkBytes = 7, Seed = 17 });
-            bool same;
-            try
-            {
-                var loaded = ImageFrame.Load(chunked);
-                same = loaded.Pixels.AsSpan().SequenceEqual(referencePixels);
-            }
-            catch
-            {
-                same = false;
-            }
-
-            string half = TruncatedOutcome(data, data.Length / 2);
-            string minusOne = TruncatedOutcome(data, data.Length - 1);
-            table.Add(name, data.Length, same ? "是" : "否", half, minusOne);
-
-            if (minusOne.StartsWith("返回图像", StringComparison.Ordinal))
-            {
-                findings.Add($"{name}: 缺失尾部 1 字节（GIF trailer 0x3B）仍返回图像，尾部完整性没有自检。");
-            }
-        }
-
-        AppendTable(table);
-    }
-
-    private static string TruncatedOutcome(byte[] data, int keep)
-    {
-        byte[] truncated = data[..Math.Max(0, keep)];
-        using var stream = new SimulatedNetworkStream(truncated, new NetworkProfile
-        {
-            ChunkBytes = 4096,
-            FaultMode = FaultMode.EarlyEof,
-            FaultAtBytes = truncated.Length,
-        });
-
-        try
-        {
-            var frame = ImageFrame.Load(stream);
-            return $"返回图像 {frame.Width}x{frame.Height}";
-        }
-        catch (Exception ex)
-        {
-            return Classify(ex);
-        }
-    }
-
     // ---------------------------------------------------------------- 工具
 
     private static string FindRepoRoot()
@@ -912,17 +852,32 @@ internal static class Program
             $"逻辑核 {Environment.ProcessorCount}");
         sb.AppendLine();
         sb.AppendLine("测试台：`tools/streamnet`。被测入口：`JpegDecoder.DecodeFromStreamAsync`、" +
-            "`ImageFrame.LoadJpeg/Load(Stream)`、`JpegEncoder/PngWriter/GifEncoder/WebpEncoderAdapter` 的 Stream 写出。");
+            "`ImageFrame.Load(Stream)`（PNG/GIF/BMP/WebP）、`JpegEncoder/PngWriter/GifEncoder/BmpWriter/WebpEncoderAdapter` 的 Stream 写出。");
+        sb.AppendLine("§1~§10 的深度矩阵用 JPEG 跑（它有完整的 marker/扫描状态机）；§11 把同一组网络条件对五种格式各跑一遍。");
         sb.AppendLine("所有输入都经过一个**不可 Seek** 的仿真网络流：固定/抖动分片、逐次延迟、提前 EOF（FIN）、" +
             "连接重置（RST）、可中途取消。");
 
         sb.AppendLine();
         sb.AppendLine("## 结论摘要");
         sb.AppendLine();
-        sb.AppendLine("唯一的高危问题是**渐进式 JPEG 在扫描边界被截断时不会报错**：解码器的位读取器把"
-            + "「数据源读尽」当作 EOI 补 0xFF，多扫描 JPEG 只解出前几个扫描也会被 `ValidateScansComplete`"
-            + " 判为完整（它只检查「组件是否解到过系数」），于是返回一张严重失真的图像。" +
-            "默认行为保持宽松（兼容历史），网络场景应显式打开 `requireEoi: true`。");
+        sb.AppendLine("两个高危问题属于同一类：**传输在「结构边界」被截断时解码器不报错，直接返回残缺图像**。");
+        sb.AppendLine();
+        sb.AppendLine("1. **渐进式 JPEG 在扫描边界被截断**：位读取器把「数据源读尽」当作 EOI 补 0xFF，"
+            + "多扫描 JPEG 只解出前几个扫描也会被 `ValidateScansComplete` 判为完整"
+            + "（它只检查「组件是否解到过系数」），于是返回一张严重失真的图像。");
+        sb.AppendLine("2. **GIF 在 LZW 数据块边界被截断**：`LzwDecoder` 读不到下一个块时「尽力返回已解出的像素」，"
+            + "未解出的部分留在画布缓冲里（背景色或上一帧残影），调用方拿到一张看起来正常、实则残缺的图像"
+            + "（§11.2 实测 62/69 例，最坏像素差异 42.93%）。"
+            + "更糟的是未解出的像素取自 `ArrayPool` 的残留内容——那是上一个使用者（可能是别的图片、"
+            + "别的请求）的数据，既让输出不确定，也是一条跨请求的内存泄漏路径。");
+        sb.AppendLine();
+        sb.AppendLine("两者默认都保持宽松（兼容历史），网络场景应显式打开 `requireComplete`"
+            + "（JPEG 上等价于 `requireEoi`）。严格模式下两者的静默损坏都是 0 例。");
+        sb.AppendLine();
+        sb.AppendLine("**格式支持**：五种格式都能从不可 Seek 流读、也都能写到不可 Seek 流。其中 JPEG / PNG / GIF / BMP "
+            + "是边读边解，内存与文件大小同阶；**WebP 必须先把整条流读进缓冲**——libwebp 只接受连续内存块，"
+            + "WebP 的「流式」只省调用方代码、不省内存（15 KB 文件仍需 3 MB 解码缓冲，全部是像素）。"
+            + "PNG / BMP / WebP 的入口本身就会拒绝截断数据，不需要开关。");
         sb.AppendLine();
         foreach (string level in new[] { "P0", "P1", "P2" })
         {
@@ -934,9 +889,10 @@ internal static class Program
             sb.AppendLine();
         }
 
-        sb.AppendLine("**未发现问题的维度**：分片交付一致性（1 B ~ 256 KB，§1）、连接重置传播（§3）、" +
-            "取消响应（§4）、限速下的线性开销（§5）、16 路并发无串扰（§7）、写出侧分片确定性与断链后可用性（§8）、" +
-            "PNG/BMP/WebP 截断拒绝（§11）。");
+        sb.AppendLine("**未发现问题的维度**：五种格式的分片交付一致性（1 B ~ 256 KB，§1 与 §11.1）、"
+            + "连接重置传播（§3 与 §11.3）、取消响应（§4 与 §11.3）、限速下的线性开销（§5 与 §11.3）、"
+            + "16 路 JPEG 并发与 15 路跨格式并发无串扰（§7 与 §11.4）、"
+            + "五种格式写出侧分片确定性与断链后可用性（§8 与 §11.5）、PNG/BMP/WebP 截断拒绝（§11.2）。");
         sb.AppendLine();
 
         sb.AppendLine("## 未修复（需决策）");
@@ -944,10 +900,13 @@ internal static class Program
         sb.AppendLine("1. **CLI 退出码恒为 0**：`Program.Main` 是 `void`，解码/编码失败只打印到 stdout。" +
             "实测 `--stream-strict` 拒绝截断文件后 `exit code` 仍是 0，网络管道里无法判定成败。" +
             "要改就得先定批量语义（部分失败返回几？），故本轮只记录。");
-        sb.AppendLine("2. **`ImageFrame.LoadJpeg` 没有 `CancellationToken`**：只能下沉到 `JpegDecoder.DecodeFromStreamAsync` 才能取消。");
-        sb.AppendLine("3. **只支持 `ReadAsync` 的流无法解码**：熵解码是同步循环。要么让调用方先把整条流异步读进内存，要么增加一个" +
+        sb.AppendLine("2. **`ImageFrame.LoadJpeg` 没有 `CancellationToken`**：只能下沉到 `JpegDecoder.DecodeFromStreamAsync` 才能取消。"
+            + "PNG/GIF/BMP/WebP 的 Stream 入口同理，取消只能由流自身抛异常（HTTP 客户端断开正是这种形态）。");
+        sb.AppendLine("3. **CLI 的 `--stream-strict` 只作用于 JPEG**：非 JPEG 走 `Image.Load*` 的文件路径，"
+            + "没有接到 `ImageFrame.Load(Stream, requireComplete)`。命令行上要严格解码 GIF，需先改成流式加载。");
+        sb.AppendLine("4. **只支持 `ReadAsync` 的流无法解码**：熵解码是同步循环。要么让调用方先把整条流异步读进内存，要么增加一个" +
             "「异步读满 → 内存解码」的入口；后者会放弃流式的内存优势。");
-        sb.AppendLine("4. **库内没有像素/内存预算闸门**：`MemoryGuard` 只服务 CLI 的文件路径，Stream 入口不经过它。");
+        sb.AppendLine("5. **库内没有像素/内存预算闸门**：`MemoryGuard` 只服务 CLI 的文件路径，Stream 入口不经过它。");
         sb.AppendLine();
 
         sb.AppendLine("## 复现方式");
@@ -955,7 +914,8 @@ internal static class Program
         sb.AppendLine("```bash");
         sb.AppendLine("dotnet run --project tools/streamnet -c Release                 # 全量矩阵（约 1 分钟）");
         sb.AppendLine("dotnet run --project tools/streamnet -c Release -- --only 2     # 只跑第 2 个场景");
-        sb.AppendLine("dotnet test --filter FullyQualifiedName~NetworkStreamingTests   # 回归测试（15 条）");
+        sb.AppendLine("dotnet test --filter FullyQualifiedName~NetworkStreamingTests   # 回归测试（19 条）");
+        sb.AppendLine("dotnet run --project tools/streamnet -c Release -- --gif-repeat 3  # 编码确定性诊断");
         sb.AppendLine("```");
         sb.AppendLine();
 
@@ -970,9 +930,15 @@ internal static class Program
             "现在先用 `ExceptionDispatchInfo` 原样抛出回调异常，再判断 `WebPEncode` 返回值。");
         sb.AppendLine("3. **WebP 解码异常归类**：截断/损坏数据的 `InvalidOperationException` 改为 `InvalidDataException`，" +
             "与 PNG/JPEG 的「数据问题」口径一致。");
+        sb.AppendLine("4. **GIF 严格模式 + 残留内存清零**（对应 P0-2）：`GifDecoder.DecodeRgb24/DecodeRgba32/DecodeAnimation*` 增加 "
+            + "`requireComplete`；`LzwDecoder` 在像素解完前遇到块结束或提前的结束码时抛 `InvalidDataException`；"
+            + "`ImageFrame.Load(Stream, requireComplete)` 一并覆盖 GIF 与 JPEG。"
+            + "同时把宽松模式下「未解出的像素」从 `ArrayPool` 残留改为清零——否则同一份截断数据两次解码会给出不同结果"
+            + "（实测未清零时静默损坏 51 例/最坏 46.75%，清零后稳定为 62 例/42.93%），"
+            + "本质是把池里上一份图像的内容渲染进了输出。正常文件的解码路径不受影响（全量 354 条测试通过）。");
         sb.AppendLine();
-        sb.AppendLine("宽松/严格两种模式在 4 个样本上的对照见 §2：严格模式把「静默损坏」从 24 例降到 0 例，" +
-            "且完整文件全部照常通过（§1 的分片矩阵全程开启严格模式，无一误拒）。");
+        sb.AppendLine("宽松/严格对照见 §2（JPEG，4 个样本）与 §11.2（五种格式）：严格模式把 JPEG 的静默损坏从 24 例、"
+            + "GIF 的从 62 例都降到 0 例，且完整文件全部照常通过（§1 与 §11.1 的分片矩阵无一误拒）。");
         sb.AppendLine();
 
         sb.Append(body);

@@ -1,13 +1,21 @@
 # 网络传输流式调用的稳定性与健壮性实测
 
-> 生成时间：2026-10-19 11:41　·　运行时 .NET 10.0.13　·　逻辑核 12
+> 生成时间：2026-10-19 13:17　·　运行时 .NET 10.0.13　·　逻辑核 12
 
-测试台：`tools/streamnet`。被测入口：`JpegDecoder.DecodeFromStreamAsync`、`ImageFrame.LoadJpeg/Load(Stream)`、`JpegEncoder/PngWriter/GifEncoder/WebpEncoderAdapter` 的 Stream 写出。
+测试台：`tools/streamnet`。被测入口：`JpegDecoder.DecodeFromStreamAsync`、`ImageFrame.Load(Stream)`（PNG/GIF/BMP/WebP）、`JpegEncoder/PngWriter/GifEncoder/BmpWriter/WebpEncoderAdapter` 的 Stream 写出。
+§1~§10 的深度矩阵用 JPEG 跑（它有完整的 marker/扫描状态机）；§11 把同一组网络条件对五种格式各跑一遍。
 所有输入都经过一个**不可 Seek** 的仿真网络流：固定/抖动分片、逐次延迟、提前 EOF（FIN）、连接重置（RST）、可中途取消。
 
 ## 结论摘要
 
-唯一的高危问题是**渐进式 JPEG 在扫描边界被截断时不会报错**：解码器的位读取器把「数据源读尽」当作 EOI 补 0xFF，多扫描 JPEG 只解出前几个扫描也会被 `ValidateScansComplete` 判为完整（它只检查「组件是否解到过系数」），于是返回一张严重失真的图像。默认行为保持宽松（兼容历史），网络场景应显式打开 `requireEoi: true`。
+两个高危问题属于同一类：**传输在「结构边界」被截断时解码器不报错，直接返回残缺图像**。
+
+1. **渐进式 JPEG 在扫描边界被截断**：位读取器把「数据源读尽」当作 EOI 补 0xFF，多扫描 JPEG 只解出前几个扫描也会被 `ValidateScansComplete` 判为完整（它只检查「组件是否解到过系数」），于是返回一张严重失真的图像。
+2. **GIF 在 LZW 数据块边界被截断**：`LzwDecoder` 读不到下一个块时「尽力返回已解出的像素」，未解出的部分留在画布缓冲里（背景色或上一帧残影），调用方拿到一张看起来正常、实则残缺的图像（§11.2 实测 62/69 例，最坏像素差异 42.93%）。更糟的是未解出的像素取自 `ArrayPool` 的残留内容——那是上一个使用者（可能是别的图片、别的请求）的数据，既让输出不确定，也是一条跨请求的内存泄漏路径。
+
+两者默认都保持宽松（兼容历史），网络场景应显式打开 `requireComplete`（JPEG 上等价于 `requireEoi`）。严格模式下两者的静默损坏都是 0 例。
+
+**格式支持**：五种格式都能从不可 Seek 流读、也都能写到不可 Seek 流。其中 JPEG / PNG / GIF / BMP 是边读边解，内存与文件大小同阶；**WebP 必须先把整条流读进缓冲**——libwebp 只接受连续内存块，WebP 的「流式」只省调用方代码、不省内存（15 KB 文件仍需 3 MB 解码缓冲，全部是像素）。PNG / BMP / WebP 的入口本身就会拒绝截断数据，不需要开关。
 
 **P0**
 
@@ -15,27 +23,33 @@
 - 5_star_base.jpg: 宽松模式在扫描边界截断时静默返回损坏图像 9/184 例，最坏像素差异 96.92 %（最深移除 247116 B，占 86.2%）。
 - progressive.jpg: 宽松模式在扫描边界截断时静默返回损坏图像 6/144 例，最坏像素差异 38.21 %（最深移除 2044117 B，占 66.1%）。
 
+**P1**
+
+- JPEG: 截断后有 4/79 例**静默返回像素不同的图像**（最坏差异 92.2 %，最深截掉 72% 字节）。严格模式（requireComplete）下静默损坏 0 例。
+- GIF: 截断后有 62/69 例**静默返回像素不同的图像**（最坏差异 42.9 %，最深截掉 100% 字节）。严格模式（requireComplete）下静默损坏 0 例。
+
 **P2**
 
 - 内存放大：3.09 MB 的 143 MP 渐进 JPEG 在流式解码中仍分配 409 MB（139× 文件大小）；库内没有可配置的像素数/内存预算闸门，网络输入需要调用方自己限制尺寸或字节数。
 - 只支持异步读取的流在熵解码阶段抛 `NotSupportedException`：`DecodeFromStreamAsync` 的异步承诺是部分的。
-- GIF: 缺失尾部 1 字节（GIF trailer 0x3B）仍返回图像，尾部完整性没有自检。
 
-**未发现问题的维度**：分片交付一致性（1 B ~ 256 KB，§1）、连接重置传播（§3）、取消响应（§4）、限速下的线性开销（§5）、16 路并发无串扰（§7）、写出侧分片确定性与断链后可用性（§8）、PNG/BMP/WebP 截断拒绝（§11）。
+**未发现问题的维度**：五种格式的分片交付一致性（1 B ~ 256 KB，§1 与 §11.1）、连接重置传播（§3 与 §11.3）、取消响应（§4 与 §11.3）、限速下的线性开销（§5 与 §11.3）、16 路 JPEG 并发与 15 路跨格式并发无串扰（§7 与 §11.4）、五种格式写出侧分片确定性与断链后可用性（§8 与 §11.5）、PNG/BMP/WebP 截断拒绝（§11.2）。
 
 ## 未修复（需决策）
 
 1. **CLI 退出码恒为 0**：`Program.Main` 是 `void`，解码/编码失败只打印到 stdout。实测 `--stream-strict` 拒绝截断文件后 `exit code` 仍是 0，网络管道里无法判定成败。要改就得先定批量语义（部分失败返回几？），故本轮只记录。
-2. **`ImageFrame.LoadJpeg` 没有 `CancellationToken`**：只能下沉到 `JpegDecoder.DecodeFromStreamAsync` 才能取消。
-3. **只支持 `ReadAsync` 的流无法解码**：熵解码是同步循环。要么让调用方先把整条流异步读进内存，要么增加一个「异步读满 → 内存解码」的入口；后者会放弃流式的内存优势。
-4. **库内没有像素/内存预算闸门**：`MemoryGuard` 只服务 CLI 的文件路径，Stream 入口不经过它。
+2. **`ImageFrame.LoadJpeg` 没有 `CancellationToken`**：只能下沉到 `JpegDecoder.DecodeFromStreamAsync` 才能取消。PNG/GIF/BMP/WebP 的 Stream 入口同理，取消只能由流自身抛异常（HTTP 客户端断开正是这种形态）。
+3. **CLI 的 `--stream-strict` 只作用于 JPEG**：非 JPEG 走 `Image.Load*` 的文件路径，没有接到 `ImageFrame.Load(Stream, requireComplete)`。命令行上要严格解码 GIF，需先改成流式加载。
+4. **只支持 `ReadAsync` 的流无法解码**：熵解码是同步循环。要么让调用方先把整条流异步读进内存，要么增加一个「异步读满 → 内存解码」的入口；后者会放弃流式的内存优势。
+5. **库内没有像素/内存预算闸门**：`MemoryGuard` 只服务 CLI 的文件路径，Stream 入口不经过它。
 
 ## 复现方式
 
 ```bash
 dotnet run --project tools/streamnet -c Release                 # 全量矩阵（约 1 分钟）
 dotnet run --project tools/streamnet -c Release -- --only 2     # 只跑第 2 个场景
-dotnet test --filter FullyQualifiedName~NetworkStreamingTests   # 回归测试（15 条）
+dotnet test --filter FullyQualifiedName~NetworkStreamingTests   # 回归测试（19 条）
+dotnet run --project tools/streamnet -c Release -- --gif-repeat 3  # 编码确定性诊断
 ```
 
 ## 本轮修复
@@ -43,8 +57,9 @@ dotnet test --filter FullyQualifiedName~NetworkStreamingTests   # 回归测试�
 1. **严格 EOI 模式**（对应 P0）：`JpegDecoder.DecodeFromStreamAsync(..., requireEoi: true)` 与 `ImageFrame.LoadJpeg(..., requireEoi: true)`；CLI 新增 `--stream-strict`。位读取器新增 `ReachedEndOfData`——数据源读尽却未遇到真实 marker 时置位，解码器据此拒绝「扫描边界截断」。默认关闭，保持既有宽松行为不变。
 2. **WebP 写出异常保形**（对应 P1）：`WebpCodec` 原先把写出回调里的 `IOException` 包成 `InvalidOperationException`，调用方无法用 `catch (IOException)` 区分「传输中断」与「编码器内部错误」；现在先用 `ExceptionDispatchInfo` 原样抛出回调异常，再判断 `WebPEncode` 返回值。
 3. **WebP 解码异常归类**：截断/损坏数据的 `InvalidOperationException` 改为 `InvalidDataException`，与 PNG/JPEG 的「数据问题」口径一致。
+4. **GIF 严格模式 + 残留内存清零**（对应 P0-2）：`GifDecoder.DecodeRgb24/DecodeRgba32/DecodeAnimation*` 增加 `requireComplete`；`LzwDecoder` 在像素解完前遇到块结束或提前的结束码时抛 `InvalidDataException`；`ImageFrame.Load(Stream, requireComplete)` 一并覆盖 GIF 与 JPEG。同时把宽松模式下「未解出的像素」从 `ArrayPool` 残留改为清零——否则同一份截断数据两次解码会给出不同结果（实测未清零时静默损坏 51 例/最坏 46.75%，清零后稳定为 62 例/42.93%），本质是把池里上一份图像的内容渲染进了输出。正常文件的解码路径不受影响（全量 354 条测试通过）。
 
-宽松/严格两种模式在 4 个样本上的对照见 §2：严格模式把「静默损坏」从 24 例降到 0 例，且完整文件全部照常通过（§1 的分片矩阵全程开启严格模式，无一误拒）。
+宽松/严格对照见 §2（JPEG，4 个样本）与 §11.2（五种格式）：严格模式把 JPEG 的静默损坏从 24 例、GIF 的从 62 例都降到 0 例，且完整文件全部照常通过（§1 与 §11.1 的分片矩阵无一误拒）。
 
 
 ## 1. 分片交付一致性（分片大小 A/B）
@@ -53,30 +68,30 @@ dotnet test --filter FullyQualifiedName~NetworkStreamingTests   # 回归测试�
 
 | 文件 | 字节 | 分片 | Read 次数 | 解码 ms | 像素一致 |
 |---|---|---|---|---|---|
-| video-001.rgb.jpeg | 6237 | 1 | 6237 | 14.7 | 是 |
-| video-001.rgb.jpeg | 6237 | 3 | 2079 | 1.2 | 是 |
-| video-001.rgb.jpeg | 6237 | 17 | 367 | 1.0 | 是 |
-| video-001.rgb.jpeg | 6237 | 1024 | 7 | 0.9 | 是 |
+| video-001.rgb.jpeg | 6237 | 1 | 6237 | 16.9 | 是 |
+| video-001.rgb.jpeg | 6237 | 3 | 2079 | 1.3 | 是 |
+| video-001.rgb.jpeg | 6237 | 17 | 367 | 1.1 | 是 |
+| video-001.rgb.jpeg | 6237 | 1024 | 7 | 1.0 | 是 |
 | video-001.rgb.jpeg | 6237 | 16384 | 1 | 0.9 | 是 |
-| video-001.rgb.jpeg | 6237 | 262144 | 1 | 0.9 | 是 |
-| Amish-Noka-Dresser.jpg | 56140 | 1 | 56140 | 61.7 | 是 |
-| Amish-Noka-Dresser.jpg | 56140 | 3 | 18714 | 54.8 | 是 |
-| Amish-Noka-Dresser.jpg | 56140 | 17 | 3303 | 52.6 | 是 |
-| Amish-Noka-Dresser.jpg | 56140 | 1024 | 55 | 52.1 | 是 |
-| Amish-Noka-Dresser.jpg | 56140 | 16384 | 4 | 62.6 | 是 |
-| Amish-Noka-Dresser.jpg | 56140 | 262144 | 4 | 11.7 | 是 |
-| 5_star_base.jpg | 286515 | 1 | 286515 | 59.0 | 是 |
-| 5_star_base.jpg | 286515 | 3 | 95505 | 35.5 | 是 |
-| 5_star_base.jpg | 286515 | 17 | 16854 | 27.3 | 是 |
-| 5_star_base.jpg | 286515 | 1024 | 280 | 25.2 | 是 |
-| 5_star_base.jpg | 286515 | 16384 | 18 | 25.2 | 是 |
-| 5_star_base.jpg | 286515 | 262144 | 18 | 24.5 | 是 |
+| video-001.rgb.jpeg | 6237 | 262144 | 1 | 1.0 | 是 |
+| Amish-Noka-Dresser.jpg | 56140 | 1 | 56140 | 64.7 | 是 |
+| Amish-Noka-Dresser.jpg | 56140 | 3 | 18714 | 59.1 | 是 |
+| Amish-Noka-Dresser.jpg | 56140 | 17 | 3303 | 55.9 | 是 |
+| Amish-Noka-Dresser.jpg | 56140 | 1024 | 55 | 56.0 | 是 |
+| Amish-Noka-Dresser.jpg | 56140 | 16384 | 4 | 44.4 | 是 |
+| Amish-Noka-Dresser.jpg | 56140 | 262144 | 4 | 33.4 | 是 |
+| 5_star_base.jpg | 286515 | 1 | 286515 | 65.4 | 是 |
+| 5_star_base.jpg | 286515 | 3 | 95505 | 40.6 | 是 |
+| 5_star_base.jpg | 286515 | 17 | 16854 | 30.8 | 是 |
+| 5_star_base.jpg | 286515 | 1024 | 280 | 29.1 | 是 |
+| 5_star_base.jpg | 286515 | 16384 | 18 | 28.4 | 是 |
+| 5_star_base.jpg | 286515 | 262144 | 18 | 28.5 | 是 |
 | progressive.jpg | 3091834 | 1 | - | - | 跳过(过大) |
-| progressive.jpg | 3091834 | 3 | 1030612 | 380.4 | 是 |
-| progressive.jpg | 3091834 | 17 | 181873 | 337.4 | 是 |
-| progressive.jpg | 3091834 | 1024 | 3020 | 325.4 | 是 |
-| progressive.jpg | 3091834 | 16384 | 189 | 315.5 | 是 |
-| progressive.jpg | 3091834 | 262144 | 189 | 316.2 | 是 |
+| progressive.jpg | 3091834 | 3 | 1030612 | 406.7 | 是 |
+| progressive.jpg | 3091834 | 17 | 181873 | 347.1 | 是 |
+| progressive.jpg | 3091834 | 1024 | 3020 | 351.0 | 是 |
+| progressive.jpg | 3091834 | 16384 | 189 | 404.0 | 是 |
+| progressive.jpg | 3091834 | 262144 | 189 | 387.7 | 是 |
 
 `ImageFrame.LoadJpeg(useStreamingDecoder: true)` 与 `ImageFrame.Load(byte[])` 一致: **是**（1000x1000, 分片 5 B）。
 
@@ -103,9 +118,9 @@ dotnet test --filter FullyQualifiedName~NetworkStreamingTests   # 回归测试�
 | 2 | 0.0% | IO: 模拟网络故障：连接被对端重置 (RST) | 0.1 |
 | 10 | 0.0% | IO: 模拟网络故障：连接被对端重置 (RST) | 0.0 |
 | 2865 | 1.0% | IO: 模拟网络故障：连接被对端重置 (RST) | 0.0 |
-| 57303 | 20.0% | IO: 模拟网络故障：连接被对端重置 (RST) | 3.2 |
-| 143257 | 50.0% | IO: 模拟网络故障：连接被对端重置 (RST) | 7.6 |
-| 257863 | 90.0% | IO: 模拟网络故障：连接被对端重置 (RST) | 18.3 |
+| 57303 | 20.0% | IO: 模拟网络故障：连接被对端重置 (RST) | 3.3 |
+| 143257 | 50.0% | IO: 模拟网络故障：连接被对端重置 (RST) | 8.5 |
+| 257863 | 90.0% | IO: 模拟网络故障：连接被对端重置 (RST) | 19.8 |
 
 
 ## 4. 传输中途取消
@@ -114,8 +129,8 @@ dotnet test --filter FullyQualifiedName~NetworkStreamingTests   # 回归测试�
 
 | 场景 | 分片 | 结果 | 耗时 ms | 已交付 |
 |---|---|---|---|---|
-| 中途取消 | 64 | Canceled | 4.8 | 71680/286515 |
-| 中途取消 | 4096 | Canceled | 3.5 | 73728/286515 |
+| 中途取消 | 64 | Canceled | 5.6 | 71680/286515 |
+| 中途取消 | 4096 | Canceled | 3.7 | 73728/286515 |
 | 预取消 token | - | Canceled | 0 | 0/286515 |
 
 注意：`ImageFrame.LoadJpeg(stream, useStreamingDecoder: true)` 没有 token 参数，高层入口无法取消；只能改用 `JpegDecoder.DecodeFromStreamAsync`。
@@ -126,10 +141,10 @@ dotnet test --filter FullyQualifiedName~NetworkStreamingTests   # 回归测试�
 
 | 分片 | 每次延迟 ms | Read 次数 | 注入延迟 ms | 墙钟 ms | 开销 ms | 吞吐 KB/s |
 |---|---|---|---|---|---|---|
-| 16384 | 20 | 18 | 360 | 386 | 26 | 724.4 |
-| 1024 | 2 | 280 | 560 | 606 | 46 | 461.8 |
-| 1024 | 0.5 | 280 | 140 | 164 | 24 | 1702.7 |
-| 256 | 0.2 | 1120 | 224 | 251 | 27 | 1116.9 |
+| 16384 | 20 | 18 | 360 | 389 | 29 | 719.6 |
+| 1024 | 2 | 280 | 560 | 608 | 48 | 460.2 |
+| 1024 | 0.5 | 280 | 140 | 164 | 24 | 1703.1 |
+| 256 | 0.2 | 1120 | 224 | 263 | 39 | 1062.6 |
 
 
 ## 6. 内存开销（流式 vs 整文件）
@@ -139,7 +154,7 @@ dotnet test --filter FullyQualifiedName~NetworkStreamingTests   # 回归测试�
 | 文件 | 字节 | 路径 | 分配 MB | 放大倍数 | 相对整文件 |
 |---|---|---|---|---|---|
 | Amish-Noka-Dresser.jpg | 56140 | 整文件 | 2.88 | 53.7× | 基准 |
-| Amish-Noka-Dresser.jpg | 56140 | 流式 | 2.90 | 54.1× | +0.02 MB |
+| Amish-Noka-Dresser.jpg | 56140 | 流式 | 2.88 | 53.8× | +0.00 MB |
 | progressive.jpg | 3091834 | 整文件 | 409.11 | 138.7× | 基准 |
 | progressive.jpg | 3091834 | 流式 | 409.12 | 138.7× | +0.00 MB |
 
@@ -149,7 +164,7 @@ dotnet test --filter FullyQualifiedName~NetworkStreamingTests   # 回归测试�
 
 16 个任务同时解码，分片与延迟随机；一半在随机位置提前 EOF。检查死锁、串扰与结果确定性。
 
-墙钟 32 ms；返回图像 8 路（其中与参考一致 8 路），InvalidData 8 路，其他 0 路。
+墙钟 31 ms；返回图像 8 路（其中与参考一致 8 路），InvalidData 8 路，其他 0 路。
 
 ## 8. 写出侧：编码到不可 Seek 的网络响应流
 
@@ -177,14 +192,100 @@ dotnet test --filter FullyQualifiedName~NetworkStreamingTests   # 回归测试�
 24000×24000: 子进程退出码 `0`，输出：`THROW InvalidDataException: Scan decode failed (mx=969, my=2, componentId=1, bx=1938, by=4, bytesConsumed=7811, bitCount…`。
 注意：第二组报 `InvalidData` 是因为截断的熵数据在填充块解完后就失败了，并未真正分配 576 MP 的系数数组，因此本项**不能**证明「大图不会 OOM」。真正的内存风险见 §6：3.09 MB 的文件需要 409 MB，文件大小完全不能作为准入依据。
 
-## 11. 非 JPEG 格式经网络流加载
+## 11. 全格式流式矩阵（PNG / GIF / BMP / WebP / JPEG 对照）
 
-`ImageFrame.Load(Stream)` 对不可 Seek 流先缓存 12 字节头再拼接尾部。验证分片一致性，以及 50% / 仅差 1 字节截断时的行为。
+`ImageFrame.Load(Stream)` 对不可 Seek 流只缓存 12 字节头，随后交给各格式自己的解码器。这里把 §1~§8 的网络条件对五种格式各跑一遍：分片一致性、截断扫描、连接重置/取消/限速、内存、并发、写出侧。样本统一由同一张 1000×1000 图重新编码，参照像素取整文件解码结果。
 
-| 格式 | 字节 | 分片一致 | 截断 50% | 截断 -1B |
+| 格式 | 字节 | 解码路径 | 严格开关 | 像素长度 |
 |---|---|---|---|---|
-| PNG | 368192 | 是 | InvalidData | InvalidData |
-| GIF | 218433 | 是 | EndOfStream | 返回图像 1000x1000 |
-| WebP | 15216 | 是 | InvalidData | InvalidData |
-| BMP | 3000054 | 是 | EndOfStream | EndOfStream |
+| JPEG | 56140 | 真流式 | requireComplete | 3000000 |
+| PNG | 368192 | 真流式 | 无（始终拒绝截断） | 3000000 |
+| GIF | 218433 | 真流式 | requireComplete | 3000000 |
+| BMP | 3000054 | 真流式 | 无（始终拒绝截断） | 3000000 |
+| WebP | 15216 | 整读缓冲 | 无（始终拒绝截断） | 3000000 |
+
+
+### 11.1 分片交付一致性
+
+分片大小 1 B ~ 256 KB。不可 Seek 流会把「一次 Read 只给 1 字节」放大成几十万次调用，用于暴露依赖单次读满的假设。
+
+| 格式 | 1 B | 7 B | 64 B | 1 KB | 16 KB | 256 KB | 全部一致 |
+|---|---|---|---|---|---|---|---|
+| JPEG | 一致 | 一致 | 一致 | 一致 | 一致 | 一致 | 是 |
+| PNG | 一致 | 一致 | 一致 | 一致 | 一致 | 一致 | 是 |
+| GIF | 一致 | 一致 | 一致 | 一致 | 一致 | 一致 | 是 |
+| BMP | 一致 | 一致 | 一致 | 一致 | 一致 | 一致 | 是 |
+| WebP | 一致 | 一致 | 一致 | 一致 | 一致 | 一致 | 是 |
+
+
+### 11.2 截断扫描（FIN，取整文件比例 + 各格式结构边界，宽松 vs 严格）
+
+每个格式在 50~70 个位置截断（含 chunk / block / row 边界，最敏感的位置就在这里）。结果分三类：报错、接受且像素与完整文件一致（缺的只是尾部元数据）、**接受但像素不同**（静默损坏）。JPEG 与 GIF 各跑宽松/严格两遍，其余格式的入口本身就会拒绝截断。
+
+| 格式 | 字节 | 用例 | 宽松:抛 | 宽松:接受一致 | 宽松:静默损坏 | 严格:静默损坏 | 严格:抛 | 最深静默截断 | 最坏差异 | 异常类型 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| JPEG | 56140 | 79 | 74 | 1 | 4 | 0 | 79 | -40163 B（72%） | 92.18 % | InvalidData×74 |
+| PNG | 368192 | 53 | 53 | 0 | 0 | —（入口本身拒绝） | — | — | — | InvalidData×53 |
+| GIF | 218433 | 69 | 6 | 1 | 62 | 0 | 68 | -217652 B（100%） | 42.93 % | EndOfStream×6 |
+| BMP | 3000054 | 104 | 104 | 0 | 0 | —（入口本身拒绝） | — | — | — | EndOfStream×104 |
+| WebP | 15216 | 100 | 100 | 0 | 0 | —（入口本身拒绝） | — | — | — | InvalidData×100 |
+
+静默损坏样例：
+
+| 格式 | 静默损坏样例（宽松模式） |
+|---|---|
+| JPEG | -40163B → 92.2 %；-35999B → 91.8 %；-21425B → 31.8 %；-19770B → 29.9 % |
+| PNG | 无 |
+| GIF | -217652B → 42.9 %；-214313B → 42.5 %；-211241B → 41.8 %；-207913B → 41.2 %；-204841B → 40.7 %；-201513B → 40.0 % |
+| BMP | 无 |
+| WebP | 无 |
+
+说明：`接受一致` 表示数据虽被截断，但缺失的只是尾部元数据（PNG 的 IEND、GIF 的 trailer），像素仍然完整——不构成画质风险，只是「无法区分完整传输与被截断的传输」。
+
+### 11.3 连接重置 / 中途取消 / 限速
+
+RST 在 10%、50%、90% 字节处注入；取消由流自身在 50% 处抛 `OperationCanceledException`（非 JPEG 的入口没有 `CancellationToken`，HTTP 客户端断开时正是这种形态）；限速用 4 KB / 2 ms。关注点：传输错误能否以可捕获的异常原样到达调用方，而不是被吞掉或改写成别的类型。
+
+| 格式 | RST@10% | RST@50% | RST@90% | 取消@50% | 限速墙钟/注入 |
+|---|---|---|---|---|---|
+| JPEG | IO | IO | IO | Canceled | 37 / 28 ms（14 次读） |
+| PNG | IO | IO | IO | Canceled | 205 / 200 ms（100 次读） |
+| GIF | IO | IO | IO | Canceled | 3440 / 3418 ms（1709 次读） |
+| BMP | IO | IO | IO | Canceled | 2009 / 2002 ms（1001 次读） |
+| WebP | IO | IO | IO | Canceled | 21 / 10 ms（5 次读） |
+
+
+### 11.4 内存与并发
+
+内存：`ImageFrame.Load(byte[])`（整文件在内存）对照 `Load(Stream)`（不可 Seek 网络流）。并发：5 种格式各 3 路同时从随机分片的网络流解码，像素必须各自与参照一致。
+
+| 格式 | 文件字节 | 整文件分配 MB | 流式分配 MB | 流式/整文件 | 流式放大倍数 |
+|---|---|---|---|---|---|
+| JPEG | 56140 | 2.93 | 2.88 | 0.98× | 53.8× |
+| PNG | 368192 | 2.86 | 2.86 | 1.00× | 8.2× |
+| GIF | 218433 | 2.87 | 2.89 | 1.01× | 13.9× |
+| BMP | 3000054 | 2.86 | 2.86 | 1.00× | 1.0× |
+| WebP | 15216 | 6.69 | 6.68 | 1.00× | 460.2× |
+
+| 格式 | 路 1 | 路 2 | 路 3 |
+|---|---|---|---|
+| JPEG | 一致 | 一致 | 一致 |
+| PNG | 一致 | 一致 | 一致 |
+| GIF | 一致 | 一致 | 一致 |
+| BMP | 一致 | 一致 | 一致 |
+| WebP | 一致 | 一致 | 一致 |
+
+15 路并发（5 格式 × 3 副本，随机分片）总耗时 20 ms，异常/错误 0 路。
+
+### 11.5 写出侧（分片写 + 断链）
+
+五种格式各编码到只写流：7 字节分片写入必须与 `MemoryStream` 逐字节一致；写入到 25% 处断链必须抛 `IOException`，且编码器之后仍能产出同样字节。
+
+| 格式 | 字节 | 7 B 分片 | 与内存一致 | 断链@25% | 断链后重编码 |
+|---|---|---|---|---|---|
+| JPEG | 59725 | OK | 是 | IO | 一致 |
+| PNG | 368192 | OK | 是 | IO | 一致 |
+| GIF | 218433 | OK | 是 | IO | 一致 |
+| BMP | 3000054 | OK | 是 | IO | 一致 |
+| WebP | 15216 | OK | 是 | IO | 一致 |
 
