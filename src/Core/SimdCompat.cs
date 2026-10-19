@@ -11,7 +11,7 @@ namespace SharpImageConverter.Core;
 /// 本库原有的向量化实现全部建立在 <c>System.Runtime.Intrinsics.X86</c> 之上
 /// （SSE2 / SSSE3 / SSE4.1 / AVX2）。在 arm64 上这些 <c>IsSupported</c> 全部为
 /// <c>false</c>，于是所有 <c>if (Ssse3.IsSupported)</c> 形式的守卫整条失效，
-/// 程序静默退回标量实现，性能急剧下降（详见 docs/ArmPerfBaseline.md）。
+/// 程序静默退回标量实现，性能急剧下降（详见 docs/ArmFindings.md）。
 ///
 /// 本类把这些操作抽象成单一入口，**x86 分支逐字保持原有的 x86 内在函数调用**，
 /// 因此对 x86 的行为、产物与性能不产生任何影响；只有 arm64 才会走 NEON 分支。
@@ -340,7 +340,7 @@ internal static class SimdCompat
 
     /// <summary>pslldq：整体左移 <paramref name="bytes"/> 字节（0..15），低位补 0。</summary>
     /// <remarks>
-    /// NEON 侧用 <c>EXT</c> 合成。语义已实测确认（见 docs/ArmPerfBaseline.md §5）：
+    /// NEON 侧用 <c>EXT</c> 合成。语义已实测确认（见 docs/ArmFindings.md §5）：
     /// <c>ExtractVector128(zero, v, n)</c> = <c>psrldq(v, n)</c>；
     /// <c>ExtractVector128(zero, v, 16-n)</c> = <c>pslldq(v, n)</c>。
     /// <para>
@@ -751,7 +751,7 @@ internal static class SimdCompat
     // ------------------------------------------------------------------
     // 解交织加载（LD2 / LD3 / LD4）—— ✅ 实测否决，**默认不走LD3**
     //
-    // 原假设（见 docs/ArmExclusiveSimd.md §3.2）：arm64 一条 LD3 可顶掉
+    // 原假设（见 docs/ArmFindings.md §8.2）：arm64 一条 LD3 可顶掉
     // 「3ldr + 9 tbl + 9 and + 6 orr」共 27 条指令，故应显著更快。
     //
     // ✅ 2026-10-09 在 M4 上实测，**该假设不成立，LD3 反而更慢**：

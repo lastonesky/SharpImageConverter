@@ -89,9 +89,14 @@ SharpImageConverter/
 │  └── SharpImageConverter.Cli.csproj
 ├── SharpImageConverter.Tests/   # Test project
 ├── docs/                        # Engineering docs (see docs/README.md)
-│  ├── PerfReport.md             # Performance findings and optimization status
-│  ├── AuditVerification.md      # Verification of an external audit report
-│  ├── goal.md                   # Gap list vs. mature libraries
+│  ├── PerfReport.md             # Performance measurements and rejected directions
+│  ├── Optimize.md               # Lossy-optimizer design and usage
+│  ├── OptimizeAudit.md          # Directional audit of --optimize
+│  ├── OptimizePlan.md           # --optimize improvement plan and results
+│  ├── GifFindings.md            # GIF algorithms and performance notes
+│  ├── ArmFindings.md            # ARM baseline and ARM-only instruction results
+│  ├── SimdPitfalls.md           # SIMD pitfalls and audit verification
+│  ├── Release.md                # Release process
 │  └── reference/                # Specification source material
 └── README.md / README.en.md
 ```

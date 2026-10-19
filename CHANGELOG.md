@@ -1,5 +1,23 @@
 ## 未发布
 
+### 文档
+- **`docs/` 整理：13 份 Markdown 合并为 7 份**，删除已完成使命的过期文档。
+  - 新增 `docs/ArmFindings.md`：合并 `ArmPerfBaseline.md` + `ArmExclusiveSimd.md`
+    （基线数字、调优后 A/B、NEON 语义等价、LD3/RDM/CRC 三条实测判决）。
+  - 新增 `docs/SimdPitfalls.md`：合并两份 `AuditVerification-*.md`
+    （审计复核结论 + 已落地修复 + 暂缓原因 + K1–K15 陷阱），去掉逐条任务状态表。
+  - 新增 `docs/GifFindings.md`：合并 `GifAlgorithmAnalysis.md` + `GIFQuantizerOptimize.md` 与 `PerfReport.md` 的 GIF 段；
+    顺带纠正一处过时说法——默认量化器是 `OctreeBayer`，Wu+Floyd–Steinberg 只是可选项，
+    原「量化器分析」把 Wu 当成了唯一/默认路径。
+  - `docs/PerfReport.md` 重写为「性能实测记录与已否决方向」：删掉早期手写的
+    「性能问题定位 / 优化建议 / 验证方法」清单（其中多条已标注「问题确认不存在」）
+    与已作废的手写参考实现数字；AVX-VNNI 从独立文档压缩为一句结论（缩小慢 4.0x、放大慢 1.8x）。
+  - 删除 `goal.md`（早期「与成熟库的差距清单」，条目已全部实现或不再适用）、`VnniResizeFindings.md`、
+    `PerfCompare-2026-03-08-vs-2026-10-02.md`（由 `tools/perf/run-bench.ps1` 再生成，不入库）。
+  - 同步更新 `README.md` / `README.en.md` 的目录树与 `docs/README.md` 索引；
+    `src/Core/SimdCompat.cs`、`src/Formats/Gif/OctreeQuantizer.cs`、`tools/perf/SicBench/Bench.cs`
+    里的文档引用改为新路径。
+
 ## 1.2.0（相对 v1.1.0）
 
 ### 修复
@@ -421,7 +439,7 @@
     | GIF 编解码 | +3.4% ~ +14.2%（标量回退本就是查表实现，天花板低） |
     123 项中 58 项提速明显；118 项产物逐字节一致，
     5 项 JPEG 解码差异为**继承自 x86 的既有差异**（SIMD 用色度复制、标量用双线性上采样）。
-    逐项取证与三个存疑项的分析见 `docs/ArmPerfBaseline.md` §7。
+    逐项取证与三个存疑项的分析见 `docs/ArmFindings.md` §7。
   - **Adler32 移植**：`s1 += b[i]; s2 += s1;` 的跨迭代依赖链把标量吞吐锁在 1.62 GB/s；
     改用 `psadbw` 求 s1、`pmaddwd` 求加权 s2、`HorizontalSumInt32`（NEON 单条 `addv`）归约后达 **7.81 GB/s（4.8x）**，
     12 组数据（含 5552 边界与 `Update` 串联）逐位一致。

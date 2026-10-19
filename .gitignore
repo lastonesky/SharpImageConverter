@@ -127,3 +127,6 @@ examples/
 .perf/
 tools/perf/SicBench/bin/
 tools/perf/SicBench/obj/
+
+# 基准对比报告由 tools/perf/run-bench.ps1 自动生成，可随时重跑，不入库
+docs/PerfCompare-*.md

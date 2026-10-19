@@ -92,14 +92,19 @@ SharpImageConverter/
 │  └── SharpImageConverter.Cli.csproj
 ├── SharpImageConverter.Tests/   # 单元测试工程
 ├── docs/                        # 工程类文档（索引见 docs/README.md）
-│  ├── PerfReport.md             # 性能问题定位与优化状态
-│  ├── AuditVerification.md      # 外部审计报告复核
-│  ├── goal.md                   # 与成熟库的差距清单
+│  ├── PerfReport.md             # 性能实测记录与已否决方向
+│  ├── Optimize.md               # 智能有损压缩设计与用法
+│  ├── OptimizeAudit.md          # --optimize 方向性审计
+│  ├── OptimizePlan.md           # --optimize 改进计划与执行记录
+│  ├── GifFindings.md            # GIF 算法与性能记录
+│  ├── ArmFindings.md            # ARM 基线与专属指令实测
+│  ├── SimdPitfalls.md           # SIMD 实现陷阱与审计复核
+│  ├── Release.md                # 发布流程约定
 │  └── reference/                # 规范原文等参考资料
 └── README.md / README.en.md
 ```
 
-工程类文档（性能分析、审计复核、差距清单）统一放在 `docs/`，入口见 [docs/README.md](docs/README.md)。
+工程类文档（性能记录、算法分析、实现陷阱、发布口径）统一放在 `docs/`，入口见 [docs/README.md](docs/README.md)。
 
 ## 使用方式（API）
 

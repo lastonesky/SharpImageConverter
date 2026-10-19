@@ -596,7 +596,7 @@ public sealed class OctreeQuantizer
     /// 解交织走 <see cref="SimdCompat.LoadRgb24Unzip3"/>。该封装在 arm64 上走
     /// <c>tbl</c>、x86 上走 <c>pshufb</c>，两条都是 3 次加载 + 9 次置换 + 6 次 or，
     /// 产物与性能不受影响。曾评估的 <c>LD3</c> 单指令方案已在 M4 实测否决（慢 9.4%），
-    /// 详见 docs/ArmExclusiveSimd.md §3.2。
+    /// 详见 docs/ArmFindings.md §8.2。
     /// </para>
     /// <para>
     /// 每轮 16 像素 / 48 字节。NEON 寄存器定长 128 位且 .NET 未暴露任何 ARM 侧
