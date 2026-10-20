@@ -1,6 +1,6 @@
 using SharpImageConverter.Core;
 
-namespace Tests.Helpers
+namespace SharpImageConverter.Tests.Helpers
 {
     public static class TestImageFactory
     {

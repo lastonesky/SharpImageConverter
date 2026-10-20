@@ -6,15 +6,27 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
   </PropertyGroup>
+  <!--
+    测试按领域分目录（命名空间统一为 SharpImageConverter.Tests）：
+      Compat/     SIMD 与标量参考实现的逐字节一致性
+      Codec/      各格式编解码、往返、语料与畸形输入
+      Jpeg/       JPEG 编码器内部构件（Huffman/采样缓存/渐进式）
+      Optimize/   optimize 模式的质量搜索、量化与跨格式转换
+      Streaming/  流式 / 网络仿真与内存守卫
+      Cli/        CLI 进程边界端到端
+      Helpers/    断言与样本构造工具
+  -->
   <ItemGroup>
-    <ProjectReference Include="..\\src\\SharpImageConverter.csproj" />
+    <ProjectReference Include="../src/SharpImageConverter.csproj" />
+    <!-- 只为保证 CLI 在测试前构建好（端到端测试直接 exec 它的 dll，不走 dotnet run：省 2.6 s）。 -->
+    <ProjectReference Include="../Cli/SharpImageConverter.Cli.csproj" ReferenceOutputAssembly="false" />
   </ItemGroup>
   <ItemGroup>
     <!-- 网络仿真流与 tools/streamnet 共用同一份源码，避免测试台与回归测试行为漂移。 -->
-    <Compile Include="..\\tools\\streamnet\\NetworkSim.cs" Link="Helpers\\NetworkSim.cs" />
+    <Compile Include="../tools/streamnet/NetworkSim.cs" Link="Helpers/NetworkSim.cs" />
   </ItemGroup>
   <ItemGroup>
-    <None Include="..\\src\\runtimes\\**\\*.*">
+    <None Include="../src/runtimes/**/*.*">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
   </ItemGroup>
