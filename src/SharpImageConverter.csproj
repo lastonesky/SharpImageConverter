@@ -31,6 +31,21 @@
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
   </PropertyGroup>
 
+  <!-- 本仓库 origin 拉取地址是 gitee.com，Microsoft.SourceLink.GitHub 不识别该域名，
+       会生成空的 sourcelink.json 并报「源代码管理信息不可用」警告。
+       这里在 GitHub 提供程序初始化之前把仓库地址改指到 GitHub 镜像，
+       使 SourceLink 仍能生成有效的源映射。 -->
+  <Target Name="_SicSetSourceLinkRepositoryUrl"
+          BeforeTargets="_InitializeGitHubSourceLinkUrl"
+          Condition="'$(EnableSourceLink)' == 'true'">
+    <PropertyGroup>
+      <PrivateRepositoryUrl>https://github.com/lastonesky/SharpImageConverter</PrivateRepositoryUrl>
+    </PropertyGroup>
+    <ItemGroup>
+      <SourceRoot Update="%(Identity)" RepositoryUrl="https://github.com/lastonesky/SharpImageConverter" />
+    </ItemGroup>
+  </Target>
+
   <!-- 原生库选择：指定 RuntimeIdentifier 时以 RID 为准；未指定时按宿主 OS。
        这样跨平台发布（如在 Windows 上发布 linux-x64）不会混入错误平台的原生库。 -->
   <PropertyGroup>

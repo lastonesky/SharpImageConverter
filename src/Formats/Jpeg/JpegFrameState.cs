@@ -914,7 +914,7 @@ internal sealed partial class JpegFrameState
     /// 接管外部的量化系数与组件几何，供「跳过熵解码」的重建使用。
     /// </summary>
     /// <remarks>
-    /// 只给 optimize 搜索期用（见 <see cref="JpegEncoder.EncodeCoefficients"/>）。
+    /// 只给 optimize 搜索期用（见 <see cref="JpegEncoder.EncodeCoefficients(byte[], int, int, int, JpegChromaSubsampling, bool, ImageMetadata?, IMcuCoefficientSink, bool)"/>）。
     /// 系数由调用方按组件平面布局填好后，本状态机只负责反量化 + IDCT + 上采样 + 色彩转换，
     /// 走的仍是与正常解码完全相同的 <see cref="ReconstructImage()"/>，因此像素结果一致。
     /// </remarks>

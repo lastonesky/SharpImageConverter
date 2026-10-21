@@ -580,13 +580,13 @@ public static class JpegEncoder
     /// <remarks>
     /// 供 optimize 搜索期的多档质量评估使用：produce 只跟源图和几何有关，与质量无关，
     /// 所以 <see cref="JpegSampleCache"/> 采一次、这里按质量档反复量化即可。
-    /// 与 <see cref="EncodeCoefficients"/> 的差别只有「样本从哪来」——两者喂给
+    /// 与 <see cref="EncodeCoefficients(byte[], int, int, int, JpegChromaSubsampling, bool, ImageMetadata?, IMcuCoefficientSink, bool)"/> 的差别只有「样本从哪来」——两者喂给
     /// <c>DctQuantizeInPlace</c> 的样本逐位相同，量化系数因此也逐位相同。
     ///
     /// 与流式管线相比还省掉了 MCU 批的池化租借、队列同步和 <c>LastNzPacked</c>（只有熵编码用）：
     /// 这里是按行并行的批处理，每个 MCU 用 1.5 KB 栈缓冲原地 DCT+量化，结果直接过
     /// <see cref="IMcuCoefficientSink.Accept"/> 落到组件平面。各线程写的 MCU 下标互不相交，
-    /// <see cref="IMcuCoefficientSink.Begin"/> 也在并行区之外调用，因此无需同步。
+    /// <see cref="IMcuCoefficientSink.Begin(int, int, JpegChromaSubsampling, ReadOnlySpan{byte}, ReadOnlySpan{byte})"/> 也在并行区之外调用，因此无需同步。
     /// </remarks>
     /// <summary>
     /// 从逐行像素源直接编码 JPEG：按 MCU 行读取 RGB 窄带，DCT/量化后立即熵编码。
