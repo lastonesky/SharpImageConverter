@@ -262,7 +262,7 @@ namespace SharpImageConverter.Tests
                         Assert.Equal(img.Width, loaded.Width);
                         Assert.Equal(img.Height, loaded.Height);
                         File.Delete(path);
-                    }));
+                    }, TestContext.Current.CancellationToken));
                 }
             }
             await Task.WhenAll(tasks);

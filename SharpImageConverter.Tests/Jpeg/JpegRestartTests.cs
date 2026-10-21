@@ -63,7 +63,7 @@ public sealed class JpegRestartTests
 
         var imgSync = JpegDecoder.Decode(data);
         using var ms = new MemoryStream(data);
-        var streamResult = await JpegDecoder.DecodeFromStreamAsync(ms);
+        var streamResult = await JpegDecoder.DecodeFromStreamAsync(ms, TestContext.Current.CancellationToken);
 
         Assert.Equal(imgSync.Width, streamResult.Image.Width);
         Assert.Equal(imgSync.Height, streamResult.Image.Height);

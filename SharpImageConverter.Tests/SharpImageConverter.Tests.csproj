@@ -5,6 +5,8 @@
     <IsPackable>false</IsPackable>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
+    <!-- .NET 10 SDK 的 dotnet test 已不支持 VSTest 目标，需显式启用 Microsoft.Testing.Platform 新体验（https://aka.ms/dotnet-test-mtp-error）。 -->
+    <TestingPlatformDotnetTestSupport>true</TestingPlatformDotnetTestSupport>
   </PropertyGroup>
   <!--
     测试按领域分目录（命名空间统一为 SharpImageConverter.Tests）：

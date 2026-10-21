@@ -38,7 +38,7 @@ namespace SharpImageConverter.Tests
             byte[] reference = ReferenceRgb(data);
 
             using var stream = new SimulatedNetworkStream(data, new NetworkProfile { ChunkBytes = chunk });
-            var result = await JpegDecoder.DecodeFromStreamAsync(stream, default, false, requireEoi: true);
+            var result = await JpegDecoder.DecodeFromStreamAsync(stream, TestContext.Current.CancellationToken, false, requireEoi: true);
 
             Assert.Equal(reference, result.Image.ToRgb24());
         }
@@ -53,7 +53,7 @@ namespace SharpImageConverter.Tests
             byte[] reference = ReferenceRgb(data);
 
             using var stream = new SimulatedNetworkStream(data, new NetworkProfile { ChunkBytes = 4096 });
-            var result = await JpegDecoder.DecodeFromStreamAsync(stream, default, false, requireEoi: true);
+            var result = await JpegDecoder.DecodeFromStreamAsync(stream, TestContext.Current.CancellationToken, false, requireEoi: true);
 
             Assert.Equal(reference, result.Image.ToRgb24());
         }
@@ -69,7 +69,7 @@ namespace SharpImageConverter.Tests
             using var stream = new SimulatedNetworkStream(truncated, EofProfile(truncated.Length));
 
             await Assert.ThrowsAsync<InvalidDataException>(() =>
-                JpegDecoder.DecodeFromStreamAsync(stream, default, false, requireEoi: true));
+                JpegDecoder.DecodeFromStreamAsync(stream, TestContext.Current.CancellationToken, false, requireEoi: true));
         }
 
         [Fact]
@@ -83,7 +83,7 @@ namespace SharpImageConverter.Tests
 
             byte[] truncated = data[..boundary];
             using var stream = new SimulatedNetworkStream(truncated, EofProfile(truncated.Length));
-            byte[] rgb = (await JpegDecoder.DecodeFromStreamAsync(stream)).Image.ToRgb24();
+            byte[] rgb = (await JpegDecoder.DecodeFromStreamAsync(stream, TestContext.Current.CancellationToken)).Image.ToRgb24();
 
             Assert.Equal(reference.Length, rgb.Length);
             int diff = 0;
@@ -102,7 +102,7 @@ namespace SharpImageConverter.Tests
             using var stream = new SimulatedNetworkStream(truncated, EofProfile(truncated.Length));
 
             await Assert.ThrowsAsync<InvalidDataException>(() =>
-                JpegDecoder.DecodeFromStreamAsync(stream, default, false, requireEoi: true));
+                JpegDecoder.DecodeFromStreamAsync(stream, TestContext.Current.CancellationToken, false, requireEoi: true));
         }
 
         [Fact]
@@ -116,7 +116,8 @@ namespace SharpImageConverter.Tests
                 FaultAtBytes = data.Length / 2,
             });
 
-            await Assert.ThrowsAsync<IOException>(() => JpegDecoder.DecodeFromStreamAsync(stream));
+            await Assert.ThrowsAsync<IOException>(() =>
+                JpegDecoder.DecodeFromStreamAsync(stream, TestContext.Current.CancellationToken));
         }
 
         [Fact]
@@ -148,7 +149,8 @@ namespace SharpImageConverter.Tests
                 SyncReadUnsupported = true,
             });
 
-            await Assert.ThrowsAsync<NotSupportedException>(() => JpegDecoder.DecodeFromStreamAsync(stream));
+            await Assert.ThrowsAsync<NotSupportedException>(() =>
+                JpegDecoder.DecodeFromStreamAsync(stream, TestContext.Current.CancellationToken));
         }
 
         // ---------------------------------------------------------------- GIF
