@@ -1,5 +1,6 @@
 ﻿using System.Buffers;
 using SharpImageConverter.Core;
+using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
 
 namespace SharpImageConverter.Formats.Jpeg;
@@ -110,6 +111,26 @@ public static partial class JpegDecoder
         ushort[] yQuant = quantTables[yComp.QuantTableId].Table;
         ushort[] cbQuant = quantTables[cbComp.QuantTableId].Table;
         ushort[] crQuant = quantTables[crComp.QuantTableId].Table;
+
+        // fancy 上采样需要跨 MCU 的邻域色度样本（jdsample.c 的 h2v1/h2v2 fancy，三角滤波），
+        // 每 MCU 独立融合写像素的旧路径拿不到邻居，因此 4:2:0 / 4:2:2 走两阶段：
+        // 阶段一并行 IDCT 色度块到完整平面，阶段二按 MCU 行条带逐行过滤 + 转换。
+        // 色度过窄（不超过 2 个样本）时 libjpeg 自己也退回复制，沿用旧路径。
+        int realChromaW = (width + 1) >> 1;
+        if (realChromaW > 2)
+        {
+            bool parallel = (long)width * height >= 60_000L * Environment.ProcessorCount + 300_000 && mcuY >= 2;
+            if (is420)
+            {
+                Decode420FancyAll(yComp, cbComp, crComp, yQuant, cbQuant, crQuant, output, width, height, mcuX, mcuY, parallel);
+                return true;
+            }
+            if (is422)
+            {
+                Decode422FancyAll(yComp, cbComp, crComp, yQuant, cbQuant, crQuant, output, width, height, mcuX, mcuY, parallel);
+                return true;
+            }
+        }
 
         void DecodeMcu(int mx, int my)
         {
@@ -250,6 +271,301 @@ public static partial class JpegDecoder
             temp.Slice(src, copyW * 3).CopyTo(output.AsSpan(dst));
         }
     }
+
+    // ---------- 4:2:0 / 4:2:2 libjpeg 风格 fancy 上采样 ----------
+
+    // 滤波公式与 jdsample.c（h2v1/h2v2 fancy）逐位一致，与 SharpImage 的 libjpeg 移植对拍验证：
+    //   4:2:2（h2v1）：偶数目标列 (3*S[x] + S[x-1] + 1) >> 2，奇数目标列 (3*S[x] + S[x+1] + 2) >> 2，
+    //                  首列偶 / 末列奇退化为源样本本身（邻域钳制到自身）。
+    //   4:2:0（h2v2）：先按行做垂直 (3,1) 混合 A = 3*S[r0] + S[r1]（偶输出行向上的行、奇输出行向下的行，
+    //                  镜像行钳制到边界），再对 A 做水平滤波：偶列 (3A[x] + A[x-1] + 8) >> 4，
+    //                  奇列 (3A[x] + A[x+1] + 7) >> 4。
+    // 滤波在 0..255 的样本域进行；送入 ConvertRowYCbCrToRgb 前再转回 -128 基的有符号域。
+
+    private static void Decode420FancyAll(ComponentState yComp, ComponentState cbComp, ComponentState crComp,
+        ushort[] yQuant, ushort[] cbQuant, ushort[] crQuant, byte[] output, int width, int height,
+        int mcuX, int mcuY, bool parallel)
+    {
+        int chromaStride = mcuX * 8;
+        int chromaH = mcuY * 8;
+        int realChromaW = (width + 1) >> 1;
+        int realChromaH = (height + 1) >> 1;
+
+        byte[] cbPlane = ArrayPool<byte>.Shared.Rent(chromaStride * chromaH);
+        byte[] crPlane = ArrayPool<byte>.Shared.Rent(chromaStride * chromaH);
+        try
+        {
+            // 阶段一：色度块 IDCT → 字节平面（互不相交，可并行）。
+            unsafe void Phase1(int my)
+            {
+                fixed (byte* pCb = cbPlane)
+                fixed (byte* pCr = crPlane)
+                {
+                    for (int mx = 0; mx < mcuX; mx++)
+                    {
+                        int bi = my * cbComp.BlocksX + mx;
+                        byte* dstCb = pCb + (my * 8) * chromaStride + mx * 8;
+                        byte* dstCr = pCr + (my * 8) * chromaStride + mx * 8;
+                        SimdJpegPipeline.Idct8x8ToPlane(cbComp.GetBlockSpan(bi), cbQuant, dstCb, chromaStride);
+                        SimdJpegPipeline.Idct8x8ToPlane(crComp.GetBlockSpan(bi), crQuant, dstCr, chromaStride);
+                    }
+                }
+            }
+
+            // 阶段二：按 MCU 行条带过滤 + Y IDCT + 色彩转换（条带间不共享可写区间，条带内串行）。
+            void Phase2(int my)
+            {
+                Decode420FancyStrip(my, yComp, cbComp, crComp, yQuant, cbQuant, crQuant,
+                    output, width, height, mcuX, cbPlane, crPlane, chromaStride, realChromaW, realChromaH);
+            }
+
+            if (parallel)
+            {
+                Parallel.For(0, mcuY, Phase1);
+                Parallel.For(0, mcuY, Phase2);
+            }
+            else
+            {
+                for (int my = 0; my < mcuY; my++) Phase1(my);
+                for (int my = 0; my < mcuY; my++) Phase2(my);
+            }
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(cbPlane);
+            ArrayPool<byte>.Shared.Return(crPlane);
+        }
+    }
+
+    private static unsafe void Decode420FancyStrip(int my, ComponentState yComp, ComponentState cbComp, ComponentState crComp,
+        ushort[] yQuant, ushort[] cbQuant, ushort[] crQuant, byte[] output, int width, int height, int mcuX,
+        byte[] cbPlane, byte[] crPlane, int chromaStride, int realChromaW, int realChromaH)
+    {
+        int py0 = my * 16;
+        if (py0 >= height) return;
+        int rows = Math.Min(16, height - py0);
+        int filterLen = mcuX * 16;   // 每个过滤行 = 本条带的完整输出宽度
+        int chromaCols = mcuX * 8;
+
+        short[] cbF = ArrayPool<short>.Shared.Rent(filterLen * rows);
+        short[] crF = ArrayPool<short>.Shared.Rent(filterLen * rows);
+        Span<byte> temp = stackalloc byte[16 * 16 * 3];
+        try
+        {
+            fixed (byte* pCb = cbPlane)
+            fixed (byte* pCr = crPlane)
+            fixed (byte* pOut = output)
+            fixed (short* pCbF = cbF)
+            fixed (short* pCrF = crF)
+            fixed (byte* pTemp = temp)
+            {
+                int stride = width * 3;
+
+                // 1) 逐输出行：垂直 (3,1) 混合 + 水平 fancy → 过滤色度行（0..255 域）。
+                for (int j = 0; j < rows; j++)
+                {
+                    int yRow = py0 + j;
+                    int r0 = yRow >> 1;
+                    int r1 = ((j & 1) == 0) ? (r0 > 0 ? r0 - 1 : 0)
+                                           : (r0 + 1 < realChromaH ? r0 + 1 : realChromaH - 1);
+                    SimdJpegPipeline.FancyVh2x2(pCb + (long)r0 * chromaStride, pCb + (long)r1 * chromaStride, chromaCols, realChromaW, pCbF + (long)j * filterLen);
+                    SimdJpegPipeline.FancyVh2x2(pCr + (long)r0 * chromaStride, pCr + (long)r1 * chromaStride, chromaCols, realChromaW, pCrF + (long)j * filterLen);
+                }
+
+                // 2) 逐 MCU：Y IDCT + 过滤色度 → RGB24。
+                for (int mx = 0; mx < mcuX; mx++)
+                {
+                    int px = mx * 16;
+                    if (px >= width) break;
+
+                    int blocksX = yComp.BlocksX;
+                    int yTop = (my * 2) * blocksX + mx * 2;
+                    int yBot = (my * 2 + 1) * blocksX + mx * 2;
+                    SimdJpegPipeline.Block8x8Vectors vy0 = SimdJpegPipeline.Idct8x8ToVectors(yComp.GetBlockSpan(yTop), yQuant);
+                    SimdJpegPipeline.Block8x8Vectors vy1 = SimdJpegPipeline.Idct8x8ToVectors(yComp.GetBlockSpan(yTop + 1), yQuant);
+                    SimdJpegPipeline.Block8x8Vectors vy2 = SimdJpegPipeline.Idct8x8ToVectors(yComp.GetBlockSpan(yBot), yQuant);
+                    SimdJpegPipeline.Block8x8Vectors vy3 = SimdJpegPipeline.Idct8x8ToVectors(yComp.GetBlockSpan(yBot + 1), yQuant);
+
+                    bool direct = px + 16 <= width && py0 + 16 <= height;
+                    byte* pDestBase = direct ? pOut + (long)py0 * stride + px * 3 : pTemp;
+                    int destStride = direct ? stride : 16 * 3;
+
+                    for (int j = 0; j < rows; j++)
+                    {
+                        Vector128<short> yL, yR;
+                        if (j < 8)
+                        {
+                            yL = SimdJpegPipeline.GetRow(in vy0, j);
+                            yR = SimdJpegPipeline.GetRow(in vy1, j);
+                        }
+                        else
+                        {
+                            yL = SimdJpegPipeline.GetRow(in vy2, j - 8);
+                            yR = SimdJpegPipeline.GetRow(in vy3, j - 8);
+                        }
+
+                        short* fcb = pCbF + (long)j * filterLen + px;
+                        short* fcr = pCrF + (long)j * filterLen + px;
+                        Vector128<short> cbL = Vector128.Load(fcb) - ChromaZero;
+                        Vector128<short> cbR = Vector128.Load(fcb + 8) - ChromaZero;
+                        Vector128<short> crL = Vector128.Load(fcr) - ChromaZero;
+                        Vector128<short> crR = Vector128.Load(fcr + 8) - ChromaZero;
+
+                        byte* pRow = pDestBase + (long)j * destStride;
+                        SimdJpegPipeline.ConvertRowYCbCrToRgb(yL, cbL, crL, pRow);
+                        SimdJpegPipeline.ConvertRowYCbCrToRgb(yR, cbR, crR, pRow + 24);
+                    }
+
+                    if (!direct)
+                    {
+                        int copyW = Math.Min(16, width - px);
+                        for (int j = 0; j < rows; j++)
+                        {
+                            Buffer.MemoryCopy(pTemp + (long)j * 16 * 3, pOut + (long)(py0 + j) * stride + px * 3, copyW * 3, copyW * 3);
+                        }
+                    }
+                }
+            }
+        }
+        finally
+        {
+            ArrayPool<short>.Shared.Return(cbF);
+            ArrayPool<short>.Shared.Return(crF);
+        }
+    }
+
+
+    private static void Decode422FancyAll(ComponentState yComp, ComponentState cbComp, ComponentState crComp,
+        ushort[] yQuant, ushort[] cbQuant, ushort[] crQuant, byte[] output, int width, int height,
+        int mcuX, int mcuY, bool parallel)
+    {
+        int chromaStride = mcuX * 8;
+        int chromaH = mcuY * 8;
+        int realChromaW = (width + 1) >> 1;
+
+        byte[] cbPlane = ArrayPool<byte>.Shared.Rent(chromaStride * chromaH);
+        byte[] crPlane = ArrayPool<byte>.Shared.Rent(chromaStride * chromaH);
+        try
+        {
+            unsafe void Phase1(int my)
+            {
+                fixed (byte* pCb = cbPlane)
+                fixed (byte* pCr = crPlane)
+                {
+                    for (int mx = 0; mx < mcuX; mx++)
+                    {
+                        int bi = my * cbComp.BlocksX + mx;
+                        SimdJpegPipeline.Idct8x8ToPlane(cbComp.GetBlockSpan(bi), cbQuant, pCb + (long)(my * 8) * chromaStride + mx * 8, chromaStride);
+                        SimdJpegPipeline.Idct8x8ToPlane(crComp.GetBlockSpan(bi), crQuant, pCr + (long)(my * 8) * chromaStride + mx * 8, chromaStride);
+                    }
+                }
+            }
+
+            void Phase2(int my)
+            {
+                Decode422FancyStrip(my, yComp, cbComp, crComp, yQuant, cbQuant, crQuant,
+                    output, width, height, mcuX, cbPlane, crPlane, chromaStride, realChromaW);
+            }
+
+            if (parallel)
+            {
+                Parallel.For(0, mcuY, Phase1);
+                Parallel.For(0, mcuY, Phase2);
+            }
+            else
+            {
+                for (int my = 0; my < mcuY; my++) Phase1(my);
+                for (int my = 0; my < mcuY; my++) Phase2(my);
+            }
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(cbPlane);
+            ArrayPool<byte>.Shared.Return(crPlane);
+        }
+    }
+
+    private static unsafe void Decode422FancyStrip(int my, ComponentState yComp, ComponentState cbComp, ComponentState crComp,
+        ushort[] yQuant, ushort[] cbQuant, ushort[] crQuant, byte[] output, int width, int height, int mcuX,
+        byte[] cbPlane, byte[] crPlane, int chromaStride, int realChromaW)
+    {
+        int py0 = my * 8;
+        if (py0 >= height) return;
+        int rows = Math.Min(8, height - py0);
+        int filterLen = mcuX * 16;
+        int chromaCols = mcuX * 8;
+
+        short[] cbF = ArrayPool<short>.Shared.Rent(filterLen * rows);
+        short[] crF = ArrayPool<short>.Shared.Rent(filterLen * rows);
+        Span<byte> temp = stackalloc byte[8 * 16 * 3];
+        try
+        {
+            fixed (byte* pCb = cbPlane)
+            fixed (byte* pCr = crPlane)
+            fixed (byte* pOut = output)
+            fixed (short* pCbF = cbF)
+            fixed (short* pCrF = crF)
+            fixed (byte* pTemp = temp)
+            {
+                int stride = width * 3;
+
+                for (int j = 0; j < rows; j++)
+                {
+                    int yRow = py0 + j;
+                    SimdJpegPipeline.FancyH1x2(pCb + (long)yRow * chromaStride, chromaCols, realChromaW, pCbF + (long)j * filterLen);
+                    SimdJpegPipeline.FancyH1x2(pCr + (long)yRow * chromaStride, chromaCols, realChromaW, pCrF + (long)j * filterLen);
+                }
+
+                for (int mx = 0; mx < mcuX; mx++)
+                {
+                    int px = mx * 16;
+                    if (px >= width) break;
+
+                    int blocksX = yComp.BlocksX;
+                    int yRowBase = my * blocksX + mx * 2;
+                    SimdJpegPipeline.Block8x8Vectors vy0 = SimdJpegPipeline.Idct8x8ToVectors(yComp.GetBlockSpan(yRowBase), yQuant);
+                    SimdJpegPipeline.Block8x8Vectors vy1 = SimdJpegPipeline.Idct8x8ToVectors(yComp.GetBlockSpan(yRowBase + 1), yQuant);
+
+                    bool direct = px + 16 <= width && py0 + 8 <= height;
+                    byte* pDestBase = direct ? pOut + (long)py0 * stride + px * 3 : pTemp;
+                    int destStride = direct ? stride : 16 * 3;
+
+                    for (int j = 0; j < rows; j++)
+                    {
+                        Vector128<short> yL = SimdJpegPipeline.GetRow(in vy0, j);
+                        Vector128<short> yR = SimdJpegPipeline.GetRow(in vy1, j);
+
+                        short* fcb = pCbF + (long)j * filterLen + px;
+                        short* fcr = pCrF + (long)j * filterLen + px;
+                        Vector128<short> cbL = Vector128.Load(fcb) - ChromaZero;
+                        Vector128<short> cbR = Vector128.Load(fcb + 8) - ChromaZero;
+                        Vector128<short> crL = Vector128.Load(fcr) - ChromaZero;
+                        Vector128<short> crR = Vector128.Load(fcr + 8) - ChromaZero;
+
+                        byte* pRow = pDestBase + (long)j * destStride;
+                        SimdJpegPipeline.ConvertRowYCbCrToRgb(yL, cbL, crL, pRow);
+                        SimdJpegPipeline.ConvertRowYCbCrToRgb(yR, cbR, crR, pRow + 24);
+                    }
+
+                    if (!direct)
+                    {
+                        int copyW = Math.Min(16, width - px);
+                        for (int j = 0; j < rows; j++)
+                        {
+                            Buffer.MemoryCopy(pTemp + (long)j * 16 * 3, pOut + (long)(py0 + j) * stride + px * 3, copyW * 3, copyW * 3);
+                        }
+                    }
+                }
+            }
+        }
+        finally
+        {
+            ArrayPool<short>.Shared.Return(cbF);
+            ArrayPool<short>.Shared.Return(crF);
+        }
+    }
+
+    private static readonly Vector128<short> ChromaZero = Vector128.Create((short)128);
 
     // ---------- 色彩空间判定与分量排序 ----------
 

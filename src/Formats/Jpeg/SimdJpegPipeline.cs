@@ -30,6 +30,7 @@ internal static class SimdJpegPipeline
 
     // YCbCr to RGB constants (fixed-point 16 bits)
     private const int ColorShift = 16;
+    private static readonly Vector128<int> ColorOneHalf = Vector128.Create(1 << 15);
     private const int Fix_1_402 = 91881;
     private const int Fix_0_34414 = 22554;
     private const int Fix_0_71414 = 46802;
@@ -290,8 +291,80 @@ internal static class SimdJpegPipeline
         ConvertRowYCbCrToRgb(yR, cbR, crR, pRowDest + 24);
     }
 
+    /// <summary>从 Block8x8Vectors 取第 i 行（0..7）。</summary>
+    internal static Vector128<short> GetRow(in Block8x8Vectors b, int i) => i switch
+    {
+        0 => b.V0, 1 => b.V1, 2 => b.V2, 3 => b.V3,
+        4 => b.V4, 5 => b.V5, 6 => b.V6, _ => b.V7,
+    };
+
+    private static readonly Vector128<short> LevelShift128 = Vector128.Create((short)128);
+    /// <summary>色度 0..255 域转 -128 基有符号域的减数（ConvertRowYCbCrToRgb 的入参约定）。</summary>
+    internal static readonly Vector128<short> ChromaLevel128 = Vector128.Create((short)128);
+    private static readonly Vector128<short> MaxByteValue = Vector128.Create((short)255);
+
+    /// <summary>
+    /// IDCT 一个块并把空间域样本（0..255，已做 +128 电平偏移与钳位）写入字节平面。
+    /// 供 fancy 上采样的两阶段路径使用：先重建完整色度平面，再逐行跨块过滤。
+    /// </summary>
+    internal static unsafe void Idct8x8ToPlane(ReadOnlySpan<short> coefficients, ushort[] quant, byte* plane, int stride)
+    {
+        Block8x8Vectors b = Idct8x8ToVectors(coefficients, quant);
+        StorePlaneRow(b.V0, plane + 0 * stride);
+        StorePlaneRow(b.V1, plane + 1 * stride);
+        StorePlaneRow(b.V2, plane + 2 * stride);
+        StorePlaneRow(b.V3, plane + 3 * stride);
+        StorePlaneRow(b.V4, plane + 4 * stride);
+        StorePlaneRow(b.V5, plane + 5 * stride);
+        StorePlaneRow(b.V6, plane + 6 * stride);
+        StorePlaneRow(b.V7, plane + 7 * stride);
+    }
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static unsafe Block8x8Vectors Idct8x8ToVectors(ReadOnlySpan<short> coefficients, ushort[] quant)
+    private static unsafe void StorePlaneRow(Vector128<short> v, byte* dst)
+    {
+        // IDCT 输出是 -128 基的有符号域；+128 还原到 0..255 再钳位，随后按无符号打包。
+        Vector128<short> shifted = v + LevelShift128;
+        Vector128<short> clamped = SimdCompat.MaxInt16(SimdCompat.MinInt16(shifted, MaxByteValue), Vector128<short>.Zero);
+        Vector128<byte> bytes = SimdCompat.PackUnsignedSaturate(clamped, clamped);
+        Unsafe.WriteUnaligned(dst, bytes.AsUInt64().GetElement(0));
+    }
+
+    /// <summary>fancy h2v2：行0/行1 做垂直 (3,1) 混合 A=3*row0+row1，再水平滤波出 2x 宽的行（0..255 域）。</summary>
+    internal static unsafe void FancyVh2x2(byte* row0, byte* row1, int chromaCols, int realCols, short* dst)
+    {
+        int last = realCols - 1;
+        int aPrev = 3 * row0[0] + row1[0];
+        int aCur = aPrev;
+        for (int x = 0; x < chromaCols; x++)
+        {
+            // x 超过真实色度宽度时（右缘填充列）邻域钳制到最后一个真实样本，与 libjpeg 的 context 复制一致。
+            int aNext = x < last ? 3 * row0[x + 1] + row1[x + 1] : aCur;
+            dst[2 * x] = (short)((aCur * 3 + aPrev + 8) >> 4);
+            dst[2 * x + 1] = (short)((aCur * 3 + aNext + 7) >> 4);
+            aPrev = aCur;
+            aCur = aNext;
+        }
+    }
+
+    /// <summary>fancy h2v1：单行水平滤波出 2x 宽的行（0..255 域）。</summary>
+    internal static unsafe void FancyH1x2(byte* row, int chromaCols, int realCols, short* dst)
+    {
+        int last = realCols - 1;
+        int prev = row[0];
+        int cur = prev;
+        for (int x = 0; x < chromaCols; x++)
+        {
+            int next = x < last ? row[x + 1] : cur;
+            dst[2 * x] = (short)((cur * 3 + prev + 1) >> 2);
+            dst[2 * x + 1] = (short)((cur * 3 + next + 2) >> 2);
+            prev = cur;
+            cur = next;
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static unsafe Block8x8Vectors Idct8x8ToVectors(ReadOnlySpan<short> coefficients, ushort[] quant)
     {
         fixed (short* cPtr = coefficients)
         fixed (ushort* qPtr = quant)
@@ -318,7 +391,7 @@ internal static class SimdJpegPipeline
         }
     }
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private unsafe static void ConvertRowYCbCrToRgb(Vector128<short> y, Vector128<short> cb, Vector128<short> cr, byte* pDest)
+    internal unsafe static void ConvertRowYCbCrToRgb(Vector128<short> y, Vector128<short> cb, Vector128<short> cr, byte* pDest)
     {
         y = (y + Bias128);
 
@@ -384,9 +457,12 @@ internal static class SimdJpegPipeline
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static void ConvertCore(Vector128<int> y, Vector128<int> cb, Vector128<int> cr, out Vector128<int> r, out Vector128<int> g, out Vector128<int> b)
     {
-        Vector128<int> r_off = cr * Fix_1_402 >> ColorShift;
-        Vector128<int> g_off = ((cb * Fix_0_34414) + (cr * Fix_0_71414)) >> ColorShift;
-        Vector128<int> b_off = cb * Fix_1_772 >> ColorShift;
+        // 与 libjpeg jdcolor.c 一致：算术移位前先加 ONE_HALF（1 << 15）四舍五入。
+        // 此前直接 >> 会向负方向截断，与 libjpeg 相比造成约四成像素 ±1 的普遍色差。
+        Vector128<int> half = ColorOneHalf;
+        Vector128<int> r_off = (cr * Fix_1_402 + half) >> ColorShift;
+        Vector128<int> g_off = ((cb * Fix_0_34414) + (cr * Fix_0_71414) + half) >> ColorShift;
+        Vector128<int> b_off = (cb * Fix_1_772 + half) >> ColorShift;
 
         r = y + r_off;
         g = y - g_off;

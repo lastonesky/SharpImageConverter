@@ -624,9 +624,10 @@ public sealed class JpegImage
         int cbShift = cb - 128;
         int crShift = cr - 128;
 
-        int rr = y + ((91881 * crShift) >> 16);
-        int gg = y - ((22554 * cbShift + 46802 * crShift) >> 16);
-        int bb = y + ((116130 * cbShift) >> 16);
+        // 移位前加 ONE_HALF（1 << 15）四舍五入，与 libjpeg jdcolor.c 一致，消除普遍的 ±1 色差。
+        int rr = y + ((91881 * crShift + 32768) >> 16);
+        int gg = y - ((22554 * cbShift + 46802 * crShift + 32768) >> 16);
+        int bb = y + ((116130 * cbShift + 32768) >> 16);
 
         r = ClampToByte(rr);
         g = ClampToByte(gg);
