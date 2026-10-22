@@ -119,9 +119,7 @@ StyleCopReport.xml
 
 
 examples/
-.trae/
 .workbuddy/
-.github/
 
 # A/B performance harness working data (corpus, per-run CSVs, built binaries)
 .perf/
