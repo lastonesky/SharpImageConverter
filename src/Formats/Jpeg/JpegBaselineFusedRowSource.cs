@@ -63,7 +63,6 @@ internal sealed class JpegBaselineFusedRowSource : IRowImageSource
     private readonly byte[] _nextCrRow = null!;
     private readonly short[] _cbF = null!;
     private readonly short[] _crF = null!;
-    private RowBlocks? _currentBand;
     private RowBlocks? _lookaheadBand;
     private bool _started;
 

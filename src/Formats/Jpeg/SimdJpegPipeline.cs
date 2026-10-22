@@ -299,6 +299,9 @@ internal static class SimdJpegPipeline
     };
 
     private static readonly Vector128<short> LevelShift128 = Vector128.Create((short)128);
+    private static readonly Vector128<short> ZeroShort = Vector128<short>.Zero;
+    private static readonly Vector128<short> Neg128Short = Vector128.Create((short)-128);
+    private static readonly Vector128<short> Pos127Short = Vector128.Create((short)127);
     /// <summary>色度 0..255 域转 -128 基有符号域的减数（ConvertRowYCbCrToRgb 的入参约定）。</summary>
     internal static readonly Vector128<short> ChromaLevel128 = Vector128.Create((short)128);
     private static readonly Vector128<short> MaxByteValue = Vector128.Create((short)255);
@@ -330,8 +333,72 @@ internal static class SimdJpegPipeline
         Unsafe.WriteUnaligned(dst, bytes.AsUInt64().GetElement(0));
     }
 
-    /// <summary>fancy h2v2：行0/行1 做垂直 (3,1) 混合 A=3*row0+row1，再水平滤波出 2x 宽的行（0..255 域）。</summary>
+    /// <summary>fancy h2v2：行0/行1 做垂直 (3,1) 混合 A=3*row0+row1，再水平滤波出 2x 宽的行（0..255 域）。
+    /// 大图走 SIMD：A 行向量化计算，水平滤波用三路重叠加载 + unpack 交织存储。</summary>
     internal static unsafe void FancyVh2x2(byte* row0, byte* row1, int chromaCols, int realCols, short* dst)
+    {
+        if (!SimdCompat.VectorBytesSupported || SimdCompat.ForceScalar || realCols < 8)
+        {
+            FancyVh2x2Scalar(row0, row1, chromaCols, realCols, dst);
+            return;
+        }
+
+        int last = realCols - 1;
+        // A 行（含尾部复制到 chromaCols，右缘填充列的钳制语义与标量版一致）。
+        short* aRow = stackalloc short[chromaCols + 16];
+        int x = 0;
+        for (; x + 8 <= realCols; x += 8)
+        {
+            Vector128<byte> b0 = Vector128.Load(row0 + x);
+            Vector128<byte> b1 = Vector128.Load(row1 + x);
+            Vector128<short> s0Lo = SimdCompat.UnpackLow<byte>(b0, SimdCompat.ZeroByte).AsInt16();
+            Vector128<short> s0Hi = SimdCompat.UnpackHigh<byte>(b0, SimdCompat.ZeroByte).AsInt16();
+            Vector128<short> s1Lo = SimdCompat.UnpackLow<byte>(b1, SimdCompat.ZeroByte).AsInt16();
+            Vector128<short> s1Hi = SimdCompat.UnpackHigh<byte>(b1, SimdCompat.ZeroByte).AsInt16();
+            Vector128<short> lo = SimdCompat.AddInt16(SimdCompat.AddInt16(SimdCompat.AddInt16(s0Lo, s0Lo), s0Lo), s1Lo);
+            Vector128<short> hi = SimdCompat.AddInt16(SimdCompat.AddInt16(SimdCompat.AddInt16(s0Hi, s0Hi), s0Hi), s1Hi);
+            lo.Store(aRow + x);
+            hi.Store(aRow + x + 8);
+        }
+        int tailA = x <= last ? 3 * row0[last] + row1[last] : 0;
+        for (; x < realCols; x++)
+        {
+            aRow[x] = (short)(3 * row0[x] + row1[x]);
+            tailA = aRow[x];
+        }
+        for (; x < chromaCols; x++)
+        {
+            aRow[x] = (short)tailA;
+        }
+
+        // 水平滤波：左缘 x=0 鑑制，向量区三路重叠加载，尾部标量。
+        int a0 = aRow[0];
+        dst[0] = (short)((a0 * 3 + a0 + 8) >> 4);
+        dst[1] = (short)((a0 * 3 + (realCols > 1 ? aRow[1] : a0) + 7) >> 4);
+
+        int xx = 1;
+        for (; xx + 8 < chromaCols; xx += 8)
+        {
+            Vector128<short> cur = Vector128.Load(aRow + xx);
+            Vector128<short> prev = Vector128.Load(aRow + xx - 1);
+            Vector128<short> next = Vector128.Load(aRow + xx + 1);
+            Vector128<short> cur3 = SimdCompat.AddInt16(SimdCompat.AddInt16(cur, cur), cur);
+            Vector128<short> even = (cur3 + prev + EightShort) >> 4;
+            Vector128<short> odd = (cur3 + next + SevenShort) >> 4;
+            SimdCompat.UnpackLow<short>(even, odd).Store(dst + 2L * xx);
+            SimdCompat.UnpackHigh<short>(even, odd).Store(dst + 2L * xx + 8);
+        }
+        for (; xx < chromaCols; xx++)
+        {
+            int ac = aRow[xx];
+            int ap = aRow[xx - 1];
+            int an = xx + 1 < chromaCols ? aRow[xx + 1] : ac;
+            dst[2 * xx] = (short)((ac * 3 + ap + 8) >> 4);
+            dst[2 * xx + 1] = (short)((ac * 3 + an + 7) >> 4);
+        }
+    }
+
+    private static unsafe void FancyVh2x2Scalar(byte* row0, byte* row1, int chromaCols, int realCols, short* dst)
     {
         int last = realCols - 1;
         int aPrev = 3 * row0[0] + row1[0];
@@ -347,8 +414,53 @@ internal static class SimdJpegPipeline
         }
     }
 
-    /// <summary>fancy h2v1：单行水平滤波出 2x 宽的行（0..255 域）。</summary>
+    /// <summary>fancy h2v1：单行水平滤波出 2x 宽的行（0..255 域）。大图走 SIMD。</summary>
     internal static unsafe void FancyH1x2(byte* row, int chromaCols, int realCols, short* dst)
+    {
+        if (!SimdCompat.VectorBytesSupported || SimdCompat.ForceScalar || realCols < 8)
+        {
+            FancyH1x2Scalar(row, chromaCols, realCols, dst);
+            return;
+        }
+
+        int last = realCols - 1;
+        int s0 = row[0];
+        dst[0] = (short)((s0 * 3 + s0 + 1) >> 2);
+        dst[1] = (short)((s0 * 3 + (realCols > 1 ? row[1] : s0) + 2) >> 2);
+
+        int xx = 1;
+        // 高位半段（x'=xx+8..xx+15）的 next 需读到 row[x'+1]=row[xx+16]，故边界为 xx+16 ≤ last。
+        for (; xx + 16 <= last; xx += 8)
+        {
+            Vector128<byte> c = Vector128.Load(row + xx);
+            Vector128<byte> p = Vector128.Load(row + xx - 1);
+            Vector128<byte> n = Vector128.Load(row + xx + 1);
+            Vector128<short> sc = SimdCompat.UnpackLow<byte>(c, SimdCompat.ZeroByte).AsInt16();
+            Vector128<short> sch = SimdCompat.UnpackHigh<byte>(c, SimdCompat.ZeroByte).AsInt16();
+            Vector128<short> sp = SimdCompat.UnpackLow<byte>(p, SimdCompat.ZeroByte).AsInt16();
+            Vector128<short> sph = SimdCompat.UnpackHigh<byte>(p, SimdCompat.ZeroByte).AsInt16();
+            Vector128<short> sn = SimdCompat.UnpackLow<byte>(n, SimdCompat.ZeroByte).AsInt16();
+            Vector128<short> snh = SimdCompat.UnpackHigh<byte>(n, SimdCompat.ZeroByte).AsInt16();
+            Vector128<short> sc3 = SimdCompat.AddInt16(SimdCompat.AddInt16(sc, sc), sc);
+            Vector128<short> sch3 = SimdCompat.AddInt16(SimdCompat.AddInt16(sch, sch), sch);
+            Vector128<short> even = (sc3 + sp + OneShort) >> 2;
+            Vector128<short> odd = (sc3 + sn + TwoShort) >> 2;
+            Vector128<short> evenH = (sch3 + sph + OneShort) >> 2;
+            Vector128<short> oddH = (sch3 + snh + TwoShort) >> 2;
+            SimdCompat.UnpackLow<short>(even, odd).Store(dst + 2L * xx);
+            SimdCompat.UnpackHigh<short>(even, odd).Store(dst + 2L * xx + 8);
+        }
+        for (; xx < chromaCols; xx++)
+        {
+            int sc2 = xx <= last ? row[xx] : row[last];
+            int sp = xx > 0 ? (xx - 1 <= last ? row[xx - 1] : row[last]) : sc2;
+            int sn = xx + 1 <= last ? row[xx + 1] : sc2;
+            dst[2 * xx] = (short)((sc2 * 3 + sp + 1) >> 2);
+            dst[2 * xx + 1] = (short)((sc2 * 3 + sn + 2) >> 2);
+        }
+    }
+
+    private static unsafe void FancyH1x2Scalar(byte* row, int chromaCols, int realCols, short* dst)
     {
         int last = realCols - 1;
         int prev = row[0];
@@ -362,6 +474,11 @@ internal static class SimdJpegPipeline
             cur = next;
         }
     }
+
+    private static readonly Vector128<short> OneShort = Vector128.Create((short)1);
+    private static readonly Vector128<short> TwoShort = Vector128.Create((short)2);
+    private static readonly Vector128<short> SevenShort = Vector128.Create((short)7);
+    private static readonly Vector128<short> EightShort = Vector128.Create((short)8);
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static unsafe Block8x8Vectors Idct8x8ToVectors(ReadOnlySpan<short> coefficients, ushort[] quant)
@@ -393,7 +510,13 @@ internal static class SimdJpegPipeline
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal unsafe static void ConvertRowYCbCrToRgb(Vector128<short> y, Vector128<short> cb, Vector128<short> cr, byte* pDest)
     {
-        y = (y + Bias128);
+        // libjpeg 在 IDCT 输出时就经 range_limit 鑑位到 [0,255] 再做色彩转换；
+        // 此前这里直接用未鑑位的原始 IDCT 值参与运算、只对最终和鑑位，
+        // 在饱和/过冲区域会产生 ±1~14 的系统性色差。这里对齐 libjpeg 语义：
+        // Y 鉑到 [0,255]（再转 -128 域），色度鉑到 [−128,127]。
+        y = SimdCompat.MinInt16(SimdCompat.MaxInt16(y + Bias128, ZeroShort), MaxByteValue);
+        cb = SimdCompat.MinInt16(SimdCompat.MaxInt16(cb, Neg128Short), Pos127Short);
+        cr = SimdCompat.MinInt16(SimdCompat.MaxInt16(cr, Neg128Short), Pos127Short);
 
         Vector128<int> yl = Vector128.WidenLower(y);
         Vector128<int> yh = Vector128.WidenUpper(y);

@@ -58,42 +58,41 @@ internal static class FastIDCT
 
         Span<int> workspace = stackalloc int[64];
 
-        for (int y = 0; y < 8; y++)
+        // 第一趟沿列（与 libjpeg jidctint.c 一致：先列后行；两趟顺序影响舍入，必须对齐）。
+        for (int col = 0; col < 8; col++)
         {
-            int row = y * 8;
-
-            int c1 = coefficients[row + 1];
-            int c2 = coefficients[row + 2];
-            int c3 = coefficients[row + 3];
-            int c4 = coefficients[row + 4];
-            int c5 = coefficients[row + 5];
-            int c6 = coefficients[row + 6];
-            int c7 = coefficients[row + 7];
+            int c1 = coefficients[col + 8];
+            int c2 = coefficients[col + 16];
+            int c3 = coefficients[col + 24];
+            int c4 = coefficients[col + 32];
+            int c5 = coefficients[col + 40];
+            int c6 = coefficients[col + 48];
+            int c7 = coefficients[col + 56];
 
             if ((c1 | c2 | c3 | c4 | c5 | c6 | c7) == 0)
             {
-                int dcval = (coefficients[row + 0] * quant[row + 0]) << Pass1Bits;
-                workspace[row + 0] = dcval;
-                workspace[row + 1] = dcval;
-                workspace[row + 2] = dcval;
-                workspace[row + 3] = dcval;
-                workspace[row + 4] = dcval;
-                workspace[row + 5] = dcval;
-                workspace[row + 6] = dcval;
-                workspace[row + 7] = dcval;
+                int dcval = (coefficients[col] * quant[col]) << Pass1Bits;
+                workspace[col * 8 + 0] = dcval;
+                workspace[col * 8 + 1] = dcval;
+                workspace[col * 8 + 2] = dcval;
+                workspace[col * 8 + 3] = dcval;
+                workspace[col * 8 + 4] = dcval;
+                workspace[col * 8 + 5] = dcval;
+                workspace[col * 8 + 6] = dcval;
+                workspace[col * 8 + 7] = dcval;
                 continue;
             }
 
-            int q0 = quant[row + 0];
-            int q1 = quant[row + 1];
-            int q2 = quant[row + 2];
-            int q3 = quant[row + 3];
-            int q4 = quant[row + 4];
-            int q5 = quant[row + 5];
-            int q6 = quant[row + 6];
-            int q7 = quant[row + 7];
+            int q0 = quant[col];
+            int q1 = quant[col + 8];
+            int q2 = quant[col + 16];
+            int q3 = quant[col + 24];
+            int q4 = quant[col + 32];
+            int q5 = quant[col + 40];
+            int q6 = quant[col + 48];
+            int q7 = quant[col + 56];
 
-            int in0 = coefficients[row + 0] * q0;
+            int in0 = coefficients[col] * q0;
             int in1 = c1 * q1;
             int in2 = c2 * q2;
             int in3 = c3 * q3;
@@ -146,14 +145,14 @@ internal static class FastIDCT
             tmp2o += z2o + z3o;
             tmp3o += z1o + z4o;
 
-            workspace[row + 0] = Descale(tmp10 + tmp3o, ConstBits - Pass1Bits);
-            workspace[row + 7] = Descale(tmp10 - tmp3o, ConstBits - Pass1Bits);
-            workspace[row + 1] = Descale(tmp11 + tmp2o, ConstBits - Pass1Bits);
-            workspace[row + 6] = Descale(tmp11 - tmp2o, ConstBits - Pass1Bits);
-            workspace[row + 2] = Descale(tmp12 + tmp1o, ConstBits - Pass1Bits);
-            workspace[row + 5] = Descale(tmp12 - tmp1o, ConstBits - Pass1Bits);
-            workspace[row + 3] = Descale(tmp13 + tmp0o, ConstBits - Pass1Bits);
-            workspace[row + 4] = Descale(tmp13 - tmp0o, ConstBits - Pass1Bits);
+            workspace[col * 8 + 0] = Descale(tmp10 + tmp3o, ConstBits - Pass1Bits);
+            workspace[col * 8 + 7] = Descale(tmp10 - tmp3o, ConstBits - Pass1Bits);
+            workspace[col * 8 + 1] = Descale(tmp11 + tmp2o, ConstBits - Pass1Bits);
+            workspace[col * 8 + 6] = Descale(tmp11 - tmp2o, ConstBits - Pass1Bits);
+            workspace[col * 8 + 2] = Descale(tmp12 + tmp1o, ConstBits - Pass1Bits);
+            workspace[col * 8 + 5] = Descale(tmp12 - tmp1o, ConstBits - Pass1Bits);
+            workspace[col * 8 + 3] = Descale(tmp13 + tmp0o, ConstBits - Pass1Bits);
+            workspace[col * 8 + 4] = Descale(tmp13 - tmp0o, ConstBits - Pass1Bits);
         }
 
         for (int x = 0; x < 8; x++)
@@ -173,14 +172,15 @@ internal static class FastIDCT
                 if ((uint)v > 255u) v = v < 0 ? 0 : 255;
 
                 byte b = (byte)v;
-                dest[(0 * destStride) + x] = b;
-                dest[(1 * destStride) + x] = b;
-                dest[(2 * destStride) + x] = b;
-                dest[(3 * destStride) + x] = b;
-                dest[(4 * destStride) + x] = b;
-                dest[(5 * destStride) + x] = b;
-                dest[(6 * destStride) + x] = b;
-                dest[(7 * destStride) + x] = b;
+                // 第二趟遍历的是行 x：输出沿列展开。
+                dest[(x * destStride) + 0] = b;
+                dest[(x * destStride) + 1] = b;
+                dest[(x * destStride) + 2] = b;
+                dest[(x * destStride) + 3] = b;
+                dest[(x * destStride) + 4] = b;
+                dest[(x * destStride) + 5] = b;
+                dest[(x * destStride) + 6] = b;
+                dest[(x * destStride) + 7] = b;
                 continue;
             }
 
@@ -230,14 +230,15 @@ internal static class FastIDCT
             tmp2o += z2o + z3o;
             tmp3o += z1o + z4o;
 
-            WriteOut(dest, destStride, x, 0, tmp10 + tmp3o);
-            WriteOut(dest, destStride, x, 7, tmp10 - tmp3o);
-            WriteOut(dest, destStride, x, 1, tmp11 + tmp2o);
-            WriteOut(dest, destStride, x, 6, tmp11 - tmp2o);
-            WriteOut(dest, destStride, x, 2, tmp12 + tmp1o);
-            WriteOut(dest, destStride, x, 5, tmp12 - tmp1o);
-            WriteOut(dest, destStride, x, 3, tmp13 + tmp0o);
-            WriteOut(dest, destStride, x, 4, tmp13 - tmp0o);
+            // 输出位置 k → dest[行x, 列k]；与 WriteOut 的 (x=列, y=行) 参数序对应。
+            WriteOut(dest, destStride, 0, x, tmp10 + tmp3o);
+            WriteOut(dest, destStride, 7, x, tmp10 - tmp3o);
+            WriteOut(dest, destStride, 1, x, tmp11 + tmp2o);
+            WriteOut(dest, destStride, 6, x, tmp11 - tmp2o);
+            WriteOut(dest, destStride, 2, x, tmp12 + tmp1o);
+            WriteOut(dest, destStride, 5, x, tmp12 - tmp1o);
+            WriteOut(dest, destStride, 3, x, tmp13 + tmp0o);
+            WriteOut(dest, destStride, 4, x, tmp13 - tmp0o);
         }
     }
 
