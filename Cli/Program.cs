@@ -140,7 +140,7 @@ class Program
         Console.WriteLine("操作: resize:WxH | resizebilinear:WxH | resizefit:WxH | grayscale");
         Console.WriteLine("参数: --quality N | --subsample 420/422/444 | --jpeg-progressive | --keep-metadata | --idct int/float | --stream | --stream-strict | --memory-limit N | --no-memory-guard | --jpeg-debug | --gif-frames | --gray | --dithering on/off");
         Console.WriteLine("WebP 档位: --webp-method 0~6（默认 3；q>=75 时 method 4 自动降为 3（>140 MP 有 3~4 倍悬崖），6 最省体积最慢）");
-        Console.WriteLine("JPEG 编码: 默认 baseline；--jpeg-progressive 输出 progressive（SOF2）");
+        Console.WriteLine("JPEG 编码: 默认 baseline；--jpeg-progressive 输出 progressive（SOF2）；--jpeg-trellis 启用 RD 优化量化（同画质省 5%~15% 体积，编码耗时约 3~10 倍，默认关闭）");
         Console.WriteLine("GIF 耗时统计: --gif-debug（分阶段耗时）| --gif-bench N（重复 N 次取最小/中位/平均，默认 5）");
         Console.WriteLine("JPEG 耗时统计: --jpeg-bench N（重复 N 次；配合环境变量 SIC_JPEG_STAGE_TIMING=1 输出分阶段耗时）");
         Console.WriteLine("GIF 量化器: --gif-quantizer octree(默认,八叉树+Bayer) | wu/legacy(原 Wu+Floyd–Steinberg)");
@@ -482,6 +482,12 @@ class Program
             if (string.Equals(a, "--jpeg-progressive", StringComparison.OrdinalIgnoreCase))
             {
                 options.JpegProgressive = true;
+                continue;
+            }
+            if (string.Equals(a, "--jpeg-trellis", StringComparison.OrdinalIgnoreCase))
+            {
+                // RD 优化量化：只在显式请求时启用（每块退回标量 FDCT + DP，编码耗时约为最近值的 3~10 倍）。
+                options.JpegTrellis = true;
                 continue;
             }
             if (string.Equals(a, "--opt-no-jpeg-progressive", StringComparison.OrdinalIgnoreCase))
@@ -1104,9 +1110,23 @@ class Program
             options.OutputPath = EnsureOutputPath(options.InputPath, options.OutputPath, options.OutputExtension ?? ".png");
             string output = options.OutputPath ?? throw new InvalidOperationException("输出路径为空");
             var target = ImageOptimizer.DetectKindByExtension(Path.GetExtension(output));
-            StreamingConversion.Convert(
-                options.InputPath, output, target, options.Gray,
-                options.JpegQuality ?? 75, JpegSubsamplingOf(options), options.JpegProgressive);
+            try
+            {
+                StreamingConversion.Convert(
+                    options.InputPath, output, target, options.Gray,
+                    options.JpegQuality ?? 75, JpegSubsamplingOf(options), options.JpegProgressive,
+                    options.UseFloatIdct);
+            }
+            catch (NotSupportedException ex) when (options.UseFloatIdct)
+            {
+                // 逐行解码的 4:2:0/4:2:2 只有「SIMD 定点 + fancy 上采样」或「浮点 + 双线性」两种组合，
+                // 后者会牺牲色度清晰度，所以拒绝浮点 IDCT。这里退回整数 IDCT 并把原因说清楚，
+                // 而不是让内存守卫自动触发的流式路径直接失败。
+                Console.WriteLine($"⚠️ {ex.Message}（已回退整数 IDCT）");
+                StreamingConversion.Convert(
+                    options.InputPath, output, target, options.Gray,
+                    options.JpegQuality ?? 75, JpegSubsamplingOf(options), options.JpegProgressive);
+            }
             Console.WriteLine($"✅ 流式转换完成: {output}");
             return true;
         }
@@ -1156,7 +1176,7 @@ class Program
         if (ext is ".jpg" or ".jpeg")
         {
             int q = options.JpegQuality ?? 75;
-            var optionsJpeg = new JpegEncoderOptions(q, JpegSubsamplingOf(options), keepMetadata: false, enableDiagnostics: false);
+            var optionsJpeg = new JpegEncoderOptions(q, JpegSubsamplingOf(options), keepMetadata: false, enableDiagnostics: false, optimizeHuffman: false, trellisQuantization: options.JpegTrellis);
             EncodeJpegWithOptions(frame, path, optionsJpeg, options.JpegProgressive);
             return;
         }
@@ -1332,7 +1352,7 @@ class Program
     {
         int q = options.JpegQuality ?? 75;
         bool isInputGray = IsGrayRgb(image);
-        var encoderOptions = new JpegEncoderOptions(q, JpegSubsamplingOf(options), keepMetadata, options.JpegDebug);
+        var encoderOptions = new JpegEncoderOptions(q, JpegSubsamplingOf(options), keepMetadata, options.JpegDebug, optimizeHuffman: false, trellisQuantization: options.JpegTrellis);
         if (options.Gray || isInputGray)
         {
             var grayImage = ToGray8(image);
@@ -1347,7 +1367,7 @@ class Program
     {
         int q = options.JpegQuality ?? 75;
         bool isInputGray = IsGrayRgba(rgbaImage);
-        var encoderOptions = new JpegEncoderOptions(q, JpegSubsamplingOf(options), keepMetadata: true, enableDiagnostics: options.JpegDebug);
+        var encoderOptions = new JpegEncoderOptions(q, JpegSubsamplingOf(options), keepMetadata: true, enableDiagnostics: options.JpegDebug, optimizeHuffman: false, trellisQuantization: options.JpegTrellis);
         if (options.Gray || isInputGray)
         {
             var rgb = new Image<Rgb24>(rgbaImage.Width, rgbaImage.Height, RgbaToRgb(rgbaImage.Buffer), rgbaImage.Metadata);
