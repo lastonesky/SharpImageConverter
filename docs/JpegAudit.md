@@ -98,6 +98,65 @@
 2. **DP 的码率模型用标准 Huffman 表**；当 `optimizeHuffman=true`（optimize 默认开）时第二遍用按图优化的表，
    码率估计与实际有偏差。实测该组合仍有 −20% 体积，偏差可接受；要更准需把第一遍统计的真实码长回灌 DP，代价是再一轮迭代。
 
+**SIMD 覆盖与剩余空间（2026-10-23 实测，探针 `E:\tmp\tcqprobe`）**
+
+先说结论：**trellis 并不是「不能用 SIMD FDCT」**，而是没必要——`SimdJpegEncodePipeline.ForwardDct8x8`
+（非融合版，正是为「不带量化」保留的）与标量 FDCT 逐位一致（4.19 MP 全量 4,194,304 个系数零差异），
+接上后端到端 **548 vs 549 ms**（10 对交错、中位差 0.11%，产物 md5 相同），因为 FDCT 只占 trellis 单块的 2%。
+所以 `DctQuantizeInPlace` 保留标量 FDCT 是为了少一条运行时分派，不是能力限制。
+
+单块成本分解（2048×2048 灰度块、q80、单线程；DP 用逐行复刻版测量，三段只差被删掉的那段）：
+
+| DP 阶段 | ns/块 | 占 DP | 现状 |
+|---|---|---|---|
+| 骨架：`G[s] = min_q(dp[16q+s] + q·λZRL)` + `next[]` 移位 | 1377 | 37% | 已是 16 lane 向量 min/add |
+| 候选枚举 / 分类（含 `MinRate`） | 1363 | 38% | 混合：`MinRate` 向量化但归约差 |
+| 回溯定位 `bestRun` | 889 | 24% | 已是向量比较 + lane 扫描 |
+
+- **`MinRate` 是最大单项**：每块约 189 次调用、合计 ≈ 1500 ns（单次 7.97 ns）。标量对照 11.5 ns，
+  向量版只快 1.45×——16 个 lane 只用上 1.45×，说明瓶颈不在算，而在 `acc[lane]` 的 8 次逐 lane 提取
+  （每次都是一条 shuffle/extract）。改成 shuffle 折叠或「存回栈 + 一次扫描」应能到 2~3 ns/次。
+- **码率表每块重算 160 项**：169~202 ns（占 DP 4~5%），只依赖 (λ, 标准 AC 码长表)，可提到 `TrellisContext`。
+- **回溯定位**扫 64 个状态找最小代价（889 ns，24%）；可在 `G` 计算时顺带记 argmin_q、在 `MinRate` 里记 argmin_s
+  直接得 `bestRun`，但要保住现有「r 升序第一个」的平局规则，且必须逐字节验证产物。
+
+不能靠「加宽向量」解决的部分：DP 是 min-plus 递推，63 个位置**严格串行**（位置 p 的 dp 依赖 p-1），
+唯一可并行维度是 16 个 `run mod 16` 状态；单块内的候选枚举（≤3 个）与 (run,size) 码表查找是 gather + 分支，
+SIMD 收益有限（VNNI 也帮不上，见 `JpegTrellisQuantizer` 类注释）。块间并行已由 `ProcessDct` 的 `dctWorkers`（≤8）承担。
+
+粗算：上面三处都不加宽向量、只改实现质量，DP 可降 ~30%（4.4 → ~3.1 µs/块），端到端 trellis 编码约 −25%。
+
+**三处优化的落地结果（2026-10-23，探针 `E:\tmp\tcqab`，与 `E:\tmp\sic-baseline` worktree 交错 A/B）**
+
+已全部落地（`JpegTrellisQuantizer` + `JpegEncoder.TrellisContext`）：
+
+1. **码率表上提**：新增 `JpegTrellisQuantizer.Context`（rate 表 + λ64/ZRL/EOB 缩放值），
+   由 `JpegEncoder.TrellisContext` 构造时每表建一次（luma/chroma 各一），`QuantizeInPlace` 新增 Context 重载；
+   旧签名保留并内部走 Context（测试继续用它）。极端 λ（env 覆盖超 int32 快路径范围）仍回落 legacy long DP。
+2. **`MinRate` 水平归约**：256 位向量先 `vextracti128` 折半，128 位内 2 次 shuffle-min，不再逐 lane 提取。
+   同进程环境变量 A/B 过 shuffle 折叠 vs 标量 4-lane 提取：**无显著差异**（min 3548 vs 3549 ns/块），
+   保留 shuffle 版。
+3. **回溯定位改 argmin 分解**：不再整体重扫 64 个状态。`bestRateMin = min_s(g[s] + rate[cat,s])` 且
+   回溯只在 `bestCost < Inf32` 时发生 ⇒ 饱和哨兵不参与等式，故「第一个达标的 r」可分解为
+   「并列的 s（向量等值比较）× 该列最小 q（≤4 次标量比较）」，取并列 s 中最小的 r——
+   与旧 64 状态升序扫描逐位等价（含平局规则）。
+
+实测（4.19 MP / 65536 块、q80、λ=9.6、12 轮轮转取 min，跨运行多次重复）：
+
+| 路径 | ns/块 |
+|---|---|
+| baseline 旧 DP（含每块建表） | 4205~4323 |
+| new 旧签名入口（每块一次 Context 分配，非生产路径） | 3540~3590 |
+| **new ctx 直调（= 新生产路径）** | **3252~3371** |
+
+**DP 4205 → 3252 ns/块 ≈ −23%**（未到粗算的 −30%：shuffle 折叠实测没拿到预期的额外收益，
+主要进账来自回溯定位的消除）。CreateContext 每图一次，摊销后 <5 ns/块。
+
+逐字节验证：**9 图 × q60/80/95 的 `--to jpg --jpeg-trellis`（27 个产物）与
+3 个 `--optimize --opt-jpeg-trellis` 产物，baseline 与新版 md5 全部一致**；
+进程内真实图旧签名 vs Context API 差异 0/4,194,304；`VectorizedDp_MatchesLegacyCost`
+（5 档 λ × 40 组随机块）继续通过。372 个非 Slow 测试全绿。
+
 **测试素材陷阱（复测时别踩）**：`5_star_base.jpg` 本身是 q80 档量化表编码的渐进式 4:2:2 JPEG；
 用「解码→重编码」做 RD 曲线时，在与原图相同量化格点（q80）会出现 PSNR 尖峰，中间档位被二次压缩拉低，
 曲线非单调是素材现象，不是编码器 bug（已用 WIC 独立解码交叉验证）。RD 评估要用单代源（PNG 或无损）。
