@@ -117,10 +117,17 @@ namespace SharpImageConverter.Compression
         private static readonly double[] s_weightsRgba = [0.2392, 0.4696, 0.0912, 0.2];
 
         /// <summary>
-        /// 启用按带分片的像素下限。低于此值串行更快（并行调度与分片合并的固定开销摊不平）：
-        /// 按 ~1.9 ns/px 算，4 MP 串行约 8 ms，24 核并行约 1 ms。
+        /// 启用按带分片的像素下限。低于此值串行更快（并行调度与分片合并的固定开销摊不平）。
         /// </summary>
-        private const long ParallelPixelThreshold = 4_000_000;
+        /// <remarks>
+        /// 旧值 4_000_000 是按「~1.9 ns/px」推算的，实测串行是 20 ns/px（早于本值落地时为 34），
+        /// 于是 1~4 MP 的照片全程串行评估，反而比 4.19 MP 的图慢得多。
+        /// 实测串行/并行拐点（本机 12 线程、RGB）：0.010 MP 0.63x、0.022 MP 1.28x、
+        /// 0.040 MP 1.75x、0.102 MP 3.78x、0.250 MP 3.79x、4.194 MP 4.98x —— 0.02 MP 起并行就划算了。
+        /// 取值 500_000 而不是拐点本身：目录批量时外层已按文件并行，内层再开满线程只会超订，
+        /// 所以把「多花线程」的范围限制在 0.5 MP 以上（那里并行已是 3.8x）。
+        /// </remarks>
+        private const long ParallelPixelThreshold = 500_000;
 
         /// <summary>
         /// 比较两幅同尺寸图像的差异。
@@ -417,6 +424,78 @@ namespace SharpImageConverter.Compression
             // 按「带」累加：一带 = blockSize 行，4×4 块不会跨带。
             // 分片因此只是把若干整带分给不同线程，分片内部的累加顺序与串行版逐项相同。
             void Accumulate(ReadOnlySpan<byte> refSpan, ReadOnlySpan<byte> testSpan, int bandStart, int bandEnd, ref double rawSquared, ref double absSum, ref double blockSquared, ref long blockCount)
+            {
+                if (channels == 3)
+                {
+                    AccumulateRgb(refSpan, testSpan, bandStart, bandEnd, ref rawSquared, ref absSum, ref blockSquared, ref blockCount);
+                }
+                else
+                {
+                    AccumulateRgba(refSpan, testSpan, bandStart, bandEnd, ref rawSquared, ref absSum, ref blockSquared, ref blockCount);
+                }
+            }
+
+            // RGB 专用路径。通用循环里每个通道都算 `(v * 255 + 255/2) / 255` —— 那是为 RGBA 预乘
+            // alpha 写的，3 通道下该式恒等于 v（整数除法：floor((255v+127)/255) = v），属于纯空转。
+            // 这里按通道展开、把 weights 提到循环外，累加顺序与通用循环逐项相同，结果逐位不变。
+            void AccumulateRgb(ReadOnlySpan<byte> refSpan, ReadOnlySpan<byte> testSpan, int bandStart, int bandEnd, ref double rawSquared, ref double absSum, ref double blockSquared, ref long blockCount)
+            {
+                double w0 = weights[0];
+                double w1 = weights[1];
+                double w2 = weights[2];
+                for (int b = bandStart; b < bandEnd; b++)
+                {
+                    int by = b * blockSize;
+                    int yEnd = Math.Min(by + blockSize, height);
+                    for (int bx = 0; bx < width; bx += blockSize)
+                    {
+                        int xEnd = Math.Min(bx + blockSize, width);
+                        int columns = xEnd - bx;
+                        double r0 = 0, r1 = 0, r2 = 0;
+                        double t0 = 0, t1 = 0, t2 = 0;
+                        int n = 0;
+
+                        for (int y = by; y < yEnd; y++)
+                        {
+                            int p = y * rowBytes + bx * 3;
+                            int pEnd = p + columns * 3;
+                            for (; p < pEnd; p += 3)
+                            {
+                                int rv0 = refSpan[p], tv0 = testSpan[p];
+                                int rv1 = refSpan[p + 1], tv1 = testSpan[p + 1];
+                                int rv2 = refSpan[p + 2], tv2 = testSpan[p + 2];
+                                r0 += rv0; t0 += tv0;
+                                r1 += rv1; t1 += tv1;
+                                r2 += rv2; t2 += tv2;
+
+                                int d0 = rv0 - tv0;
+                                rawSquared += w0 * d0 * d0;
+                                absSum += w0 * (d0 < 0 ? -d0 : d0);
+                                int d1 = rv1 - tv1;
+                                rawSquared += w1 * d1 * d1;
+                                absSum += w1 * (d1 < 0 ? -d1 : d1);
+                                int d2 = rv2 - tv2;
+                                rawSquared += w2 * d2 * d2;
+                                absSum += w2 * (d2 < 0 ? -d2 : d2);
+                            }
+
+                            n += columns;
+                        }
+
+                        if (n == 0) continue;
+                        double inv = 1.0 / n;
+                        double e0 = (r0 - t0) * inv;
+                        blockSquared += w0 * e0 * e0;
+                        double e1 = (r1 - t1) * inv;
+                        blockSquared += w1 * e1 * e1;
+                        double e2 = (r2 - t2) * inv;
+                        blockSquared += w2 * e2 * e2;
+                        blockCount++;
+                    }
+                }
+            }
+
+            void AccumulateRgba(ReadOnlySpan<byte> refSpan, ReadOnlySpan<byte> testSpan, int bandStart, int bandEnd, ref double rawSquared, ref double absSum, ref double blockSquared, ref long blockCount)
             {
                 Span<double> refSum = stackalloc double[4];
                 Span<double> testSum = stackalloc double[4];
