@@ -2322,8 +2322,11 @@ public static class JpegEncoder
     {
         if (trellis != null)
         {
-            // trellis 需要看到量化前的 DCT 系数；SIMD 融合路径会原地销毁它们，
-            // 因此这里退回标量 FDCT（该模式只为离线评估/显式 opt-in 服务）。
+            // trellis 需要看到量化前的 DCT 系数；融合版 ForwardDctQuantize8x8 在写回时就乘倒数，
+            // 拿不到量化前系数，所以只能走非融合路径。
+            // 非融合的 SIMD 版（SimdJpegEncodePipeline.ForwardDct8x8）与标量逐位一致，但接上实测
+            // 端到端无差异（4.19 MP q80：548 vs 549 ms，产物 md5 相同）——FDCT 只占 trellis 单块
+            // 的 2%（91 vs 4315 ns），96% 以上是 DP 本身。因此这里保留标量，少一条运行时分派。
             FDCT8x8IntInPlace(block);
             return trellis.Quantize(block, quantRecip, chroma);
         }
@@ -2733,23 +2736,24 @@ public static class JpegEncoder
     /// 且下游只读，因此可以在多次编码之间共享同一份不可变实例。
     /// </summary>
     /// <summary>
-    /// trellis 量化上下文：量化表 / 标准 AC Huffman 码长 / RD 乘子。
+    /// trellis 量化上下文：量化表 / 标准 AC Huffman 码长 / RD 乘子 / 每表的码率预计算。
+    /// 码率表、ZRL/EOB 缩放值只由 AC 码长表和 λ 决定，与块内容无关，
+    /// 在构造时（每张图一次）算好，避免每块重算 176 项。
     /// </summary>
     private sealed class TrellisContext
     {
         private readonly byte[] _lumaQuant;
         private readonly byte[] _chromaQuant;
-        private readonly byte[] _lumaAcBits;
-        private readonly byte[] _chromaAcBits;
-        private readonly double _lambda;
+        private readonly JpegTrellisQuantizer.Context _lumaTrellis;
+        private readonly JpegTrellisQuantizer.Context _chromaTrellis;
 
         public TrellisContext(byte[] lumaQuant, byte[] chromaQuant, int quality)
         {
             _lumaQuant = lumaQuant;
             _chromaQuant = chromaQuant;
-            _lumaAcBits = BuildAcCodeLengths(AcYHuffTable);
-            _chromaAcBits = BuildAcCodeLengths(AcCHuffTable);
-            _lambda = JpegTrellisQuantizer.LambdaForQuality(quality);
+            double lambda = JpegTrellisQuantizer.LambdaForQuality(quality);
+            _lumaTrellis = JpegTrellisQuantizer.CreateContext(BuildAcCodeLengths(AcYHuffTable), lambda);
+            _chromaTrellis = JpegTrellisQuantizer.CreateContext(BuildAcCodeLengths(AcCHuffTable), lambda);
         }
 
         public int Quantize(Span<int> block, int[] quantRecip, bool chroma)
@@ -2757,8 +2761,7 @@ public static class JpegEncoder
                 block,
                 quantRecip,
                 chroma ? _chromaQuant : _lumaQuant,
-                chroma ? _chromaAcBits : _lumaAcBits,
-                _lambda);
+                chroma ? _chromaTrellis : _lumaTrellis);
 
         private static byte[] BuildAcCodeLengths(HuffCode[] table)
         {

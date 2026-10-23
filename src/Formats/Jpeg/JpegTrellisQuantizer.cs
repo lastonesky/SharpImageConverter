@@ -1,5 +1,7 @@
 using System;
 using System.Numerics;
+using System.Runtime.CompilerServices;
+using System.Runtime.Intrinsics;
 
 namespace SharpImageConverter.Formats.Jpeg;
 
@@ -64,7 +66,6 @@ internal static class JpegTrellisQuantizer
     [ThreadStatic] private static int[]? t_dp32;
     [ThreadStatic] private static int[]? t_next32;
     [ThreadStatic] private static int[]? t_g;
-    [ThreadStatic] private static int[]? t_rate;
     [ThreadStatic] private static byte[]? t_prevRun;
     [ThreadStatic] private static short[]? t_value16;
 
@@ -96,6 +97,56 @@ internal static class JpegTrellisQuantizer
     }
 
     /// <summary>
+    /// 跨块复用的预计算上下文：码率表、λ、ZRL/EOB 缩放值都只由 AC 码长表和 λ 决定，
+    /// 与块内容无关。同一张图的所有块共用一个实例，避免每块重算 176 项码率表。
+    /// </summary>
+    internal sealed class Context
+    {
+        /// <summary>rate[cat, s] = λ64 × len(symbol = s&lt;&lt;4 | cat)，cat ∈ [1,10]、s ∈ [0,15]。</summary>
+        internal readonly int[] Rate = new int[11 * 16];
+
+        /// <summary>λ×64（long 口径，供 legacy 路径与范围检查）。</summary>
+        internal readonly long LambdaScaled;
+
+        /// <summary>λ×64 的 int32 视图，仅 <see cref="FastPath"/> 为 true 时有效。</summary>
+        internal readonly int LambdaScaled32;
+
+        internal readonly int ZrlScaled;
+        internal readonly int EobScaled;
+        internal readonly byte[] AcCodeLengths;
+
+        /// <summary>λ×64 落在 int32 快路径安全范围（否则走 legacy long DP）。</summary>
+        internal bool FastPath => LambdaScaled >= 0 && LambdaScaled <= MaxLambdaScaledForInt32;
+
+        internal Context(ReadOnlySpan<byte> acCodeLengths, double lambda)
+        {
+            AcCodeLengths = acCodeLengths.ToArray();
+            LambdaScaled = (long)Math.Round(lambda * 64.0);
+            if (!FastPath)
+            {
+                return;
+            }
+
+            LambdaScaled32 = (int)LambdaScaled;
+            ZrlScaled = Math.Max(1, (int)acCodeLengths[0xF0]) * LambdaScaled32;
+            EobScaled = Math.Max(1, (int)acCodeLengths[0x00]) * LambdaScaled32;
+            for (int cat = 1; cat <= 10; cat++)
+            {
+                for (int s = 0; s < 16; s++)
+                {
+                    int length = acCodeLengths[(s << 4) | cat];
+                    if (length <= 0) length = 16;
+                    Rate[(cat << 4) | s] = length * LambdaScaled32;
+                }
+            }
+        }
+    }
+
+    /// <summary>为一张图（一套 AC 码长表 + λ）创建跨块复用的上下文。</summary>
+    internal static Context CreateContext(ReadOnlySpan<byte> acCodeLengths, double lambda)
+        => new(acCodeLengths, lambda);
+
+    /// <summary>
     /// 原地把 DCT 系数（自然顺序、8 倍缩放）替换为 trellis 量化结果。
     /// </summary>
     /// <param name="block">DCT 系数，原地改写为量化值（自然顺序）</param>
@@ -111,15 +162,24 @@ internal static class JpegTrellisQuantizer
         ReadOnlySpan<byte> acCodeLengths,
         double lambda)
     {
+        return QuantizeInPlace(block, recip, quant, CreateContext(acCodeLengths, lambda));
+    }
+
+    /// <summary>跨块复用 <see cref="Context"/> 的入口：一次建表，每个块只做 DP。</summary>
+    internal static int QuantizeInPlace(
+        Span<int> block,
+        ReadOnlySpan<int> recip,
+        ReadOnlySpan<byte> quant,
+        Context context)
+    {
         // DC 保持最近值：DC 差分对整体亮度/码率的影响与 AC 的 run 模型不同，收益也小。
         block[0] = QuantizeNearest(block[0], recip[0]);
 
-        long lambdaScaled = (long)Math.Round(lambda * 64.0);
-        if (lambdaScaled > MaxLambdaScaledForInt32 || lambdaScaled < 0)
+        if (!context.FastPath)
         {
-            return QuantizeInPlaceLegacy(block, recip, quant, acCodeLengths, lambdaScaled);
+            return QuantizeInPlaceLegacy(block, recip, quant, context.AcCodeLengths, context.LambdaScaled);
         }
-        return QuantizeInPlaceVectorized(block, recip, quant, acCodeLengths, (int)lambdaScaled);
+        return QuantizeInPlaceVectorized(block, recip, quant, context);
     }
 
     // ---------------------------------------------------------------------
@@ -130,13 +190,15 @@ internal static class JpegTrellisQuantizer
         Span<int> block,
         ReadOnlySpan<int> recip,
         ReadOnlySpan<byte> quant,
-        ReadOnlySpan<byte> acCodeLengths,
-        int lambdaScaled)
+        Context context)
     {
+        int lambdaScaled = context.LambdaScaled32;
+        int zrlScaled = context.ZrlScaled;
+
         int[] dpArr = t_dp32 ??= new int[N];
         int[] nextArr = t_next32 ??= new int[N];
         int[] gArr = t_g ??= new int[16];
-        int[] rateArr = t_rate ??= new int[11 * 16];
+        int[] rateArr = context.Rate;
         byte[] prevRunArr = t_prevRun ??= new byte[N];
         short[] valueArr = t_value16 ??= new short[N];
 
@@ -144,20 +206,6 @@ internal static class JpegTrellisQuantizer
         Span<int> next = nextArr.AsSpan(0, N);
         Span<int> g = gArr.AsSpan(0, 16);
         Span<int> rate = rateArr.AsSpan(0, 11 * 16);
-
-        int zrl = Math.Max(1, (int)acCodeLengths[0xF0]);
-        int zrlScaled = zrl * lambdaScaled;
-
-        // rate[cat, s] = λ64 × len(symbol = s<<4 | cat)，cat ∈ [1,10]、s ∈ [0,15]。
-        for (int cat = 1; cat <= 10; cat++)
-        {
-            for (int s = 0; s < 16; s++)
-            {
-                int length = acCodeLengths[(s << 4) | cat];
-                if (length <= 0) length = 16;
-                rate[(cat << 4) | s] = length * lambdaScaled;
-            }
-        }
 
         ReadOnlySpan<byte> zigzag = JpegConstants.ZigZag;
 
@@ -188,7 +236,6 @@ internal static class JpegTrellisQuantizer
             ref int dpRef = ref dp[0];
             ref int nextRef = ref next[0];
             ref int gRef = ref g[0];
-            ref int rateRef = ref rate[0];
 
             // G[s] = min_q(dp[16q+s] + q×λZRL)。G 只跟 dp 有关，与候选值/category 无关。
             for (int i = 0; i < 16; i += lanes)
@@ -252,30 +299,12 @@ internal static class JpegTrellisQuantizer
             if (bestValue != 0)
             {
                 // 回溯只需要 (上一状态, 量化值)：run≥1 的转移是确定的，无需 64×64 父表。
-                // 用向量按 r 升序找第一个等于最小代价的状态（保持旧实现的平局规则）。
-                int bestRun = 0;
-                var minVec = new Vector<int>(bestRateMin);
-                int rateOffset = bestCategory << 4;
-                bool found = false;
-                for (int r = 0; r < N && !found; r += lanes)
-                {
-                    Vector<int> costVec = Vector.LoadUnsafe(ref dpRef, (nuint)r)
-                        + new Vector<int>((r >> 4) * zrlScaled)
-                        + Vector.LoadUnsafe(ref rateRef, (nuint)(rateOffset + (r & 15)));
-                    costVec = Vector.Min(costVec, infVec);
-                    if (Vector.Equals(costVec, minVec) != Vector<int>.Zero)
-                    {
-                        for (int lane = 0; lane < lanes; lane++)
-                        {
-                            if (costVec[lane] == bestRateMin)
-                            {
-                                bestRun = r + lane;
-                                found = true;
-                                break;
-                            }
-                        }
-                    }
-                }
+                // 不再整体重扫 64 个状态：由 bestRateMin 的定义，
+                //   Min(dp[r] + q·λZRL + rate[cat, r&15], Inf32) == bestRateMin
+                // 可分解为「g[s] + rate[cat,s] == bestRateMin 的 s」×「dp[16q+s] + q·λZRL == g[s]
+                // 的最小 q」，r = 16q+s，取所有并列 s 中最小的 r——与旧的 64 状态升序向量
+                // 扫描逐位等价（含「r 升序第一个」平局规则），但典型情况只扫 1 列 × ≤4 个 q。
+                int bestRun = FindBestRun(dp, g, rate, bestCategory, bestRateMin, zrlScaled, lanes);
                 prevRunArr[p] = (byte)bestRun;
                 valueArr[p] = (short)bestValue;
             }
@@ -307,9 +336,8 @@ internal static class JpegTrellisQuantizer
             next = swap;
         }
 
-        // 终止代价：run>0 还要补一个 EOB。
-        int eobBits = Math.Max(1, (int)acCodeLengths[0x00]);
-        int eobScaled = eobBits * lambdaScaled;
+        // 终止代价：run>0 还要补一个 EOB（EOB 缩放值已在 Context 里预计算）。
+        int eobScaled = context.EobScaled;
         int bestTotal = int.MaxValue;
         int bestState = 0;
         for (int r = 0; r < N; r++)
@@ -346,7 +374,11 @@ internal static class JpegTrellisQuantizer
         return 0;
     }
 
-    /// <summary>min_s(g[s] + rate[cat, s])，16 lane 向量归约。</summary>
+    /// <summary>
+    /// min_s(g[s] + rate[cat, s])，16 lane 向量归约。
+    /// 水平 min 用 shuffle 折叠（128 位内 2 次 shuffle + min，256 位先 vextracti128 折半），
+    /// 不做逐 lane 提取——<c>acc[lane]</c> 逐个取标量是原实现的主要开销。
+    /// </summary>
     private static int MinRate(Span<int> g, Span<int> rate, int category, int lanes)
     {
         ref int gRef = ref g[0];
@@ -356,13 +388,92 @@ internal static class JpegTrellisQuantizer
         {
             acc = Vector.Min(acc, Vector.LoadUnsafe(ref gRef, (nuint)i) + Vector.LoadUnsafe(ref rateRef, (nuint)i));
         }
-        int best = acc[0];
-        for (int lane = 1; lane < lanes; lane++)
+        return HorizontalMin(acc);
+    }
+
+    /// <summary>水平 min：把向量宽度折叠到 128 位后做 2 次 shuffle-min。</summary>
+    private static int HorizontalMin(Vector<int> acc)
+    {
+        if (Vector<int>.Count == 16)
         {
-            int value = acc[lane];
-            if (value < best) best = value;
+            Vector512<int> v = acc.AsVector512();
+            return HorizontalMin(Vector256.Min(v.GetLower(), v.GetUpper()));
         }
-        return best;
+        if (Vector<int>.Count == 8)
+        {
+            Vector256<int> v = acc.AsVector256();
+            return HorizontalMin(Vector128.Min(v.GetLower(), v.GetUpper()));
+        }
+        return HorizontalMin(acc.AsVector128());
+    }
+
+    private static int HorizontalMin(Vector256<int> v)
+        => HorizontalMin(Vector128.Min(v.GetLower(), v.GetUpper()));
+
+    private static int HorizontalMin(Vector128<int> m)
+    {
+        m = Vector128.Min(m, Vector128.Shuffle(m, Vector128.Create(2, 3, 0, 1)));
+        m = Vector128.Min(m, Vector128.Shuffle(m, Vector128.Create(1, 0, 3, 2)));
+        return m.ToScalar();
+    }
+
+    /// <summary>
+    /// 固定 <paramref name="category"/> 时，找出使
+    /// <c>Min(dp[r] + q·λZRL + rate[cat, r&amp;15], Inf32) == bestRateMin</c> 的最小 r。
+    /// </summary>
+    /// <remarks>
+    /// bestRateMin = min_s(g[s] + rate[cat,s])（MinRate 的返回值），且回溯只在 bestCost &lt; Inf32
+    /// 时发生，所以 bestRateMin &lt; Inf32，饱和哨兵不参与等式。对每个并列达到最小值的 s（升序），
+    /// 找最小的 q 使 dp[16q+s] + q·λZRL == g[s]（g[s] &lt; Inf32 时必存在且等价于取饱和前相等），
+    /// r = 16q + s，取所有并列 s 中最小的 r。与旧的 64 状态升序向量扫描逐位等价。
+    /// </remarks>
+    private static int FindBestRun(
+        ReadOnlySpan<int> dp,
+        ReadOnlySpan<int> g,
+        ReadOnlySpan<int> rate,
+        int category,
+        int bestRateMin,
+        int zrlScaled,
+        int lanes)
+    {
+        ref int gRef = ref System.Runtime.InteropServices.MemoryMarshal.GetReference(g);
+        ref int rateRef = ref System.Runtime.CompilerServices.Unsafe.Add(
+            ref System.Runtime.InteropServices.MemoryMarshal.GetReference(rate), category << 4);
+        var minVec = new Vector<int>(bestRateMin);
+        int bestRun = -1;
+        for (int sStart = 0; sStart < 16; sStart += lanes)
+        {
+            Vector<int> m = Vector.LoadUnsafe(ref gRef, (nuint)sStart)
+                + Vector.LoadUnsafe(ref rateRef, (nuint)sStart);
+            Vector<int> equals = Vector.Equals(m, minVec);
+            if (equals == Vector<int>.Zero)
+            {
+                continue;
+            }
+            for (int lane = 0; lane < lanes; lane++)
+            {
+                if (equals[lane] == 0)
+                {
+                    continue;
+                }
+                int s = sStart + lane;
+                // q 升序找第一个达到 g[s] 的状态（该列内最小的 r）。
+                for (int q = 0; q < 4; q++)
+                {
+                    if (dp[(q << 4) + s] + q * zrlScaled == g[s])
+                    {
+                        int r = (q << 4) + s;
+                        if (bestRun < 0 || r < bestRun)
+                        {
+                            bestRun = r;
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+        // 旧实现找不到时的兜底是 0（理论上不可达：bestRateMin 是最小值必有并列项）。
+        return bestRun < 0 ? 0 : bestRun;
     }
 
     private static int Saturate(long value)
