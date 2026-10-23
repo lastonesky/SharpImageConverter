@@ -43,12 +43,13 @@ namespace SharpImageConverter.Processing
             bool gray,
             int jpegQuality = 75,
             JpegChromaSubsampling jpegSubsampling = JpegChromaSubsampling.Yuv420,
-            bool jpegProgressive = false)
+            bool jpegProgressive = false,
+            bool useFloatingPointIdct = false)
         {
             string? dir = Path.GetDirectoryName(outputPath);
             if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
 
-            using IRowImageSource source = CreateSource(inputPath);
+            using IRowImageSource source = CreateSource(inputPath, useFloatingPointIdct);
             if (target == ImageOptimizer.ImageKind.Jpeg)
             {
                 using (var output = new FileStream(outputPath, FileMode.Create, FileAccess.Write, FileShare.None, 64 * 1024))
@@ -82,7 +83,7 @@ namespace SharpImageConverter.Processing
             sink.Complete();
         }
 
-        private static IRowImageSource CreateSource(string inputPath)
+        private static IRowImageSource CreateSource(string inputPath, bool useFloatingPointIdct = false)
         {
             var kind = ImageOptimizer.DetectFormat(inputPath);
             return kind switch
@@ -91,7 +92,7 @@ namespace SharpImageConverter.Processing
                 ImageOptimizer.ImageKind.Png => PngRowSource.Open(inputPath),
                 ImageOptimizer.ImageKind.Gif => new GifRowSource(inputPath),
                 ImageOptimizer.ImageKind.Webp => new WebpRowSource(inputPath),
-                ImageOptimizer.ImageKind.Jpeg => JpegRowSource.Open(inputPath),
+                ImageOptimizer.ImageKind.Jpeg => JpegRowSource.Open(inputPath, useFloatingPointIdct),
                 _ => throw new NotSupportedException($"格式 {kind} 不支持逐行解码"),
             };
         }

@@ -95,7 +95,9 @@ internal sealed partial class JpegFrameState
                 && components[0].H == 1 && components[0].V == 1
                 && components[1].H == 1 && components[1].V == 1
                 && components[2].H == 1 && components[2].V == 1;
-            _fusedSimd = _convertYCbCr && _channels == 3 && (y420 || y444);
+            // 浮点 IDCT 只有标量路径（FloatingPointIDCT），融合条带用的是 SIMD 定点 IDCT；
+            // 请求浮点时必须绕开融合路径，否则该选项在流式解码里被静默忽略。
+            _fusedSimd = !_useFloatingPointIdct && _convertYCbCr && _channels == 3 && (y420 || y444);
             _is420 = y420;
             _mcuWidth = y420 ? 16 : 8;
             if (_channels is not (1 or 3))

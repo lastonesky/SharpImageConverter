@@ -135,6 +135,73 @@ namespace SharpImageConverter.Tests
         }
 
         [Fact]
+        public void JpegRowSource_HonorsFloatingPointIdct()
+        {
+            // 回归：JpegRowSource 曾收下 useFloatingPointIdct 却从不透传，--stream --idct float 静默无效。
+            // 4:4:4 没有色度上采样，浮点路径必须与整幅浮点解码一致。
+            int w = 320, h = 240;
+            byte[] rgb = GradientRgb(w, h);
+            string input = NewTemp(".jpg");
+            try
+            {
+                using (var fs = File.Create(input))
+                {
+                    JpegEncoder.Write(fs, w, h, rgb, new JpegEncoderOptions(90, JpegChromaSubsampling.Yuv444, keepMetadata: false));
+                }
+
+                byte[] fixedPoint = ReadAllRows(input, useFloatingPointIdct: false);
+                byte[] floating = ReadAllRows(input, useFloatingPointIdct: true);
+                Assert.False(fixedPoint.AsSpan().SequenceEqual(floating),
+                    "浮点 IDCT 与定点 IDCT 输出完全相同 ⇒ 标志没有真正生效");
+
+                byte[] expected = JpegDecoder.Decode(File.ReadAllBytes(input), useFloatingPointIdct: true).ToRgb24();
+                Assert.True(expected.AsSpan().SequenceEqual(floating),
+                    "4:4:4 的行级浮点 IDCT 与整幅浮点解码应当逐字节一致");
+            }
+            finally
+            {
+                if (File.Exists(input)) File.Delete(input);
+            }
+        }
+
+        [Fact]
+        public void JpegRowSource_RejectsFloatingPointIdctOnSubsampled420()
+        {
+            // 4:2:0 的浮点路径会把 fancy 上采样换成双线性，明确拒绝而不是静默降质。
+            int w = 320, h = 240;
+            byte[] rgb = GradientRgb(w, h);
+            string input = NewTemp(".jpg");
+            try
+            {
+                using (var fs = File.Create(input))
+                {
+                    JpegEncoder.Write(fs, w, h, rgb, new JpegEncoderOptions(90, JpegChromaSubsampling.Yuv420, keepMetadata: false));
+                }
+                Assert.Throws<NotSupportedException>(() => JpegRowSource.Open(input, useFloatingPointIdct: true));
+                using var rows = JpegRowSource.Open(input);   // 整数 IDCT 照旧可用
+                Assert.Equal(w, rows.Width);
+            }
+            finally
+            {
+                if (File.Exists(input)) File.Delete(input);
+            }
+        }
+
+        private static byte[] ReadAllRows(string path, bool useFloatingPointIdct)
+        {
+            using var rows = JpegRowSource.Open(path, useFloatingPointIdct);
+            var row = new byte[rows.Width * 3];
+            var all = new byte[rows.Width * rows.Height * 3];
+            for (int y = 0; y < rows.Height; y++)
+            {
+                Assert.True(rows.ReadRow(row));
+                row.CopyTo(all, y * rows.Width * 3);
+            }
+            Assert.False(rows.ReadRow(row));
+            return all;
+        }
+
+        [Fact]
         public void StreamingConversion_PreservesPngAlpha()
         {
             int w = 41, h = 27;

@@ -16,18 +16,18 @@ public static partial class JpegDecoder
     /// 解析基线 JPEG 到系数（不重建像素），供无损 Huffman 重排使用。
     /// 调用方必须在用完后调用 <see cref="JpegFrameState.DisposeResources"/>。
     /// </summary>
-    internal static JpegFrameState ParseForTranscode(ReadOnlySpan<byte> data, out ScanHeader scan)
+    internal static JpegFrameState ParseForTranscode(ReadOnlySpan<byte> data, out ScanHeader scan, bool useFloatingPointIdct = false)
     {
-        var parser = new Parser(data, useFloatingPointIdct: false);
+        var parser = new Parser(data, useFloatingPointIdct);
         return parser.ParseState(out scan);
     }
 
     /// <summary>
     /// 只解析到第一个 SOS：返回帧状态、扫描头和熵数据偏移，供逐 MCU 行解码使用。
     /// </summary>
-    internal static JpegFrameState ParseHeadersForRows(ReadOnlySpan<byte> data, out ScanHeader scan, out int entropyOffset)
+    internal static JpegFrameState ParseHeadersForRows(ReadOnlySpan<byte> data, out ScanHeader scan, out int entropyOffset, bool useFloatingPointIdct = false)
     {
-        var parser = new Parser(data, useFloatingPointIdct: false);
+        var parser = new Parser(data, useFloatingPointIdct);
         return parser.ParseHeadersForRows(out scan, out entropyOffset);
     }
 
