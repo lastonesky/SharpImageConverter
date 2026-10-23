@@ -427,50 +427,6 @@ namespace SharpImageConverter.Compression
         }
 
         /// <summary>
-        /// 复刻 <see cref="SearchLadder"/> 的「候选访问序列」，用于并行搜索后保证行为完全一致。
-        /// </summary>
-        /// <remarks>
-        /// optimize 的搜索期要对每个候选各做一次完整编码，而 PNG/GIF/WebP 的候选内编码
-        /// （deflate / libwebp）都是**单线程**的，12 核上只用 1 个核。把候选并行评估后，
-        /// 就能把这段墙钟压到「最慢一个候选」的量级。
-        /// <para>
-        /// 但二分是串行的：下一个要评估哪个候选取决于上一个是否达标，无法事先知道。
-        /// 因此做法是「先并行全量评估 → 再按本函数复刻的访问序列挑结果」，
-        /// 这样最终参与体积比较的候选集合与串行二分**逐个相同**，产物逐字节不变。
-        /// 额外多评估出来的那些候选只用于内部，不参与挑选。
-        /// </para>
-        /// </remarks>
-        /// <param name="count">阶梯长度</param>
-        /// <param name="accept">达标判定（按下标）</param>
-        /// <returns>访问到的下标，按二分实际评估顺序排列；整体不达标时只有最高档一个</returns>
-        internal static List<int> ReplayLadderVisits(int count, Func<int, bool> accept)
-        {
-            var visits = new List<int>(count);
-            if (count <= 0) return visits;
-            var seen = new bool[count];
-            void Visit(int i)
-            {
-                if (seen[i]) return;
-                seen[i] = true;
-                visits.Add(i);
-            }
-
-            int lo = 0, hi = count - 1;
-            Visit(hi);
-            // 与 SearchLadder 一致：最高档不达标就直接收工，不再往下探
-            if (!accept(hi)) return visits;
-
-            while (lo < hi)
-            {
-                int mid = (lo + hi) >> 1;
-                Visit(mid);
-                if (accept(mid)) hi = mid;
-                else lo = mid + 1;
-            }
-            return visits;
-        }
-
-        /// <summary>
         /// optimize 搜索期「并行评估候选」的并行度上限。
         /// </summary>
         /// <remarks>

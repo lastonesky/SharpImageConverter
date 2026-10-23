@@ -35,16 +35,11 @@ internal static class SimdJpegEncodePipeline
     // 每块将产生 ~88 次 vpbroadcastd。这里统一提升为静态只读向量，与 QuantBias / C2 / CConst128
     // 保持同一策略，也让 JIT 无需依赖循环不变式外提即可直接引用常量池。
     private static readonly Vector128<int> VFix_0_298631336 = Vector128.Create(Fix_0_298631336);
-    private static readonly Vector128<int> VFix_0_390180644 = Vector128.Create(Fix_0_390180644);
     private static readonly Vector128<int> VFix_0_541196100 = Vector128.Create(Fix_0_541196100);
     private static readonly Vector128<int> VFix_0_765366865 = Vector128.Create(Fix_0_765366865);
-    private static readonly Vector128<int> VFix_0_899976223 = Vector128.Create(Fix_0_899976223);
     private static readonly Vector128<int> VFix_1_175875602 = Vector128.Create(Fix_1_175875602);
     private static readonly Vector128<int> VFix_1_501321110 = Vector128.Create(Fix_1_501321110);
-    private static readonly Vector128<int> VFix_1_847759065 = Vector128.Create(Fix_1_847759065);
-    private static readonly Vector128<int> VFix_1_961570560 = Vector128.Create(Fix_1_961570560);
     private static readonly Vector128<int> VFix_2_053119869 = Vector128.Create(Fix_2_053119869);
-    private static readonly Vector128<int> VFix_2_562915447 = Vector128.Create(Fix_2_562915447);
     private static readonly Vector128<int> VFix_3_072711026 = Vector128.Create(Fix_3_072711026);
 
     // 取负版本：避免在热路径里对常量向量再执行一次运行时取负（psubd）。

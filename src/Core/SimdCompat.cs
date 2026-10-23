@@ -431,24 +431,12 @@ internal static class SimdCompat
         => Sse2.IsSupported ? Sse2.Max(a, b) : AdvSimd.Max(a, b);
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public static Vector128<short> SubtractInt16(Vector128<short> a, Vector128<short> b)
-        => Sse2.IsSupported ? Sse2.Subtract(a, b) : AdvSimd.Subtract(a, b);
-
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public static Vector128<ushort> AddUInt16(Vector128<ushort> a, Vector128<ushort> b)
-        => Sse2.IsSupported ? Sse2.Add(a, b) : AdvSimd.Add(a, b);
-
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static Vector128<ushort> SubtractUInt16(Vector128<ushort> a, Vector128<ushort> b)
         => Sse2.IsSupported ? Sse2.Subtract(a, b) : AdvSimd.Subtract(a, b);
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static Vector128<int> AddInt32(Vector128<int> a, Vector128<int> b)
         => Sse2.IsSupported ? Sse2.Add(a, b) : AdvSimd.Add(a, b);
-
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public static Vector128<int> SubtractInt32(Vector128<int> a, Vector128<int> b)
-        => Sse2.IsSupported ? Sse2.Subtract(a, b) : AdvSimd.Subtract(a, b);
 
     // ------------------------------------------------------------------
     // 乘法（低半部分）

@@ -790,14 +790,6 @@ internal static class SimdHelper
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public static int RoundDownToMultiple(int value, int multiple)
-    {
-        if (multiple <= 0) throw new ArgumentOutOfRangeException(nameof(multiple));
-        if (value < 0) throw new ArgumentOutOfRangeException(nameof(value));
-        return value - (value % multiple);
-    }
-
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static bool IsAligned(nuint address, int alignment)
     {
         alignment = NormalizeAlignment(alignment);

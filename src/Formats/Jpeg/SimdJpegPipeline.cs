@@ -435,18 +435,14 @@ internal static class SimdJpegPipeline
             Vector128<byte> c = Vector128.Load(row + xx);
             Vector128<byte> p = Vector128.Load(row + xx - 1);
             Vector128<byte> n = Vector128.Load(row + xx + 1);
+            // 只处理「低半段」8 个样本：一次迭代产出 16 个输出（8 像素 × 2），
+            // 高位半段的 unpack/filter 结果从来不被写回，已删除（原先白算 4 条 unpack + 6 条算术）。
             Vector128<short> sc = SimdCompat.UnpackLow<byte>(c, SimdCompat.ZeroByte).AsInt16();
-            Vector128<short> sch = SimdCompat.UnpackHigh<byte>(c, SimdCompat.ZeroByte).AsInt16();
             Vector128<short> sp = SimdCompat.UnpackLow<byte>(p, SimdCompat.ZeroByte).AsInt16();
-            Vector128<short> sph = SimdCompat.UnpackHigh<byte>(p, SimdCompat.ZeroByte).AsInt16();
             Vector128<short> sn = SimdCompat.UnpackLow<byte>(n, SimdCompat.ZeroByte).AsInt16();
-            Vector128<short> snh = SimdCompat.UnpackHigh<byte>(n, SimdCompat.ZeroByte).AsInt16();
             Vector128<short> sc3 = SimdCompat.AddInt16(SimdCompat.AddInt16(sc, sc), sc);
-            Vector128<short> sch3 = SimdCompat.AddInt16(SimdCompat.AddInt16(sch, sch), sch);
             Vector128<short> even = (sc3 + sp + OneShort) >> 2;
             Vector128<short> odd = (sc3 + sn + TwoShort) >> 2;
-            Vector128<short> evenH = (sch3 + sph + OneShort) >> 2;
-            Vector128<short> oddH = (sch3 + snh + TwoShort) >> 2;
             SimdCompat.UnpackLow<short>(even, odd).Store(dst + 2L * xx);
             SimdCompat.UnpackHigh<short>(even, odd).Store(dst + 2L * xx + 8);
         }

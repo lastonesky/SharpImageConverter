@@ -15,12 +15,6 @@ namespace SharpImageConverter.Compression
     internal static class JpegOptimizer
     {
         /// <summary>
-        /// A/B 开关：置 <c>SIC_JPEG_NOCACHE=1</c> 时搜索期退回「每候选重跑一遍 produce」，
-        /// 用于同一份二进制内对照样本缓存的收益（跨二进制对比有 ±2% 系统偏差，见项目方法论）。
-        /// </summary>
-        private static readonly bool s_disableSampleCache =
-            Environment.GetEnvironmentVariable("SIC_JPEG_NOCACHE") == "1";
-        /// <summary>
         /// 同格式优化：读入源文件，按 JPEG 重编码为最小体积。
         /// </summary>
         internal static OptimizationResult Run(string input, string output, long originalSize, OptimizeOptions o)
@@ -103,12 +97,6 @@ namespace SharpImageConverter.Compression
                 // 占单候选 56%，采一次缓存后各档只做「量化 + 重建 + 评估」。
                 ImageQuality Score(int quality)
                 {
-                    if (s_disableSampleCache)
-                    {
-                        JpegEncoder.EncodeCoefficients(rgb, width, height, quality, subsampling, keepMetadata: false, metadata: null, sink, o.JpegTrellisQuantization);
-                        return QualityMetrics.Compare(rgb, sink.Reconstruct(), width, height, 3);
-                    }
-
                     if (!samples.Matches(width, height, subsampling))
                     {
                         samples.Capture(rgb, width, height, subsampling);
