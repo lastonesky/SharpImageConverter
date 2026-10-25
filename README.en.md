@@ -317,17 +317,8 @@ dotnet run -- photo.jpg --to webp --optimize
 dotnet run -- d:\images d:\out --to webp --optimize --recursive
 ```
 
-## AI Usage Disclosure
-
-This project has been developed with AI assistance since October 2025:
-
-- **Tools used**: Trae in the early phase (Gemini 3 Flash and GPT 5.2–5.4), later mainly Xiaomi Mimo and DeepSeek V4 Flash; lengthy web chats on ChatGPT and Qwen were also used to debug hard issues and look up references.
-- **Division of work**: the author defines goals, locates and describes concrete bug symptoms (wrong colors, missing detail, misalignment, whole-image gray, luma correct but chroma wrong, etc.) and decides the technical direction; the AI writes and modifies the code. The typical loop is "AI draft → real-world testing exposes problems → human reports symptoms → AI fixes → regression check".
-- **History**: the early AI-written JPEG codec was largely unusable and took a long period of back-and-forth plus research to get decode/encode right; GIF and PNG grew step by step from the most basic online tutorials; JPEG's DCT went through float → AAN fast algorithm → pseudo-SIMD → real SIMD.
-- **Human contribution**: requirements and architecture decisions, bug triage and reporting, key technical choices (e.g. the SIMD optimization path), and hands-on acceptance testing at every step (baselines and corpus validation in `docs/`).
-
 ## License
 
-This project is primarily generated with AI assistance and is licensed under the [MIT License](LICENSE).
+This project is licensed under the [MIT License](LICENSE).
 
 > Position statement: The following companies and their affiliates are **not welcome** to use this project: Tencent (腾讯), Huawei (华为), Alibaba (阿里巴巴), ByteDance (字节跳动), Baidu (百度), Meituan (美团), JD.com / JD (京东), Xiaomi (小米), Sina (新浪), Youku (优酷), iQIYI (爱奇艺). This is the author's personal position and does not constitute a legal restriction — the MIT license is open to everyone, and the author has neither the time nor resources to pursue enforcement.
