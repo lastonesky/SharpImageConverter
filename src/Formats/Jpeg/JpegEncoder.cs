@@ -339,7 +339,6 @@ public static class JpegEncoder
         public int Sequence;
         public byte[]? Order;
         public int[]? Buffer;
-        public int BlockStride;
         /// <summary>每个块 lastNz（0..63）按 6 位打包，由 DCT 阶段预计算，避免熵编码阶段重复扫描。</summary>
         public ulong LastNzPacked;
 
@@ -424,12 +423,9 @@ public static class JpegEncoder
         JpegChromaSubsampling.Yuv422 => Order422,
         _ => Order444,
     };
-    internal static int BlockCountOf(JpegChromaSubsampling s) => s switch
-    {
-        JpegChromaSubsampling.Yuv420 => 6,
-        JpegChromaSubsampling.Yuv422 => 4,
-        _ => 3,
-    };
+
+    /// <summary>每个 MCU 的块数。顺序表一项对应一块，因此直接由 <see cref="OrderOf"/> 导出，避免两份映射漂移。</summary>
+    internal static int BlockCountOf(JpegChromaSubsampling s) => OrderOf(s).Length;
     private static readonly byte[] OrderGray = [0];
 
     private static readonly byte[] StdLumaQuant =
@@ -629,16 +625,13 @@ public static class JpegEncoder
         WriteDht(stream, 1, 1, AcChromaCounts, AcChromaSymbols);
         WriteSos(stream);
 
-        int mcuW = subsampling == JpegChromaSubsampling.Yuv444 ? 8 : 16;
-        int mcuH = subsampling == JpegChromaSubsampling.Yuv420 ? 16 : 8;
+        // 几何一律走 SamplingH/V、BlockCountOf、OrderOf：此前这里是同文件内第二份 switch，
+        // 改采样语义时容易漏改（与 WriteSof0 里的采样因子写入保持单一出处）。
+        int mcuW = SamplingH(subsampling) * 8;
+        int mcuH = SamplingV(subsampling) * 8;
         int mcuX = (width + mcuW - 1) / mcuW;
         int mcuY = (height + mcuH - 1) / mcuH;
-        int blockCount = subsampling switch
-        {
-            JpegChromaSubsampling.Yuv420 => 6,
-            JpegChromaSubsampling.Yuv422 => 4,
-            _ => 3,
-        };
+        int blockCount = BlockCountOf(subsampling);
         byte[] order = OrderOf(subsampling);
         byte[] band = new byte[width * mcuH * 3];
         byte[] sourceRow = new byte[width * source.Channels];
@@ -671,25 +664,7 @@ public static class JpegEncoder
             Span<int> blocks = stackalloc int[6 * 64];
             for (int mx = 0; mx < mcuX; mx++)
             {
-                if (subsampling == JpegChromaSubsampling.Yuv420)
-                {
-                    FillMcu420RgbToYCbCr(
-                        band, width, rows, mx * 16, 0,
-                        blocks[..64], blocks[64..128], blocks[128..192], blocks[192..256],
-                        blocks[256..320], blocks[320..384], null);
-                }
-                else if (subsampling == JpegChromaSubsampling.Yuv422)
-                {
-                    FillMcu422RgbToYCbCr(
-                        band, width, rows, mx * 16, 0,
-                        blocks[..64], blocks[64..128], blocks[128..192], blocks[192..256], null);
-                }
-                else
-                {
-                    FillBlockRgbToYCbCr444(
-                        band, width, rows, mx * 8, 0,
-                        blocks[..64], blocks[64..128], blocks[128..192], null);
-                }
+                FillRgbMcuSamples(band, width, rows, subsampling, mx * mcuW, 0, blocks[..(blockCount * 64)], null);
 
                 for (int i = 0; i < blockCount; i++)
                 {
@@ -1033,7 +1008,7 @@ public static class JpegEncoder
         {
             dctTasks[i] = Task.Run(() => RunStage(() => ProcessDct(sampleQueue, dctQueue, qYRecip, qCRecip, trellis, token), cts), token);
         }
-        var t4 = Task.Run(() => RunStage(() => ProcessHuffmanOrdered(dctQueue, dctWorkers, bw, dcY, acY, dcC, acC, token, coefficientSink), cts), token);
+        var t4 = Task.Run(() => RunStage(() => ConsumeEntropy(dctQueue, dctWorkers, bw, dcY, acY, dcC, acC, coefficientSink, token), cts), token);
 
         Task.WaitAll(dctTasks);
         Task.WaitAll(t1, t4);
@@ -1063,9 +1038,12 @@ public static class JpegEncoder
         Task[] dctTasks = new Task[dctWorkers];
         for (int i = 0; i < dctWorkers; i++)
         {
-            dctTasks[i] = Task.Run(() => RunStage(() => ProcessDctGray(sampleQueue, dctQueue, qYRecip, token), cts), token);
+            // 灰度 MCU 只有 1 块且 Order=[0]，走彩色版泵时 chroma 恒为 false、qCRecip 永不被取，
+            // trellis 传 null 即退化为同一个 DctQuantizeInPlace 两参重载 —— 与旧 ProcessDctGray 逐位相同。
+            dctTasks[i] = Task.Run(() => RunStage(() => ProcessDct(sampleQueue, dctQueue, qYRecip, qYRecip, null, token), cts), token);
         }
-        var t4 = Task.Run(() => RunStage(() => ProcessHuffmanGrayOrdered(dctQueue, dctWorkers, bw, dcY, acY, token), cts), token);
+        var grayConsumer = WriteMcuConsumer.Gray(bw, dcY, acY);
+        var t4 = Task.Run(() => RunStage(() => ProcessEntropyOrdered(dctQueue, dctWorkers, ref grayConsumer, token), cts), token);
 
         Task.WaitAll(dctTasks);
         Task.WaitAll(t1, t4);
@@ -1113,116 +1091,44 @@ public static class JpegEncoder
         McuBatch? batch = null;
         try
         {
-            if (subsampling == JpegChromaSubsampling.Yuv420)
-            {
-                int mcusX = (width + 15) / 16;
-                int mcusY = (height + 15) / 16;
+            // 几何与块顺序只有 OrderOf / BlockCountOf / SamplingH/V 一份出处；
+            // 具体 420/422/444 的填充差异收在 FillRgbMcuSamples 里，这里只负责遍历与入队。
+            int blockCount = BlockCountOf(subsampling);
+            byte[] order = OrderOf(subsampling);
+            int mcuW = SamplingH(subsampling) * 8;
+            int mcuH = SamplingV(subsampling) * 8;
+            int mcusX = (width + mcuW - 1) / mcuW;
+            int mcusY = (height + mcuH - 1) / mcuH;
+            int coefficients = blockCount * 64;
 
-                for (int my = 0; my < mcusY; my++)
-                {
-                    for (int mx = 0; mx < mcusX; mx++)
-                    {
-                        var mcu = new SampledMcuRef
-                        {
-                            BlockCount = 6,
-                            Sequence = sequence++,
-                            Order = Order420,
-                            BlockStride = 6,
-                            Buffer = ArrayPool<int>.Shared.Rent(6 * 64)
-                        };
-                        try
-                        {
-                            FillMcu420RgbToYCbCr(
-                                rgb24,
-                                width,
-                                height,
-                                mx * 16,
-                                my * 16,
-                                mcu.GetBlockSpan(0),
-                                mcu.GetBlockSpan(1),
-                                mcu.GetBlockSpan(2),
-                                mcu.GetBlockSpan(3),
-                                mcu.GetBlockSpan(4),
-                                mcu.GetBlockSpan(5),
-                                metrics);
-                            EnqueueSampledMcu(output, ref batch, mcu, batchSize, token);
-                        }
-                        catch
-                        {
-                            mcu.Free();
-                            throw;
-                        }
-                    }
-                }
-            }
-            else if (subsampling == JpegChromaSubsampling.Yuv422)
+            for (int my = 0; my < mcusY; my++)
             {
-                int mcusX = (width + 15) / 16;
-                int mcusY = (height + 7) / 8;
-                for (int my = 0; my < mcusY; my++)
+                for (int mx = 0; mx < mcusX; mx++)
                 {
-                    for (int mx = 0; mx < mcusX; mx++)
+                    var mcu = new SampledMcuRef
                     {
-                        var mcu = new SampledMcuRef
-                        {
-                            BlockCount = 4,
-                            Sequence = sequence++,
-                            Order = Order422,
-                            BlockStride = 4,
-                            Buffer = ArrayPool<int>.Shared.Rent(4 * 64)
-                        };
-                        try
-                        {
-                            FillMcu422RgbToYCbCr(
-                                rgb24, width, height, mx * 16, my * 8,
-                                mcu.GetBlockSpan(0), mcu.GetBlockSpan(1),
-                                mcu.GetBlockSpan(2), mcu.GetBlockSpan(3), metrics);
-                            EnqueueSampledMcu(output, ref batch, mcu, batchSize, token);
-                        }
-                        catch
-                        {
-                            mcu.Free();
-                            throw;
-                        }
+                        BlockCount = blockCount,
+                        Sequence = sequence++,
+                        Order = order,
+                        Buffer = ArrayPool<int>.Shared.Rent(coefficients)
+                    };
+                    try
+                    {
+                        FillRgbMcuSamples(
+                            rgb24,
+                            width,
+                            height,
+                            subsampling,
+                            mx * mcuW,
+                            my * mcuH,
+                            mcu.Buffer.AsSpan(0, coefficients),
+                            metrics);
+                        EnqueueSampledMcu(output, ref batch, mcu, batchSize, token);
                     }
-                }
-            }
-            else
-            {
-                int blocksX = (width + 7) / 8;
-                int blocksY = (height + 7) / 8;
-
-                for (int by = 0; by < blocksY; by++)
-                {
-                    for (int bx = 0; bx < blocksX; bx++)
+                    catch
                     {
-                        var mcu = new SampledMcuRef
-                        {
-                            BlockCount = 3,
-                            Sequence = sequence++,
-                            Order = Order444,
-                            BlockStride = 3,
-                            Buffer = ArrayPool<int>.Shared.Rent(3 * 64)
-                        };
-                        try
-                        {
-                            FillBlockRgbToYCbCr444(
-                                rgb24,
-                                width,
-                                height,
-                                bx * 8,
-                                by * 8,
-                                mcu.GetBlockSpan(0),
-                                mcu.GetBlockSpan(1),
-                                mcu.GetBlockSpan(2),
-                                metrics);
-                            EnqueueSampledMcu(output, ref batch, mcu, batchSize, token);
-                        }
-                        catch
-                        {
-                            mcu.Free();
-                            throw;
-                        }
+                        mcu.Free();
+                        throw;
                     }
                 }
             }
@@ -1280,7 +1186,6 @@ public static class JpegEncoder
                         BlockCount = 1,
                         Sequence = sequence++,
                         Order = OrderGray,
-                        BlockStride = 1,
                         Buffer = ArrayPool<int>.Shared.Rent(64)
                     };
                     try
@@ -1358,54 +1263,6 @@ public static class JpegEncoder
                             packed |= (ulong)lastNz << (i * 6);
                         }
                         mcu.LastNzPacked = packed;
-                    }
-                    catch
-                    {
-                        for (int j = m; j < batch.Count; j++)
-                        {
-                            batch.Items[j].Free();
-                        }
-                        ReturnMcuBatch(batch);
-                        throw;
-                    }
-                }
-
-                output.Enqueue(batch, token);
-            }
-        }
-        finally
-        {
-            if (JpegPerfProbe.Enabled)
-            {
-                JpegPerfProbe.Add(JpegPerfProbe.DctWall, Stopwatch.GetTimestamp() - probeStart);
-            }
-        }
-    }
-
-    private static void ProcessDctGray(
-        PipeQueue<McuBatch> input,
-        PipeQueue<McuBatch> output,
-        int[] qYRecip,
-        CancellationToken token)
-    {
-        long probeStart = JpegPerfProbe.Enabled ? Stopwatch.GetTimestamp() : 0;
-        try
-        {
-            for (; ; )
-            {
-                var batch = input.Dequeue(token);
-                if (batch == null)
-                {
-                    output.Enqueue(null, token);
-                    break;
-                }
-
-                for (int m = 0; m < batch.Count; m++)
-                {
-                    ref SampledMcuRef mcu = ref batch.Items[m];
-                    try
-                    {
-                        mcu.LastNzPacked = (ulong)DctQuantizeInPlace(mcu.GetBlockSpan(0), qYRecip);
                     }
                     catch
                     {
@@ -1511,70 +1368,245 @@ public static class JpegEncoder
         ArrayPool<int>.Shared.Return(pendingSequences, clearArray: false);
     }
 
-    private static void WriteMcuHuffman(
-        SampledMcuRef mcu,
-        JpegBitWriter bw,
-        HuffCode[] dcY,
-        HuffCode[] acY,
-        HuffCode[] dcC,
-        HuffCode[] acC,
-        ref int prevYdc,
-        ref int prevCbdc,
-        ref int prevCrdc)
+    /// <summary>
+    /// 块级符号的落地目标。符号推导（DC 差分 → zigzag 上的 (run,value) → EOB/ZRL）只有
+    /// <see cref="CodeBlock"/> 一份实现，实现方只决定符号「落到哪」：写进位流，或只记进直方图。
+    /// 以前「统计版」与「写位版」是两份逐行镜像的代码（改一处必须手工同步另一处），
+    /// 现在两遍一致由构造保证，不再依赖注释与自觉。
+    /// </summary>
+    private interface IBlockSymbols
     {
-        for (int i = 0; i < mcu.BlockCount; i++)
+        /// <summary>DC 差分符号。category 已由共享逻辑算出，幅值位由实现方按需编码（统计趟不需要它）。</summary>
+        void Dc(int diff, int category);
+
+        /// <summary>EOB，符号 0x00。</summary>
+        void Eob();
+
+        /// <summary>ZRL：run 满 16 时的填充符，符号 0xF0。</summary>
+        void Zrl();
+
+        /// <summary>AC 符号，symbol = (run &lt;&lt; 4) | category。value 是系数原值，只有写位趟需要它算幅值位。</summary>
+        void Ac(int symbol, int value, int category);
+    }
+
+    /// <summary>写位流版块消费者；dc/ac 是调用方按分量挑好的表。</summary>
+    private struct WriteBlockSymbols(JpegBitWriter bw, HuffCode[] dc, HuffCode[] ac) : IBlockSymbols
+    {
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public void Dc(int diff, int category) => bw.WriteHuffAndBits(dc[category], category == 0 ? 0u : EncodeMagnitudeBits(diff, category), category);
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public void Eob() => bw.WriteHuff(ac[0x00]);
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public void Zrl() => bw.WriteHuff(ac[0xF0]);
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public void Ac(int symbol, int value, int category) => bw.WriteHuffAndBits(ac[symbol], EncodeMagnitudeBits(value, category), category);
+    }
+
+    /// <summary>统计版块消费者：同一份符号序列只加计数，不产生任何位。</summary>
+    private struct CountBlockSymbols(long[] dcHist, long[] acHist) : IBlockSymbols
+    {
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public void Dc(int diff, int category) => dcHist[category]++;
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public void Eob() => acHist[0x00]++;
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public void Zrl() => acHist[0xF0]++;
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public void Ac(int symbol, int value, int category) => acHist[symbol]++;
+    }
+
+    /// <summary>
+    /// 单块熵符号推导的唯一实现。<paramref name="lastNz"/> 是 zigzag 序里最后一个非零下标
+    /// （0 表示 AC 全零），由 DCT 阶段预计算并打包进 <c>SampledMcuRef.LastNzPacked</c>。
+    /// 用泛型 + struct 约束而不是接口动态分发：熵编码是编码耗时的大头（143MP 上 huffman-busy
+    /// 与 produce 同量级），每符号一次的调用必须被 JIT 内联掉，不能留虚调用。
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void CodeBlock<TSymbols>(TSymbols symbols, Span<int> block, int lastNz, ref int prevDc)
+        where TSymbols : struct, IBlockSymbols
+    {
+        int dcCoeff = block[0];
+        int diff = dcCoeff - prevDc;
+        prevDc = dcCoeff;
+
+        symbols.Dc(diff, MagnitudeCategory(diff));
+
+        if (lastNz == 0)
         {
-            int lastNz = (int)((mcu.LastNzPacked >> (i * 6)) & 0x3F);
-            byte comp = mcu.Order![i];
-            if (comp == 0)
+            symbols.Eob();
+            return;
+        }
+
+        int run = 0;
+        for (int k = 1; k <= lastNz; k++)
+        {
+            int idx = JpegConstants.ZigZag[k];
+            int v = block[idx];
+            if (v == 0)
             {
-                HuffmanWriteBlock(bw, mcu.GetBlockSpan(i), lastNz, dcY, acY, ref prevYdc);
+                run++;
+                continue;
             }
-            else if (comp == 1)
+
+            while (run >= 16)
             {
-                HuffmanWriteBlock(bw, mcu.GetBlockSpan(i), lastNz, dcC, acC, ref prevCbdc);
+                symbols.Zrl();
+                run -= 16;
             }
-            else
+
+            int cat = MagnitudeCategory(v);
+            symbols.Ac((run << 4) | cat, v, cat);
+            run = 0;
+        }
+
+        if (lastNz != 63) symbols.Eob();
+    }
+
+    /// <summary>逐行编码路径（<see cref="EncodeStreaming"/>）的块写出入口；流水线路径走 <see cref="WriteMcuConsumer"/>。</summary>
+    private static void HuffmanWriteBlock(JpegBitWriter bw, Span<int> block, int lastNz, HuffCode[] dc, HuffCode[] ac, ref int prevDc)
+        => CodeBlock(new WriteBlockSymbols(bw, dc, ac), block, lastNz, ref prevDc);
+
+    /// <summary>
+    /// 熵阶段的三种落地目标之一：写位流 / 只统计符号 / 把量化系数移交给 sink。
+    /// 消费者以 <c>ref</c> 传入 <see cref="ProcessEntropyOrdered"/>，因此跨 MCU 存活的
+    /// 状态（直方图、DC 预测器）可以直接放值字段；位流写入器与 sink 仍是引用类型。
+    /// </summary>
+    private interface IMcuConsumer
+    {
+        /// <summary>按全局光栅顺序消费一个 MCU，返回前必须 Free 它的系数缓冲。</summary>
+        void Consume(ref SampledMcuRef mcu);
+    }
+
+    /// <summary>
+    /// 写位流版：按 mcu.Order 把每块交给所属分量的表。
+    /// 灰度只有一个分量（Order = [0]），同一条路径自然覆盖，不需要单独的灰度熵编码循环。
+    /// </summary>
+    private struct WriteMcuConsumer : IMcuConsumer
+    {
+        private readonly JpegBitWriter _bw;
+        private readonly HuffCode[] _dcY;
+        private readonly HuffCode[] _acY;
+        private readonly HuffCode[] _dcC;
+        private readonly HuffCode[] _acC;
+
+        /// <summary>DC 预测器按分量分槽：Y / Cb / Cr（灰度只用 Y）。</summary>
+        private int _prevYdc;
+        private int _prevCbdc;
+        private int _prevCrdc;
+
+        public WriteMcuConsumer(JpegBitWriter bw, HuffCode[] dcY, HuffCode[] acY, HuffCode[] dcC, HuffCode[] acC)
+        {
+            _bw = bw;
+            _dcY = dcY;
+            _acY = acY;
+            _dcC = dcC;
+            _acC = acC;
+        }
+
+        /// <summary>灰度编码：没有色度分量，色度表留空（Order 里不会出现分量 1/2）。</summary>
+        public static WriteMcuConsumer Gray(JpegBitWriter bw, HuffCode[] dcY, HuffCode[] acY) => new(bw, dcY, acY, null, null);
+
+        public void Consume(ref SampledMcuRef mcu)
+        {
+            byte[] order = mcu.Order!;
+            for (int i = 0; i < mcu.BlockCount; i++)
             {
-                HuffmanWriteBlock(bw, mcu.GetBlockSpan(i), lastNz, dcC, acC, ref prevCrdc);
+                int lastNz = (int)((mcu.LastNzPacked >> (i * 6)) & 0x3F);
+                Span<int> block = mcu.GetBlockSpan(i);
+                switch (order[i])
+                {
+                    case 0:
+                        CodeBlock(new WriteBlockSymbols(_bw, _dcY, _acY), block, lastNz, ref _prevYdc);
+                        break;
+                    case 1:
+                        CodeBlock(new WriteBlockSymbols(_bw, _dcC, _acC), block, lastNz, ref _prevCbdc);
+                        break;
+                    default:
+                        CodeBlock(new WriteBlockSymbols(_bw, _dcC, _acC), block, lastNz, ref _prevCrdc);
+                        break;
+                }
             }
+            mcu.Free();
         }
     }
 
-    private static void ProcessHuffmanOrdered(
-        PipeQueue<McuBatch> input,
-        int completionCount,
-        JpegBitWriter bw,
-        HuffCode[] dcY,
-        HuffCode[] acY,
-        HuffCode[] dcC,
-        HuffCode[] acC,
-        CancellationToken token,
-        IMcuCoefficientSink? coefficientSink = null)
+    /// <summary>统计版：与写位流版走同一份 <see cref="CodeBlock"/>，差别只在符号落进直方图。</summary>
+    private struct CountMcuConsumer : IMcuConsumer
     {
-        int prevYdc = 0;
-        int prevCbdc = 0;
-        int prevCrdc = 0;
+        private readonly HuffmanHistograms _hist;
+        private int _prevYdc;
+        private int _prevCbdc;
+        private int _prevCrdc;
+
+        public CountMcuConsumer(HuffmanHistograms hist)
+        {
+            _hist = hist;
+        }
+
+        public void Consume(ref SampledMcuRef mcu)
+        {
+            byte[] order = mcu.Order!;
+            for (int i = 0; i < mcu.BlockCount; i++)
+            {
+                int lastNz = (int)((mcu.LastNzPacked >> (i * 6)) & 0x3F);
+                Span<int> block = mcu.GetBlockSpan(i);
+                switch (order[i])
+                {
+                    case 0:
+                        CodeBlock(new CountBlockSymbols(_hist.DcY, _hist.AcY), block, lastNz, ref _prevYdc);
+                        break;
+                    case 1:
+                        CodeBlock(new CountBlockSymbols(_hist.DcC, _hist.AcC), block, lastNz, ref _prevCbdc);
+                        break;
+                    default:
+                        CodeBlock(new CountBlockSymbols(_hist.DcC, _hist.AcC), block, lastNz, ref _prevCrdc);
+                        break;
+                }
+            }
+            mcu.Free();
+        }
+    }
+
+    /// <summary>
+    /// 「只产系数」模式：后面不会再写出任何字节，所以整趟位流熵编码直接跳过，
+    /// 只保留乱序重排与系数移交（省掉一整遍 Huffman）。
+    /// </summary>
+    private struct CoefficientMcuConsumer : IMcuConsumer
+    {
+        private readonly IMcuCoefficientSink _sink;
+
+        public CoefficientMcuConsumer(IMcuCoefficientSink sink)
+        {
+            _sink = sink;
+        }
+
+        public void Consume(ref SampledMcuRef mcu)
+        {
+            _sink.Accept(mcu.Sequence, mcu.Buffer!.AsSpan(0, mcu.BlockCount * 64), mcu.BlockCount, mcu.Order!);
+            mcu.Free();
+        }
+    }
+
+    /// <summary>
+    /// 熵阶段主循环（唯一实现）。DCT worker 是并发跑的，MCU 到达顺序不等于光栅顺序，
+    /// 而 DC 预测器与 AC 符号序列都必须按全局顺序推进，所以这里用 pending ring 把乱序
+    /// 到达的 MCU 重排回顺序，再按序交给 <paramref name="consumer"/>：命中 expected 走直写快路径，
+    /// 其余暂存 ring，补齐后连续清空；环装不下时按需扩容。
+    /// 历史上这段循环有写位/统计/灰度三份复制，现在只有一份，差别全在消费者里。
+    /// </summary>
+    private static void ProcessEntropyOrdered<TConsumer>(PipeQueue<McuBatch> input, int completionCount, ref TConsumer consumer, CancellationToken token)
+        where TConsumer : struct, IMcuConsumer
+    {
         int expected = 0;
         int completed = 0;
         long probeStart = JpegPerfProbe.Enabled ? Stopwatch.GetTimestamp() : 0;
         RentPendingState(256, out var pendingItems, out var pendingSequences, out int pendingCapacity, out int pendingMask);
-
-        // 有序消费一个 MCU：先按需交出量化系数，再决定是否写位流。
-        // coefficientSink 非空即「只产系数」模式 —— 此时后续不会有任何字节被 FlushFinal 写出，
-        // 所以这里直接不跑 WriteMcuHuffman（省掉整趟熵编码），只保留排序与系数移交。
-        void Emit(ref SampledMcuRef mcu, ref int py, ref int pcb, ref int pcr)
-        {
-            if (coefficientSink != null)
-            {
-                coefficientSink.Accept(mcu.Sequence, mcu.Buffer.AsSpan(0, mcu.BlockCount * 64), mcu.BlockCount, mcu.Order!);
-            }
-            else
-            {
-                WriteMcuHuffman(mcu, bw, dcY, acY, dcC, acC, ref py, ref pcb, ref pcr);
-            }
-            mcu.Free();
-        }
 
         try
         {
@@ -1594,7 +1626,7 @@ public static class JpegEncoder
                         ref SampledMcuRef mcu = ref batch.Items[i];
                         if (mcu.Sequence == expected)
                         {
-                            Emit(ref mcu, ref prevYdc, ref prevCbdc, ref prevCrdc);
+                            consumer.Consume(ref mcu);
                             expected++;
 
                             while (true)
@@ -1607,7 +1639,7 @@ public static class JpegEncoder
 
                                 ref SampledMcuRef pending = ref pendingItems[expectedIndex];
                                 pendingSequences[expectedIndex] = -1;
-                                Emit(ref pending, ref prevYdc, ref prevCbdc, ref prevCrdc);
+                                consumer.Consume(ref pending);
                                 expected++;
                             }
                         }
@@ -1644,7 +1676,7 @@ public static class JpegEncoder
                 }
                 ref SampledMcuRef pending = ref pendingItems[index];
                 pendingSequences[index] = -1;
-                Emit(ref pending, ref prevYdc, ref prevCbdc, ref prevCrdc);
+                consumer.Consume(ref pending);
                 expected++;
             }
         }
@@ -1655,6 +1687,34 @@ public static class JpegEncoder
                 JpegPerfProbe.Add(JpegPerfProbe.Huffman, Stopwatch.GetTimestamp() - probeStart);
             }
             ReturnPendingState(pendingItems, pendingSequences, pendingCapacity);
+        }
+    }
+
+    /// <summary>
+    /// 熵阶段落地点的运行期分流：普通编码写位流，「只产系数」模式交给 sink。
+    /// 分流放在循环外，是为了让热循环内部既没有分支也没有接口分发
+    /// （两个泛型实例各自只看到一种消费者）。
+    /// </summary>
+    private static void ConsumeEntropy(
+        PipeQueue<McuBatch> input,
+        int completionCount,
+        JpegBitWriter bw,
+        HuffCode[] dcY,
+        HuffCode[] acY,
+        HuffCode[] dcC,
+        HuffCode[] acC,
+        IMcuCoefficientSink? coefficientSink,
+        CancellationToken token)
+    {
+        if (coefficientSink is null)
+        {
+            var consumer = new WriteMcuConsumer(bw, dcY, acY, dcC, acC);
+            ProcessEntropyOrdered(input, completionCount, ref consumer, token);
+        }
+        else
+        {
+            var consumer = new CoefficientMcuConsumer(coefficientSink);
+            ProcessEntropyOrdered(input, completionCount, ref consumer, token);
         }
     }
 
@@ -1700,176 +1760,13 @@ public static class JpegEncoder
         {
             dctTasks[i] = Task.Run(() => RunStage(() => ProcessDct(sampleQueue, dctQueue, qYRecip, qCRecip, trellis, token), cts), token);
         }
-        var t4 = Task.Run(() => RunStage(() => ProcessHuffmanCount(dctQueue, dctWorkers, hist, token), cts), token);
+        var consumer = new CountMcuConsumer(hist);
+        var t4 = Task.Run(() => RunStage(() => ProcessEntropyOrdered(dctQueue, dctWorkers, ref consumer, token), cts), token);
 
         Task.WaitAll(dctTasks);
         Task.WaitAll(t1, t4);
         JpegPerfProbe.End(JpegPerfProbe.EncodeTotal);
         return hist;
-    }
-
-    /// <summary>统计版 MCU 写出：与 <see cref="WriteMcuHuffman"/> 完全同构，只记符号不写位。</summary>
-    private static void CountMcuHuffman(
-        ref SampledMcuRef mcu,
-        HuffmanHistograms hist,
-        ref int prevYdc,
-        ref int prevCbdc,
-        ref int prevCrdc)
-    {
-        for (int i = 0; i < mcu.BlockCount; i++)
-        {
-            int lastNz = (int)((mcu.LastNzPacked >> (i * 6)) & 0x3F);
-            byte comp = mcu.Order![i];
-            if (comp == 0)
-            {
-                HuffmanCountBlock(mcu.GetBlockSpan(i), lastNz, ref prevYdc, hist.DcY, hist.AcY);
-            }
-            else if (comp == 1)
-            {
-                HuffmanCountBlock(mcu.GetBlockSpan(i), lastNz, ref prevCbdc, hist.DcC, hist.AcC);
-            }
-            else
-            {
-                HuffmanCountBlock(mcu.GetBlockSpan(i), lastNz, ref prevCrdc, hist.DcC, hist.AcC);
-            }
-        }
-    }
-
-    /// <summary>统计版块编码：符号推导逻辑与 <see cref="HuffmanWriteBlock"/> 必须逐行一致。</summary>
-    private static void HuffmanCountBlock(Span<int> block, int lastNz, ref int prevDc, long[] dcHist, long[] acHist)
-    {
-        int dcCoeff = block[0];
-        int diff = dcCoeff - prevDc;
-        prevDc = dcCoeff;
-
-        dcHist[MagnitudeCategory(diff)]++;
-
-        if (lastNz == 0)
-        {
-            acHist[0x00]++;
-            return;
-        }
-
-        int run = 0;
-        for (int k = 1; k <= lastNz; k++)
-        {
-            int idx = JpegConstants.ZigZag[k];
-            int v = block[idx];
-            if (v == 0)
-            {
-                run++;
-                continue;
-            }
-
-            while (run >= 16)
-            {
-                acHist[0xF0]++;
-                run -= 16;
-            }
-
-            acHist[(run << 4) | MagnitudeCategory(v)]++;
-            run = 0;
-        }
-
-        if (lastNz != 63) acHist[0x00]++;
-    }
-
-    /// <summary>
-    /// 统计版 Huffman 阶段：与 <see cref="ProcessHuffmanOrdered"/> 相同的乱序重排逻辑，
-    /// 只是把「写位」换成「记符号」。DC 预测依赖全局顺序，重排不可省。
-    /// </summary>
-    private static void ProcessHuffmanCount(
-        PipeQueue<McuBatch> input,
-        int completionCount,
-        HuffmanHistograms hist,
-        CancellationToken token)
-    {
-        int prevYdc = 0;
-        int prevCbdc = 0;
-        int prevCrdc = 0;
-        int expected = 0;
-        int completed = 0;
-        RentPendingState(256, out var pendingItems, out var pendingSequences, out int pendingCapacity, out int pendingMask);
-
-        try
-        {
-            while (completed < completionCount)
-            {
-                var batch = input.Dequeue(token);
-                if (batch == null)
-                {
-                    completed++;
-                    continue;
-                }
-
-                try
-                {
-                    for (int i = 0; i < batch.Count; i++)
-                    {
-                        ref SampledMcuRef mcu = ref batch.Items[i];
-                        if (mcu.Sequence == expected)
-                        {
-                            CountMcuHuffman(ref mcu, hist, ref prevYdc, ref prevCbdc, ref prevCrdc);
-                            mcu.Free();
-                            expected++;
-
-                            while (true)
-                            {
-                                int expectedIndex = expected & pendingMask;
-                                if (pendingSequences[expectedIndex] != expected)
-                                {
-                                    break;
-                                }
-
-                                ref SampledMcuRef pending = ref pendingItems[expectedIndex];
-                                pendingSequences[expectedIndex] = -1;
-                                CountMcuHuffman(ref pending, hist, ref prevYdc, ref prevCbdc, ref prevCrdc);
-                                pending.Free();
-                                expected++;
-                            }
-                        }
-                        else
-                        {
-                            EnsurePendingCapacity(ref pendingItems, ref pendingSequences, ref pendingCapacity, ref pendingMask, mcu.Sequence);
-                            int index = mcu.Sequence & pendingMask;
-                            while (pendingSequences[index] != -1 && pendingSequences[index] != mcu.Sequence)
-                            {
-                                index = (index + 1) & pendingMask;
-                            }
-                            pendingItems[index] = mcu;
-                            pendingSequences[index] = mcu.Sequence;
-                            mcu = default;
-                        }
-                    }
-                }
-                finally
-                {
-                    for (int i = 0; i < batch.Count; i++)
-                    {
-                        batch.Items[i].Free();
-                    }
-                    ReturnMcuBatch(batch);
-                }
-            }
-
-            while (true)
-            {
-                int index = expected & pendingMask;
-                if (pendingSequences[index] != expected)
-                {
-                    break;
-                }
-                ref SampledMcuRef pending = ref pendingItems[index];
-                pendingSequences[index] = -1;
-                CountMcuHuffman(ref pending, hist, ref prevYdc, ref prevCbdc, ref prevCrdc);
-                pending.Free();
-                expected++;
-            }
-        }
-        finally
-        {
-            ReturnPendingState(pendingItems, pendingSequences, pendingCapacity);
-        }
     }
 
     /// <summary>
@@ -2206,105 +2103,6 @@ public static class JpegEncoder
         return true;
     }
 
-    private static void ProcessHuffmanGrayOrdered(
-        PipeQueue<McuBatch> input,
-        int completionCount,
-        JpegBitWriter bw,
-        HuffCode[] dcY,
-        HuffCode[] acY,
-        CancellationToken token)
-    {
-        int prevYdc = 0;
-        int expected = 0;
-        int completed = 0;
-        long probeStart = JpegPerfProbe.Enabled ? Stopwatch.GetTimestamp() : 0;
-        RentPendingState(256, out var pendingItems, out var pendingSequences, out int pendingCapacity, out int pendingMask);
-
-        try
-        {
-            while (completed < completionCount)
-            {
-                var batch = input.Dequeue(token);
-                if (batch == null)
-                {
-                    completed++;
-                    continue;
-                }
-
-                try
-                {
-                    for (int i = 0; i < batch.Count; i++)
-                    {
-                        ref SampledMcuRef mcu = ref batch.Items[i];
-                        if (mcu.Sequence == expected)
-                        {
-                            HuffmanWriteBlock(bw, mcu.GetBlockSpan(0), (int)(mcu.LastNzPacked & 0x3F), dcY, acY, ref prevYdc);
-                            mcu.Free();
-                            expected++;
-
-                            while (true)
-                            {
-                                int expectedIndex = expected & pendingMask;
-                                if (pendingSequences[expectedIndex] != expected)
-                                {
-                                    break;
-                                }
-
-                                ref SampledMcuRef pending = ref pendingItems[expectedIndex];
-                                pendingSequences[expectedIndex] = -1;
-                                HuffmanWriteBlock(bw, pending.GetBlockSpan(0), (int)(pending.LastNzPacked & 0x3F), dcY, acY, ref prevYdc);
-                                pending.Free();
-                                expected++;
-                            }
-                        }
-                        else
-                        {
-                            EnsurePendingCapacity(ref pendingItems, ref pendingSequences, ref pendingCapacity, ref pendingMask, mcu.Sequence);
-                            int index = mcu.Sequence & pendingMask;
-                            while (pendingSequences[index] != -1 && pendingSequences[index] != mcu.Sequence)
-                            {
-                                index = (index + 1) & pendingMask;
-                            }
-                            pendingItems[index] = mcu;
-                            pendingSequences[index] = mcu.Sequence;
-                            mcu = default;
-                        }
-                    }
-                }
-                finally
-                {
-                    for (int i = 0; i < batch.Count; i++)
-                    {
-                        batch.Items[i].Free();
-                    }
-                    ReturnMcuBatch(batch);
-                }
-            }
-
-            while (true)
-            {
-                int index = expected & pendingMask;
-                if (pendingSequences[index] != expected)
-                {
-                    break;
-                }
-                ref SampledMcuRef pending = ref pendingItems[index];
-                pendingSequences[index] = -1;
-                HuffmanWriteBlock(bw, pending.GetBlockSpan(0), (int)(pending.LastNzPacked & 0x3F), dcY, acY, ref prevYdc);
-                pending.Free();
-                expected++;
-            }
-        }
-        finally
-        {
-            if (JpegPerfProbe.Enabled)
-            {
-                JpegPerfProbe.Add(JpegPerfProbe.Huffman, Stopwatch.GetTimestamp() - probeStart);
-            }
-            ReturnPendingState(pendingItems, pendingSequences, pendingCapacity);
-        }
-    }
-
     /// <summary>
     /// FDCT + 量化。分派说明（原先两档用的是**不同的门控谓词**，已统一）：
     /// <list type="bullet">
@@ -2394,49 +2192,51 @@ public static class JpegEncoder
         return 0;
     }
 
-    private static void HuffmanWriteBlock(JpegBitWriter bw, Span<int> block, int lastNz, HuffCode[] dc, HuffCode[] ac, ref int prevDc)
-    {
-        int dcCoeff = block[0];
-        int diff = dcCoeff - prevDc;
-        prevDc = dcCoeff;
-
-        int dcCat = MagnitudeCategory(diff);
-        bw.WriteHuffAndBits(dc[dcCat], dcCat == 0 ? 0u : EncodeMagnitudeBits(diff, dcCat), dcCat);
-
-        if (lastNz == 0)
-        {
-            bw.WriteHuff(ac[0x00]);
-            return;
-        }
-
-        int run = 0;
-        for (int k = 1; k <= lastNz; k++)
-        {
-            int idx = JpegConstants.ZigZag[k];
-            int v = block[idx];
-            if (v == 0)
-            {
-                run++;
-                continue;
-            }
-
-            while (run >= 16)
-            {
-                bw.WriteHuff(ac[0xF0]);
-                run -= 16;
-            }
-
-            int cat = MagnitudeCategory(v);
-            int sym = (run << 4) | cat;
-            bw.WriteHuffAndBits(ac[sym], EncodeMagnitudeBits(v, cat), cat);
-            run = 0;
-        }
-
-        if (lastNz != 63) bw.WriteHuff(ac[0x00]);
-    }
-
     // 只有整数 FDCT 实现：浮点 FDCT 已在早期版本中移除。整数版本在 x86/ARM 上结果一致，
     // 避免了跨平台浮点舍入差异，且与 libjpeg 的 islow 整数 FDCT 精度对齐。
+
+    /// <summary>
+    /// 按采样方式把一个 MCU 的 RGB 填成 YCbCr 系数块（块顺序与 <see cref="OrderOf"/> 一致）。
+    /// </summary>
+    /// <remarks>
+    /// 420/422/444 的 MCU 尺寸、块数与填充函数分派只在这里维护。此前
+    /// <see cref="ProduceRgbSamples"/>、<see cref="EncodeStreaming"/> 和
+    /// <see cref="JpegSampleCache"/> 各写一份同构的 if/else，改采样语义时必须三处同步；
+    /// 现在调用方只提供几何与目标 span，分支正确性由这一处保证。
+    /// </remarks>
+    internal static void FillRgbMcuSamples(
+        byte[] rgb,
+        int width,
+        int height,
+        JpegChromaSubsampling subsampling,
+        int baseX,
+        int baseY,
+        Span<int> blocks,
+        EncodeMetrics? metrics)
+    {
+        switch (subsampling)
+        {
+            case JpegChromaSubsampling.Yuv420:
+                FillMcu420RgbToYCbCr(
+                    rgb, width, height, baseX, baseY,
+                    blocks[..64], blocks.Slice(64, 64), blocks.Slice(128, 64),
+                    blocks.Slice(192, 64), blocks.Slice(256, 64), blocks.Slice(320, 64),
+                    metrics);
+                break;
+            case JpegChromaSubsampling.Yuv422:
+                FillMcu422RgbToYCbCr(
+                    rgb, width, height, baseX, baseY,
+                    blocks[..64], blocks.Slice(64, 64), blocks.Slice(128, 64), blocks.Slice(192, 64),
+                    metrics);
+                break;
+            default:
+                FillBlockRgbToYCbCr444(
+                    rgb, width, height, baseX, baseY,
+                    blocks[..64], blocks.Slice(64, 64), blocks.Slice(128, 64),
+                    metrics);
+                break;
+        }
+    }
 
     internal static unsafe void FillMcu422RgbToYCbCr(
         byte[] rgb,
