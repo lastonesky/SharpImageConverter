@@ -27,6 +27,8 @@ internal sealed class JpegSampleCache : IDisposable
     private JpegChromaSubsampling subsampling;
     private int mcuX;
     private int mcuY;
+    private int mcuSizeX;
+    private int mcuSizeY;
     private int blockCount;
     private bool filled;
 
@@ -34,7 +36,7 @@ internal sealed class JpegSampleCache : IDisposable
 
     public int McuY => mcuY;
 
-    /// <summary>每个 MCU 的块数：4:2:0 为 6（4Y+2C），4:4:4 为 3。</summary>
+    /// <summary>每个 MCU 的块数：4:2:0 为 6（4Y+2C），4:2:2 为 4（2Y+2C），4:4:4 为 3。</summary>
     public int BlockCount => blockCount;
 
     /// <summary>缓存是否已经按这组几何采样过。</summary>
@@ -58,8 +60,8 @@ internal sealed class JpegSampleCache : IDisposable
             width = w;
             height = h;
             subsampling = useSubsampling;
-            int mcuSizeX = 8 * JpegEncoder.SamplingH(useSubsampling);
-            int mcuSizeY = 8 * JpegEncoder.SamplingV(useSubsampling);
+            mcuSizeX = JpegEncoder.SamplingH(useSubsampling) * 8;
+            mcuSizeY = JpegEncoder.SamplingV(useSubsampling) * 8;
             mcuX = (w + mcuSizeX - 1) / mcuSizeX;
             mcuY = (h + mcuSizeY - 1) / mcuSizeY;
             blockCount = JpegEncoder.BlockCountOf(useSubsampling);
@@ -85,29 +87,11 @@ internal sealed class JpegSampleCache : IDisposable
         int stride = blockCount * 64;
         for (int mx = 0; mx < mcuX; mx++)
         {
-            if (subsampling == JpegChromaSubsampling.Yuv420)
-            {
-                // 与 ProduceRgbSamples 的调用完全一致（含边界复制），保证样本逐位相同。
-                JpegEncoder.FillMcu420RgbToYCbCr(
-                    rgb24, width, height, mx * 16, my * 16,
-                    samples[..64], samples.Slice(64, 64), samples.Slice(128, 64),
-                    samples.Slice(192, 64), samples.Slice(256, 64), samples.Slice(320, 64),
-                    null);
-            }
-            else if (subsampling == JpegChromaSubsampling.Yuv422)
-            {
-                JpegEncoder.FillMcu422RgbToYCbCr(
-                    rgb24, width, height, mx * 16, my * 8,
-                    samples[..64], samples.Slice(64, 64), samples.Slice(128, 64), samples.Slice(192, 64),
-                    null);
-            }
-            else
-            {
-                JpegEncoder.FillBlockRgbToYCbCr444(
-                    rgb24, width, height, mx * 8, my * 8,
-                    samples[..64], samples.Slice(64, 64), samples.Slice(128, 64),
-                    null);
-            }
+            // 与 ProduceRgbSamples 共用同一个分派入口（含边界复制），保证样本逐位相同。
+            JpegEncoder.FillRgbMcuSamples(
+                rgb24, width, height, subsampling,
+                mx * mcuSizeX, my * mcuSizeY,
+                samples[..stride], null);
 
             Span<byte> dst = target.AsSpan((my * mcuX + mx) * stride, stride);
             for (int k = 0; k < stride; k++)
