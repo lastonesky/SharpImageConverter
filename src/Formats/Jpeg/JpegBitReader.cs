@@ -1,5 +1,6 @@
 using System;
 using System.Buffers;
+using System.Buffers.Binary;
 using System.IO;
 using System.Runtime.CompilerServices;
 using System.Threading;
@@ -20,9 +21,10 @@ internal ref struct JpegBitReader
     private ReadOnlySpan<byte> data;
     private int offset;
     private int bytesConsumed;
-    private uint bitBuffer;
+    private ulong bitBuffer;
     private int bitCount;
     private int pendingMarker;
+    private int markerEndOffset;
     private int padByteCount;
     private bool reachedEndOfData;
     private readonly JpegStreamInput? streamInput;
@@ -36,6 +38,7 @@ internal ref struct JpegBitReader
         bitBuffer = 0;
         bitCount = 0;
         pendingMarker = -1;
+        markerEndOffset = -1;
         padByteCount = 0;
         streamInput = null;
         cancellationToken = default;
@@ -49,6 +52,7 @@ internal ref struct JpegBitReader
         bitBuffer = 0;
         bitCount = 0;
         pendingMarker = -1;
+        markerEndOffset = -1;
         padByteCount = 0;
         streamInput = input;
         this.cancellationToken = cancellationToken;
@@ -67,6 +71,13 @@ internal ref struct JpegBitReader
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         get => pendingMarker;
     }
+
+    /// <summary>
+    /// 已检出 marker 的 code 字节之后在数据源中的位置；-1 表示尚未检出。
+    /// 批量 refill 会预取数个字节，<see cref="BytesConsumed"/> 因此领先于真实位流位置；
+    /// 需要把文件游标对齐到 marker 时必须用本属性。
+    /// </summary>
+    public readonly int MarkerEndOffset => markerEndOffset;
 
     public readonly int BytesConsumed
     {
@@ -89,6 +100,7 @@ internal ref struct JpegBitReader
         bitBuffer = 0;
         bitCount = 0;
         pendingMarker = -1;
+        markerEndOffset = -1;
         padByteCount = 0;
     }
 
@@ -136,9 +148,34 @@ internal ref struct JpegBitReader
         return true;
     }
 
+    /// <summary>
+    /// 目标装载深度（位）。32 位一次装载可让约 4 个符号才 refill 一次；
+    /// 上界 32 保证 bitCount + 32 ≤ 64 不溢出 ulong。
+    /// </summary>
+    private const int FillTarget = 32;
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private void FillBitBuffer(int minBits)
     {
+        int target = minBits < FillTarget ? FillTarget : minBits;
+
+        // 快路径：一次装 4 字节。窗口内无 0xFF 时可直接整块压入（约 98.5% 命中）；
+        // 命中 0xFF 就退回慢路径，由原有的逐字节填充剥离逻辑处理 0xFF00 与 marker。
+        while (bitCount <= 32 && bitCount < target && streamInput is null &&
+               (uint)(offset + 4) <= (uint)data.Length)
+        {
+            uint w = BinaryPrimitives.ReadUInt32LittleEndian(data.Slice(offset, 4));
+            if (((~w - 0x01010101u) & ~(~w) & 0x80808080u) != 0)
+            {
+                break;
+            }
+
+            bitBuffer = (bitBuffer << 32) | BinaryPrimitives.ReverseEndianness(w);
+            bitCount += 32;
+            offset += 4;
+            bytesConsumed += 4;
+        }
+
         while (bitCount < minBits)
         {
             if (pendingMarker == (int)JpegMarker.EOI && padByteCount < 4)
@@ -157,6 +194,7 @@ internal ref struct JpegBitReader
             if (!TryReadByte(out byte b))
             {
                 pendingMarker = (int)JpegMarker.EOI;
+                markerEndOffset = bytesConsumed;
                 continue;
             }
 
@@ -165,6 +203,7 @@ internal ref struct JpegBitReader
                 if (!TryReadByte(out byte next))
                 {
                     pendingMarker = (int)JpegMarker.EOI;
+                    markerEndOffset = bytesConsumed;
                     continue;
                 }
 
@@ -173,6 +212,7 @@ internal ref struct JpegBitReader
                     if (!TryReadByte(out next))
                     {
                         pendingMarker = (int)JpegMarker.EOI;
+                        markerEndOffset = bytesConsumed;
                         break;
                     }
                 }
@@ -189,6 +229,7 @@ internal ref struct JpegBitReader
                 else
                 {
                     pendingMarker = next;
+                    markerEndOffset = bytesConsumed;
                     if (pendingMarker == (int)JpegMarker.EOI)
                     {
                         continue;
@@ -216,12 +257,12 @@ internal ref struct JpegBitReader
                 return mask;
             }
 
-            uint avail = bitCount == 0 ? 0u : (bitBuffer & ((1u << bitCount) - 1u));
+            uint avail = bitCount == 0 ? 0u : (uint)(bitBuffer & ((1UL << bitCount) - 1UL));
             uint pad = (uint)((1 << missing) - 1);
             return ((avail << missing) | pad) & mask;
         }
 
-        return (bitBuffer >> (bitCount - count)) & ((uint)(1 << count) - 1);
+        return (uint)(bitBuffer >> (bitCount - count)) & ((uint)(1 << count) - 1);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -241,6 +282,12 @@ internal ref struct JpegBitReader
         bitCount -= count;
     }
 
+    /// <summary>
+    /// 缓冲中已确知有 <paramref name="count"/> 位时直接扣减，跳过 refill。
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public void SkipBitsBuffered(int count) => bitCount -= count;
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public uint ReadBits(int count)
     {
@@ -257,7 +304,17 @@ internal ref struct JpegBitReader
             return 0;
         }
 
-        int v = (int)ReadBits(size);
+        uint raw = PeekBits(size);
+        if (bitCount >= size)
+        {
+            bitCount -= size;
+        }
+        else
+        {
+            SkipBits(size);
+        }
+
+        int v = (int)raw;
         int vt = 1 << (size - 1);
         if (v < vt)
         {

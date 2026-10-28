@@ -524,7 +524,10 @@ internal sealed partial class JpegFrameState
 
     private void DecodeBaselineBlock(ref JpegBitReader reader, ComponentState comp, Span<short> block)
     {
-        int s = dcTables[comp.DcTableId].Decode(ref reader);
+        HuffmanDecodingTable dcTable = dcTables[comp.DcTableId];
+        HuffmanDecodingTable acTable = acTables[comp.AcTableId];
+
+        int s = dcTable.Decode(ref reader);
         int diff = reader.ReceiveAndExtend(s);
         comp.DcPredictor += diff;
         block[0] = (short)comp.DcPredictor;
@@ -533,7 +536,7 @@ internal sealed partial class JpegFrameState
         ReadOnlySpan<byte> zigzag = JpegConstants.ZigZag;
         while (k < 64)
         {
-            int rs = acTables[comp.AcTableId].Decode(ref reader);
+            int rs = acTable.Decode(ref reader);
             int r = rs >> 4;
             s = rs & 0x0F;
 

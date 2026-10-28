@@ -110,7 +110,15 @@ internal sealed class HuffmanDecodingTable
         if (f != 0)
         {
             int s = f >> 8;
-            reader.SkipBits(s);
+            if (reader.BitCount >= s)
+            {
+                reader.SkipBitsBuffered(s);
+            }
+            else
+            {
+                reader.SkipBits(s);
+            }
+
             return (byte)f;
         }
 

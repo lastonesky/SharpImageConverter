@@ -305,7 +305,9 @@ public static partial class JpegDecoder
                 reader.ClearPendingMarker();
             }
 
-            offset = entropyStart + reader.BytesConsumed;
+            // 批量 refill 会预取若干字节，BytesConsumed 领先于真实位流位置；
+            // 这里必须用 marker 的实际结束位置，否则多扫描（渐进式）文件会从错位处继续解析。
+            offset = entropyStart + (reader.MarkerEndOffset >= 0 ? reader.MarkerEndOffset : reader.BytesConsumed);
         }
 
         private void SkipSegment()
