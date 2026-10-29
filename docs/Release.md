@@ -97,9 +97,9 @@ gh workflow run release.yml --repo lastonesky/SharpImageConverter --ref master -
 |---|---|
 | `SharpImageConverter.X.Y.Z.nupkg` | 由 `release` 工作流从**该 tag 的源码**打包上传；`nuget-publish` 工作流也把同版本推到了 nuget.org。同源同版本，但不保证逐字节相同（两者打包环境不同），以 nuget.org 上的为权威。 |
 | `SharpImageConverter.X.Y.Z.snupkg` | 同上（符号包） |
-| `SharpImageConverter.Cli-X.Y.Z-win-x64.exe` | 单文件自包含（原生库内嵌，运行时自解压），**无需安装 .NET** |
+| `SharpImageConverter.Cli-X.Y.Z-win-x64.exe` | 单文件**依赖框架**（原生库内嵌，运行时自解压），需已安装 .NET 10 运行时 |
 | `SharpImageConverter.Cli-X.Y.Z-linux-x64.tar.gz` | 同上 |
-| `SharpImageConverter.Cli-X.Y.Z-osx-arm64.tar.gz` | 目录式发布（tar 内含同名目录，解压后跑目录里的 `SharpImageConverter.Cli`）；用 `macos-15`(arm64) 原生构建，已在实机冒烟测试通过 |
+| `SharpImageConverter.Cli-X.Y.Z-osx-arm64.tar.gz` | 目录式**依赖框架**发布（tar 内含同名目录，解压后跑目录里的 `SharpImageConverter.Cli`）；用 `macos-15`(arm64) 原生构建，已在实机冒烟测试通过 |
 | `SHA256SUMS.txt` | 覆盖以上全部资产 |
 
 本机构建 CLI 资产用同名脚本（版本号自动取自 csproj，产物落在被 gitignore 的 `.artifacts/release/`）：
@@ -110,10 +110,15 @@ tools/build-cli.sh win-x64 linux-x64             # 多平台
 tools/build-cli.sh osx-arm64                     # 必须在 macOS 上跑（否则脚本直接报错退出）
 ```
 
-发布参数：win/linux 用 `-c Release -r <rid> --self-contained true -p:PublishSingleFile=true
--p:IncludeNativeLibrariesForSelfExtract=true -p:EnableCompressionInSingleFile=true
--p:DebugType=none -p:GenerateDocumentationFile=false`；macOS 用 `-p:PublishSingleFile=false`，
-外加 dylib 的 `install_name_tool` 修复与 ad-hoc 签名（详见脚本注释）。
+发布参数：win/linux 用 `-c Release -r <rid> --self-contained false -p:PublishSingleFile=true
+-p:IncludeNativeLibrariesForSelfExtract=true -p:DebugType=none
+-p:GenerateDocumentationFile=false`；macOS 用 `-p:PublishSingleFile=false`，外加 dylib 的
+`install_name_tool` 修复与 ad-hoc 签名（详见脚本注释）。
+
+**1.3.0 起依赖框架发布**：不再 `--self-contained true`（自包含运行时体积太大，win exe
+38 MB → 1.35 MB）。注意 `EnableCompressionInSingleFile` 在依赖框架下会报
+NETSDK1176，不能带。使用者需自行安装 .NET 10 运行时；CI 冒烟测试能跑是因为 runner
+上本来就装了 setup-dotnet 指定的运行时。
 
 ## 七、发布前验证
 

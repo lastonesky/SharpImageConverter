@@ -6,18 +6,21 @@
 #   例如：tools/build-cli.sh win-x64 linux-x64 osx-arm64
 #
 # 产物（.artifacts/release/，已被 .gitignore 忽略）：
-#   SharpImageConverter.Cli-<version>-win-x64.exe        单文件自包含
-#   SharpImageConverter.Cli-<version>-linux-x64.tar.gz   单文件自包含（tar 内含单个可执行文件）
-#   SharpImageConverter.Cli-<version>-osx-arm64.tar.gz   目录式（tar 内含同名目录）
+#   SharpImageConverter.Cli-<version>-win-x64.exe        单文件，依赖框架（需已安装 .NET 10 运行时）
+#   SharpImageConverter.Cli-<version>-linux-x64.tar.gz   单文件，依赖框架（tar 内含单个可执行文件）
+#   SharpImageConverter.Cli-<version>-osx-arm64.tar.gz   目录式，依赖框架（tar 内含同名目录）
 #   SHA256SUMS.txt
 #
-# 两个平台差异的原因：
-# - win / linux：单文件 + 自包含（含原生 libwebp，运行时自解压），使用者无需安装 .NET。
-# - macOS：仓库里的 webp dylib 带着构建机的 @rpath（/Users/lastonesky/Project/libwebp/build）
-#   与版本化依赖名（@rpath/libsharpyuv.0.dylib 等），别的机器上解析不了依赖。修复必须用
-#   macOS 的 install_name_tool 在发布目录里改，因此 macOS 走**目录式**发布（原生库散落在
-#   可执行文件旁），并在构建机上补 @loader_path rpath、按依赖名提供副本、再做 ad-hoc 签名。
-#   ⇒ osx-arm64 必须在 macOS 上构建（CI 用 macos-15）。
+# 自 1.3.0 起改为**依赖框架**发布（--self-contained false）：自包含运行时体积太大，
+# 使用者需自行安装 .NET 10 运行时。win/linux 仍是单文件（托管程序集打进 exe，
+# 原生 libwebp 以 IncludeNativeLibrariesForSelfExtract 内嵌、运行时自解压到临时目录），
+# 资产形态与自包含版相同，只是体积大幅缩小。
+#
+# 平台差异（仍然成立）：
+# - macOS 的 webp dylib 带着构建机的 @rpath 与版本化依赖名（@rpath/libsharpyuv.0.dylib 等），
+#   别的机器上解析不了依赖。修复必须用 macOS 的 install_name_tool 在发布目录里改，因此
+#   macOS 走**目录式**发布（原生库散落在可执行文件旁），并补 @loader_path rpath、
+#   按依赖名提供副本、再做 ad-hoc 签名。⇒ osx-arm64 必须在 macOS 上构建（CI 用 macos-15）。
 #
 # 版本号取自 src/SharpImageConverter.csproj 的 <Version>，因此必须先改版本号再执行本脚本。
 # CI 侧对应 .github/workflows/release.yml。
@@ -99,7 +102,7 @@ for RID in "${RIDS[@]}"; do
 
   if [ "$RID" = "osx-arm64" ]; then
     dotnet publish Cli/SharpImageConverter.Cli.csproj \
-      -c Release -r "$RID" --self-contained true \
+      -c Release -r "$RID" --self-contained false \
       -p:PublishSingleFile=false \
       -p:DebugType=none \
       -p:GenerateDocumentationFile=false \
@@ -109,10 +112,9 @@ for RID in "${RIDS[@]}"; do
     tar $TAR_EXTRA -czf "$OUT/$NAME.tar.gz" -C "$STAGE" "$NAME"
   else
     dotnet publish Cli/SharpImageConverter.Cli.csproj \
-      -c Release -r "$RID" --self-contained true \
+      -c Release -r "$RID" --self-contained false \
       -p:PublishSingleFile=true \
       -p:IncludeNativeLibrariesForSelfExtract=true \
-      -p:EnableCompressionInSingleFile=true \
       -p:DebugType=none \
       -p:GenerateDocumentationFile=false \
       -o "$STAGE/$RID" >/dev/null

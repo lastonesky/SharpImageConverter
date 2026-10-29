@@ -1,5 +1,15 @@
 ## 未发布
 
+## 1.3.0（相对 v1.2.0）
+
+### 发布
+- **CLI 资产改为依赖框架（framework-dependent）发布**：`tools/build-cli.sh` 由
+  `--self-contained true` 改为 `false`，并去掉 `EnableCompressionInSingleFile`
+  （NETSDK1176：压缩单文件仅支持自包含）。资产形态不变（win 单文件 `.exe` /
+  linux 单 exe tar / osx 目录 tar），原生 libwebp 仍经 `IncludeNativeLibrariesForSelfExtract`
+  内嵌、运行时自解压。win-x64 从自包含的 38.1 MB 降到 **1.35 MB**（本机实测，约 1/28）。
+  代价是使用者需自行安装 .NET 10 运行时。
+
 ### 性能
 - **JPEG optimize 大图 28.6 s → 3.45 s（143 MP `examples/progressive.jpg`）**，三个独立原因：
   - **4:2:2 解码补上 SIMD 快速路径**：`TryDecodeInterleavedYCbCrSimd` 此前只认 Y=1×1 / 2×2，
