@@ -1,5 +1,13 @@
 ## 未发布
 
+### 构建
+- **`dotnet test` 切换到 .NET 10 SDK 的 MTP 模式**：.NET 10 SDK 起 Microsoft.Testing.Platform
+  不再支持挂在 VSTest 目标上，`dotnet test` 全挂（CI 与本机同病）。`global.json` 只声明
+  `test.runner = Microsoft.Testing.Platform`（不锁 SDK 版本）；CI 显式传 solution 改用
+  `--solution`（新模式不吃位置参数）。**`TempProbeFidelityBlocks` 缺本机
+  `%TEMP%\bench\fidelity` 语料时改为 Skip 而非失败**（该探针依赖跑 bench 留下的文件，
+  机器间不保证存在，CI 上必挂）。
+
 ## 1.3.0（相对 v1.2.0）
 
 ### 发布
