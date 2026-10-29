@@ -252,6 +252,14 @@ public class IdctGoldenTests
     public void TempProbeFidelityBlocks()
     {
         string dir = Path.Combine(Path.GetTempPath(), "bench", "fidelity");
+        if (!Directory.Exists(dir)
+            || !File.Exists(Path.Combine(dir, "photo1_444_q50.jpg"))
+            || !File.Exists(Path.Combine(dir, "grad444_q50.jpg")))
+        {
+            // 本测试是临时探针：依赖本机 %TEMP%\bench\fidelity 下跑 bench 留下的语料，
+            // 机器间不保证存在（CI / 清理过 TEMP 的机器都没有），缺语料时跳过而不是失败。
+            Assert.Skip("缺少 %TEMP%\\bench\\fidelity 语料（仅本机调试用），跳过");
+        }
         foreach (string name in new[] { "photo1_444_q50.jpg", "grad444_q50.jpg" })
         {
             byte[] data = File.ReadAllBytes(Path.Combine(dir, name));
