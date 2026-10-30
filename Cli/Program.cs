@@ -1,5 +1,6 @@
 ﻿using System.Diagnostics;
 using System.Globalization;
+using System.Reflection;
 using SharpImageConverter.Compression;
 using SharpImageConverter.Core;
 using SharpImageConverter.Processing;
@@ -45,23 +46,58 @@ sealed class Program
     /// </remarks>
     const int DefaultDirectoryParallelismNoJpeg = 4;
 
-    static void Main(string[] args)
+    /// <summary>成功。</summary>
+    const int ExitSuccess = 0;
+
+    /// <summary>处理失败（解码/编码/IO 出错，或目录批量里有文件失败）。</summary>
+    const int ExitFailure = 1;
+
+    /// <summary>用法错误（未知参数、缺少输入路径、输入不存在）。</summary>
+    const int ExitUsage = 2;
+
+    static int Main(string[] args)
     {
         if (args.Length < 1)
         {
             PrintUsage();
-            return;
+            return ExitUsage;
         }
+
+        // --help / --version 必须在「把 args[0] 当输入路径」之前处理，
+        // 否则 sic --help 会报「输入文件不存在: --help」。
+        if (HasAnyFlag(args, "--help", "-h", "-?"))
+        {
+            PrintUsage();
+            return ExitSuccess;
+        }
+        if (HasAnyFlag(args, "--version"))
+        {
+            Console.WriteLine(GetVersionString());
+            return ExitSuccess;
+        }
+
         string inputPath = args[0];
         bool isDir = Directory.Exists(inputPath);
         bool isFile = File.Exists(inputPath);
         if (!isDir && !isFile)
         {
             Console.Error.WriteLine($"输入文件不存在: {inputPath}");
-            return;
+            Console.Error.WriteLine("用 --help 查看用法。");
+            return ExitUsage;
         }
         // 参数解析与行为选项汇总
         var options = ParseOptions(args, inputPath);
+        if (options.UnknownArguments.Count > 0)
+        {
+            // 未知参数不再被静默吞掉：此前 `--foo bar` 会把 bar 当成输出路径，
+            // 于是文件被写到意料之外的位置，而命令行看起来"成功"了。
+            foreach (string unknown in options.UnknownArguments)
+            {
+                Console.Error.WriteLine($"未知参数: {unknown}");
+            }
+            Console.Error.WriteLine("用 --help 查看支持的选项。");
+            return ExitUsage;
+        }
         options.IsDirectoryInput = isDir;
         EnableGifDiagnostics(options);
         // JPEG 诊断走 Trace.WriteLine，默认无监听器时输出全部丢失，这里补一个控制台监听器
@@ -80,7 +116,7 @@ sealed class Program
             else
             {
                 RunGifBench(options, options.GifBench.Value);
-                return;
+                return ExitSuccess;
             }
         }
 
@@ -94,48 +130,86 @@ sealed class Program
             else
             {
                 RunJpegBench(options, options.JpegBench.Value);
-                return;
+                return ExitSuccess;
             }
         }
 
         var swTotal = Stopwatch.StartNew();
+        int failures = 0;
         try
         {
             if (options.Optimize)
             {
                 // --optimize 与 --to / 目标扩展名同时给出 → 一步完成「转换 + 智能压缩」
-                if (TryResolveConvertTarget(options, isDir, out string targetExt))
-                {
-                    RunConvertOptimize(options, isDir, targetExt);
-                }
-                else
-                {
-                    RunOptimize(options, isDir);
-                }
+                failures = TryResolveConvertTarget(options, isDir, out string targetExt)
+                    ? RunConvertOptimize(options, isDir, targetExt)
+                    : RunOptimize(options, isDir);
                 swTotal.Stop();
                 Console.WriteLine($"⏱️ 总耗时: {swTotal.ElapsedMilliseconds} ms");
-                return;
+                return failures == 0 ? ExitSuccess : ExitFailure;
             }
 
-            bool wroteFile = isDir ? ProcessDirectory(options) : Process(options);
+            bool wroteFile;
+            if (isDir)
+            {
+                failures = ProcessDirectory(options);
+                wroteFile = true;
+            }
+            else
+            {
+                wroteFile = Process(options);
+            }
             swTotal.Stop();
             if (wroteFile)
             {
                 Console.WriteLine($"✅ 写入完成: {options.OutputPath}");
             }
             Console.WriteLine($"⏱️ 总耗时: {swTotal.ElapsedMilliseconds} ms");
+            return failures == 0 ? ExitSuccess : ExitFailure;
         }
         catch (Exception ex)
         {
             swTotal.Stop();
             string prefix = options.UseStreamingDecoder ? "流式解码失败" : "处理失败";
             Console.Error.WriteLine($"{prefix}: {ex.GetType().Name}: {ex.Message}");
+            return ExitFailure;
         }
+    }
+
+    /// <summary>
+    /// 命令行里是否出现了指定的任一开关（大小写不敏感）。用于 --help / --version 这类
+    /// 与业务参数无关、按惯例可出现在任意位置的元开关。
+    /// </summary>
+    static bool HasAnyFlag(string[] args, params string[] names)
+    {
+        for (int i = 0; i < args.Length; i++)
+        {
+            for (int n = 0; n < names.Length; n++)
+            {
+                if (string.Equals(args[i], names[n], StringComparison.OrdinalIgnoreCase)) return true;
+            }
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// 版本号取自库程序集（含 SourceLink 的 +sha 后缀，这里截掉 commit 部分）。
+    /// </summary>
+    static string GetVersionString()
+    {
+        var asm = typeof(ImageOptimizer).Assembly;
+        string? informational = asm
+            .GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion;
+        string version = informational ?? asm.GetName().Version?.ToString() ?? "unknown";
+        int plus = version.IndexOf('+');
+        if (plus > 0) version = version[..plus];
+        return $"SharpImageConverter {version}";
     }
 
     static void PrintUsage()
     {
-        Console.WriteLine("用法: dotnet run -- <输入文件或文件夹路径> [输出文件或文件夹路径] [操作] [--quality N]");
+        Console.WriteLine("用法: sic <输入文件或文件夹> [输出文件或文件夹] [操作] [选项]");
+        Console.WriteLine("      sic --help | --version");
         Console.WriteLine("支持输入: .jpg/.jpeg/.png/.bmp/.webp/.gif");
         Console.WriteLine("支持输出: .jpg/.jpeg/.png/.bmp/.webp/.gif");
         Console.WriteLine("操作: resize:WxH | resizebilinear:WxH | resizefit:WxH | grayscale");
@@ -150,13 +224,18 @@ sealed class Program
         Console.WriteLine("智能压缩: --optimize [--opt-quality N] [--opt-webp-min N] [--opt-webp-large-min N] [--max-colors N] [--no-dither] [--opt-no-png-deflate9] [--opt-no-jpeg-progressive] [--opt-jpeg-subsample-compare] [--opt-jpeg-trellis] [--opt-verbose] [--min-saving 百分比] [--opt-lossy-min-gain 百分比]");
         Console.WriteLine("  说明: 在画质基本不变的前提下把 JPG/PNG/GIF/WEBP/BMP 压到最小，默认输出 <原名>.min.<原扩展名>");
         Console.WriteLine("转换+压缩: --to <格式> --optimize   转成目标格式并直接输出该格式下最小体积（无需再 optimize 一遍）");
-        Console.WriteLine("  示例: dotnet run -- photo.jpg --to webp --optimize   →  photo.webp（已是最小体积）");
+        Console.WriteLine("  示例: sic photo.jpg --to webp --optimize   →  photo.webp（已是最小体积）");
+        Console.WriteLine("退出码: 0 成功 | 1 处理失败（含批量中有文件失败） | 2 用法错误（未知参数/输入不存在）");
     }
 
     /// <summary>
     /// 智能压缩模式：保持原格式输出体积最小的版本。
     /// </summary>
-    static void RunOptimize(CliOptions options, bool isDir)
+    /// <summary>
+    /// 智能压缩模式：保持原格式输出体积最小的版本。
+    /// </summary>
+    /// <returns>失败的文件数（单文件模式为 0 或 1，失败时直接抛异常交给 Main）</returns>
+    static int RunOptimize(CliOptions options, bool isDir)
     {
         var opt = BuildOptimizeOptions(options);
 
@@ -166,7 +245,7 @@ sealed class Program
             var result = ImageOptimizer.Optimize(options.InputPath, output, opt);
             PrintOptimizeResult(result);
             options.OutputPath = output;
-            return;
+            return 0;
         }
 
         string inputDir = options.InputPath;
@@ -178,6 +257,7 @@ sealed class Program
         int parallel = ResolveDirectoryParallelism(options, files, optimizing: true, targetExt: null);
         long savedTotal = 0, beforeTotal = 0, afterTotal = 0;
         int kept = 0;
+        int failed = 0;
 
         Parallel.ForEach(files, new ParallelOptions { MaxDegreeOfParallelism = parallel }, file =>
         {
@@ -206,13 +286,15 @@ sealed class Program
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"❌ {Path.GetFileName(file)}: {ex.GetType().Name}: {ex.Message}");
+                lock (files) failed++;
+                Console.Error.WriteLine($"❌ {Path.GetFileName(file)}: {ex.GetType().Name}: {ex.Message}");
             }
         });
 
         double ratio = beforeTotal > 0 ? (double)savedTotal / beforeTotal : 0;
-        Console.WriteLine($"✅ 智能压缩完成: {files.Count} 个文件，{FormatSize(beforeTotal)} → {FormatSize(afterTotal)}（省 {ratio:P1}）{(kept > 0 ? $"，{kept} 个无收益已保留原图" : "")}");
+        Console.WriteLine($"✅ 智能压缩完成: {files.Count} 个文件，{FormatSize(beforeTotal)} → {FormatSize(afterTotal)}（省 {ratio:P1}）{(kept > 0 ? $"，{kept} 个无收益已保留原图" : "")}{(failed > 0 ? $"，失败 {failed} 个" : "")}");
         options.OutputPath = outDir;
+        return failed;
     }
 
     /// <summary>
@@ -256,7 +338,8 @@ sealed class Program
     /// 转换 + 智能压缩：把输入转成目标格式，并直接产出该格式下体积最小的版本，
     /// 无需再单独跑一遍 <c>--optimize</c>。
     /// </summary>
-    static void RunConvertOptimize(CliOptions options, bool isDir, string targetExt)
+    /// <returns>失败的文件数</returns>
+    static int RunConvertOptimize(CliOptions options, bool isDir, string targetExt)
     {
         var opt = BuildOptimizeOptions(options);
 
@@ -268,7 +351,7 @@ sealed class Program
             var result = ImageOptimizer.Optimize(options.InputPath, output, opt);
             PrintOptimizeResult(result);
             options.OutputPath = result.OutputPath;
-            return;
+            return 0;
         }
 
         string inputDir = options.InputPath;
@@ -280,6 +363,7 @@ sealed class Program
         int parallel = ResolveDirectoryParallelism(options, files, optimizing: true, targetExt);
         long savedTotal = 0, beforeTotal = 0, afterTotal = 0;
         int converted = 0;
+        int failed = 0;
         var locker = new object();
 
         Parallel.ForEach(files, new ParallelOptions { MaxDegreeOfParallelism = parallel }, file =>
@@ -310,12 +394,14 @@ sealed class Program
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"❌ {Path.GetFileName(file)}: {ex.GetType().Name}: {ex.Message}");
+                lock (locker) failed++;
+                Console.Error.WriteLine($"❌ {Path.GetFileName(file)}: {ex.GetType().Name}: {ex.Message}");
             }
         });
 
-        Console.WriteLine($"✅ 转换+智能压缩完成: {converted} 个文件 → {targetExt}，{FormatSize(beforeTotal)} → {FormatSize(afterTotal)}");
+        Console.WriteLine($"✅ 转换+智能压缩完成: {converted} 个文件 → {targetExt}，{FormatSize(beforeTotal)} → {FormatSize(afterTotal)}{(failed > 0 ? $"，失败 {failed} 个" : "")}");
         options.OutputPath = outDir;
+        return failed;
     }
 
     /// <summary>
@@ -652,10 +738,22 @@ sealed class Program
             {
                 continue;
             }
-            if (options.OutputPath == null && !a.StartsWith('-'))
+            if (!a.StartsWith('-'))
             {
-                options.OutputPath = a;
+                if (options.OutputPath == null)
+                {
+                    options.OutputPath = a;
+                }
+                else
+                {
+                    // 多余的第二个位置参数：以前被静默忽略，用户以为生效了
+                    options.UnknownArguments.Add(a);
+                }
+                continue;
             }
+            // 走到这里的开关没有任何分支认领：以前 `--foo bar` 会把 bar 当成输出路径，
+            // 文件被写到意料之外的地方而命令行看起来"成功"。现在一律报用法错误。
+            options.UnknownArguments.Add(a);
         }
         return options;
     }
@@ -685,7 +783,11 @@ sealed class Program
         return false;
     }
 
-    static bool ProcessDirectory(CliOptions options)
+    /// <summary>
+    /// 目录批量转换。
+    /// </summary>
+    /// <returns>失败的文件数</returns>
+    static int ProcessDirectory(CliOptions options)
     {
         string inputDir = options.InputPath;
         string outDir = options.OutputPath ?? inputDir;
@@ -719,24 +821,21 @@ sealed class Program
                 }
                 string resolved = ResolveOutputPath(file, desired, defaultExt);
                 var perFileOptions = CloneOptionsForFile(options, file, resolved);
-                bool wrote = Process(perFileOptions);
-                if (wrote)
-                {
-                    lock (locker) success++;
-                }
-                else
-                {
-                    lock (locker) success++;
-                }
+                // Process 返回 false 只表示「没有单个输出文件」（GIF 拆帧），不是失败
+                Process(perFileOptions);
+                lock (locker) success++;
             }
-            catch
+            catch (Exception ex)
             {
+                // 此前这里是个裸 catch：失败只累加计数，连文件名都不打印，
+                // 批量跑完只看到"失败 N"，无从定位。
                 lock (locker) fail++;
+                Console.Error.WriteLine($"❌ {Path.GetFileName(file)}: {ex.GetType().Name}: {ex.Message}");
             }
         });
         Console.WriteLine($"✅ 转换完成: 成功 {success}，失败 {fail}");
         options.OutputPath = outDir;
-        return true;
+        return fail;
     }
 
     /// <summary>
@@ -1069,7 +1168,7 @@ sealed class Program
             ?? (options.Operations.Count == 0 ? ".png" : ".bmp");
         var source = ImageOptimizer.DetectFormat(options.InputPath);
         var target = ImageOptimizer.DetectKindByExtension(targetExt);
-        if (target == ImageOptimizer.ImageKind.Unknown) return;
+        if (target == ImageFormatKind.Unknown) return;
 
         long explicitLimit = options.MemoryLimitMb is > 0 ? options.MemoryLimitMb.Value * 1024L * 1024L : 0;
         var verdict = MemoryGuard.CheckPlain(source, target, options.InputPath, explicitLimit);
@@ -1079,7 +1178,7 @@ sealed class Program
                 return;
             case MemoryGuard.Action.UseStreaming:
                 if (options.Operations.Count == 0
-                    && !(options.Gray && target == ImageOptimizer.ImageKind.Jpeg)
+                    && !(options.Gray && target == ImageFormatKind.Jpeg)
                     && StreamingConversion.IsSupported(source, target, options.InputPath))
                 {
                     options.ForceStreaming = true;
@@ -1088,7 +1187,7 @@ sealed class Program
                         $"{verdict.BudgetBytes / 1048576.0:F1} MB；已切换到逐行流式转换（{source} → {target}）。");
                     return;
                 }
-                if (source == ImageOptimizer.ImageKind.Jpeg)
+                if (source == ImageFormatKind.Jpeg)
                 {
                     // 目标不支持逐行编码时，至少切到流式输入解码。
                     options.UseStreamingDecoder = true;
@@ -1733,65 +1832,5 @@ sealed class Program
             idx++;
         } while (File.Exists(candidate));
         return candidate;
-    }
-
-    private sealed class CliOptions(string inputPath)
-    {
-        public string InputPath { get; } = inputPath;
-        public string? OutputPath { get; set; }
-        public int? JpegQuality { get; set; }
-        public bool? Subsample420 { get; set; }
-        public JpegChromaSubsampling? JpegSubsampling { get; set; }
-        public bool KeepMetadata { get; set; }
-        public bool GifFrames { get; set; }
-        public bool Dithering { get; set; } = true;
-        public bool UseFloatIdct { get; set; }
-        public bool UseStreamingDecoder { get; set; }
-        public bool RequireEoi { get; set; }
-        public bool Gray { get; set; }
-        public bool JpegDebug { get; set; }
-        public bool GifDebug { get; set; }
-        public int? GifBench { get; set; }
-        public int? JpegBench { get; set; }
-        public string? GifQuantizer { get; set; } // "octree"(默认) | "wu"/"legacy"/"fs" 切回原实现
-        public int GifDitherStrength { get; set; } = 8; // Bayer 抖动幅度，仅 octree 生效
-        public List<Action<ImageProcessingContext>> Operations { get; } = [];
-        public bool IsDirectoryInput { get; set; }
-        public bool Recursive { get; set; }
-        public string? OutputExtension { get; set; }
-        public int? Parallelism { get; set; }
-        public bool SkipExisting { get; set; }
-        public bool Optimize { get; set; }
-        public int? OptimizeQuality { get; set; }
-        public int? OptimizeWebpMin { get; set; }
-        public int? OptimizeWebpLargeMin { get; set; }
-        public int? OptimizeLossyMinGain { get; set; }
-        public int? OptimizeMinSsim { get; set; }
-        public int? OptimizeMinWorstSsim { get; set; }
-        public int? MaxColors { get; set; }
-        public bool NoDither { get; set; }
-        public bool NoPngDeflate9 { get; set; }
-        public bool JpegProgressive { get; set; }
-        public bool NoJpegProgressive { get; set; }
-        public bool JpegSubsampleCompare { get; set; }
-        public bool NoJpegSubsampleCompare { get; set; }
-        public bool JpegTrellis { get; set; }
-        public long? MemoryLimitMb { get; set; }
-        public bool NoMemoryGuard { get; set; }
-        public bool ForceStreaming { get; set; }
-        public bool OptimizeVerbose { get; set; }
-        public int? MinSaving { get; set; }
-
-        /// <summary>
-        /// 允许 WebP 编码绕过 <c>WebpCodec</c> 的全局 EncodeLock，从而让**外层**文件级并行真正并发。
-        /// 只在「纯转换路径 + 外层已并行」时由目录批量打开：该路径没有候选并行可叠加，
-        /// 而默认的 EncodeLock 会把外层并行整体串行化。
-        /// </summary>
-        public bool ParallelWebpEncode { get; set; }
-
-        /// <summary>
-        /// libwebp 的 <c>config.method</c>（0~6），null 表示用库默认（<see cref="WebpEncoderOptions"/> 的 3）。
-        /// </summary>
-        public int? WebpMethod { get; set; }
     }
 }
