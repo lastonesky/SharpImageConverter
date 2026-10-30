@@ -39,6 +39,14 @@ namespace SharpImageConverter.Core
                 && head[0] == (byte)'R' && head[1] == (byte)'I' && head[2] == (byte)'F' && head[3] == (byte)'F'
                 && head[8] == (byte)'W' && head[9] == (byte)'E' && head[10] == (byte)'B' && head[11] == (byte)'P') return ImageFormatKind.Webp;
             if (head.Length >= 2 && head[0] == (byte)'B' && head[1] == (byte)'M') return ImageFormatKind.Bmp;
+            // 以下两种只识别、不读写：识别它们的唯一用途是把「无法识别的图像格式」
+            // 换成「识别到 TIFF，但当前只支持 …」的可操作提示（见 ImageInfo.UnsupportedMessage）。
+            if (head.Length >= 4
+                && ((head[0] == 0x49 && head[1] == 0x49 && head[2] == 0x2A && head[3] == 0x00)   // "II*\0" 小端
+                    || (head[0] == 0x4D && head[1] == 0x4D && head[2] == 0x00 && head[3] == 0x2A))) // "MM\0*" 大端
+                return ImageFormatKind.Tiff;
+            if (head.Length >= 4 && head[0] == 0x00 && head[1] == 0x00
+                && (head[2] == 0x01 || head[2] == 0x02) && head[3] == 0x00) return ImageFormatKind.Ico;
             return ImageFormatKind.Unknown;
         }
 

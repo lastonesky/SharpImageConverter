@@ -253,6 +253,8 @@ being silently consumed as an output path.
 ### Supported Formats
 - Input: .jpg/.jpeg/.png/.bmp/.webp/.gif
 - Output: .jpg/.jpeg/.png/.bmp/.webp/.gif
+- Detected but **not readable/writable**: TIFF, ICO/CUR. These are reported by name
+  (e.g. `TIFF detected, but only JPEG / PNG / BMP / GIF / WebP are supported`) instead of a vague "unknown format".
 
 Special cases:
 - GIF → WebP: when input is animated GIF and output extension is `.webp`, encodes animated WebP (preserving frame timing and loop count where possible)
@@ -304,6 +306,9 @@ Special cases:
   - PNG/GIF/WebP have no such cliff (same batch: `png` 4 = 3069 ms, `gif` 4 = 2182 ms, `webp` 8 = 6926 ms), so **non-JPEG batches widen to 4**.
   - **One exception**: `--optimize` for WebP already saturates the candidates internally (libwebp encoding is single-threaded, so candidate parallelism is its only multi-core lever), therefore the outer level stays at 1 to avoid stacking with the inner one.
 - Skip existing: `--skip-existing` (skip if target file already exists)
+- Output control:
+  - `--quiet`: no progress or summary lines; errors still go to stderr (exit-code semantics unchanged).
+  - `--json`: print a **single JSON object** to stdout (per-file input/output paths, byte counts, quality metrics and failure reasons) and suppress the human-readable progress lines. Output is always UTF-8. Diagnostic output such as `--gif-bench` / `--jpeg-bench` is unaffected.
 - Output location: when the second argument is a folder, preserves the relative structure of the source directory; if not specified, outputs next to the source files
 - Default extension: `.png` when no operation; `.bmp` when operations are present; explicit `--to/--out-ext` takes precedence
 

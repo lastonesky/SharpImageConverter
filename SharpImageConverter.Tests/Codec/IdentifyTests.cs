@@ -202,6 +202,62 @@ namespace SharpImageConverter.Tests
         }
 
         /// <summary>
+        /// 未支持的格式（TIFF / ICO）即便不提供读写，也要**识别出来并报名字**，
+        /// 让调用方区分「文件是 TIFF，本库不支持」与「这根本不是图像」。
+        /// </summary>
+        [Theory]
+        [InlineData("tiff", new byte[] { 0x49, 0x49, 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00 }, "TIFF")]
+        [InlineData("tiff", new byte[] { 0x4D, 0x4D, 0x00, 0x2A, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x10 }, "TIFF")]
+        [InlineData("ico", new byte[] { 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x01, 0x01, 0x00, 0x00, 0x01, 0x00 }, "ICO")]
+        [InlineData("cur", new byte[] { 0x00, 0x00, 0x02, 0x00, 0x01, 0x00, 0x01, 0x01, 0x00, 0x00, 0x01, 0x00 }, "ICO")]
+        public void Identify_Recognized_But_Unsupported_Format_Names_Itself(string ext, byte[] header, string expectedName)
+        {
+            string path = NewTemp("." + ext);
+            try
+            {
+                File.WriteAllBytes(path, header);
+                var ex = Assert.Throws<NotSupportedException>(() => Image.Identify(path));
+                Assert.Contains(expectedName, ex.Message, StringComparison.Ordinal);
+                Assert.Contains("JPEG", ex.Message, StringComparison.Ordinal); // 顺带给出支持的格式
+            }
+            finally
+            {
+                File.Delete(path);
+            }
+        }
+
+        /// <summary>
+        /// 真正无法识别的内容也要把支持的格式列出来（此前只说「无法识别的图像格式」）。
+        /// </summary>
+        [Fact]
+        public void Identify_Unknown_Format_Message_Lists_Supported_Formats()
+        {
+            string path = NewTemp(".bin");
+            try
+            {
+                File.WriteAllBytes(path, Encoding.ASCII.GetBytes("not an image at all"));
+                var ex = Assert.Throws<NotSupportedException>(() => Image.Identify(path));
+                Assert.Contains("JPEG / PNG / BMP / GIF / WebP", ex.Message, StringComparison.Ordinal);
+            }
+            finally
+            {
+                File.Delete(path);
+            }
+        }
+
+        /// <summary>
+        /// <see cref="ImageFrame.Load(Stream, bool)"/> 走同一套嗅探，TIFF 也应报出格式名。
+        /// </summary>
+        [Fact]
+        public void ImageFrame_Load_Tiff_Throws_With_Format_Name()
+        {
+            var header = new byte[] { 0x49, 0x49, 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00 };
+            using var ms = new MemoryStream(header);
+            var ex = Assert.Throws<NotSupportedException>(() => ImageFrame.Load(ms));
+            Assert.Contains("TIFF", ex.Message, StringComparison.Ordinal);
+        }
+
+        /// <summary>
         /// 格式已识别但头部损坏（此处把 PNG 的 IHDR 类型破坏）应抛 InvalidDataException。
         /// </summary>
         [Fact]

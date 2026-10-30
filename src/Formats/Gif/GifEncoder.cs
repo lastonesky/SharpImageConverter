@@ -246,10 +246,47 @@ public class GifEncoder
         FinishTiming(timing);
     }
 
+    /// <summary>
+    /// 编码多帧动画为 GIF。要求各帧都是 RGB24，且尺寸一致。
+    /// </summary>
+    /// <remarks>
+    /// 与 <see cref="Encode(ImageFrame, Stream)"/> 同样的步长前提：量化按「3 字节/像素」直接切
+    /// 缓冲区，逐帧都不做 alpha 降级。尺寸上 GIF 只有一份逻辑屏幕尺寸，循环里统一取首帧的
+    /// 宽高——尺寸不一的帧会被按首帧尺寸重新解释，得到错位的花屏，所以在入口就拒掉。
+    /// </remarks>
+    /// <param name="frames">帧列表（每帧必须为 RGB24，且尺寸相同）</param>
+    /// <param name="frameDurationsMs">每帧时长（毫秒），数量必须与帧数一致</param>
+    /// <param name="loopCount">循环次数，0 表示无限</param>
+    /// <param name="stream">输出流</param>
+    /// <exception cref="ArgumentException">帧与时长数量不一致；某帧不是 RGB24；某帧尺寸与首帧不一致</exception>
     public void EncodeAnimation(IReadOnlyList<ImageFrame> frames, IReadOnlyList<int> frameDurationsMs, int loopCount, Stream stream)
     {
         if (frames.Count == 0) return;
+        if (frameDurationsMs.Count != frames.Count)
+        {
+            throw new ArgumentException(
+                $"帧数（{frames.Count}）与时长数（{frameDurationsMs.Count}）不一致。",
+                nameof(frameDurationsMs));
+        }
+
         int w = frames[0].Width, h = frames[0].Height;
+        for (int i = 0; i < frames.Count; i++)
+        {
+            ImageFrame frame = frames[i];
+            if (frame.PixelFormat != ImagePixelFormat.Rgb24)
+            {
+                throw new ArgumentException(
+                    $"GIF 动画编码只接受 RGB24 帧，第 {i} 帧为 {frame.PixelFormat}；请先调用 ToRgb24()。",
+                    nameof(frames));
+            }
+            if (frame.Width != w || frame.Height != h)
+            {
+                throw new ArgumentException(
+                    $"GIF 动画编码要求各帧尺寸一致（首帧 {w}x{h}），第 {i} 帧为 {frame.Width}x{frame.Height}。",
+                    nameof(frames));
+            }
+        }
+
 
         var timing = BeginTiming(w * h * frames.Count, frames.Count);
         long t0 = Now(timing);

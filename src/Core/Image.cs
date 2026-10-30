@@ -233,7 +233,12 @@ namespace SharpImageConverter.Core
                 var kind = ImageHeaderReader.Sniff(head[..read]);
                 if (kind == ImageFormatKind.Unknown)
                 {
-                    throw new NotSupportedException("无法识别的图像格式");
+                    throw new NotSupportedException($"无法识别的图像格式（当前支持 {ImageInfo.SupportedFormatList}）");
+                }
+                if (ImageInfo.IsRecognizedButUnsupported(kind))
+                {
+                    // TIFF / ICO 能识别但不读写：报出格式名，别让调用方自己去猜文件是什么。
+                    throw new NotSupportedException(ImageInfo.UnsupportedMessage(kind));
                 }
 
                 stream.Position = start;

@@ -24,6 +24,15 @@ namespace SharpImageConverter.Core
         Webp = 4,
         /// <summary>BMP</summary>
         Bmp = 5,
+        /// <summary>
+        /// TIFF。仅**识别**，不提供读写：字节序头 <c>II*\0</c> / <c>MM\0*</c> 之后是 IFD 链，
+        /// 压缩方式多达十余种（LZW / PackBits / CCITT / JPEG / ZIP …），属独立工程量。
+        /// </summary>
+        Tiff = 6,
+        /// <summary>
+        /// ICO / CUR（type 1 / type 2）。仅**识别**，不提供读写。
+        /// </summary>
+        Ico = 7,
     }
 
     /// <summary>
@@ -78,8 +87,29 @@ namespace SharpImageConverter.Core
             ImageFormatKind.Gif => "GIF",
             ImageFormatKind.Webp => "WebP",
             ImageFormatKind.Bmp => "BMP",
+            ImageFormatKind.Tiff => "TIFF",
+            ImageFormatKind.Ico => "ICO",
             _ => "Unknown",
         };
+
+        /// <summary>
+        /// 可读写的格式清单（用于错误文案）。TIFF / ICO 能识别但不在其中。
+        /// </summary>
+        internal static string SupportedFormatList => "JPEG / PNG / BMP / GIF / WebP";
+
+        /// <summary>
+        /// 文件头能识别、但本库不提供读写的格式（TIFF / ICO）。
+        /// 这类格式要在入口就给出「检测到 XX，但当前只支持 …」的提示，
+        /// 而不是笼统的「无法识别的图像格式」。
+        /// </summary>
+        internal static bool IsRecognizedButUnsupported(ImageFormatKind kind) => kind is ImageFormatKind.Tiff or ImageFormatKind.Ico;
+
+        /// <summary>
+        /// 「识别到但不支持」的统一文案。
+        /// </summary>
+        /// <param name="kind">已识别的格式</param>
+        internal static string UnsupportedMessage(ImageFormatKind kind) =>
+            $"识别到 {GetFormatName(kind)}，但当前只支持 {SupportedFormatList}";
 
         /// <summary>值相等比较</summary>
         /// <param name="other">另一个图像信息</param>

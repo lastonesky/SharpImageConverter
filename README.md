@@ -245,6 +245,8 @@ sic --version   # 打印版本号
 ### 支持格式
 - 输入: .jpg/.jpeg/.png/.bmp/.webp/.gif
 - 输出: .jpg/.jpeg/.png/.bmp/.webp/.gif
+- 能识别但**不支持读写**：TIFF、ICO/CUR。遇到时会明确报出格式名
+  （如 `识别到 TIFF，但当前只支持 JPEG / PNG / BMP / GIF / WebP`），而不是笼统的「未知图像格式」。
 
 特殊情况：
 - GIF → WebP：当输入为动图 GIF、输出扩展名为 `.webp` 时，会编码为动图 WebP（尽量保留帧间隔与循环次数）
@@ -275,6 +277,18 @@ sic --version   # 打印版本号
   - `--to ext` / `--to=ext`（同义：`--out-ext`）：指定输出后缀（bmp/png/jpg/jpeg/webp/gif；单文件同样生效）。
   - `--parallel N`：并行度（目录模式，**默认按批次格式自动选择**：含 JPEG 编码时为 2，其余为 4；WebP 的 optimize 内部已并行，此时外层保持 1）。
   - `--skip-existing`：目标文件存在时跳过。
+- 输出控制：
+  - `--quiet`：不打印进度与汇总，只把错误写到 stderr（退出码语义不变）。
+  - `--json`：结果以**单个 JSON 对象**输出到 stdout（含逐文件的输入输出路径、字节数、画质指标与失败原因），
+    逐文件的进度行不再打印，适合脚本消费。输出固定为 UTF-8。
+    `--gif-bench` / `--jpeg-bench` 这类诊断输出不受影响。
+
+    ```jsonc
+    { "Mode": "optimize", "TotalFiles": 1, "Failed": 0, "SavedBytes": 50001,
+      "Files": [ { "Input": "a.jpg", "Output": "a.min.jpg", "Ok": true,
+                   "OriginalSize": 286515, "OptimizedSize": 236514,
+                   "Psnr": 41.49, "PerceptualPsnr": 45.38 } ] }
+    ```
 - 智能压缩参数（配合 `--optimize`）：
   - `--opt-quality N`：目标画质 0-100（默认 88）。95≈保守、88≈均衡、75≈激进。
   - `--opt-webp-min N`：WebP 小图质量搜索下界（默认 20；独立于 JPEG）。

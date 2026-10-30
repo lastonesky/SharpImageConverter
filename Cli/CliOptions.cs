@@ -161,4 +161,16 @@ internal sealed class CliOptions(string inputPath)
     /// libwebp 的 <c>config.method</c>（0~6），null 表示用库默认（<see cref="WebpEncoderOptions"/> 的 3）。
     /// </summary>
     public int? WebpMethod { get; set; }
+
+    /// <summary>
+    /// 机器可读输出：结果以单个 JSON 对象打印到 stdout，逐文件的进度行不再打印。
+    /// 退出码语义不变（0/1/2），脚本可同时用两者判断。
+    /// </summary>
+    public bool Json { get; set; }
+
+    /// <summary>
+    /// 安静模式：不打印任何进度/汇总信息，只把错误写到 stderr。
+    /// 与 <see cref="Json"/> 同时给出时以安静为准（两者都不打印）——明确要求"别说话"优先。
+    /// </summary>
+    public bool Quiet { get; set; }
 }

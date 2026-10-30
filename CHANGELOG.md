@@ -57,6 +57,23 @@
 - **`GifEncoder.Encode(ImageFrame)` 不校验像素格式**：量化按「3 字节/像素」直接切
   缓冲区，传入 32 位帧会按错误步长取样，产出错位花屏而不报错。现显式要求 RGB24
   （`ArgumentException`，附修复提示）；`ImageFrame.SaveAsGif` 内部照旧自动规范化。
+- **`GifEncoder.EncodeAnimation` 不校验每帧**：与单帧同一类前提（3 字节/像素），但
+  此前逐帧都不校验，传 `Rgba32` 帧仍会静默花屏；同时它也不校验各帧尺寸一致
+  ——GIF 只有一份逻辑屏幕尺寸，尺寸不一的帧会被按首帧宽高重新解释。现入口一次性校验
+  帧数/时长数对齐、每帧 `Rgb24`、每帧尺寸与首帧一致（报出第几帧与期望值），
+  且不产出半个文件。
+- **TIFF / ICO 现在会被识别并显式拒绝**：`ImageHeaderReader.Sniff` 增加 TIFF
+  （`II*\0` / `MM\0*`）与 ICO/CUR（`00 00 <type 1|2> 00`）判定，`ImageFormatKind`
+  新增 `Tiff` / `Ico` 两个值（仅识别，不提供读写）。此前这类文件落到笼统的
+  「无法识别的图像格式」，调用方分不清是文件坏了还是格式没支持；现在
+  `Image.Identify` / `ImageFrame.Load` / `Configuration.LoadRgb24|LoadRgba32` 抛出
+  「识别到 TIFF，但当前只支持 JPEG / PNG / BMP / GIF / WebP」，`--optimize` 把同一句
+  写进 `Reason`（保留原图，不报错）。
+- **`ImageFrame.ApplyExifOrientation` 改写原帧元数据**：返回新帧时直接写
+  `Metadata.Orientation = 1`，而两个帧共享同一个 `ImageMetadata` 实例——"返回新图、
+  原图不变"的契约是空的，调用方原图的 EXIF 方向会被悄悄改成 1。现新增
+  `ImageMetadata.Clone()`（浅拷贝，Exif/ICC 仍共享引用），新帧改副本。
+  `orientation == 1` 时仍按约定返回同一实例，不做复制。
 
 ### API
 - **新增 `Image.Identify(string|Stream) → ImageInfo`**：只读文件头，给出格式、宽高、
@@ -88,6 +105,15 @@
 - `CliOptions` 从 `Program.cs` 抽到 `Cli/CliOptions.cs`（只放字段与默认值，
   解析逻辑仍留在 `ParseOptions`）；顺带删掉 `ProcessDirectory` 里两个分支都做
   `success++` 的死逻辑。
+- **新增 `--json` / `--quiet`**：`--json` 把结果作为**单个 JSON 对象**打到 stdout
+  （模式、耗时、逐文件的输入输出路径与字节数、PSNR/感知 PSNR/SSIM、失败原因），
+  逐文件的进度行不再打印；**输出固定 UTF-8**（Windows 控制台默认 GBK，否则中文方法名
+  与画质摘要会写成解析不了的字节，实测 `JSONDecodeError`）。`--quiet` 只留错误：
+  进度与汇总全部静默，但 stderr 上的失败原因照旧（否则脚本只知道"失败了"）。
+  输出口径收在新增的 `Cli/CliReporter.cs` 里，各命令路径不再各自判断开关。
+  bench 类诊断输出（`--gif-bench` / `--jpeg-bench`）不受这两个开关影响。
+- `nuget-publish.yml` 的 `setup-dotnet` 由 `8.0.x` 改 `10.0.x`：库只出 `net10.0`，
+  此前全靠 runner 预装 SDK 才没炸。
 
 ### 文档
 - **README / README.en 与产物对齐**：目标框架此前写 `net8.0;net10.0`，实际只有

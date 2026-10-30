@@ -201,5 +201,111 @@ namespace SharpImageConverter.Tests
                 if (Directory.Exists(dir)) Directory.Delete(dir, recursive: true);
             }
         }
+
+        /// <summary>
+        /// <c>--json</c>：stdout 必须是一个可解析的 JSON 对象，且不再夹带人看的进度行。
+        /// </summary>
+        [Fact]
+        public void Json_Output_Is_Single_Parseable_Object()
+        {
+            string input = NewTemp(".png");
+            string output = NewTemp(".jpg");
+            try
+            {
+                Core.Image.Save(Helpers.TestImageFactory.CreateGradient(32, 32), input);
+                var (code, stdout, stderr) = RunCli(input, output, "--json");
+                Assert.Equal(0, code);
+                Assert.Equal(string.Empty, stderr);
+
+                using var doc = System.Text.Json.JsonDocument.Parse(stdout);
+                var root = doc.RootElement;
+                Assert.Equal("convert", root.GetProperty("Mode").GetString());
+                Assert.Equal(1, root.GetProperty("TotalFiles").GetInt32());
+                Assert.Equal(0, root.GetProperty("Failed").GetInt32());
+                Assert.True(root.GetProperty("Files").GetArrayLength() == 1);
+                // 关键：不能出现 emoji/耗时这类人看的进度行（会破坏脚本解析）
+                Assert.DoesNotContain("⏱️", stdout, StringComparison.Ordinal);
+                Assert.DoesNotContain("✅", stdout, StringComparison.Ordinal);
+            }
+            finally
+            {
+                if (File.Exists(input)) File.Delete(input);
+                if (File.Exists(output)) File.Delete(output);
+            }
+        }
+
+        /// <summary>
+        /// <c>--json</c> 的输出必须是 UTF-8：Windows 控制台默认代码页是 GBK，
+        /// 中文（方法名/画质摘要）会被写成解析不了的字节。
+        /// </summary>
+        [Fact]
+        public void Json_Output_Is_Valid_Utf8()
+        {
+            string input = NewTemp(".jpg");
+            try
+            {
+                Core.Image.Save(Helpers.TestImageFactory.CreateGradient(48, 48), input);
+                var (code, stdout, _) = RunCli(input, "--optimize", "--json");
+                Assert.Equal(0, code);
+
+                // 若代码页不对，这一行会抛（实测 GBK 字节无法按 UTF-8 解码）
+                using var doc = System.Text.Json.JsonDocument.Parse(stdout);
+                var file = doc.RootElement.GetProperty("Files")[0];
+                string method = file.GetProperty("Method").GetString() ?? string.Empty;
+                Assert.Contains("JPEG", method, StringComparison.Ordinal);
+                Assert.False(method.Contains('�'));
+            }
+            finally
+            {
+                if (File.Exists(input)) File.Delete(input);
+                string min = Path.ChangeExtension(input, ".min.jpg");
+                if (File.Exists(min)) File.Delete(min);
+            }
+        }
+
+        /// <summary>
+        /// <c>--quiet</c>：成功时不打印任何东西，但文件照产、退出码照旧。
+        /// </summary>
+        [Fact]
+        public void Quiet_Succeeds_Silently()
+        {
+            string input = NewTemp(".png");
+            string output = NewTemp(".jpg");
+            try
+            {
+                Core.Image.Save(Helpers.TestImageFactory.CreateGradient(32, 32), input);
+                var (code, stdout, stderr) = RunCli(input, output, "--quiet");
+                Assert.Equal(0, code);
+                Assert.Equal(string.Empty, stdout);
+                Assert.Equal(string.Empty, stderr);
+                Assert.True(File.Exists(output));
+            }
+            finally
+            {
+                if (File.Exists(input)) File.Delete(input);
+                if (File.Exists(output)) File.Delete(output);
+            }
+        }
+
+        /// <summary>
+        /// <c>--quiet</c> 不吞错误：失败时 stderr 仍要给出文件名与原因，否则脚本只知道"失败了"。
+        /// </summary>
+        [Fact]
+        public void Quiet_Still_Prints_Errors()
+        {
+            string input = NewTemp(".png");
+            try
+            {
+                File.WriteAllBytes(input, [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00]);
+                var (code, stdout, stderr) = RunCli(input, NewTemp(".jpg"), "--quiet");
+                Assert.Equal(1, code);
+                Assert.Equal(string.Empty, stdout);
+                Assert.Contains("处理失败", stderr, StringComparison.Ordinal);
+            }
+            finally
+            {
+                if (File.Exists(input)) File.Delete(input);
+            }
+        }
     }
 }

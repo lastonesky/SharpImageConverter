@@ -165,7 +165,8 @@ public sealed class ImageFrame
         if (read < 2) throw new InvalidDataException("流数据过短");
 
         // 格式嗅探统一走 ImageHeaderReader（与 Configuration / ImageOptimizer / Image.Identify 同一实现）
-        switch (ImageHeaderReader.Sniff(header.AsSpan(0, read)))
+        var kind = ImageHeaderReader.Sniff(header.AsSpan(0, read));
+        switch (kind)
         {
             case ImageFormatKind.Jpeg:
                 return LoadJpeg(decodeStream, useStreamingDecoder: requireComplete, requireEoi: requireComplete);
@@ -178,7 +179,11 @@ public sealed class ImageFrame
             case ImageFormatKind.Webp:
                 return LoadWebp(decodeStream);
             default:
-                throw new NotSupportedException("无法识别的图像格式");
+                throw new NotSupportedException(
+                    Core.ImageInfo.IsRecognizedButUnsupported(kind)
+                        // TIFF / ICO 能识别但不读写：报出格式名，别让调用方去猜这个文件是什么
+                        ? Core.ImageInfo.UnsupportedMessage(kind)
+                        : $"无法识别的图像格式（当前支持 {Core.ImageInfo.SupportedFormatList}）");
         }
     }
 
@@ -490,7 +495,7 @@ public sealed class ImageFrame
                 SaveAsWebp(path);
                 break;
             default:
-                throw new NotSupportedException($"不支持的输出文件格式: {ext}");
+                throw new NotSupportedException($"不支持的输出文件格式: {ext}（当前支持 {Core.ImageInfo.SupportedFormatList}）");
         }
     }
 
@@ -677,16 +682,23 @@ public sealed class ImageFrame
     }
 
     /// <summary>
-    /// 按 EXIF 方向对图像进行旋转/翻转并返回新图像
+    /// 按 EXIF 方向对图像进行旋转/翻转并返回新图像。
     /// </summary>
+    /// <remarks>
+    /// 返回的帧与当前帧**不共享元数据**：新帧的方向为 1（已烘焙进像素），
+    /// 因此这里复制一份 <see cref="ImageMetadata"/> 再改副本。此前直接写
+    /// <c>Metadata.Orientation</c>，而两个帧共享同一个实例，「返回新图、原图不变」不成立
+    /// ——调用方的原帧 EXIF 会被悄悄改成 1。
+    /// </remarks>
     /// <param name="orientation">EXIF 方向值（1-8）</param>
-    /// <returns>应用方向后的新图像帧</returns>
+    /// <returns>应用方向后的新图像帧（<paramref name="orientation"/> 为 1 时返回当前帧本身）</returns>
     public ImageFrame ApplyExifOrientation(int orientation)
     {
         if (orientation == 1) return this;
         var t = ApplyExifOrientation(Pixels, Width, Height, orientation);
-        Metadata.Orientation = 1;
-        return new ImageFrame(t.width, t.height, t.pixels, metadata: Metadata);
+        var meta = Metadata.Clone();
+        meta.Orientation = 1;
+        return new ImageFrame(t.width, t.height, t.pixels, metadata: meta);
     }
 
     /// <summary>

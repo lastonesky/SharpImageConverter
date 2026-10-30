@@ -98,5 +98,34 @@ namespace SharpImageConverter.Tests
                 Assert.Equal(expected, actual.Pixels);
             }
         }
+
+        /// <summary>
+        /// 旋转后新帧的方向重置为 1，但**原帧的元数据不能被改**：
+        /// 此前两个帧共享同一个 <see cref="ImageMetadata"/> 实例，
+        /// 「返回新图、原图不变」的契约是空的。
+        /// </summary>
+        [Fact]
+        public void ApplyExifOrientation_Does_Not_Mutate_Source_Metadata()
+        {
+            var frame = new ImageFrame(8, 8, MakeData(8 * 8 * 3, 3));
+            frame.Metadata.Orientation = 6;
+
+            var rotated = frame.ApplyExifOrientation(6);
+
+            Assert.Equal(6, frame.Metadata.Orientation);
+            Assert.Equal(1, rotated.Metadata.Orientation);
+            Assert.NotSame(frame.Metadata, rotated.Metadata);
+        }
+
+        /// <summary>
+        /// 方向为 1 时约定返回同一实例（零开销），因此不做元数据复制。
+        /// </summary>
+        [Fact]
+        public void ApplyExifOrientation_Identity_Returns_Same_Instance()
+        {
+            var frame = new ImageFrame(8, 8, MakeData(8 * 8 * 3, 5));
+            frame.Metadata.Orientation = 1;
+            Assert.Same(frame, frame.ApplyExifOrientation(1));
+        }
     }
 }

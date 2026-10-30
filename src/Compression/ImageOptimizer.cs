@@ -90,7 +90,12 @@ namespace SharpImageConverter.Compression
                 case ImageFormatKind.Bmp:
                     return OptimizeBmp(inputPath, output, originalSize, o);
                 default:
-                    return Finish(inputPath, output, originalSize, null, null, default, o, "不支持的图片格式");
+                    // TIFF / ICO 能识别但不读写：把格式名写进 Reason，
+                    // 否则 CLI 上只看到「不支持的图片格式」，分不清是文件坏了还是格式没支持。
+                    return Finish(inputPath, output, originalSize, null, null, default, o,
+                        Core.ImageInfo.IsRecognizedButUnsupported(sourceKind)
+                            ? Core.ImageInfo.UnsupportedMessage(sourceKind)
+                            : $"不支持的图片格式（当前支持 {Core.ImageInfo.SupportedFormatList}）");
             }
         }
 

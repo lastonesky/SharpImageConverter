@@ -229,6 +229,86 @@ namespace SharpImageConverter.Tests
             Assert.Equal("GIF89a", System.Text.Encoding.ASCII.GetString(bytes, 0, 6));
         }
 
+        /// <summary>
+        /// 动画编码与单帧编码同一类前提：逐帧都按 3 字节/像素切缓冲区，
+        /// 32 位帧必须被拒绝（此前 <c>EncodeAnimation</c> 完全不校验）。
+        /// </summary>
+        [Fact]
+        public void GifEncoder_EncodeAnimation_NonRgb24_Frame_Throws()
+        {
+            var rgb = CreateRgbGradient(8, 8);
+            var rgba = CreateRgbaChecker(8, 8);
+            var frames = new[]
+            {
+                new ImageFrame(8, 8, rgb, ImagePixelFormat.Rgb24),
+                new ImageFrame(8, 8, rgba, ImagePixelFormat.Rgba32),
+            };
+
+            using var ms = new MemoryStream();
+            var ex = Assert.Throws<ArgumentException>(() => new GifEncoder().EncodeAnimation(frames, [100, 100], 0, ms));
+            Assert.Contains("第 1 帧", ex.Message, StringComparison.Ordinal);
+            Assert.Equal(0, ms.Length); // 入口就拒绝，不产出半个文件
+        }
+
+        /// <summary>
+        /// GIF 只有一份逻辑屏幕尺寸，尺寸不一的帧会被按首帧宽高重新解释（花屏），入口必须拒绝。
+        /// </summary>
+        [Fact]
+        public void GifEncoder_EncodeAnimation_SizeMismatch_Throws()
+        {
+            var rgb8 = CreateRgbGradient(8, 8);
+            var rgb4 = CreateRgbGradient(4, 4);
+            var frames = new[]
+            {
+                new ImageFrame(8, 8, rgb8, ImagePixelFormat.Rgb24),
+                new ImageFrame(4, 4, rgb4, ImagePixelFormat.Rgb24),
+            };
+
+            using var ms = new MemoryStream();
+            var ex = Assert.Throws<ArgumentException>(() => new GifEncoder().EncodeAnimation(frames, [100, 100], 0, ms));
+            Assert.Contains("首帧 8x8", ex.Message, StringComparison.Ordinal);
+        }
+
+        /// <summary>
+        /// 帧与时长数量不一致时，旧实现靠索引越界兜底；现在应当在入口给出可读的异常。
+        /// </summary>
+        [Fact]
+        public void GifEncoder_EncodeAnimation_DurationCountMismatch_Throws()
+        {
+            var rgb = CreateRgbGradient(8, 8);
+            var frames = new[]
+            {
+                new ImageFrame(8, 8, rgb, ImagePixelFormat.Rgb24),
+                new ImageFrame(8, 8, rgb, ImagePixelFormat.Rgb24),
+            };
+
+            using var ms = new MemoryStream();
+            var ex = Assert.Throws<ArgumentException>(() => new GifEncoder().EncodeAnimation(frames, [100], 0, ms));
+            Assert.Contains("时长数", ex.Message, StringComparison.Ordinal);
+        }
+
+        /// <summary>
+        /// 合法输入（同尺寸 RGB24 + 时长对齐）仍应正常产出 GIF89a 动画。
+        /// </summary>
+        [Fact]
+        public void GifEncoder_EncodeAnimation_Valid_Frames_Writes_Header()
+        {
+            var rgb = CreateRgbGradient(8, 8);
+            var frames = new[]
+            {
+                new ImageFrame(8, 8, rgb, ImagePixelFormat.Rgb24),
+                new ImageFrame(8, 8, rgb, ImagePixelFormat.Rgb24),
+                new ImageFrame(8, 8, rgb, ImagePixelFormat.Rgb24),
+            };
+
+            using var ms = new MemoryStream();
+            new GifEncoder().EncodeAnimation(frames, [100, 100, 100], 0, ms);
+
+            byte[] bytes = ms.ToArray();
+            Assert.Equal("GIF89a", System.Text.Encoding.ASCII.GetString(bytes, 0, 6));
+            Assert.Equal(0x3B, bytes[^1]); // trailer
+        }
+
         private static byte[] CreateRgbGradient(int w, int h)
         {
             var rgb = new byte[w * h * 3];

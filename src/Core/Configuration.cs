@@ -167,7 +167,34 @@ namespace SharpImageConverter.Core
                     return decoded;
                 }
             }
-            throw new NotSupportedException("未知图像格式");
+            throw BuildUnknownFormatException(stream, start);
+        }
+
+        /// <summary>
+        /// 没有解码器能识别该数据时抛出的异常。先嗅一次文件头：
+        /// TIFF / ICO 这类「能识别但不提供读写」的格式要报出格式名，
+        /// 否则调用方只能看到「未知图像格式」，无法判断是不是自己传错了文件。
+        /// </summary>
+        private static NotSupportedException BuildUnknownFormatException(Stream stream, long start)
+        {
+            long saved = stream.Position;
+            try
+            {
+                Span<byte> head = stackalloc byte[ImageHeaderReader.SniffBytes];
+                stream.Position = start;
+                int read = stream.ReadAtLeast(head, head.Length, throwOnEndOfStream: false);
+                var kind = ImageHeaderReader.Sniff(head[..read]);
+                if (ImageInfo.IsRecognizedButUnsupported(kind))
+                {
+                    return new NotSupportedException(ImageInfo.UnsupportedMessage(kind));
+                }
+            }
+            finally
+            {
+                stream.Position = saved;
+            }
+
+            return new NotSupportedException($"未知图像格式（当前支持 {ImageInfo.SupportedFormatList}）");
         }
 
         /// <summary>
@@ -292,7 +319,7 @@ namespace SharpImageConverter.Core
                     return decoded;
                 }
             }
-            throw new NotSupportedException("未知图像格式");
+            throw BuildUnknownFormatException(stream, start);
         }
 
         /// <summary>
