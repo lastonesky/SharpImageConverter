@@ -1,0 +1,56 @@
+name: ci
+
+# 日常门禁：每次 push 与 PR 都编译 + 跑快速测试集（Category!=Slow）。
+# 发布相关（tag → Release 资产 / NuGet）分别在 release.yml 与 nuget-publish.yml，
+# 本工作流不产出任何制品，只回答一个问题：这次提交还能不能编译通过、测过。
+#
+# 为什么必须有这一层：仓库此前只有 tag 触发的流水线，日常提交没有回归门禁，
+# 而项目的验收口径是「产物逐字节一致」，恰恰最依赖自动回归。见 docs/Review-2026-10-30.md §5.1。
+
+on:
+  push:
+    branches: ["**"]
+    paths-ignore:
+      - "docs/**"
+      - "**/*.md"
+  pull_request:
+
+permissions:
+  contents: read
+
+# 同一分支的旧运行被新提交取代时直接取消，省 runner 配额
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DOTNET_NOLOGO: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  build-test:
+    name: build + test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # 只跑 x64 的两个主力平台：ARM 与 macOS 由 release.yml 在打 tag 时各跑一次实机冒烟，
+        # 日常门禁不值得为它们多花两倍机时。
+        os: [windows-latest, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: "10.0.x"
+
+      # 编译即门禁：Directory.Build.props 打开了分析器，src 在 Release 下
+      # 把分析器警告视为错误（CodeAnalysisTreatWarningsAsErrors），所以这一步能挡住新增问题。
+      - name: Build
+        run: dotnet build SharpImageConvert.slnx -c Release
+
+      # 只跑快速集：143MP 用例标了 Category=Slow，单机要几十秒且吃内存，不适合每次 PR 都跑。
+      - name: Test (fast)
+        run: dotnet test --solution SharpImageConvert.slnx -c Release --filter "Category!=Slow"
