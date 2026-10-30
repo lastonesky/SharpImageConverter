@@ -211,6 +211,27 @@ var r = ImageOptimizer.Optimize("banner.gif", "banner.min.gif", options);
 Console.WriteLine($"{r.SavedRatio:P1} / {r.Quality.PerceptualPsnr:F2} dB");
 ```
 
+- Identify without decoding pixels:
+
+```csharp
+var info = Image.Identify("photo.jpg");
+// info.Format (ImageFormatKind.Jpeg), info.Width/Height, info.IsProgressive,
+// info.FrameCount (real GIF frame count), info.PixelCount
+Console.WriteLine(info); // JPEG 4032x3024 (progressive)
+```
+
+- In-memory streams (`Image.Load(Stream)` / `Image.Save(image, Stream, ext)`):
+
+```csharp
+using var input = File.OpenRead("input.jpg");
+var image = Image.Load(input);
+
+using var output = new MemoryStream();
+Image.Save(image, output, ".webp"); // encoder chosen by extension, no temp files
+```
+
+Streams must be seekable; for non-seekable network streams use `ImageFrame.Load(stream, requireComplete)`.
+
 ## Command Line Interface (CLI)
 
 Located in the `Cli/` directory, providing convenient format conversion and simple processing capabilities.
@@ -220,7 +241,14 @@ Located in the `Cli/` directory, providing convenient format conversion and simp
 ```bash
 # Run from the Cli directory
 dotnet run -- <input file or folder> [output file or folder] [operation] [options]
+
+sic --help      # print all options (never treated as an input path)
+sic --version   # print version
 ```
+
+Exit codes: `0` success, `1` processing failure (including any failed file in a batch),
+`2` usage error (unknown option, missing input). Unknown options are rejected instead of
+being silently consumed as an output path.
 
 ### Supported Formats
 - Input: .jpg/.jpeg/.png/.bmp/.webp/.gif

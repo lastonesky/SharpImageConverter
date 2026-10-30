@@ -168,25 +168,32 @@ var rgba = Image.LoadRgba32("input.png");
 Image.Save(rgba, "output.webp");
 ```
 
+- 只读文件头识别（不解码像素）：
+
+```csharp
+var info = Image.Identify("photo.jpg");
+// info.Format = ImageFormatKind.Jpeg，info.Width/Height，info.IsProgressive
+// info.FrameCount（GIF 真实帧数）、info.PixelCount
+Console.WriteLine(info); // JPEG 4032x3024 (progressive)
+```
+
 - 流式操作（Stream）：
 
 ```csharp
 using SharpImageConverter; // ImageFrame
 
-// 从流加载（自动嗅探格式）
+// 可 Seek 的流：直接用 Image 门面的 Stream 重载
 using var input = File.OpenRead("input.jpg");
-var frame = ImageFrame.Load(input);
-
-// 如需处理，转换为 Image<Rgb24>
-var image = new Image<Rgb24>(frame.Width, frame.Height, frame.Pixels);
+var image = Image.Load(input);            // 或 Image.Load(input, ".jpg") 给个提示
 image.Mutate(ctx => ctx.Grayscale());
 
-// 保存到流（需明确指定格式，或封装回 ImageFrame 使用便捷方法）
 using var output = new MemoryStream();
-// 方式 A: 使用 ImageFrame 便捷方法
-new ImageFrame(image.Width, image.Height, image.Buffer).SaveAsPng(output);
-// 方式 B: 使用特定编码器
-// new SharpImageConverter.Formats.PngEncoderAdapter().EncodeRgb24(output, image);
+Image.Save(image, output, ".webp");       // 按扩展名选编码器，全程不落临时文件
+
+// 不可 Seek 的流（网络/Socket）：用 ImageFrame，它会把已读部分缓存起来
+using var network = new MemoryStream();   // 示例：任意只读流
+var frame = ImageFrame.Load(network);     // 支持 requireComplete: true 严格模式
+new ImageFrame(frame.Width, frame.Height, frame.Pixels).SaveAsWebp("out.webp");
 ```
 
 - 智能有损压缩（TinyPNG 式，保持原格式）：
@@ -227,7 +234,13 @@ Windows 为单文件 `.exe`，Linux 为 `.tar.gz`，两者都是自包含的，*
 ```bash
 # 在 Cli 目录下运行
 dotnet run -- <输入文件或文件夹路径> [输出文件或文件夹路径] [操作] [参数]
+
+sic --help      # 打印全部选项（不当作输入路径）
+sic --version   # 打印版本号
 ```
+
+退出码：`0` 成功、`1` 处理失败（含目录批量中有文件失败）、`2` 用法错误（未知参数、输入不存在）。
+未知参数会直接报错并返回 2，不会被当成输出路径。
 
 ### 支持格式
 - 输入: .jpg/.jpeg/.png/.bmp/.webp/.gif
