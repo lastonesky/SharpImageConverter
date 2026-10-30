@@ -326,6 +326,7 @@ Special cases:
 - `--opt-lossy-min-gain N` : adjust that threshold (percent, default 10)
 - `--opt-verbose` : print size and quality of every candidate
 - `--keep-metadata` : keep metadata (by default EXIF is dropped, ICC is preserved)
+- `--strict-format` : fail when the input extension contradicts the file header (exit code 1, no output written). By default the content decides how to read and the extension decides how to write, so a PNG saved as `a.jpg` is silently turned into a real JPEG by `--optimize`; this flag rejects that instead. Applies to plain conversions and `--optimize` alike.
 
 ### Folder Batch Conversion
 - Recursion: `--recursive` (traverse subdirectories)

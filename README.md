@@ -333,6 +333,9 @@ sic - - --to jpg < in.png > out.jpg   # 两端都是管道
   - `--opt-lossy-min-gain N`：调整上述有损再压缩门槛（百分比，默认 10）。
   - `--opt-verbose`：打印每个候选方案的体积与画质，便于调参。
   - `--keep-metadata`：保留元数据（默认丢弃 EXIF、保留 ICC）。
+  - `--strict-format`：输入扩展名与文件头内容不符时报错（退出码 1，不产出文件）。默认口径是
+    **内容决定怎么读、扩展名决定怎么写**，所以 PNG 内容存成 `a.jpg` 再 `--optimize` 会被隐式转成真 JPEG；
+    开启后直接失败，适合文件名不可信的上传/批处理。普通转换与 `--optimize` 都生效。
 
 > `--optimize` 与 `--to` 组合即为「转换 + 智能压缩」：转成目标格式时**直接产出该格式下体积最小的版本**，
 > 无需先转换再单独 optimize 一遍。输出扩展名与源格式不同的显式输出路径（如 `photo.jpg out.webp --optimize`）会自动走同一路径。

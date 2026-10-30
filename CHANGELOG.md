@@ -105,6 +105,23 @@
   原图不变"的契约是空的，调用方原图的 EXIF 方向会被悄悄改成 1。现新增
   `ImageMetadata.Clone()`（浅拷贝，Exif/ICC 仍共享引用），新帧改副本。
   `orientation == 1` 时仍按约定返回同一实例，不做复制。
+- **`Image.Identify(Stream)` 对不可 Seek 的流整读进内存**：为读 24 字节把整条流
+  `CopyTo(MemoryStream)`，143 MB 上传即 143 MB 常驻，与「只读文件头、不解码像素」自相矛盾。
+  现 `ImageHeaderReader` 统一用 `SkipForward`（可 Seek 就 `Seek`，否则读并丢弃），
+  `Identify` 只回放已读的 12 字节嗅探前缀，内存与文件大小无关。代价是**不可 Seek 时流会被
+  消费且无法回退**（可 Seek 时仍还原位置），已写进 XML 注释。
+- **`ImageInfo` 对动画 WebP / APNG 报 `FrameCount=1`、`IsAnimated=false`**：`TryReadInfo` 的
+  WebP 分支恒传 1 帧、PNG 分支只读 IHDR 不看 `acTL`。现 PNG 扫描到 `IDAT` 前读
+  `acTL.num_frames`、WebP 在 `VP8X.flags` bit1 置位时数 `ANMF`；异常值（0/1/超大）按「至少
+  2 帧」上报——`IsAnimated` 正确比精确帧数更重要，否则 optimize 会把多帧图当单帧重编码。
+- **`--optimize` 的隐式格式转换没有刹车**：输入按内容、输出按扩展名，于是「PNG 内容 +
+  `.jpg` 名」会被默默转成真 JPEG。新增 `OptimizeOptions.RequireFormatMatch` 与 CLI
+  `--strict-format`，判定收敛在 `ImageOptimizer.EnsureFormatMatches`（转换与 optimize 共用）：
+  不符抛 `InvalidDataException`、退出码 1、不产出文件；扩展名无法识别时不拦。
+- **`ImageOptimizer` 里另有一份 PNG 嗅探**：`DetectSourceTraits` 自带 ~90 行 PNG chunk 扫描与
+  WebP 块遍历，是「嗅探唯一实现」收敛之后长出来的第二份。现改为复用
+  `ImageHeaderReader.TryReadInfo`（`ImageInfo` 增加内部 `Is16Bit`），私有副本删除。
+  16-bit PNG 与 APNG 的 optimize 行为不变，36 个 CLI 产物逐字节一致。
 
 ### API
 - **新增 `Image.Identify(string|Stream) → ImageInfo`**：只读文件头，给出格式、宽高、
