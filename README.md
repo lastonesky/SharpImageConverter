@@ -81,25 +81,29 @@
 ```
 SharpImageConverter/
 ├── src/                         # 库主体（对外 API）
-│  ├── Core/                     # Image/Configuration 等基础类型
-│  ├── Formats/                  # 格式嗅探与 Adapter（JPEG/PNG/BMP/WebP/GIF）
-│  ├── Processing/               # Mutate/Resize/Grayscale 等处理管线
-│  ├── Metadata/                 # 元数据结构（Orientation 等）
+│  ├── Core/                     # Image/Configuration/像素类型/格式注册
+│  ├── Formats/                  # 各格式编解码与 Adapter（JPEG/PNG/BMP/WebP/GIF）
+│  ├── Processing/               # Mutate/Resize/Grayscale 等处理管线、逐行流式转换
+│  ├── Compression/              # 智能有损压缩（Optimize）：画质度量、各格式优化器、量化器
+│  ├── Metadata/                 # 元数据结构（Orientation/EXIF/ICC/DPI）
+│  ├── ImageFrame.cs             # 另一套图像载体（支持 BGR/BGRA 与不可 Seek 流）
 │  ├── runtimes/                 # WebP 原生库（win-x64/linux-x64/osx-arm64）
 │  └── SharpImageConverter.csproj
-├── Cli/                         # 独立命令行项目
+├── Cli/                         # 独立命令行项目（当前为单文件 Program.cs）
 │  ├── Program.cs
 │  └── SharpImageConverter.Cli.csproj
-├── SharpImageConverter.Tests/   # 单元测试工程
+├── SharpImageConverter.Tests/   # 单元/回归测试（按 Compat/Codec/Jpeg/Optimize/Streaming/Cli 分域）
 ├── docs/                        # 工程类文档（索引见 docs/README.md）
 │  ├── PerfReport.md             # 性能实测记录与已否决方向
 │  ├── Optimize.md               # 智能有损压缩设计与用法
 │  ├── OptimizeAudit.md          # --optimize 方向性审计
 │  ├── OptimizePlan.md           # --optimize 改进计划与执行记录
+│  ├── JpegAudit.md              # JPEG 死代码清单与剩余性能空间
 │  ├── GifFindings.md            # GIF 算法与性能记录
 │  ├── ArmFindings.md            # ARM 基线与专属指令实测
 │  ├── SimdPitfalls.md           # SIMD 实现陷阱与审计复核
 │  ├── Release.md                # 发布流程约定
+│  ├── Review-2026-10-30.md      # 整体改进评审（API/结构/门禁问题清单）
 │  └── reference/                # 规范原文等参考资料
 └── README.md / README.en.md
 ```
@@ -109,13 +113,16 @@ SharpImageConverter/
 ## 使用方式（API）
 
 环境要求：
-- .NET SDK 8.0 或更高版本（本库目标框架：`net8.0;net10.0`）
-- Windows/Linux/macOS（WebP 对应平台需加载 `runtimes/` 下原生库）
+- **.NET SDK 10.0**（本库当前只产出 `net10.0` 单一目标框架；多目标到 `net8.0` 需要先确认
+  SIMD/运行时 API 的可用性，尚未提供。请以 `src/SharpImageConverter.csproj` 的
+  `TargetFramework` 为准）
+- Windows x64 / Linux x64 / macOS arm64（WebP 依赖 `runtimes/` 下对应 RID 的原生 libwebp；
+  **linux-arm64 与 osx-x64 目前没有原生库**，这两个平台只能使用 JPEG/PNG/BMP/GIF）
 
 ## 安装（NuGet）
 
 ```bash
-dotnet add package SharpImageConverter --version 0.1.6.1-preview
+dotnet add package SharpImageConverter
 ```
 
 引用命名空间：

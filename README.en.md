@@ -78,25 +78,29 @@ This library was originally created to address several practical issues we encou
 ```
 SharpImageConverter/
 ├── src/                         # Library (public API)
-│  ├── Core/                     # Core types like Image/Configuration
-│  ├── Formats/                  # Format sniffing and adapters (JPEG/PNG/BMP/WebP/GIF)
-│  ├── Processing/               # Mutate/Resize/Grayscale pipelines
-│  ├── Metadata/                 # Metadata structures (Orientation, etc.)
+│  ├── Core/                     # Core types: Image/Configuration/pixel types/format registry
+│  ├── Formats/                  # Codecs and adapters (JPEG/PNG/BMP/WebP/GIF)
+│  ├── Processing/               # Mutate/Resize/Grayscale pipelines, row-streaming conversion
+│  ├── Compression/              # Smart lossy optimization: quality metrics, per-format optimizers
+│  ├── Metadata/                 # Metadata structures (Orientation/EXIF/ICC/DPI)
+│  ├── ImageFrame.cs             # Second pixel container (BGR/BGRA + non-seekable streams)
 │  ├── runtimes/                 # WebP native libraries (win-x64/linux-x64/osx-arm64)
 │  └── SharpImageConverter.csproj
-├── Cli/                         # Standalone CLI project
+├── Cli/                         # Standalone CLI project (single-file Program.cs for now)
 │  ├── Program.cs
 │  └── SharpImageConverter.Cli.csproj
-├── SharpImageConverter.Tests/   # Test project
+├── SharpImageConverter.Tests/   # Tests (Compat/Codec/Jpeg/Optimize/Streaming/Cli)
 ├── docs/                        # Engineering docs (see docs/README.md)
 │  ├── PerfReport.md             # Performance measurements and rejected directions
 │  ├── Optimize.md               # Lossy-optimizer design and usage
 │  ├── OptimizeAudit.md          # Directional audit of --optimize
 │  ├── OptimizePlan.md           # --optimize improvement plan and results
+│  ├── JpegAudit.md              # JPEG dead code inventory and remaining headroom
 │  ├── GifFindings.md            # GIF algorithms and performance notes
 │  ├── ArmFindings.md            # ARM baseline and ARM-only instruction results
 │  ├── SimdPitfalls.md           # SIMD pitfalls and audit verification
 │  ├── Release.md                # Release process
+│  ├── Review-2026-10-30.md      # Overall improvement review (API/structure/CI issues)
 │  └── reference/                # Specification source material
 └── README.md / README.en.md
 ```
@@ -104,13 +108,16 @@ SharpImageConverter/
 ## Usage (API)
 
 Requirements:
-- .NET SDK 8.0 or newer (library target frameworks: `net8.0;net10.0`)
-- Windows/Linux/macOS (WebP requires loading the native libraries under `runtimes/` for your platform)
+- **.NET SDK 10.0** (the library currently ships a single `net10.0` target; multi-targeting
+  to `net8.0` is not available yet — trust `TargetFramework` in `src/SharpImageConverter.csproj`)
+- Windows x64 / Linux x64 / macOS arm64 (WebP needs the native libwebp for your RID under
+  `runtimes/`; **linux-arm64 and osx-x64 have no native libraries yet**, so only
+  JPEG/PNG/BMP/GIF work there)
 
 ## Install (NuGet)
 
 ```bash
-dotnet add package SharpImageConverter --version 0.1.6.1-preview
+dotnet add package SharpImageConverter
 ```
 
 Namespaces:

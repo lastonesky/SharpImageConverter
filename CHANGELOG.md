@@ -8,6 +8,54 @@
   `%TEMP%\bench\fidelity` 语料时改为 Skip 而非失败**（该探针依赖跑 bench 留下的文件，
   机器间不保证存在，CI 上必挂）。
 
+### CI
+- **新增 `.github/workflows/ci.yml`**：此前仓库只有 tag 触发的 `release.yml` 与
+  `nuget-publish.yml`，日常提交与 PR 没有任何自动构建/测试。现在 push（忽略纯文档改动）
+  与 PR 都会在 `windows-latest` / `ubuntu-latest` 上跑 `build -c Release` +
+  `test --filter "Category!=Slow"`，同分支旧运行自动取消。
+
+### 静态分析
+- **打开分析器并把严重级别写进 `.editorconfig`**：新增 `Directory.Build.props`
+  （`EnableNETAnalyzers` + `AnalysisMode=Recommended`），删除 src csproj 里
+  `NoWarn` 的 `8600/8602/8604/8605/8618/8625`（可空性与 unsafe 转换），
+  `src` 在 Release 下 `CodeAnalysisTreatWarningsAsErrors=true`。
+  风格类规则（CA1822/CA1051/CA1512/CA1513/CA1805/CA1859/CA1068/CA1069/CA1711、
+  CA2014 降为 suggestion）逐条在 `.editorconfig` 里显式降级并注明理由，
+  不再用一把 `NoWarn` 糊住。全解决方案 Release 构建 **0 警告**（此前是「0 警告但
+  分析器根本没开」）。清点与决策依据见 `docs/Review-2026-10-30.md` §5.2。
+
+### 修复
+- **`Configuration` 的格式注册表此前是装饰性的**：`SaveRgb24`/`SaveRgba32` 按
+  `typeof(JpegFormat)` 之类的硬编码分发，注册自定义格式后保存依旧
+  `NotSupportedException`。现改为查 `_formatTypeByExtension` → `_encoders`，
+  注册即生效；未注册的扩展名给出可操作消息（附已注册扩展名列表）。
+- **`RegisterFormat` 后加载会抛 `KeyNotFoundException`**：`LoadRgb24`/`LoadRgba32`
+  改用 `TryGetValue`，缺少解码器的格式被跳过而非把字典异常漏给调用方；
+  同时补上「只有 Rgba32 解码器时 `LoadRgb24` 降通道复用」的对称回退。
+- **`OptimizeOptions.Normalize` 原地修改入参**：注释写「返回副本」，实际返回同一引用
+  并把调用方的 `TargetQuality`/`MaxColors` 悄悄钳制。现新增 `Clone()`，`Normalize`
+  返回新实例，入参不变。
+- **自抛运行时保留异常**：`OutOfMemoryException`（NativeBufferOwner / SimdHelper /
+  WebpRowSource）改为 `InsufficientMemoryException`（它派生自前者，既有 catch 仍生效）；
+  `nameof(TPixel)` 当 `paramName`（`Image.cs`）与 `JpegFrameState.RowSource` 的
+  `IndexOutOfRangeException` 改为 `InvalidOperationException`。
+- **`JpegEncoder.PipeQueue` 持有两个 `SemaphoreSlim` 却不实现 `IDisposable`**：
+  现实现并在三处流水线的 `Task.WaitAll` 之后显式释放（不用 `using`，避免异常展开时
+  与仍在退出的 stage 抢 Wait/Release）。产物逐字节不变。
+- `LzwEncoder.Dispose` 补 `GC.SuppressFinalize`；灰度编码的色度表由 `null` 改
+  `Array.Empty<HuffCode>()`（`WriteMcuConsumer.Gray`），消除可空性警告。
+- CLI 选项解析的 `StartsWith(".")`/`StartsWith(prefix)` 改 `char` 重载或
+  `StringComparison.Ordinal`，GIF 帧号格式化改用 `CultureInfo.InvariantCulture`，
+  `Program` 标记 `sealed`。
+
+### 文档
+- **README / README.en 与产物对齐**：目标框架此前写 `net8.0;net10.0`，实际只有
+  `net10.0`；安装命令还停在 `0.1.6.1-preview`；平台矩阵未说明 `runtimes/` 只有
+  win-x64 / linux-x64 / osx-arm64（linux-arm64 与 osx-x64 无 WebP 原生库）。
+  目录结构补上 `Compression/`、`Metadata/`、`ImageFrame.cs`。
+- 新增 `docs/Review-2026-10-30.md`：整体改进评审（公共 API / 数据结构 / 行为规范化 /
+  代码组织 / 工程门禁 / 格式覆盖），含实测证据与 10 步落地顺序。
+
 ## 1.3.0（相对 v1.2.0）
 
 ### 发布

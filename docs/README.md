@@ -14,6 +14,7 @@
 | [ArmFindings.md](ArmFindings.md) | ARM（Apple M4）基线与专属指令实测：x86 SIMD 失效清单、NEON 语义等价、A/B 结果、LD3/RDM/CRC 三条判决 |
 | [SimdPitfalls.md](SimdPitfalls.md) | 外部审计复核结论 + SIMD 实现陷阱（K1–K15）与暂缓/否决清单 |
 | [Release.md](Release.md) | **发布流程约定**：版本号/tag/Release 资产/NuGet 自动发布（trusted publishing）的口径、执行清单与踩坑记录 |
+| [Review-2026-10-30.md](Review-2026-10-30.md) | **整体改进评审（快照）**：公共 API / 数据结构 / 行为规范化 / 代码组织 / 工程门禁 / 格式覆盖的问题清单，含实测证据与建议的落地顺序 |
 | [reference/](reference/) | 规范原文等参考资料（如 JPEG File Interchange Format 规范），只读存档 |
 
 ## 根目录文档
