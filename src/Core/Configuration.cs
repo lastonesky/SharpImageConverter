@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.IO;
 using SharpImageConverter;
@@ -124,11 +124,37 @@ namespace SharpImageConverter.Core
         public Image<Rgb24> LoadRgb24(string path)
         {
             using var fs = File.OpenRead(path);
+            return LoadRgb24(fs, Path.GetExtension(path));
+        }
+
+        /// <summary>
+        /// 从流加载为 Rgb24 图像（按文件头自动识别格式）。
+        /// </summary>
+        /// <remarks>
+        /// 流必须可 Seek：嗅探需要反复回到起点。不可 Seek 的输入请用
+        /// <see cref="ImageFrame.Load(Stream, bool)"/>（它会把已读部分缓存起来）。
+        /// 加载完成后流位置不确定，调用方不要依赖。
+        /// </remarks>
+        /// <param name="stream">输入数据流</param>
+        /// <param name="extensionHint">可选的扩展名提示（如 ".png"）；只决定先试哪个解码器，不影响最终判定</param>
+        /// <returns>Rgb24 图像</returns>
+        /// <exception cref="NotSupportedException">没有可用的解码器能识别该数据</exception>
+        public Image<Rgb24> LoadRgb24(Stream stream, string? extensionHint = null)
+        {
+            ArgumentNullException.ThrowIfNull(stream);
+            if (!stream.CanSeek)
+            {
+                throw new ArgumentException(
+                    "格式嗅探需要可 Seek 的流；不可 Seek 的输入请改用 ImageFrame.Load(Stream)。",
+                    nameof(stream));
+            }
+
+            long start = stream.Position;
             Type? matchedType = null;
-            if (TryGetPreferredFormat(path, out var preferredFormat))
+            if (TryGetPreferredFormatByExtension(extensionHint, out var preferredFormat))
             {
                 matchedType = preferredFormat.GetType();
-                if (TryDecodeRgb24(preferredFormat, fs) is { } preferred)
+                if (TryDecodeRgb24(preferredFormat, stream, start) is { } preferred)
                 {
                     return preferred;
                 }
@@ -136,7 +162,7 @@ namespace SharpImageConverter.Core
             foreach (var f in _formats)
             {
                 if (matchedType != null && f.GetType() == matchedType) continue;
-                if (TryDecodeRgb24(f, fs) is { } decoded)
+                if (TryDecodeRgb24(f, stream, start) is { } decoded)
                 {
                     return decoded;
                 }
@@ -147,22 +173,22 @@ namespace SharpImageConverter.Core
         /// <summary>
         /// 用指定格式尝试解码为 Rgb24；格式不匹配或该格式没有可用解码器时返回 null。
         /// 原生 Rgb24 解码器缺失但提供 Rgba32 解码器时，解码后降通道复用（与
-        /// <see cref="LoadRgba32"/> 的反向回退对称）。
+        /// <see cref="LoadRgba32(string)"/> 的反向回退对称）。
         /// </summary>
-        private Image<Rgb24>? TryDecodeRgb24(IImageFormat format, Stream stream)
+        private Image<Rgb24>? TryDecodeRgb24(IImageFormat format, Stream stream, long basePosition = 0)
         {
             Type formatType = format.GetType();
-            stream.Position = 0;
+            stream.Position = basePosition;
             if (!format.IsMatch(stream)) return null;
 
             if (_decoders.TryGetValue(formatType, out var decoder))
             {
-                stream.Position = 0;
+                stream.Position = basePosition;
                 return decoder.DecodeRgb24(stream);
             }
             if (_decodersRgba.TryGetValue(formatType, out var decoderRgba))
             {
-                stream.Position = 0;
+                stream.Position = basePosition;
                 var rgba = decoderRgba.DecodeRgba32(stream);
                 return new Image<Rgb24>(rgba.Width, rgba.Height, RgbaToRgb(rgba.Buffer), rgba.Metadata);
             }
@@ -181,6 +207,19 @@ namespace SharpImageConverter.Core
             ArgumentNullException.ThrowIfNull(image);
             ArgumentException.ThrowIfNullOrEmpty(path);
             GetEncoderOrThrow(path).EncodeRgb24(path, image);
+        }
+
+        /// <summary>
+        /// 保存 Rgb24 图像到流（按 <paramref name="extension"/> 选择编码器）。
+        /// </summary>
+        /// <param name="image">Rgb24 图像</param>
+        /// <param name="stream">输出流（不负责关闭）</param>
+        /// <param name="extension">目标格式的扩展名（".png" 或 "png"）</param>
+        public void SaveRgb24(Image<Rgb24> image, Stream stream, string extension)
+        {
+            ArgumentNullException.ThrowIfNull(image);
+            ArgumentNullException.ThrowIfNull(stream);
+            GetEncoderByExtensionOrThrow(extension).EncodeRgb24(stream, image);
         }
 
         public void SaveGray8(Image<Gray8> image, string path)
@@ -213,11 +252,34 @@ namespace SharpImageConverter.Core
         public Image<Rgba32> LoadRgba32(string path)
         {
             using var fs = File.OpenRead(path);
+            return LoadRgba32(fs, Path.GetExtension(path));
+        }
+
+        /// <summary>
+        /// 从流加载为 Rgba32 图像（按文件头自动识别格式）。
+        /// </summary>
+        /// <remarks>
+        /// 流必须可 Seek，理由同 <see cref="LoadRgb24(Stream, string?)"/>。
+        /// </remarks>
+        /// <param name="stream">输入数据流</param>
+        /// <param name="extensionHint">可选的扩展名提示（如 ".png"）</param>
+        /// <returns>Rgba32 图像</returns>
+        public Image<Rgba32> LoadRgba32(Stream stream, string? extensionHint = null)
+        {
+            ArgumentNullException.ThrowIfNull(stream);
+            if (!stream.CanSeek)
+            {
+                throw new ArgumentException(
+                    "格式嗅探需要可 Seek 的流；不可 Seek 的输入请改用 ImageFrame.Load(Stream)。",
+                    nameof(stream));
+            }
+
+            long start = stream.Position;
             Type? matchedType = null;
-            if (TryGetPreferredFormat(path, out var preferredFormat))
+            if (TryGetPreferredFormatByExtension(extensionHint, out var preferredFormat))
             {
                 matchedType = preferredFormat.GetType();
-                if (TryDecodeRgba32(preferredFormat, fs) is { } preferred)
+                if (TryDecodeRgba32(preferredFormat, stream, start) is { } preferred)
                 {
                     return preferred;
                 }
@@ -225,7 +287,7 @@ namespace SharpImageConverter.Core
             foreach (var f in _formats)
             {
                 if (matchedType != null && f.GetType() == matchedType) continue;
-                if (TryDecodeRgba32(f, fs) is { } decoded)
+                if (TryDecodeRgba32(f, stream, start) is { } decoded)
                 {
                     return decoded;
                 }
@@ -237,20 +299,20 @@ namespace SharpImageConverter.Core
         /// 用指定格式尝试解码为 Rgba32；优先原生 RGBA 解码，缺失时用 RGB 解码后补 alpha=255。
         /// 格式不匹配或该格式没有注册任何解码器时返回 null。
         /// </summary>
-        private Image<Rgba32>? TryDecodeRgba32(IImageFormat format, Stream stream)
+        private Image<Rgba32>? TryDecodeRgba32(IImageFormat format, Stream stream, long basePosition = 0)
         {
             Type formatType = format.GetType();
-            stream.Position = 0;
+            stream.Position = basePosition;
             if (!format.IsMatch(stream)) return null;
 
             if (_decodersRgba.TryGetValue(formatType, out var decoderRgba))
             {
-                stream.Position = 0;
+                stream.Position = basePosition;
                 return decoderRgba.DecodeRgba32(stream);
             }
             if (_decoders.TryGetValue(formatType, out var decoder))
             {
-                stream.Position = 0;
+                stream.Position = basePosition;
                 return ConvertRgbToRgba(decoder.DecodeRgb24(stream));
             }
             return null;
@@ -277,16 +339,44 @@ namespace SharpImageConverter.Core
         }
 
         /// <summary>
+        /// 保存 Rgba32 图像到流（按 <paramref name="extension"/> 选择编码器；该格式不支持 alpha 时降通道）。
+        /// </summary>
+        /// <param name="image">Rgba32 图像</param>
+        /// <param name="stream">输出流（不负责关闭）</param>
+        /// <param name="extension">目标格式的扩展名（".png" 或 "png"）</param>
+        public void SaveRgba32(Image<Rgba32> image, Stream stream, string extension)
+        {
+            ArgumentNullException.ThrowIfNull(image);
+            ArgumentNullException.ThrowIfNull(stream);
+            Type? formatType = ResolveFormatTypeByExtensionName(extension);
+            if (formatType != null && _encodersRgba.TryGetValue(formatType, out var enc))
+            {
+                enc.EncodeRgba32(stream, image);
+                return;
+            }
+            var rgb = new Image<Rgb24>(image.Width, image.Height, RgbaToRgb(image.Buffer), image.Metadata);
+            SaveRgb24(rgb, stream, extension);
+        }
+
+        /// <summary>
         /// 按输出路径的扩展名解析已注册的编码器；未注册的扩展名或缺失编码器时抛
         /// <see cref="NotSupportedException"/>（而不是字典访问异常）。
         /// </summary>
         private IImageEncoder GetEncoderOrThrow(string path)
+            => GetEncoderByExtensionOrThrow(Path.GetExtension(path));
+
+        /// <summary>
+        /// 按扩展名解析已注册的编码器；未注册的扩展名或缺失编码器时抛
+        /// <see cref="NotSupportedException"/>（而不是字典访问异常）。
+        /// </summary>
+        /// <param name="extension">扩展名（".png" 或 "png"）</param>
+        private IImageEncoder GetEncoderByExtensionOrThrow(string extension)
         {
-            Type? formatType = ResolveFormatTypeByExtension(path);
+            Type? formatType = ResolveFormatTypeByExtensionName(extension);
             if (formatType is null)
             {
                 throw new NotSupportedException(
-                    $"不支持的输出格式：\"{Path.GetExtension(path)}\"。已注册的扩展名：{string.Join("、", _formatTypeByExtension.Keys)}");
+                    $"不支持的输出格式：\"{extension}\"。已注册的扩展名：{string.Join("、", _formatTypeByExtension.Keys)}");
             }
             if (_encoders.TryGetValue(formatType, out var encoder))
             {
@@ -299,8 +389,15 @@ namespace SharpImageConverter.Core
         /// 扩展名 → 已注册格式类型；扩展名未注册时返回 null。
         /// </summary>
         private Type? ResolveFormatTypeByExtension(string path)
+            => ResolveFormatTypeByExtensionName(Path.GetExtension(path));
+
+        /// <summary>
+        /// 扩展名 → 已注册格式类型；扩展名未注册时返回 null。
+        /// </summary>
+        /// <param name="extension">扩展名（".png" 或 "png"）</param>
+        private Type? ResolveFormatTypeByExtensionName(string? extension)
         {
-            string? normalized = NormalizeExtension(Path.GetExtension(path));
+            string? normalized = NormalizeExtension(extension);
             if (normalized == null) return null;
             return _formatTypeByExtension.TryGetValue(normalized, out var formatType) ? formatType : null;
         }
@@ -364,9 +461,12 @@ namespace SharpImageConverter.Core
         }
 
         private bool TryGetPreferredFormat(string path, out IImageFormat format)
+            => TryGetPreferredFormatByExtension(Path.GetExtension(path), out format);
+
+        private bool TryGetPreferredFormatByExtension(string? extension, out IImageFormat format)
         {
             format = null!;
-            string? normalized = NormalizeExtension(Path.GetExtension(path));
+            string? normalized = NormalizeExtension(extension);
             if (normalized == null) return false;
             if (!_formatTypeByExtension.TryGetValue(normalized, out var formatType)) return false;
             if (_formatsByType.TryGetValue(formatType, out var matched))

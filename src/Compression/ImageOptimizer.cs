@@ -56,7 +56,7 @@ namespace SharpImageConverter.Compression
             var memory = MemoryGuard.CheckOptimize(sourceKind, inputPath, o);
 
             // 目标扩展名能识别、且与源格式不同 → 一步完成「转换 + 智能压缩」
-            if (targetKind != ImageKind.Unknown && targetKind != sourceKind)
+            if (targetKind != ImageFormatKind.Unknown && targetKind != sourceKind)
             {
                 if (memory.Action == MemoryGuard.Action.Refuse)
                 {
@@ -79,15 +79,15 @@ namespace SharpImageConverter.Compression
 
             switch (sourceKind)
             {
-                case ImageKind.Png:
+                case ImageFormatKind.Png:
                     return PngOptimizer.Run(inputPath, output, originalSize, o);
-                case ImageKind.Jpeg:
+                case ImageFormatKind.Jpeg:
                     return JpegOptimizer.Run(inputPath, output, originalSize, o);
-                case ImageKind.Gif:
+                case ImageFormatKind.Gif:
                     return GifOptimizer.Run(inputPath, output, originalSize, o);
-                case ImageKind.Webp:
+                case ImageFormatKind.Webp:
                     return WebpOptimizer.Run(inputPath, output, originalSize, o);
-                case ImageKind.Bmp:
+                case ImageFormatKind.Bmp:
                     return OptimizeBmp(inputPath, output, originalSize, o);
                 default:
                     return Finish(inputPath, output, originalSize, null, null, default, o, "不支持的图片格式");
@@ -106,62 +106,40 @@ namespace SharpImageConverter.Compression
             return Path.Combine(dir, name + ".min" + ext);
         }
 
-        internal enum ImageKind
-        {
-            Unknown,
-            Jpeg,
-            Png,
-            Gif,
-            Webp,
-            Bmp,
-        }
-
         /// <summary>
         /// 先用文件头判断格式，失败再退回扩展名。
         /// </summary>
         /// <param name="path">文件路径</param>
-        internal static ImageKind DetectFormat(string path)
+        internal static ImageFormatKind DetectFormat(string path)
         {
             try
             {
                 using var fs = File.OpenRead(path);
-                Span<byte> head = stackalloc byte[16];
-                int read = fs.Read(head);
-                if (read >= 3 && head[0] == 0xFF && head[1] == 0xD8 && head[2] == 0xFF) return ImageKind.Jpeg;
-                if (read >= 8 && head[0] == 0x89 && head[1] == 0x50 && head[2] == 0x4E && head[3] == 0x47) return ImageKind.Png;
-                if (read >= 6 && head[0] == (byte)'G' && head[1] == (byte)'I' && head[2] == (byte)'F') return ImageKind.Gif;
-                if (read >= 12 && head[0] == (byte)'R' && head[1] == (byte)'I' && head[2] == (byte)'F' && head[3] == (byte)'F'
-                    && head[8] == (byte)'W' && head[9] == (byte)'E' && head[10] == (byte)'B' && head[11] == (byte)'P') return ImageKind.Webp;
-                if (read >= 2 && head[0] == (byte)'B' && head[1] == (byte)'M') return ImageKind.Bmp;
+                Span<byte> head = stackalloc byte[ImageHeaderReader.SniffBytes];
+                int read = fs.ReadAtLeast(head, head.Length, throwOnEndOfStream: false);
+                var kind = ImageHeaderReader.Sniff(head[..read]);
+                if (kind != ImageFormatKind.Unknown) return kind;
             }
             catch
             {
                 // 读不到就走扩展名
             }
 
-            return Path.GetExtension(path).ToLowerInvariant() switch
-            {
-                ".jpg" or ".jpeg" => ImageKind.Jpeg,
-                ".png" => ImageKind.Png,
-                ".gif" => ImageKind.Gif,
-                ".webp" => ImageKind.Webp,
-                ".bmp" => ImageKind.Bmp,
-                _ => ImageKind.Unknown,
-            };
+            return DetectKindByExtension(path);
         }
 
         /// <summary>
         /// 按扩展名判断目标格式（转换的落点以扩展名为准，不嗅探文件头）。
         /// </summary>
         /// <param name="path">输出路径</param>
-        internal static ImageKind DetectKindByExtension(string path) => Path.GetExtension(path).ToLowerInvariant() switch
+        internal static ImageFormatKind DetectKindByExtension(string path) => Path.GetExtension(path).ToLowerInvariant() switch
         {
-            ".jpg" or ".jpeg" => ImageKind.Jpeg,
-            ".png" => ImageKind.Png,
-            ".gif" => ImageKind.Gif,
-            ".webp" => ImageKind.Webp,
-            ".bmp" => ImageKind.Bmp,
-            _ => ImageKind.Unknown,
+            ".jpg" or ".jpeg" => ImageFormatKind.Jpeg,
+            ".png" => ImageFormatKind.Png,
+            ".gif" => ImageFormatKind.Gif,
+            ".webp" => ImageFormatKind.Webp,
+            ".bmp" => ImageFormatKind.Bmp,
+            _ => ImageFormatKind.Unknown,
         };
 
         /// <summary>
@@ -197,15 +175,15 @@ namespace SharpImageConverter.Compression
         /// APNG 的 <c>acTL</c> 规范要求出现在第一个 <c>IDAT</c> 之前，扫到 IDAT 即可停。
         /// WebP 的动画标志在 <c>VP8X</c> 的 flags 字节 bit1，另有 <c>ANIM</c>/<c>ANMF</c> 块可兜底。
         /// </remarks>
-        internal static SourceTraits DetectSourceTraits(string path, ImageKind kind)
+        internal static SourceTraits DetectSourceTraits(string path, ImageFormatKind kind)
         {
             try
             {
                 using var fs = File.OpenRead(path);
                 return kind switch
                 {
-                    ImageKind.Png => DetectPngTraits(fs),
-                    ImageKind.Webp => DetectWebpTraits(fs),
+                    ImageFormatKind.Png => DetectPngTraits(fs),
+                    ImageFormatKind.Webp => DetectWebpTraits(fs),
                     _ => default,
                 };
             }
@@ -978,23 +956,23 @@ namespace SharpImageConverter.Compression
         /// 跨格式优化：源格式与目标格式不同，直接按目标格式产出最小体积文件。
         /// 因为用户显式要求转换，无论目标体积是否小于源文件都会写出目标格式。
         /// </summary>
-        private static OptimizationResult OptimizeConverted(string input, string output, ImageKind target, long originalSize, OptimizeOptions o, string? note = null)
+        private static OptimizationResult OptimizeConverted(string input, string output, ImageFormatKind target, long originalSize, OptimizeOptions o, string? note = null)
         {
             // 解码一次，所有目标格式共用同一份像素；同时收集「更优目标格式」建议所需的统计。
             var rgba = Configuration.Default.LoadRgba32(input);
             bool hadAlpha = !SimdHelper.IsOpaqueRgba(rgba.Buffer);
             int uniqueColors = PaletteQuantizer.CountUniqueColors(rgba.Buffer, 4097);
             string? suggestion = SuggestTarget(target, rgba.Width, rgba.Height, hadAlpha, uniqueColors);
-            string? alphaNote = hadAlpha && target is ImageKind.Jpeg or ImageKind.Bmp ? MatteNote(o) : null;
+            string? alphaNote = hadAlpha && target is ImageFormatKind.Jpeg or ImageFormatKind.Bmp ? MatteNote(o) : null;
 
             OptimizationResult result = target switch
             {
-                ImageKind.Jpeg => JpegOptimizer.RunFromImage(ComposeRgb24(rgba, o, hadAlpha), input, output, originalSize, o),
-                ImageKind.Png => PngOptimizer.RunFromImage(rgba, input, output, originalSize, o),
-                ImageKind.Webp => WebpOptimizer.RunFromImage(rgba, input, output, originalSize, o),
+                ImageFormatKind.Jpeg => JpegOptimizer.RunFromImage(ComposeRgb24(rgba, o, hadAlpha), input, output, originalSize, o),
+                ImageFormatKind.Png => PngOptimizer.RunFromImage(rgba, input, output, originalSize, o),
+                ImageFormatKind.Webp => WebpOptimizer.RunFromImage(rgba, input, output, originalSize, o),
                 // GIF 支持单帧二值透明，交给 GifOptimizer 保留，不做背景合成。
-                ImageKind.Gif => GifOptimizer.RunFromImage(rgba, input, output, originalSize, o),
-                ImageKind.Bmp => FinishConverted(input, output, originalSize, ProduceBmp(ComposeRgb24(rgba, o, hadAlpha)), o),
+                ImageFormatKind.Gif => GifOptimizer.RunFromImage(rgba, input, output, originalSize, o),
+                ImageFormatKind.Bmp => FinishConverted(input, output, originalSize, ProduceBmp(ComposeRgb24(rgba, o, hadAlpha)), o),
                 _ => throw new NotSupportedException($"不支持转换到 {target} 格式"),
             };
             return WithNote(result, note + alphaNote, suggestion);
@@ -1028,19 +1006,19 @@ namespace SharpImageConverter.Compression
         /// BMP 本身无压缩。建议文案里写清理由，避免变成“再猜一次格式”的噪声。
         /// 唯一色数用 4097 截断（照片很快命中上限，成本可忽略）。
         /// </remarks>
-        private static string? SuggestTarget(ImageKind target, int width, int height, bool hadAlpha, int uniqueColors)
+        private static string? SuggestTarget(ImageFormatKind target, int width, int height, bool hadAlpha, int uniqueColors)
         {
             bool photoLike = uniqueColors > 4096;
             return target switch
             {
-                ImageKind.Webp => null,
-                ImageKind.Jpeg when hadAlpha => "WebP 或 PNG（JPEG 不支持透明通道，当前已把 alpha 合成到背景）",
-                ImageKind.Bmp when hadAlpha => "PNG 或 WebP（BMP 无压缩且不支持透明，当前已合成背景）",
-                ImageKind.Bmp => "PNG（无损且体积通常只有 BMP 的 1/5~1/2）",
-                ImageKind.Gif when photoLike => "WebP（照片类图像 GIF 仅 256 色，有损 WebP 通常再小 30%~60%）",
-                ImageKind.Jpeg when !photoLike => "PNG 或 WebP（颜色数少、图形类内容，有损 JPEG 常常反而更大）",
-                ImageKind.Jpeg => "WebP（照片类图像通常比 JPEG 再小 25%~35%）",
-                ImageKind.Png when photoLike => "WebP（照片类图像有损 WebP 通常比 PNG 调色板小 30%~50%）",
+                ImageFormatKind.Webp => null,
+                ImageFormatKind.Jpeg when hadAlpha => "WebP 或 PNG（JPEG 不支持透明通道，当前已把 alpha 合成到背景）",
+                ImageFormatKind.Bmp when hadAlpha => "PNG 或 WebP（BMP 无压缩且不支持透明，当前已合成背景）",
+                ImageFormatKind.Bmp => "PNG（无损且体积通常只有 BMP 的 1/5~1/2）",
+                ImageFormatKind.Gif when photoLike => "WebP（照片类图像 GIF 仅 256 色，有损 WebP 通常再小 30%~60%）",
+                ImageFormatKind.Jpeg when !photoLike => "PNG 或 WebP（颜色数少、图形类内容，有损 JPEG 常常反而更大）",
+                ImageFormatKind.Jpeg => "WebP（照片类图像通常比 JPEG 再小 25%~35%）",
+                ImageFormatKind.Png when photoLike => "WebP（照片类图像有损 WebP 通常比 PNG 调色板小 30%~50%）",
                 _ => null,
             };
         }

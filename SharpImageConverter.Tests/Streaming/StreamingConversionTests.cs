@@ -57,7 +57,7 @@ namespace SharpImageConverter.Tests
             try
             {
                 using (var fs = File.Create(input)) PngWriter.Write(fs, w, h, rgb);
-                StreamingConversion.Convert(input, output, ImageOptimizer.ImageKind.Jpeg, gray: false, jpegQuality: 80);
+                StreamingConversion.Convert(input, output, ImageFormatKind.Jpeg, gray: false, jpegQuality: 80);
                 var decoded = Configuration.Default.LoadRgb24(output);
                 Assert.Equal(w, decoded.Width);
                 Assert.Equal(h, decoded.Height);
@@ -80,7 +80,7 @@ namespace SharpImageConverter.Tests
             try
             {
                 using (var fs = File.Create(input)) PngWriter.Write(fs, w, h, GradientRgb(w, h));
-                StreamingConversion.Convert(input, output, ImageOptimizer.ImageKind.Jpeg, gray: false,
+                StreamingConversion.Convert(input, output, ImageFormatKind.Jpeg, gray: false,
                     jpegQuality: 75, jpegSubsampling: JpegChromaSubsampling.Yuv420, jpegProgressive: true);
                 byte[] bytes = File.ReadAllBytes(output);
                 Assert.True(bytes.AsSpan(0, Math.Min(bytes.Length, 2048)).IndexOf(new byte[] { 0xFF, 0xC2 }) >= 0);
@@ -218,7 +218,7 @@ namespace SharpImageConverter.Tests
             try
             {
                 using (var fs = File.Create(input)) PngWriter.WriteRgba(fs, w, h, rgba);
-                StreamingConversion.Convert(input, output, ImageOptimizer.ImageKind.Png, gray: false);
+                StreamingConversion.Convert(input, output, ImageFormatKind.Png, gray: false);
                 var expected = Configuration.Default.LoadRgba32(input);
                 var actual = Configuration.Default.LoadRgba32(output);
                 Assert.Equal(expected.Buffer, actual.Buffer);
@@ -239,8 +239,8 @@ namespace SharpImageConverter.Tests
             try
             {
                 using (var fs = File.Create(input)) PngWriter.Write(fs, w, h, GradientRgb(w, h));
-                StreamingConversion.Convert(input, output, ImageOptimizer.ImageKind.Gif, gray: false);
-                Assert.True(MemoryGuard.TryReadDimensions(output, ImageOptimizer.ImageKind.Gif, out int ow, out int oh));
+                StreamingConversion.Convert(input, output, ImageFormatKind.Gif, gray: false);
+                Assert.True(MemoryGuard.TryReadDimensions(output, ImageFormatKind.Gif, out int ow, out int oh));
                 Assert.Equal((w, h), (ow, oh));
             }
             finally
@@ -389,15 +389,15 @@ namespace SharpImageConverter.Tests
                 }
                 File.WriteAllBytes(gif, MinimalGif(w, h));
 
-                Assert.True(MemoryGuard.TryReadDimensions(png, ImageOptimizer.ImageKind.Png, out int pw, out int ph));
+                Assert.True(MemoryGuard.TryReadDimensions(png, ImageFormatKind.Png, out int pw, out int ph));
                 Assert.Equal((w, h), (pw, ph));
-                Assert.True(MemoryGuard.TryReadDimensions(jpg, ImageOptimizer.ImageKind.Jpeg, out int jw, out int jh));
+                Assert.True(MemoryGuard.TryReadDimensions(jpg, ImageFormatKind.Jpeg, out int jw, out int jh));
                 Assert.Equal((w, h), (jw, jh));
-                Assert.True(MemoryGuard.TryReadDimensions(bmp, ImageOptimizer.ImageKind.Bmp, out int bw, out int bh));
+                Assert.True(MemoryGuard.TryReadDimensions(bmp, ImageFormatKind.Bmp, out int bw, out int bh));
                 Assert.Equal((w, h), (bw, bh));
-                Assert.True(MemoryGuard.TryReadDimensions(webp, ImageOptimizer.ImageKind.Webp, out int ww, out int wh));
+                Assert.True(MemoryGuard.TryReadDimensions(webp, ImageFormatKind.Webp, out int ww, out int wh));
                 Assert.Equal((w, h), (ww, wh));
-                Assert.True(MemoryGuard.TryReadDimensions(gif, ImageOptimizer.ImageKind.Gif, out int gw, out int gh, out int gf));
+                Assert.True(MemoryGuard.TryReadDimensions(gif, ImageFormatKind.Gif, out int gw, out int gh, out int gf));
                 Assert.Equal((w, h), (gw, gh));
                 Assert.Equal(1, gf);
             }
@@ -469,14 +469,14 @@ namespace SharpImageConverter.Tests
                 }
 
                 long fullRows = MemoryGuard.EstimateStreamingPlainBytes(
-                    ImageOptimizer.ImageKind.Jpeg, ImageOptimizer.ImageKind.Png, 10000, 10000, 1);
+                    ImageFormatKind.Jpeg, ImageFormatKind.Png, 10000, 10000, 1);
                 long fused = MemoryGuard.EstimateStreamingPlainBytes(
-                    ImageOptimizer.ImageKind.Jpeg, ImageOptimizer.ImageKind.Png, 10000, 10000, 1, jpegFusedRow: true);
+                    ImageFormatKind.Jpeg, ImageFormatKind.Png, 10000, 10000, 1, jpegFusedRow: true);
                 Assert.True(fused < fullRows);
 
-                var ok = MemoryGuard.CheckPlain(ImageOptimizer.ImageKind.Jpeg, ImageOptimizer.ImageKind.Png, jpg, long.MaxValue / 2);
+                var ok = MemoryGuard.CheckPlain(ImageFormatKind.Jpeg, ImageFormatKind.Png, jpg, long.MaxValue / 2);
                 Assert.Equal(MemoryGuard.Action.Ok, ok.Action);
-                var refused = MemoryGuard.CheckPlain(ImageOptimizer.ImageKind.Jpeg, ImageOptimizer.ImageKind.Png, jpg, 1);
+                var refused = MemoryGuard.CheckPlain(ImageFormatKind.Jpeg, ImageFormatKind.Png, jpg, 1);
                 Assert.Equal(MemoryGuard.Action.Refuse, refused.Action);
             }
             finally

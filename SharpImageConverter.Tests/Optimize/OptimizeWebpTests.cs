@@ -157,7 +157,7 @@ namespace SharpImageConverter.Tests
             try
             {
                 WriteAnimatedWebpHeader(input);
-                var traits = ImageOptimizer.DetectSourceTraits(input, ImageOptimizer.ImageKind.Webp);
+                var traits = ImageOptimizer.DetectSourceTraits(input, ImageFormatKind.Webp);
                 Assert.True(traits.IsAnimated);
 
                 var result = ImageOptimizer.Optimize(input, output);

@@ -146,7 +146,7 @@ public sealed class ImageFrame
     public static ImageFrame Load(Stream stream, bool requireComplete = false)
     {
         ArgumentNullException.ThrowIfNull(stream);
-        const int headerSize = 12;
+        const int headerSize = ImageHeaderReader.SniffBytes;
         byte[] header = new byte[headerSize];
         int read;
         Stream decodeStream;
@@ -164,27 +164,22 @@ public sealed class ImageFrame
         }
         if (read < 2) throw new InvalidDataException("流数据过短");
 
-        // Magic Number Detection
-        if (header[0] == 0xFF && header[1] == 0xD8)
-            return LoadJpeg(decodeStream, useStreamingDecoder: requireComplete, requireEoi: requireComplete);
-        
-        if (read >= 8 &&
-            header[0] == 0x89 && header[1] == 0x50 && header[2] == 0x4E && header[3] == 0x47 &&
-            header[4] == 0x0D && header[5] == 0x0A && header[6] == 0x1A && header[7] == 0x0A)
-            return LoadPng(decodeStream);
-            
-        if (header[0] == 'B' && header[1] == 'M')
-            return LoadBmp(decodeStream);
-            
-        if (read >= 3 && header[0] == 'G' && header[1] == 'I' && header[2] == 'F')
-            return LoadGif(decodeStream, requireComplete);
-
-        if (read >= 12 &&
-            header[0] == (byte)'R' && header[1] == (byte)'I' && header[2] == (byte)'F' && header[3] == (byte)'F' &&
-            header[8] == (byte)'W' && header[9] == (byte)'E' && header[10] == (byte)'B' && header[11] == (byte)'P')
-            return LoadWebp(decodeStream);
-
-        throw new NotSupportedException("无法识别的图像格式");
+        // 格式嗅探统一走 ImageHeaderReader（与 Configuration / ImageOptimizer / Image.Identify 同一实现）
+        switch (ImageHeaderReader.Sniff(header.AsSpan(0, read)))
+        {
+            case ImageFormatKind.Jpeg:
+                return LoadJpeg(decodeStream, useStreamingDecoder: requireComplete, requireEoi: requireComplete);
+            case ImageFormatKind.Png:
+                return LoadPng(decodeStream);
+            case ImageFormatKind.Bmp:
+                return LoadBmp(decodeStream);
+            case ImageFormatKind.Gif:
+                return LoadGif(decodeStream, requireComplete);
+            case ImageFormatKind.Webp:
+                return LoadWebp(decodeStream);
+            default:
+                throw new NotSupportedException("无法识别的图像格式");
+        }
     }
 
     private static int ReadHeader(Stream stream, byte[] header)
@@ -491,6 +486,9 @@ public sealed class ImageFrame
             case ".gif":
                 SaveAsGif(path);
                 break;
+            case ".webp":
+                SaveAsWebp(path);
+                break;
             default:
                 throw new NotSupportedException($"不支持的输出文件格式: {ext}");
         }
@@ -526,12 +524,35 @@ public sealed class ImageFrame
     }
 
     /// <summary>
-    /// 以 PNG 格式保存图像
+    /// 以 PNG 格式保存图像。
     /// </summary>
+    /// <remarks>
+    /// 32 位带 alpha 的帧（<see cref="ImagePixelFormat.Rgba32"/> /
+    /// <see cref="ImagePixelFormat.Bgra32"/>）走颜色类型 6，alpha 会保留；
+    /// 像素全不透明时 <see cref="PngWriter.WriteRgba(Stream, int, int, byte[], ImageMetadata?)"/>
+    /// 会自动降级为颜色类型 2，产物与按 RGB24 写入逐字节一致。
+    /// 此前这里一律先降成 RGB24，导致 alpha 静默丢弃。
+    /// </remarks>
     /// <param name="stream">输出流</param>
     public void SaveAsPng(Stream stream)
     {
-        PngWriter.Write(stream, Width, Height, GetRgb24Pixels());
+        // 元数据不随 PNG 写出：与本方法历史行为一致（此前也不写），避免静默改变既有产物。
+        switch (PixelFormat)
+        {
+            case ImagePixelFormat.Rgba32:
+                PngWriter.WriteRgba(stream, Width, Height, Pixels);
+                break;
+            case ImagePixelFormat.Bgra32:
+            {
+                byte[] rgba = GC.AllocateUninitializedArray<byte>(Pixels.Length);
+                SimdHelper.SwapRgbaBgra32(Pixels, rgba);
+                PngWriter.WriteRgba(stream, Width, Height, rgba);
+                break;
+            }
+            default:
+                PngWriter.Write(stream, Width, Height, GetRgb24Pixels());
+                break;
+        }
     }
 
     /// <summary>
@@ -615,6 +636,44 @@ public sealed class ImageFrame
             // 非 RGB24 帧先规范化为 RGB24（保留元数据），再交给 GIF 编码器
             encoder.Encode(ToRgb24(), stream);
         }
+    }
+
+    /// <summary>
+    /// 以 WebP 格式保存图像（默认质量 75）
+    /// </summary>
+    /// <remarks>
+    /// 带 alpha 的帧走 RGBA 编码路径（VP8L/VP8X 带 ALPH 块），alpha 保留；
+    /// 其余格式先规范化为 RGB24。
+    /// </remarks>
+    /// <param name="path">输出路径</param>
+    /// <param name="quality">有损质量（0-100）</param>
+    public void SaveAsWebp(string path, float quality = 75f)
+    {
+        using var fs = new FileStream(path, FileMode.Create, FileAccess.Write);
+        SaveAsWebp(fs, quality);
+    }
+
+    /// <summary>
+    /// 以 WebP 格式保存图像（默认质量 75）
+    /// </summary>
+    /// <param name="stream">输出流</param>
+    /// <param name="quality">有损质量（0-100）</param>
+    public void SaveAsWebp(Stream stream, float quality = 75f)
+    {
+        if (PixelFormat == ImagePixelFormat.Rgba32 || PixelFormat == ImagePixelFormat.Bgra32)
+        {
+            var rgba = PixelFormat == ImagePixelFormat.Rgba32 ? this : ToRgba32();
+            var rgbaImage = new Image<Rgba32>(Width, Height, rgba.Pixels, Metadata);
+            var encRgba = new WebpEncoderAdapterRgba();
+            encRgba.Quality = quality;
+            encRgba.EncodeRgba32(stream, rgbaImage);
+            return;
+        }
+
+        var rgbImage = new Image<Rgb24>(Width, Height, GetRgb24Pixels(), Metadata);
+        var enc = new WebpEncoderAdapter();
+        enc.Quality = quality;
+        enc.EncodeRgb24(stream, rgbImage);
     }
 
     /// <summary>

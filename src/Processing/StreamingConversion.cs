@@ -21,17 +21,17 @@ namespace SharpImageConverter.Processing
     /// </remarks>
     internal static class StreamingConversion
     {
-        internal static bool IsSupported(ImageOptimizer.ImageKind source, ImageOptimizer.ImageKind target, string inputPath)
+        internal static bool IsSupported(ImageFormatKind source, ImageFormatKind target, string inputPath)
         {
-            if (target is not (ImageOptimizer.ImageKind.Bmp or ImageOptimizer.ImageKind.Png
-                or ImageOptimizer.ImageKind.Gif or ImageOptimizer.ImageKind.Jpeg)) return false;
+            if (target is not (ImageFormatKind.Bmp or ImageFormatKind.Png
+                or ImageFormatKind.Gif or ImageFormatKind.Jpeg)) return false;
             return source switch
             {
-                ImageOptimizer.ImageKind.Bmp => BmpRowSource.IsSupported(inputPath),
-                ImageOptimizer.ImageKind.Png => PngRowSource.IsSupported(inputPath),
-                ImageOptimizer.ImageKind.Gif => GifRowSource.IsSupported(inputPath),
-                ImageOptimizer.ImageKind.Webp => WebpRowSource.IsSupported(inputPath),
-                ImageOptimizer.ImageKind.Jpeg => JpegRowSource.IsSupported(inputPath),
+                ImageFormatKind.Bmp => BmpRowSource.IsSupported(inputPath),
+                ImageFormatKind.Png => PngRowSource.IsSupported(inputPath),
+                ImageFormatKind.Gif => GifRowSource.IsSupported(inputPath),
+                ImageFormatKind.Webp => WebpRowSource.IsSupported(inputPath),
+                ImageFormatKind.Jpeg => JpegRowSource.IsSupported(inputPath),
                 _ => false,
             };
         }
@@ -39,7 +39,7 @@ namespace SharpImageConverter.Processing
         internal static void Convert(
             string inputPath,
             string outputPath,
-            ImageOptimizer.ImageKind target,
+            ImageFormatKind target,
             bool gray,
             int jpegQuality = 75,
             JpegChromaSubsampling jpegSubsampling = JpegChromaSubsampling.Yuv420,
@@ -50,7 +50,7 @@ namespace SharpImageConverter.Processing
             if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
 
             using IRowImageSource source = CreateSource(inputPath, useFloatingPointIdct);
-            if (target == ImageOptimizer.ImageKind.Jpeg)
+            if (target == ImageFormatKind.Jpeg)
             {
                 using (var output = new FileStream(outputPath, FileMode.Create, FileAccess.Write, FileShare.None, 64 * 1024))
                 {
@@ -88,26 +88,26 @@ namespace SharpImageConverter.Processing
             var kind = ImageOptimizer.DetectFormat(inputPath);
             return kind switch
             {
-                ImageOptimizer.ImageKind.Bmp => new BmpRowSource(inputPath),
-                ImageOptimizer.ImageKind.Png => PngRowSource.Open(inputPath),
-                ImageOptimizer.ImageKind.Gif => new GifRowSource(inputPath),
-                ImageOptimizer.ImageKind.Webp => new WebpRowSource(inputPath),
-                ImageOptimizer.ImageKind.Jpeg => JpegRowSource.Open(inputPath, useFloatingPointIdct),
+                ImageFormatKind.Bmp => new BmpRowSource(inputPath),
+                ImageFormatKind.Png => PngRowSource.Open(inputPath),
+                ImageFormatKind.Gif => new GifRowSource(inputPath),
+                ImageFormatKind.Webp => new WebpRowSource(inputPath),
+                ImageFormatKind.Jpeg => JpegRowSource.Open(inputPath, useFloatingPointIdct),
                 _ => throw new NotSupportedException($"格式 {kind} 不支持逐行解码"),
             };
         }
 
         private static IRowImageSink CreateSink(
             string outputPath,
-            ImageOptimizer.ImageKind target,
+            ImageFormatKind target,
             IRowImageSource source,
             bool gray)
             => target switch
             {
-                ImageOptimizer.ImageKind.Bmp => new BmpRowSink(outputPath, source.Width, source.Height, gray),
-                ImageOptimizer.ImageKind.Png => new PngRowSink(
+                ImageFormatKind.Bmp => new BmpRowSink(outputPath, source.Width, source.Height, gray),
+                ImageFormatKind.Png => new PngRowSink(
                     outputPath, source.Width, source.Height, source.Channels, source.HasAlpha, gray),
-                ImageOptimizer.ImageKind.Gif => new GifRowSink(
+                ImageFormatKind.Gif => new GifRowSink(
                     outputPath, source.Width, source.Height, source.Channels, gray),
                 _ => throw new NotSupportedException($"目标格式 {target} 不支持逐行编码"),
             };

@@ -74,8 +74,27 @@ public class GifEncoder
         GifTiming.Emit(timing, DiagnosticsLog);
     }
 
+    /// <summary>
+    /// 编码单帧图像为 GIF。
+    /// </summary>
+    /// <remarks>
+    /// 只接受 RGB24 帧：量化按「3 字节/像素、行间无填充」直接切缓冲区，
+    /// 传入 32 位帧会静默按错误步长取样（得到错位的花屏）。GIF 的逐像素
+    /// 不透明度只有「全透明 / 全不透明」两态，无法表达半透明，
+    /// 故不在此做 alpha 降级，交由调用方决定（见 <see cref="ImageFrame.SaveAsGif(Stream)"/>）。
+    /// </remarks>
+    /// <param name="image">输入帧（必须为 RGB24）</param>
+    /// <param name="stream">输出流</param>
+    /// <exception cref="ArgumentException">帧的像素格式不是 RGB24</exception>
     public void Encode(ImageFrame image, Stream stream)
     {
+        if (image.PixelFormat != ImagePixelFormat.Rgb24)
+        {
+            throw new ArgumentException(
+                $"GIF 单帧编码只接受 RGB24，当前为 {image.PixelFormat}；请先调用 ToRgb24()。",
+                nameof(image));
+        }
+
         var timing = BeginTiming(image.Width * image.Height, 1);
         long t0 = Now(timing);
         EncodeCore(image, stream, timing);
