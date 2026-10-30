@@ -86,7 +86,7 @@ SharpImageConverter/
 │  ├── ImageFrame.cs             # Second pixel container (BGR/BGRA + non-seekable streams)
 │  ├── runtimes/                 # WebP native libraries (win-x64/linux-x64/osx-arm64)
 │  └── SharpImageConverter.csproj
-├── Cli/                         # Standalone CLI project (single-file Program.cs for now)
+├── Cli/                         # Standalone CLI project (Program*.cs split by role: Parse/Process/Encode/Optimize/Bench)
 │  ├── Program.cs
 │  └── SharpImageConverter.Cli.csproj
 ├── SharpImageConverter.Tests/   # Tests (Compat/Codec/Jpeg/Optimize/Streaming/Cli)
@@ -250,6 +250,19 @@ Exit codes: `0` success, `1` processing failure (including any failed file in a 
 `2` usage error (unknown option, missing input). Unknown options are rejected instead of
 being silently consumed as an output path.
 
+**Pipes**: `-` stands for stdin/stdout. The input format is sniffed from content; the output side
+must name its format with `--to` (a pipe has no filename). Bytes are identical to the file-based
+output, and progress/summary lines go to stderr so stdout carries nothing but the image.
+
+```bash
+cat in.png | sic - out.jpg            # stdin -> file
+sic in.png - --to webp > out.webp     # file -> stdout
+sic - - --to jpg < in.png > out.jpg   # both ends piped
+```
+
+Not supported when writing to stdout: directory input, `--gif-frames`, `--json`
+(rejected by the usage check with exit code 2).
+
 ### Supported Formats
 - Input: .jpg/.jpeg/.png/.bmp/.webp/.gif
 - Output: .jpg/.jpeg/.png/.bmp/.webp/.gif
@@ -308,6 +321,7 @@ Special cases:
 - Skip existing: `--skip-existing` (skip if target file already exists)
 - Output control:
   - `--quiet`: no progress or summary lines; errors still go to stderr (exit-code semantics unchanged).
+  - `-`: standard input or standard output (positional). Output requires `--to`; mutually exclusive with `--json`, directory input and `--gif-frames`.
   - `--json`: print a **single JSON object** to stdout (per-file input/output paths, byte counts, quality metrics and failure reasons) and suppress the human-readable progress lines. Output is always UTF-8. Diagnostic output such as `--gif-bench` / `--jpeg-bench` is unaffected.
 - Output location: when the second argument is a folder, preserves the relative structure of the source directory; if not specified, outputs next to the source files
 - Default extension: `.png` when no operation; `.bmp` when operations are present; explicit `--to/--out-ext` takes precedence

@@ -89,7 +89,7 @@ SharpImageConverter/
 │  ├── ImageFrame.cs             # 另一套图像载体（支持 BGR/BGRA 与不可 Seek 流）
 │  ├── runtimes/                 # WebP 原生库（win-x64/linux-x64/osx-arm64）
 │  └── SharpImageConverter.csproj
-├── Cli/                         # 独立命令行项目（当前为单文件 Program.cs）
+├── Cli/                         # 独立命令行项目（Program*.cs 按职责拆分：Parse/Process/Encode/Optimize/Bench）
 │  ├── Program.cs
 │  └── SharpImageConverter.Cli.csproj
 ├── SharpImageConverter.Tests/   # 单元/回归测试（按 Compat/Codec/Jpeg/Optimize/Streaming/Cli 分域）
@@ -242,6 +242,18 @@ sic --version   # 打印版本号
 退出码：`0` 成功、`1` 处理失败（含目录批量中有文件失败）、`2` 用法错误（未知参数、输入不存在）。
 未知参数会直接报错并返回 2，不会被当成输出路径。
 
+**管道**：`-` 代表标准输入/输出，输入侧的格式按内容嗅探，输出侧必须用 `--to` 指定格式
+（管道没有文件名可推扩展名）。产物与写成文件时逐字节一致；进度/汇总信息改走 stderr，
+stdout 只有图片字节。
+
+```bash
+cat in.png | sic - out.jpg            # stdin → 文件
+sic in.png - --to webp > out.webp     # 文件 → stdout
+sic - - --to jpg < in.png > out.jpg   # 两端都是管道
+```
+
+限制：输出到 stdout 时不支持目录输入、`--gif-frames` 与 `--json`（都会在用法校验阶段报错并返回 2）。
+
 ### 支持格式
 - 输入: .jpg/.jpeg/.png/.bmp/.webp/.gif
 - 输出: .jpg/.jpeg/.png/.bmp/.webp/.gif
@@ -279,6 +291,7 @@ sic --version   # 打印版本号
   - `--skip-existing`：目标文件存在时跳过。
 - 输出控制：
   - `--quiet`：不打印进度与汇总，只把错误写到 stderr（退出码语义不变）。
+  - `-`：标准输入或标准输出（位置参数）。输出侧必须配 `--to`；与 `--json`、目录输入、`--gif-frames` 互斥。
   - `--json`：结果以**单个 JSON 对象**输出到 stdout（含逐文件的输入输出路径、字节数、画质指标与失败原因），
     逐文件的进度行不再打印，适合脚本消费。输出固定为 UTF-8。
     `--gif-bench` / `--jpeg-bench` 这类诊断输出不受影响。

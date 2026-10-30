@@ -13,6 +13,14 @@
     <Version>1.3.0</Version>
     <Authors>SharpImageConverter</Authors>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <!--
+      trim / AOT 兼容性声明：开启后 SDK 会带上 IL2xxx（裁剪）与 IL3xxx（AOT）分析器，
+      使用者 PublishTrimmed / PublishAot 时不会再"静默"拿到运行时错误。
+      本库不依赖反射、动态加载程序集或 object 装箱派发（编解码派发全是 typeof(T) 静态分派），
+      唯一的外部依赖是 libwebp 的 P/Invoke，属于 AOT 原生可调用面。
+    -->
+    <IsTrimmable>true</IsTrimmable>
+    <IsAotCompatible>true</IsAotCompatible>
     <Description>Pure C# cross-platform image conversion library (JPEG/PNG/BMP/WebP/GIF) with a fast integer JPEG codec and minimal dependencies.</Description>
     <PackageTags>image;jpeg;webp;converter;cli;codec</PackageTags>
     <RepositoryUrl>https://github.com/lastonesky/SharpImageConverter</RepositoryUrl>

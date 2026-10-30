@@ -53,6 +53,40 @@ namespace SharpImageConverter.Tests
             return (proc.ExitCode, stdout, stderr);
         }
 
+        /// <summary>
+        /// 跑一次 CLI，向标准输入喂字节、把标准输出按**原始字节**收回来。
+        /// </summary>
+        /// <remarks>
+        /// 不能用 <c>StandardOutput.ReadToEnd()</c>：它会按 UTF-8 解码，二进制会被替换字符破坏，
+        /// 断言就变成测编码而不是测产物。
+        /// </remarks>
+        private static (int ExitCode, byte[] StdOut, string StdErr) RunCliWithStdin(byte[]? stdin, params string[] args)
+        {
+            var psi = new ProcessStartInfo
+            {
+                FileName = "dotnet",
+                RedirectStandardInput = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                StandardErrorEncoding = Encoding.UTF8,
+            };
+            psi.ArgumentList.Add(LocateCliAssembly());
+            foreach (string a in args) psi.ArgumentList.Add(a);
+
+            using var proc = Process.Start(psi)!;
+            using (Stream childIn = proc.StandardInput.BaseStream)
+            {
+                if (stdin is { Length: > 0 }) childIn.Write(stdin, 0, stdin.Length);
+            }
+
+            using var buffer = new MemoryStream();
+            proc.StandardOutput.BaseStream.CopyTo(buffer);
+            string stderr = proc.StandardError.ReadToEnd();
+            proc.WaitForExit();
+            return (proc.ExitCode, buffer.ToArray(), stderr);
+        }
+
         private static string NewTemp(string ext)
         {
             return Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString("N") + ext);
@@ -305,6 +339,145 @@ namespace SharpImageConverter.Tests
             finally
             {
                 if (File.Exists(input)) File.Delete(input);
+            }
+        }
+
+        /// <summary>
+        /// <c>sic in.png - --to jpg</c> 写出的字节必须与 <c>sic in.png out.jpg</c> 完全一致：
+        /// 管道桥接走临时文件，不得改变编码结果，也不得被进度行污染。
+        /// </summary>
+        [Fact]
+        public void Stdout_Output_Is_Byte_Identical_To_File_Output()
+        {
+            string input = NewTemp(".png");
+            string fileOut = NewTemp(".jpg");
+            try
+            {
+                Core.Image.Save(Helpers.TestImageFactory.CreateGradient(48, 32), input);
+                Assert.Equal(0, RunCli(input, fileOut).ExitCode);
+
+                var piped = RunCliWithStdin(null, input, "-", "--to", "jpg");
+                Assert.Equal(0, piped.ExitCode);
+                Assert.Equal(File.ReadAllBytes(fileOut), piped.StdOut);
+                Assert.Contains("写入完成: -", piped.StdErr, StringComparison.Ordinal);
+            }
+            finally
+            {
+                if (File.Exists(input)) File.Delete(input);
+                if (File.Exists(fileOut)) File.Delete(fileOut);
+            }
+        }
+
+        /// <summary>
+        /// <c>sic - out.jpg</c>：输入侧的格式靠内容嗅探，不靠扩展名（管道没有文件名）。
+        /// </summary>
+        [Fact]
+        public void Stdin_Input_Is_Sniffed_And_Matches_File_Output()
+        {
+            string input = NewTemp(".png");
+            string fileOut = NewTemp(".jpg");
+            string stdinOut = NewTemp(".jpg");
+            try
+            {
+                Core.Image.Save(Helpers.TestImageFactory.CreateGradient(48, 32), input);
+                Assert.Equal(0, RunCli(input, fileOut).ExitCode);
+
+                var piped = RunCliWithStdin(File.ReadAllBytes(input), "-", stdinOut);
+                Assert.Equal(0, piped.ExitCode);
+                Assert.Equal(File.ReadAllBytes(fileOut), File.ReadAllBytes(stdinOut));
+            }
+            finally
+            {
+                foreach (string f in new[] { input, fileOut, stdinOut })
+                {
+                    if (File.Exists(f)) File.Delete(f);
+                }
+            }
+        }
+
+        /// <summary>
+        /// 输出到 stdout 时没有扩展名可用，必须显式给 <c>--to</c>；缺了就是用法错误。
+        /// </summary>
+        [Fact]
+        public void Stdout_Without_Target_Format_Is_Usage_Error()
+        {
+            string input = NewTemp(".png");
+            try
+            {
+                Core.Image.Save(Helpers.TestImageFactory.CreateGradient(16, 16), input);
+                var (code, stdout, stderr) = RunCliWithStdin(null, input, "-");
+                Assert.Equal(2, code);
+                Assert.Empty(stdout);
+                Assert.Contains("--to", stderr, StringComparison.Ordinal);
+            }
+            finally
+            {
+                if (File.Exists(input)) File.Delete(input);
+            }
+        }
+
+        /// <summary>
+        /// <c>--json</c> 与 stdout 输出互斥：同一根流不能既放报告又放图片字节。
+        /// </summary>
+        [Fact]
+        public void Stdout_With_Json_Is_Usage_Error()
+        {
+            string input = NewTemp(".png");
+            try
+            {
+                Core.Image.Save(Helpers.TestImageFactory.CreateGradient(16, 16), input);
+                var (code, stdout, stderr) = RunCliWithStdin(null, input, "-", "--to", "png", "--json");
+                Assert.Equal(2, code);
+                Assert.Empty(stdout);
+                Assert.Contains("--json", stderr, StringComparison.Ordinal);
+            }
+            finally
+            {
+                if (File.Exists(input)) File.Delete(input);
+            }
+        }
+
+        /// <summary>
+        /// 空的标准输入要明确失败（退出码 1），不能静默产出 0 字节文件。
+        /// </summary>
+        [Fact]
+        public void Empty_Stdin_Fails_Without_Writing_Output()
+        {
+            string output = NewTemp(".png");
+            try
+            {
+                var (code, _, stderr) = RunCliWithStdin([], "-", output);
+                Assert.Equal(1, code);
+                Assert.False(File.Exists(output));
+                Assert.Contains("标准输入", stderr, StringComparison.Ordinal);
+            }
+            finally
+            {
+                if (File.Exists(output)) File.Delete(output);
+            }
+        }
+
+        /// <summary>
+        /// 已移除的选项要报用法错误并说明原因，不能"警告后继续"——静默忽略会让旧脚本
+        /// 以为参数还在生效。
+        /// </summary>
+        [Fact]
+        public void Removed_Option_Fails_With_Reason()
+        {
+            string input = NewTemp(".png");
+            string output = NewTemp(".webp");
+            try
+            {
+                Core.Image.Save(Helpers.TestImageFactory.CreateGradient(16, 16), input);
+                var (code, _, stderr) = RunCli(input, output, "--opt-webp-params");
+                Assert.Equal(2, code);
+                Assert.Contains("1.3.0 移除", stderr, StringComparison.Ordinal);
+                Assert.False(File.Exists(output));
+            }
+            finally
+            {
+                if (File.Exists(input)) File.Delete(input);
+                if (File.Exists(output)) File.Delete(output);
             }
         }
     }

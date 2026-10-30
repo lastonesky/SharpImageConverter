@@ -7,6 +7,11 @@
   `--solution`（新模式不吃位置参数）。**`TempProbeFidelityBlocks` 缺本机
   `%TEMP%\bench\fidelity` 语料时改为 Skip 而非失败**（该探针依赖跑 bench 留下的文件，
   机器间不保证存在，CI 上必挂）。
+- **声明 trim / AOT 兼容性**：库 csproj 新增 `<IsTrimmable>true` /
+  `<IsAotCompatible>true</IsAotCompatible>`，SDK 随之带上 IL2xxx（裁剪）与 IL3xxx（AOT）
+  分析器——使用者 `PublishTrimmed` / `PublishAot` 时不会再"静默"拿到运行时错误。
+  开启后全库 **0 条 IL 警告**（派发全是 `typeof(T)` 静态分派，外部依赖只有 libwebp 的
+  P/Invoke），程序集带上 `AssemblyMetadata("IsTrimmable"/"IsAotCompatible","True")`。
 
 ### CI
 - **新增 `.github/workflows/ci.yml`**：此前仓库只有 tag 触发的 `release.yml` 与
@@ -114,6 +119,17 @@
   bench 类诊断输出（`--gif-bench` / `--jpeg-bench`）不受这两个开关影响。
 - `nuget-publish.yml` 的 `setup-dotnet` 由 `8.0.x` 改 `10.0.x`：库只出 `net10.0`，
   此前全靠 runner 预装 SDK 才没炸。
+- **新增管道支持：`-` 代表标准输入/输出**。编解码派发大量依赖「输出路径的扩展名」
+  （GIF 动画、WebP、渐进式 JPEG 转码等十余处分叉），直接接 `Stream` 会多出一套平行代码，
+  所以 `-` 被桥接成**临时文件 + 正确扩展名**：输入侧先落盘并按内容嗅探格式，
+  输出侧先写临时文件、成功后再复制到 stdout。走的是与真实文件完全相同的路径，
+  产物逐字节一致（`Stdout_Output_Is_Byte_Identical_To_File_Output` 逐字节比对）。
+  输出到 stdout 时进度/汇总改走 stderr，stdout 只有图片字节；
+  与 `--json`、目录输入、`--gif-frames` 互斥（用法校验阶段返回 2）。
+- **`Program.cs` 按职责拆分**（1924 行 → 6 个文件，`sealed partial class Program`）：
+  `Program.cs`（入口/用法/版本）、`Program.Parse.cs`、`Program.Process.cs`、
+  `Program.Encode.cs`、`Program.Optimize.cs`、`Program.Bench.cs`；新增 `CliStdio.cs`
+  承载管道桥接。纯物理拆分，逐行核对无内容丢失，产物 md5 与拆分前一致。
 
 ### 文档
 - **README / README.en 与产物对齐**：目标框架此前写 `net8.0;net10.0`，实际只有

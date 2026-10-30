@@ -23,13 +23,21 @@ internal sealed class CliReporter
 {
     private readonly bool _json;
     private readonly bool _quiet;
+    private readonly bool _infoToStderr;
     private readonly object _locker = new();
     private readonly List<CliFileResult> _files = [];
 
-    public CliReporter(bool json, bool quiet)
+    /// <param name="json">是否输出 JSON 报告</param>
+    /// <param name="quiet">是否静默（只留错误）</param>
+    /// <param name="infoToStderr">
+    /// 人读信息写到 stderr 而不是 stdout。结果本身就是二进制（<c>-</c> 输出）时必须打开，
+    /// 否则进度行会插进图片字节流里。
+    /// </param>
+    public CliReporter(bool json, bool quiet, bool infoToStderr = false)
     {
         _json = json;
         _quiet = quiet;
+        _infoToStderr = infoToStderr;
     }
 
     /// <summary>是否正在收集 JSON 结果（决定逐文件是否要记账）。</summary>
@@ -41,6 +49,11 @@ internal sealed class CliReporter
     public void Info(string message)
     {
         if (_quiet || _json) return;
+        if (_infoToStderr)
+        {
+            Console.Error.WriteLine(message);
+            return;
+        }
         Console.WriteLine(message);
     }
 
