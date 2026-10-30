@@ -273,7 +273,7 @@ public static class JpegEncoder
         }
     }
 
-    private sealed class PipeQueue<T> where T : class
+    private sealed class PipeQueue<T> : IDisposable where T : class
     {
         private readonly T?[] _buffer;
         private int _head;
@@ -330,6 +330,16 @@ public static class JpegEncoder
             }
             _slots.Release();
             return item;
+        }
+
+        /// <summary>
+        /// 释放两个信号量。调用点都在 <c>Task.WaitAll</c> 之后显式调用（而不是 <c>using</c>），
+        /// 避免异常展开时与仍在退出的 stage 抢 Wait/Release 而抛 ObjectDisposedException。
+        /// </summary>
+        public void Dispose()
+        {
+            _items.Dispose();
+            _slots.Dispose();
         }
     }
 
@@ -1013,6 +1023,8 @@ public static class JpegEncoder
         Task.WaitAll(dctTasks);
         Task.WaitAll(t1, t4);
         JpegPerfProbe.End(JpegPerfProbe.EncodeTotal);
+        sampleQueue.Dispose();
+        dctQueue.Dispose();
     }
 
     private static void EncodeGrayPipeline(
@@ -1048,6 +1060,8 @@ public static class JpegEncoder
         Task.WaitAll(dctTasks);
         Task.WaitAll(t1, t4);
         JpegPerfProbe.End(JpegPerfProbe.EncodeTotal);
+        sampleQueue.Dispose();
+        dctQueue.Dispose();
     }
 
     private static void RunStage(Action action, CancellationTokenSource cts)
@@ -1509,8 +1523,9 @@ public static class JpegEncoder
             _acC = acC;
         }
 
-        /// <summary>灰度编码：没有色度分量，色度表留空（Order 里不会出现分量 1/2）。</summary>
-        public static WriteMcuConsumer Gray(JpegBitWriter bw, HuffCode[] dcY, HuffCode[] acY) => new(bw, dcY, acY, null, null);
+        /// <summary>灰度编码：没有色度分量，色度表用空表占位（Order 里不会出现分量 1/2）。</summary>
+        public static WriteMcuConsumer Gray(JpegBitWriter bw, HuffCode[] dcY, HuffCode[] acY)
+            => new(bw, dcY, acY, Array.Empty<HuffCode>(), Array.Empty<HuffCode>());
 
         public void Consume(ref SampledMcuRef mcu)
         {
@@ -1766,6 +1781,8 @@ public static class JpegEncoder
         Task.WaitAll(dctTasks);
         Task.WaitAll(t1, t4);
         JpegPerfProbe.End(JpegPerfProbe.EncodeTotal);
+        sampleQueue.Dispose();
+        dctQueue.Dispose();
         return hist;
     }
 

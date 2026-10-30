@@ -1,0 +1,55 @@
+root = true
+
+# 仓库现有文件是 CRLF（git 侧由 .gitattributes 的 text=auto 归一为 LF）。
+[*]
+charset = utf-8
+end_of_line = crlf
+insert_final_newline = true
+indent_style = space
+indent_size = 4
+trim_trailing_whitespace = true
+
+[*.{md,yml,yaml,json,csproj,props,slnx}]
+indent_size = 2
+trim_trailing_whitespace = false
+
+[*.sh]
+end_of_line = lf
+
+[*.cs]
+# 命名空间风格：仓库现状 file-scoped 与 block-scoped 各占一半，
+# 统一到 file-scoped 属于纯机械重构，单独一批做；这里先给建议级提示。
+csharp_style_namespace_declarations = file_scoped:suggestion
+dotnet_style_qualification_for_field = false:suggestion
+dotnet_style_qualification_for_property = false:suggestion
+dotnet_style_qualification_for_method = false:suggestion
+
+# ---- 分析器规则：显式决策，不用 NoWarn 一把糊住 ----
+
+# 只影响可读性、且改动会波及热路径（可能改变内联决策）的风格建议
+dotnet_diagnostic.CA1822.severity = none   # 可标记为 static：公开方法改 static 属二进制破坏
+dotnet_diagnostic.CA1512.severity = none   # 用 ArgumentOutOfRangeException.ThrowIfXxx
+dotnet_diagnostic.CA1513.severity = none   # 用 ObjectDisposedException.ThrowIf
+dotnet_diagnostic.CA1805.severity = none   # 冗余默认初始化
+dotnet_diagnostic.CA1859.severity = none   # 建议改用具体类型（会牵动签名）
+
+# 既定设计，不改
+dotnet_diagnostic.CA1051.severity = none   # 可见实例字段：像素结构体 R/G/B/A 是公认写法
+dotnet_diagnostic.CA1069.severity = none   # 枚举别名同值：WebP 原生常量本就重叠
+dotnet_diagnostic.CA1711.severity = none   # 类型名以 Delegate 结尾：QualityMetricDelegate 已随 1.x 公开
+dotnet_diagnostic.CA1068.severity = none   # CancellationToken 应最后：公开签名改动破坏兼容，见 Review §2.2
+
+# 需要逐点复核但不宜在构建里长期报警：见 docs/Review-2026-10-30.md §5.2
+dotnet_diagnostic.CA2014.severity = suggestion  # 循环内 stackalloc
+
+# ---- 测试工程：命名与"故意构造坏输入"是测试语言的一部分 ----
+[SharpImageConverter.Tests/**/*.cs]
+dotnet_diagnostic.CA1707.severity = none   # 测试方法用下划线分段：Bmp_32Bit_Decode_Correct
+dotnet_diagnostic.CA5351.severity = none   # MD5 只用于产物比对，不承担安全职责
+dotnet_diagnostic.CA2201.severity = none   # 故意抛 OutOfMemoryException 以验证重试路径
+
+# ---- 基准/探针工具：同上，且不对外发布 ----
+[tools/**/*.cs]
+dotnet_diagnostic.CA5351.severity = none   # MD5 只用于产物比对
+dotnet_diagnostic.CA1305.severity = none   # 报告文本不参与机器解析
+

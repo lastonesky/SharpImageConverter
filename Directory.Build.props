@@ -1,0 +1,18 @@
+<Project>
+
+  <!--
+    全仓库统一的代码分析口径。规则的具体严重级别见根目录 .editorconfig：
+    风格类规则显式降级，真问题类规则保持默认（warning）。
+
+    历史背景：此前 src 的 csproj 里用 NoWarn 一把关掉了 CA2014 与
+    8600/8602/8604/8605/8625（可空性与 unsafe 转换），导致 Release 构建
+    "0 警告"但实际没有任何分析器在跑。详见 docs/Review-2026-10-30.md §5.2。
+  -->
+  <PropertyGroup>
+    <EnableNETAnalyzers>true</EnableNETAnalyzers>
+    <AnalysisMode>Recommended</AnalysisMode>
+    <!-- 代码风格（IDE*）不参与构建，避免把格式偏好变成编译噪声 -->
+    <EnforceCodeStyleInBuild>false</EnforceCodeStyleInBuild>
+  </PropertyGroup>
+
+</Project>

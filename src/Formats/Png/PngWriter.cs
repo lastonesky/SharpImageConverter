@@ -383,7 +383,8 @@ public static class PngWriter
             }
         }, ms, level);
         ArraySegment<byte> segment = ms.GetBuffer();
-        WriteChunk(stream, TypeIDAT, segment.Array, segment.Offset, segment.Count);
+        // PooledMemoryStream 始终持有底层数组，Array 为 null 只可能出现在零长度段
+        WriteChunk(stream, TypeIDAT, segment.Array!, segment.Offset, segment.Count);
     }
 
     /// <summary>

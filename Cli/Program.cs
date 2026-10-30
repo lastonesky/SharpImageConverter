@@ -1,4 +1,5 @@
 ﻿using System.Diagnostics;
+using System.Globalization;
 using SharpImageConverter.Compression;
 using SharpImageConverter.Core;
 using SharpImageConverter.Processing;
@@ -8,7 +9,7 @@ using SharpImageConverter.Formats.Jpeg;
 
 namespace SharpImageConverter;
 
-class Program
+sealed class Program
 {
     /// <summary>
     /// 目录批量处理的默认并行度（可被 <c>--parallel N</c> 覆盖）。
@@ -611,7 +612,7 @@ class Program
                 string v = a.Contains('=') ? a[(a.IndexOf('=') + 1)..].Trim() : string.Empty;
                 if (!string.IsNullOrEmpty(v))
                 {
-                    options.OutputExtension = NormalizeOutputExtension(v.StartsWith(".") ? v : "." + v);
+                    options.OutputExtension = NormalizeOutputExtension(v.StartsWith('.') ? v : "." + v);
                 }
                 continue;
             }
@@ -620,7 +621,7 @@ class Program
                 if (i + 1 < args.Length)
                 {
                     string v2 = args[i + 1].Trim();
-                    options.OutputExtension = NormalizeOutputExtension(v2.StartsWith(".") ? v2 : "." + v2);
+                    options.OutputExtension = NormalizeOutputExtension(v2.StartsWith('.') ? v2 : "." + v2);
                     i++;
                 }
                 continue;
@@ -651,7 +652,7 @@ class Program
             {
                 continue;
             }
-            if (options.OutputPath == null && !a.StartsWith("-", StringComparison.Ordinal))
+            if (options.OutputPath == null && !a.StartsWith('-'))
             {
                 options.OutputPath = a;
             }
@@ -1158,11 +1159,11 @@ class Program
         string ext = NormalizeOutputExtension(Path.GetExtension(baseOut));
         var gifDec = CreateGifDecoder(options);
         var frames = gifDec.DecodeAllFrames(options.InputPath);
-        int digits = Math.Max(3, frames.Count.ToString().Length);
+        int digits = Math.Max(3, frames.Count.ToString(CultureInfo.InvariantCulture).Length);
 
         for (int i = 0; i < frames.Count; i++)
         {
-            string idx = i.ToString().PadLeft(digits, '0');
+            string idx = i.ToString(CultureInfo.InvariantCulture).PadLeft(digits, '0');
             string path = Path.Combine(dir, $"{nameNoExt}_{idx}{ext}");
             SaveGifFrame(frames[i], path, ext, options);
         }
@@ -1575,7 +1576,7 @@ class Program
 
     static bool TryParseResizeOp(string op, string prefix, Func<int, int, Action<ImageProcessingContext>> factory, List<Action<ImageProcessingContext>> ops)
     {
-        if (!op.StartsWith(prefix)) return false;
+        if (!op.StartsWith(prefix, StringComparison.Ordinal)) return false;
         string sizePart = op[prefix.Length..];
         var parts = sizePart.Split(['x', '*'], StringSplitOptions.RemoveEmptyEntries);
         if (parts.Length == 2 && int.TryParse(parts[0], out int w) && int.TryParse(parts[1], out int h))

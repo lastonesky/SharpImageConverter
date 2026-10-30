@@ -335,6 +335,7 @@ public class LzwEncoder(Stream stream) : IDisposable
     public void Dispose()
     {
         FlushPacket();
+        GC.SuppressFinalize(this);
         uint[]? tab = _tab;
         if (tab != null)
         {

@@ -168,7 +168,8 @@ public static class ZlibHelper
         CompressRaw(s => s.Write(data, 0, data.Length), outMs);
         ArraySegment<byte> segment = outMs.GetBuffer();
         var result = new byte[segment.Count];
-        Buffer.BlockCopy(segment.Array, segment.Offset, result, 0, segment.Count);
+        // 同上：PooledMemoryStream 的底层数组一定存在
+        Buffer.BlockCopy(segment.Array!, segment.Offset, result, 0, segment.Count);
         return result;
     }
 

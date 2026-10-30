@@ -364,7 +364,7 @@ internal static class Bench
     private static string Trim(string s)
     {
         s = s.Replace("\r", " ").Replace("\n", " ");
-        return s.Length <= 90 ? s : s.Substring(0, 90) + "...";
+        return s.Length <= 90 ? s : string.Concat(s.AsSpan(0, 90), "...");
     }
 
     private static void PrintSummary()
@@ -377,6 +377,6 @@ internal static class Bench
         }
         int unstable = Results.Count(r => !r.Stable);
         int failed = Results.Count(r => r.Iterations == 0);
-        Console.WriteLine($"total {Results.Count()} tests, failed {failed}, unstable-output {unstable}");
+        Console.WriteLine($"total {Results.Count} tests, failed {failed}, unstable-output {unstable}");
     }
 }

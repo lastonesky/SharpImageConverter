@@ -884,7 +884,11 @@ internal unsafe sealed class AlignedBuffer<T> : IDisposable where T : unmanaged
 
         nuint byteLength = checked((nuint)length * (nuint)sizeof(T));
         void* ptr = NativeMemory.AlignedAlloc(byteLength, (nuint)alignment);
-        if (ptr is null) throw new OutOfMemoryException();
+        if (ptr is null)
+        {
+            throw new InsufficientMemoryException(
+                $"无法分配 {byteLength} 字节对齐缓冲区（对齐 {alignment}）");
+        }
         if (clear)
         {
             NativeMemory.Clear(ptr, byteLength);

@@ -72,7 +72,10 @@ internal sealed unsafe class NativeBufferOwner<T> : IDisposable where T : unmana
 
         if (ptr is null)
         {
-            throw new OutOfMemoryException();
+            // 不自抛 OutOfMemoryException（运行时保留类型，语义与真实 OOM 无法区分）；
+            // InsufficientMemoryException 派生自它，既有 catch 仍然生效。
+            throw new InsufficientMemoryException(
+                $"无法分配 {elementCount * (nuint)sizeof(T)} 字节原生缓冲区");
         }
 
         return new NativeBufferOwner<T>((T*)ptr, length);

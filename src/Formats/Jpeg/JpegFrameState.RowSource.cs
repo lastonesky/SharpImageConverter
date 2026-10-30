@@ -250,7 +250,9 @@ internal sealed partial class JpegFrameState
                     if ((uint)i0 >= (uint)band.Length || (uint)i1 >= (uint)band.Length
                         || (uint)i2 >= (uint)band.Length || (uint)i3 >= (uint)band.Length)
                     {
-                        throw new IndexOutOfRangeException(
+                        // 内部不变量被破坏（采样几何与条带不一致），不是可恢复的数据错误：
+                        // 用 InvalidOperationException 而不是保留类型 IndexOutOfRangeException。
+                        throw new InvalidOperationException(
                             $"band index out of range: c={c} comp={compIndex} x={x} y0={y0[c]} y1={y1[c]} " +
                             $"stride={stride} bandLen={band.Length} sx0={sx0} sx1={sx1}");
                     }

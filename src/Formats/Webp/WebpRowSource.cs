@@ -39,7 +39,11 @@ namespace SharpImageConverter.Formats.Webp
             _stream.Seek(0, SeekOrigin.Begin);
             _outputStride = Width * 4;
             _output = (IntPtr)System.Runtime.InteropServices.NativeMemory.Alloc((nuint)((long)Width * Height * 4));
-            if (_output == IntPtr.Zero) throw new OutOfMemoryException("WebP streaming output buffer allocation failed");
+            if (_output == IntPtr.Zero)
+            {
+                throw new InsufficientMemoryException(
+                    $"无法分配 WebP 流式输出缓冲（{Width}x{Height}x4 字节）");
+            }
             _decoder = WebpCodec.CreateIncrementalRgbaDecoder(Width, Height, _output, _outputStride);
             if (_decoder == IntPtr.Zero)
             {

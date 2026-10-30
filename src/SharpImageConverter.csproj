@@ -19,7 +19,14 @@
     <RepositoryType>git</RepositoryType>
     <PackageProjectUrl>https://github.com/lastonesky/SharpImageConverter</PackageProjectUrl>
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
-    <NoWarn>$(NoWarn);1573;1591;CA2014;8600;8602;8604;8605;8618;8625</NoWarn>
+    <!--
+      只保留「公开成员 XML 注释覆盖不足」这一类：补齐注释是独立任务（178 条 CS1591），
+      不适合和功能改动混在一起。其余可空性/unsafe 转换警告（8600/8602/8604/8605/8618/8625）
+      一律打开，由 .editorconfig 逐条决策，不再用 NoWarn 全局关闭。
+    -->
+    <NoWarn>$(NoWarn);1573;1591</NoWarn>
+    <!-- 分析器警告在 Release 下视为错误：新增问题不会悄悄进仓库 -->
+    <CodeAnalysisTreatWarningsAsErrors Condition="'$(Configuration)' == 'Release'">true</CodeAnalysisTreatWarningsAsErrors>
     <PublishRepositoryUrl Condition="'$(Configuration)' == 'Release'">true</PublishRepositoryUrl>
     <EmbedUntrackedSources Condition="'$(Configuration)' == 'Release'">true</EmbedUntrackedSources>
     <EnableSourceLink Condition="'$(Configuration)' != 'Release'">false</EnableSourceLink>

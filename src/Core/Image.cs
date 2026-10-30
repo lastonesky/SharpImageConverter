@@ -60,7 +60,13 @@ namespace SharpImageConverter.Core
 
             var pixel = default(TPixel);
             int bytesPerPixel = pixel.BytesPerPixel;
-            if (bytesPerPixel <= 0) throw new ArgumentOutOfRangeException(nameof(TPixel));
+            if (bytesPerPixel <= 0)
+            {
+                // 这是像素类型实现（IPixel）的错误，不是调用方参数错误，
+                // 因此不能把 "TPixel" 当作 paramName 传给 ArgumentOutOfRangeException。
+                throw new InvalidOperationException(
+                    $"像素类型 {typeof(TPixel).Name} 的 BytesPerPixel 必须为正数，实际为 {bytesPerPixel}");
+            }
 
             long expectedLength = (long)width * height * bytesPerPixel;
             if (expectedLength > int.MaxValue)
