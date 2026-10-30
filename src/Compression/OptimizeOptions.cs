@@ -229,9 +229,6 @@ namespace SharpImageConverter.Compression
         public double MinLossyGainRatio { get; set; } = 0.10;
 
         /// <summary>
-        /// 日志输出委托，用于观察候选方案的体积与画质。默认不输出。
-        /// </summary>
-        /// <summary>
         /// optimize 的内存预算（字节）。0 表示按「当前可用内存」自动推导。
         /// </summary>
         /// <remarks>
@@ -246,6 +243,9 @@ namespace SharpImageConverter.Compression
         /// </summary>
         public bool DisableMemoryGuard { get; set; }
 
+        /// <summary>
+        /// 日志输出委托，用于观察候选方案的体积与画质。默认不输出。
+        /// </summary>
         public Action<string>? Log { get; set; }
 
         /// <summary>
@@ -264,12 +264,19 @@ namespace SharpImageConverter.Compression
         public static OptimizeOptions Aggressive => new() { TargetQuality = 75 };
 
         /// <summary>
-        /// 校验并修正参数，返回规范化后的副本。
+        /// 复制一份选项（浅拷贝：委托按引用复制，其余均为值类型）。
+        /// 用于在规范化或改写选项前隔离调用方的实例。
         /// </summary>
-        /// <param name="options">原始选项</param>
+        public OptimizeOptions Clone() => (OptimizeOptions)MemberwiseClone();
+
+        /// <summary>
+        /// 校验并修正参数，返回**新的**规范化实例；入参不会被修改。
+        /// </summary>
+        /// <param name="options">原始选项；null 表示均衡档</param>
+        /// <returns>规范化后的副本（与 <paramref name="options"/> 不是同一实例）</returns>
         public static OptimizeOptions Normalize(OptimizeOptions? options)
         {
-            var o = options ?? Balanced;
+            var o = (options ?? Balanced).Clone();
             o.MaxColors = Math.Clamp(o.MaxColors, 2, 256);
             o.TargetQuality = Math.Clamp(o.TargetQuality, 0, 100);
             o.JpegMinQuality = Math.Clamp(o.JpegMinQuality, 1, 95);
