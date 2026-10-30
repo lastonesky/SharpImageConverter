@@ -233,9 +233,14 @@ namespace SharpImageConverter.Core
         /// 只读文件头，识别格式并取尺寸/帧数/渐进标志，**不解码像素**。
         /// </summary>
         /// <remarks>
-        /// 流必须可 Seek（JPEG 要跳过段、GIF 要跳过子块）。不可 Seek 的流会被整读进内存后再解析
-        /// —— 网络输入上请自行评估内存开销，或改用 <see cref="ImageFrame.Load(Stream, bool)"/>。
-        /// 解析完成后流位置会被还原到起始处（可 Seek 时）。
+        /// <para>
+        /// 可 Seek 的流：解析完成后位置还原到起始处，调用方可以接着解码。
+        /// </para>
+        /// <para>
+        /// 不可 Seek 的流：**不会被整读进内存**，只会顺序读到文件头所需的位置
+        /// （GIF 要扫到 trailer 才能数帧、动画 WebP 要数 <c>ANMF</c>，其余格式读到 SOF/IHDR 即止），
+        /// 内存开销与文件大小无关。代价是流被消费掉且无法回退——需要接着解码请自行缓冲。
+        /// </para>
         /// </remarks>
         /// <param name="stream">输入数据流</param>
         /// <returns>图像基本信息</returns>
@@ -244,20 +249,13 @@ namespace SharpImageConverter.Core
         public static ImageInfo Identify(Stream stream)
         {
             ArgumentNullException.ThrowIfNull(stream);
-            if (stream.CanSeek)
-            {
-                return IdentifyCore(stream);
-            }
-
-            using var buffered = new MemoryStream();
-            stream.CopyTo(buffered);
-            buffered.Position = 0;
-            return IdentifyCore(buffered);
+            return IdentifyCore(stream);
         }
 
         private static ImageInfo IdentifyCore(Stream stream)
         {
-            long start = stream.Position;
+            bool canSeek = stream.CanSeek;
+            long start = canSeek ? stream.Position : 0;
             try
             {
                 Span<byte> head = stackalloc byte[ImageHeaderReader.SniffBytes];
@@ -273,8 +271,21 @@ namespace SharpImageConverter.Core
                     throw new NotSupportedException(ImageInfo.UnsupportedMessage(kind));
                 }
 
-                stream.Position = start;
-                if (!ImageHeaderReader.TryReadInfo(stream, kind, out var info))
+                ImageInfo info;
+                bool ok;
+                if (canSeek)
+                {
+                    stream.Position = start;
+                    ok = ImageHeaderReader.TryReadInfo(stream, kind, out info);
+                }
+                else
+                {
+                    // 不可 Seek 无法回退，把已读的嗅探字节回放给解析器——否则它会从第 12 字节开始解析。
+                    // 只回放这十几个字节，内存与文件大小无关（此前是把整条流复制进 MemoryStream）。
+                    using var replay = new PrefixStream(head[..read].ToArray(), stream);
+                    ok = ImageHeaderReader.TryReadInfo(replay, kind, out info);
+                }
+                if (!ok)
                 {
                     throw new InvalidDataException($"{ImageInfo.GetFormatName(kind)} 文件头损坏，无法读出宽高");
                 }
@@ -283,8 +294,54 @@ namespace SharpImageConverter.Core
             }
             finally
             {
-                stream.Position = start;
+                if (canSeek) stream.Position = start;
             }
+        }
+
+        /// <summary>
+        /// 只读流包装：先吐出 <paramref name="prefix"/> 里已读过的字节，再继续读底层流。
+        /// </summary>
+        /// <remarks>
+        /// 只用于「嗅探时已经消费了若干字节、但底层流不可 Seek」的场景。
+        /// 本身不可 Seek（因为底层不可 Seek），不支持写。
+        /// </remarks>
+        private sealed class PrefixStream(byte[] prefix, Stream inner) : Stream
+        {
+            private int _offset;
+
+            public override bool CanRead => true;
+            public override bool CanSeek => false;
+            public override bool CanWrite => false;
+            public override long Length => throw new NotSupportedException();
+            public override long Position
+            {
+                get => throw new NotSupportedException();
+                set => throw new NotSupportedException();
+            }
+
+            public override int Read(Span<byte> buffer)
+            {
+                if (_offset < prefix.Length)
+                {
+                    int take = Math.Min(buffer.Length, prefix.Length - _offset);
+                    prefix.AsSpan(_offset, take).CopyTo(buffer);
+                    _offset += take;
+                    return take;
+                }
+                return inner.Read(buffer);
+            }
+
+            public override int Read(byte[] buffer, int offset, int count) => Read(buffer.AsSpan(offset, count));
+
+            public override void Flush()
+            {
+            }
+
+            public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+
+            public override void SetLength(long value) => throw new NotSupportedException();
+
+            public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
         }
     }
 }

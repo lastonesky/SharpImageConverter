@@ -480,5 +480,48 @@ namespace SharpImageConverter.Tests
                 if (File.Exists(output)) File.Delete(output);
             }
         }
+
+        /// <summary>
+        /// <c>--strict-format</c>：PNG 内容存成 <c>.jpg</c> 名 → 退出码 1、stderr 说明不符、不产出文件；
+        /// 不带开关时保持既有的隐式转格式（退出码 0），两条路径（转换 / optimize）都要拦得住。
+        /// </summary>
+        [Fact]
+        public void StrictFormat_Rejects_Lying_Extension()
+        {
+            string input = NewTemp(".jpg");
+            string converted = NewTemp(".jpg");
+            string optimized = NewTemp(".jpg");
+            try
+            {
+                // 用 PNG 编码器写出真实 PNG 字节，再存成 .jpg 名字
+                using (var ms = new MemoryStream())
+                {
+                    var img = Helpers.TestImageFactory.CreateGradient(24, 24);
+                    SharpImageConverter.Formats.Png.PngWriter.Write(ms, img.Width, img.Height, img.Buffer, img.Metadata);
+                    File.WriteAllBytes(input, ms.ToArray());                }
+
+                // 默认口径：仍被隐式转成 JPEG
+                var plain = RunCli(input, converted);
+                Assert.True(plain.ExitCode == 0, $"默认口径应成功，stderr: {plain.StdErr}");
+                Assert.True(File.Exists(converted));
+
+                var convert = RunCli(input, converted + ".strict.jpg", "--strict-format");
+                Assert.Equal(1, convert.ExitCode);
+                Assert.Contains("不符", convert.StdErr, StringComparison.Ordinal);
+                Assert.False(File.Exists(converted + ".strict.jpg"), "严格模式失败后不应留下输出");
+
+                var optimize = RunCli(input, optimized, "--optimize", "--strict-format");
+                Assert.Equal(1, optimize.ExitCode);
+                Assert.Contains("不符", optimize.StdErr, StringComparison.Ordinal);
+                Assert.False(File.Exists(optimized), "严格模式失败后不应留下输出");
+            }
+            finally
+            {
+                foreach (string f in new[] { input, converted, converted + ".strict.jpg", optimized })
+                {
+                    if (File.Exists(f)) File.Delete(f);
+                }
+            }
+        }
     }
 }

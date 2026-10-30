@@ -244,6 +244,17 @@ namespace SharpImageConverter.Compression
         public bool DisableMemoryGuard { get; set; }
 
         /// <summary>
+        /// 严格模式：输入扩展名与文件头内容不符时直接拒绝，而不是按内容解读、按扩展名写出。默认 false。
+        /// </summary>
+        /// <remarks>
+        /// 默认行为是「读进来按内容、写出去按扩展名」，所以把 PNG 存成 <c>a.jpg</c> 再 optimize
+        /// 会被**隐式转成真 JPEG**（扩展名视为目标格式）。这对批量流水线是反直觉的：文件名撒谎时
+        /// 应该报错而不是默默改格式。开启后由 <c>ImageOptimizer.EnsureFormatMatches</c> 抛
+        /// <see cref="System.IO.InvalidDataException"/>（CLI <c>--strict-format</c>）。
+        /// </remarks>
+        public bool RequireFormatMatch { get; set; }
+
+        /// <summary>
         /// 日志输出委托，用于观察候选方案的体积与画质。默认不输出。
         /// </summary>
         public Action<string>? Log { get; set; }

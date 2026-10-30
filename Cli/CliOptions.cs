@@ -51,6 +51,12 @@ internal sealed class CliOptions(string inputPath)
     /// <summary>严格模式：要求 JPEG 数据完整（真实 EOI）。</summary>
     public bool RequireEoi { get; set; }
 
+    /// <summary>
+    /// 严格模式：输入扩展名与实际内容不符时报错（默认按内容解读、按扩展名写出）。
+    /// 转换与 optimize 两条路径都生效。
+    /// </summary>
+    public bool StrictFormat { get; set; }
+
     /// <summary>是否转为灰度。</summary>
     public bool Gray { get; set; }
 

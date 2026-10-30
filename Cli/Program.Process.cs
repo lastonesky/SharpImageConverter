@@ -126,6 +126,8 @@ sealed partial class Program
             Dithering = src.Dithering,
             UseFloatIdct = src.UseFloatIdct,
             UseStreamingDecoder = src.UseStreamingDecoder,
+            RequireEoi = src.RequireEoi,
+            StrictFormat = src.StrictFormat,
             Gray = src.Gray,
             GifDebug = src.GifDebug,
             GifBench = src.GifBench,
@@ -206,6 +208,12 @@ sealed partial class Program
     static bool Process(CliOptions options, CliReporter reporter)
     {
         string inExt = Path.GetExtension(options.InputPath).ToLowerInvariant();
+        if (options.StrictFormat)
+        {
+            // 扩展名与文件头内容不符时报错，而不是「按内容解码、按扩展名写出」地隐式换格式。
+            // 与 optimize 共用同一处判定（ImageOptimizer.EnsureFormatMatches），避免两套文案。
+            ImageOptimizer.EnsureFormatMatches(options.InputPath, ImageOptimizer.DetectFormat(options.InputPath));
+        }
         EnsurePlainMemory(options, inExt);
 
         if (options.ForceStreaming)

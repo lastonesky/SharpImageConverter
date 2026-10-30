@@ -214,6 +214,12 @@ sealed partial class Program
                 options.RequireEoi = true;
                 continue;
             }
+            if (string.Equals(a, "--strict-format", StringComparison.OrdinalIgnoreCase))
+            {
+                // 扩展名撒谎（PNG 内容存成 .jpg）时不隐式转格式，直接报错。
+                options.StrictFormat = true;
+                continue;
+            }
             if (string.Equals(a, "--keep-metadata", StringComparison.OrdinalIgnoreCase))
             {
                 options.KeepMetadata = true;

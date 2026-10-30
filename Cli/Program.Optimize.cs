@@ -203,6 +203,7 @@ sealed partial class Program
             JpegTrellisQuantization = options.JpegTrellis,
             MemoryLimitBytes = options.MemoryLimitMb is > 0 ? options.MemoryLimitMb.Value * 1024L * 1024L : 0,
             DisableMemoryGuard = options.NoMemoryGuard,
+            RequireFormatMatch = options.StrictFormat,
             // --quiet / --json 下连候选评估日志也要关：前者要安静，后者要 stdout 干净
             Log = options.OptimizeVerbose && !(options.Quiet || options.Json) ? Console.WriteLine : null,
         };

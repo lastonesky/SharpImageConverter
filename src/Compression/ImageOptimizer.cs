@@ -1,5 +1,4 @@
 ﻿using System;
-using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.IO;
 using System.IO.Compression;
@@ -47,6 +46,9 @@ namespace SharpImageConverter.Compression
             if (!string.IsNullOrEmpty(outDir)) Directory.CreateDirectory(outDir);
 
             var sourceKind = DetectFormat(inputPath);
+            // 严格模式：输入扩展名与内容不符时直接失败。默认行为是「输入按内容判定、输出按扩展名」，
+            // 于是 `a.jpg` 里装着 PNG 会被默默转成 JPEG —— 对调用方是反直觉的（§3.5）。
+            if (o.RequireFormatMatch) EnsureFormatMatches(inputPath, sourceKind);
             var targetKind = DetectKindByExtension(output);
             var traits = DetectSourceTraits(inputPath, sourceKind);
 
@@ -97,6 +99,30 @@ namespace SharpImageConverter.Compression
                             ? Core.ImageInfo.UnsupportedMessage(sourceKind)
                             : $"不支持的图片格式（当前支持 {Core.ImageInfo.SupportedFormatList}）");
             }
+        }
+
+        /// <summary>
+        /// 严格模式：输入扩展名与文件头内容不符时抛 <see cref="InvalidDataException"/>。
+        /// </summary>
+        /// <remarks>
+        /// 这是**数据/用法错误**而不是可预期的业务失败（后者走 <see cref="OptimizationResult.Reason"/>）：
+        /// 文件自称 .jpg 却是 PNG，多半是上游流程出错，继续按扩展名写出只会掩盖问题。
+        /// 扩展名无法识别（<see cref="ImageFormatKind.Unknown"/>）时不作判断——无法比对，不该拦。
+        /// </remarks>
+        /// <param name="inputPath">输入路径</param>
+        /// <param name="contentKind">已嗅探出的内容格式</param>
+        /// <exception cref="InvalidDataException">扩展名声明的格式与内容不一致</exception>
+        internal static void EnsureFormatMatches(string inputPath, ImageFormatKind contentKind)
+        {
+            if (contentKind == ImageFormatKind.Unknown) return;
+            var declared = DetectKindByExtension(inputPath);
+            if (declared == ImageFormatKind.Unknown || declared == contentKind) return;
+
+            throw new InvalidDataException(
+                $"输入文件 {Path.GetFileName(inputPath)} 的扩展名与内容不符：" +
+                $"扩展名是 {Path.GetExtension(inputPath)}（{Core.ImageInfo.GetFormatName(declared)}），" +
+                $"实际内容却是 {Core.ImageInfo.GetFormatName(contentKind)}" +
+                "；严格模式拒绝隐式转换（--strict-format / OptimizeOptions.RequireFormatMatch）");
         }
 
         /// <summary>
@@ -173,127 +199,35 @@ namespace SharpImageConverter.Compression
         }
 
         /// <summary>
-        /// 读取文件头/关键块，判断源文件是否有 16-bit 或动画特征。
+        /// 读取文件头，判断源文件是否有 16-bit 或动画特征。
         /// </summary>
         /// <remarks>
-        /// 只读块头、按长度跳过块数据，不会把整个 PNG 读进内存；
-        /// APNG 的 <c>acTL</c> 规范要求出现在第一个 <c>IDAT</c> 之前，扫到 IDAT 即可停。
-        /// WebP 的动画标志在 <c>VP8X</c> 的 flags 字节 bit1，另有 <c>ANIM</c>/<c>ANMF</c> 块可兜底。
+        /// 直接复用 <see cref="ImageHeaderReader.TryReadInfo"/>：嗅探、尺寸、位深与帧数都在那一处解析，
+        /// 这里只做「PNG/WebP → <see cref="SourceTraits"/>」的映射。此前本文件另有一份 PNG chunk
+        /// 扫描与 WebP 块遍历（约 90 行），是 §1.2 收敛之后新长出来的第二份实现，已删除。
         /// </remarks>
+        /// <param name="path">文件路径</param>
+        /// <param name="kind">已嗅探出的格式</param>
         internal static SourceTraits DetectSourceTraits(string path, ImageFormatKind kind)
         {
+            // 只有这两种格式需要「解码前就知道」的附加特征：16-bit PNG 与动画帧。
+            if (kind is not (ImageFormatKind.Png or ImageFormatKind.Webp)) return default;
+
             try
             {
                 using var fs = File.OpenRead(path);
-                return kind switch
-                {
-                    ImageFormatKind.Png => DetectPngTraits(fs),
-                    ImageFormatKind.Webp => DetectWebpTraits(fs),
-                    _ => default,
-                };
+                Span<byte> head = stackalloc byte[ImageHeaderReader.SniffBytes];
+                int read = fs.ReadAtLeast(head, head.Length, throwOnEndOfStream: false);
+                if (ImageHeaderReader.Sniff(head[..read]) != kind) return default;
+                fs.Position = 0;
+                if (!ImageHeaderReader.TryReadInfo(fs, kind, out ImageInfo info)) return default;
+                return new SourceTraits(info.Is16Bit, info.IsAnimated);
             }
             catch
             {
                 // 读不到就当作普通文件，后续解码会给出更准确的错误
                 return default;
             }
-        }
-
-        private static SourceTraits DetectPngTraits(Stream stream)
-        {
-            Span<byte> head = stackalloc byte[8];
-            stream.ReadExactly(head);
-            if (head[0] != 0x89 || head[1] != 0x50 || head[2] != 0x4E || head[3] != 0x47)
-            {
-                return default;
-            }
-
-            bool is16Bit = false;
-            Span<byte> chunkHeader = stackalloc byte[8];
-            while (TryReadExactly(stream, chunkHeader))
-            {
-                uint length = BinaryPrimitives.ReadUInt32BigEndian(chunkHeader);
-                ReadOnlySpan<byte> type = chunkHeader.Slice(4, 4);
-
-                if (type.SequenceEqual("IHDR"u8))
-                {
-                    Span<byte> ihdr = stackalloc byte[13];
-                    stream.ReadExactly(ihdr);
-                    is16Bit = ihdr[8] == 16;
-                    // IHDR 数据后还有 4 字节 CRC
-                    if (!Skip(stream, 4)) return new SourceTraits(is16Bit, false);
-                }
-                else if (type.SequenceEqual("acTL"u8))
-                {
-                    return new SourceTraits(is16Bit, true);
-                }
-                else if (type.SequenceEqual("IDAT"u8) || type.SequenceEqual("IEND"u8))
-                {
-                    return new SourceTraits(is16Bit, false);
-                }
-                else if (!Skip(stream, (long)length + 4))
-                {
-                    return new SourceTraits(is16Bit, false);
-                }
-            }
-            return new SourceTraits(is16Bit, false);
-        }
-
-        private static SourceTraits DetectWebpTraits(Stream stream)
-        {
-            Span<byte> head = stackalloc byte[12];
-            stream.ReadExactly(head);
-            if (head[0] != (byte)'R' || head[1] != (byte)'I' || head[2] != (byte)'F' || head[3] != (byte)'F'
-                || head[8] != (byte)'W' || head[9] != (byte)'E' || head[10] != (byte)'B' || head[11] != (byte)'P')
-            {
-                return default;
-            }
-
-            Span<byte> chunk = stackalloc byte[8];
-            while (TryReadExactly(stream, chunk))
-            {
-                ReadOnlySpan<byte> fourCc = chunk.Slice(0, 4);
-                uint size = BinaryPrimitives.ReadUInt32LittleEndian(chunk.Slice(4, 4));
-                if (fourCc.SequenceEqual("VP8X"u8) && size >= 10)
-                {
-                    Span<byte> data = stackalloc byte[10];
-                    stream.ReadExactly(data);
-                    bool animated = (data[0] & 0x02) != 0;
-                    return new SourceTraits(false, animated);
-                }
-                if (fourCc.SequenceEqual("ANIM"u8) || fourCc.SequenceEqual("ANMF"u8))
-                {
-                    return new SourceTraits(false, true);
-                }
-                // 普通 VP8/VP8L 已确定不是动画；仍继续跳块只为稳妥地找到 VP8X
-                if (!Skip(stream, (long)size + (size & 1) + 4))
-                {
-                    return default;
-                }
-            }
-            return default;
-        }
-
-        private static bool TryReadExactly(Stream stream, Span<byte> buffer)
-        {
-            try
-            {
-                stream.ReadExactly(buffer);
-                return true;
-            }
-            catch (EndOfStreamException)
-            {
-                return false;
-            }
-        }
-
-        private static bool Skip(Stream stream, long bytes)
-        {
-            if (bytes < 0 || !stream.CanSeek) return false;
-            long remaining = stream.Length - stream.Position;
-            if (bytes > remaining) return false;
-            stream.Seek(bytes, SeekOrigin.Current);
-            return true;
         }
 
         /// <summary>

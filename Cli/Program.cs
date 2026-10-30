@@ -296,7 +296,7 @@ sealed partial class Program
         Console.WriteLine("支持输入: .jpg/.jpeg/.png/.bmp/.webp/.gif");
         Console.WriteLine("支持输出: .jpg/.jpeg/.png/.bmp/.webp/.gif");
         Console.WriteLine("操作: resize:WxH | resizebilinear:WxH | resizefit:WxH | grayscale");
-        Console.WriteLine("参数: --quality N | --subsample 420/422/444 | --jpeg-progressive | --keep-metadata | --idct int/float | --stream | --stream-strict | --memory-limit N | --no-memory-guard | --jpeg-debug | --gif-frames | --gray | --dithering on/off");
+        Console.WriteLine("参数: --quality N | --subsample 420/422/444 | --jpeg-progressive | --keep-metadata | --idct int/float | --stream | --stream-strict | --strict-format | --memory-limit N | --no-memory-guard | --jpeg-debug | --gif-frames | --gray | --dithering on/off");
         Console.WriteLine("WebP 档位: --webp-method 0~6（默认 3；q>=75 时 method 4 自动降为 3（>140 MP 有 3~4 倍悬崖），6 最省体积最慢）");
         Console.WriteLine("JPEG 编码: 默认 baseline；--jpeg-progressive 输出 progressive（SOF2）；--jpeg-trellis 启用 RD 优化量化（同画质省 5%~15% 体积，编码耗时约 3~10 倍，默认关闭）");
         Console.WriteLine("GIF 耗时统计: --gif-debug（分阶段耗时）| --gif-bench N（重复 N 次取最小/中位/平均，默认 5）");
@@ -310,6 +310,7 @@ sealed partial class Program
         Console.WriteLine("转换+压缩: --to <格式> --optimize   转成目标格式并直接输出该格式下最小体积（无需再 optimize 一遍）");
         Console.WriteLine("  示例: sic photo.jpg --to webp --optimize   →  photo.webp（已是最小体积）");
         Console.WriteLine("管道: - 代表标准输入/输出（如 sic - out.png --to png、cat a.png | sic - out.jpg），输出到 stdout 时必须用 --to 指定格式");
+        Console.WriteLine("严格格式: --strict-format 输入扩展名与文件头内容不符时报错（默认按内容解读、按扩展名写出，如 PNG 内容存成 .jpg 会被隐式转成 JPEG）");
         Console.WriteLine("退出码: 0 成功 | 1 处理失败（含批量中有文件失败） | 2 用法错误（未知参数/输入不存在）");
     }
 }

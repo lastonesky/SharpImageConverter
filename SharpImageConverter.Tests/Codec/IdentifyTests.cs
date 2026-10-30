@@ -116,6 +116,130 @@ namespace SharpImageConverter.Tests
         }
 
         /// <summary>
+        /// 不可 Seek 的流**不得被整读**：只读到文件头所需位置即可。
+        /// </summary>
+        /// <remarks>
+        /// 此前实现是 <c>stream.CopyTo(MemoryStream)</c>：为读 24 字节把整条流搬进内存，
+        /// 143 MB 上传即 143 MB 常驻，与「只读文件头」的定位矛盾（§2.10）。
+        /// 这里用 512×512 的 PNG（远大于 1 KB）做样本，识别读掉的字节数必须是个零头。
+        /// </remarks>
+        [Fact]
+        public void Identify_NonSeekable_Does_Not_Buffer_Whole_Stream()
+        {
+            // 随机像素 → 不可压缩，保证样本足够大（棋盘/渐变会被 deflate 压到几 KB 以内）
+            var img = TestImageFactory.CreateSolid(256, 256, 0, 0, 0);
+            new Random(12345).NextBytes(img.Buffer);
+            byte[] png;
+            using (var ms = new MemoryStream())
+            {
+                PngWriter.Write(ms, img.Width, img.Height, img.Buffer, img.Metadata);
+                png = ms.ToArray();
+            }
+            Assert.True(png.Length > 65536, $"样本只有 {png.Length} 字节，不足以证明「没有整读」");
+
+            using var counter = new CountingNonSeekableStream(png);
+            var info = Image.Identify(counter);
+
+            Assert.Equal(256, info.Width);
+            Assert.Equal(256, info.Height);
+            Assert.True(
+                counter.BytesRead <= 1024,
+                $"识别读了 {counter.BytesRead} 字节（整个文件 {png.Length} 字节），仍在整读");
+        }
+
+        /// <summary>
+        /// 动画 WebP 的帧数要真实：此前 WebP 分支恒传 1 帧，<c>IsAnimated</c> 反过来是 false。
+        /// </summary>
+        [Fact]
+        public void Identify_Animated_Webp_Reports_FrameCount()
+        {
+            const int frames = 4;
+            string path = NewTemp(".webp");
+            try
+            {
+                var list = new System.Collections.Generic.List<Image<Rgb24>>(frames);
+                for (int i = 0; i < frames; i++)
+                {
+                    list.Add(TestImageFactory.CreateChecker(16, 16, ((byte)(i * 40), (byte)20, (byte)30), (200, 200, 200), 2));
+                }
+                WebpAnimationEncoder.EncodeRgb24(path, list, [100, 100, 100, 100], loopCount: 0, quality: 75f);
+
+                var info = Image.Identify(path);
+                Assert.Equal(ImageFormatKind.Webp, info.Format);
+                Assert.Equal(frames, info.FrameCount);
+                Assert.True(info.IsAnimated);
+            }
+            finally
+            {
+                File.Delete(path);
+            }
+        }
+
+        /// <summary>
+        /// APNG 的帧数取自 <c>acTL</c>：此前 PNG 分支只读 IHDR，动画 PNG 也报 1 帧。
+        /// </summary>
+        [Fact]
+        public void Identify_Apng_Reports_FrameCount()
+        {
+            const uint frames = 6;
+            string path = NewTemp(".png");
+            try
+            {
+                File.WriteAllBytes(path, InsertActl(EncodePng(24, 16), frames));
+
+                var info = Image.Identify(path);
+                Assert.Equal(ImageFormatKind.Png, info.Format);
+                Assert.Equal((int)frames, info.FrameCount);
+                Assert.True(info.IsAnimated);
+                Assert.Equal(24, info.Width);
+                Assert.Equal(16, info.Height);
+            }
+            finally
+            {
+                File.Delete(path);
+            }
+        }
+
+        /// <summary>
+        /// 普通 PNG（没有 acTL）仍必须是单帧，别把「顺带扫 chunk」变成新的误报源。
+        /// </summary>
+        [Fact]
+        public void Identify_Plain_Png_Still_Reports_Single_Frame()
+        {
+            var info = Image.Identify(new MemoryStream(EncodePng(9, 7)));
+            Assert.Equal(1, info.FrameCount);
+            Assert.False(info.IsAnimated);
+        }
+
+        /// <summary>
+        /// 在 IHDR 之后插入 <c>acTL</c>（长度 8：num_frames + num_plays），CRC 用库里的实现算。
+        /// </summary>
+        private static byte[] InsertActl(byte[] png, uint frameCount)
+        {
+            // PNG 结构：8 字节签名 + IHDR（4 长度 + 4 类型 + 13 数据 + 4 CRC）= 33
+            const int afterIhdr = 33;
+
+            byte[] chunkData = new byte[8];
+            System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(chunkData, frameCount);
+            System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(chunkData.AsSpan(4), 0);
+
+            byte[] typeAndData = new byte[12];
+            "acTL"u8.CopyTo(typeAndData);
+            chunkData.CopyTo(typeAndData, 4);
+
+            byte[] chunk = new byte[4 + typeAndData.Length + 4];
+            System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(chunk, 8);
+            typeAndData.CopyTo(chunk, 4);
+            System.Buffers.Binary.BinaryPrimitives.WriteUInt32BigEndian(chunk.AsSpan(12), Crc32.Compute(typeAndData));
+
+            byte[] result = new byte[png.Length + chunk.Length];
+            png.AsSpan(0, afterIhdr).CopyTo(result);
+            chunk.CopyTo(result, afterIhdr);
+            png.AsSpan(afterIhdr).CopyTo(result.AsSpan(afterIhdr + chunk.Length));
+            return result;
+        }
+
+        /// <summary>
         /// 动图应报出真实帧数（此前帧数信息只在 MemoryGuard 内部可见）。
         /// </summary>
         [Fact]
@@ -295,6 +419,49 @@ namespace SharpImageConverter.Tests
             {
                 File.Delete(path);
             }
+        }
+
+        /// <summary>
+        /// 不可 Seek 的只读流，并统计被读走的总字节数（用于证明「没有整读」）。
+        /// </summary>
+        private sealed class CountingNonSeekableStream(byte[] data) : Stream
+        {
+            private int position;
+
+            public long BytesRead { get; private set; }
+
+            public override bool CanRead => true;
+            public override bool CanSeek => false;
+            public override bool CanWrite => false;
+            public override long Length => throw new NotSupportedException();
+            public override long Position
+            {
+                get => throw new NotSupportedException();
+                set => throw new NotSupportedException();
+            }
+
+            public override int Read(Span<byte> buffer)
+            {
+                int remaining = data.Length - position;
+                if (remaining <= 0) return 0;
+                int take = Math.Min(buffer.Length, remaining);
+                data.AsSpan(position, take).CopyTo(buffer);
+                position += take;
+                BytesRead += take;
+                return take;
+            }
+
+            public override int Read(byte[] buffer, int offset, int count) => Read(buffer.AsSpan(offset, count));
+
+            public override void Flush()
+            {
+            }
+
+            public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+
+            public override void SetLength(long value) => throw new NotSupportedException();
+
+            public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
         }
 
         private sealed class NonSeekableReadStream(byte[] data) : Stream

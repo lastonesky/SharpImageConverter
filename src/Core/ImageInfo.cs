@@ -45,13 +45,14 @@ namespace SharpImageConverter.Core
     /// </remarks>
     public readonly struct ImageInfo : IEquatable<ImageInfo>
     {
-        internal ImageInfo(ImageFormatKind format, int width, int height, int frameCount, bool isProgressive)
+        internal ImageInfo(ImageFormatKind format, int width, int height, int frameCount, bool isProgressive, bool is16Bit = false)
         {
             Format = format;
             Width = width;
             Height = height;
             FrameCount = frameCount;
             IsProgressive = isProgressive;
+            Is16Bit = is16Bit;
         }
 
         /// <summary>容器格式</summary>
@@ -70,7 +71,8 @@ namespace SharpImageConverter.Core
         public long PixelCount => (long)Width * Height;
 
         /// <summary>
-        /// 帧数。GIF 为实际图像块数量（≥1）；其它格式恒为 1。
+        /// 帧数。GIF 为实际图像块数量；APNG 取 <c>acTL</c> 的 <c>num_frames</c>；
+        /// 动画 WebP 为 <c>ANMF</c> 块数量；单帧格式恒为 1。
         /// </summary>
         public int FrameCount { get; }
 
@@ -79,6 +81,15 @@ namespace SharpImageConverter.Core
 
         /// <summary>是否为动图（帧数大于 1）</summary>
         public bool IsAnimated => FrameCount > 1;
+
+        /// <summary>
+        /// PNG 是否为 16-bit 位深（IHDR 的 bitDepth == 16）。
+        /// </summary>
+        /// <remarks>
+        /// 内部用：16-bit PNG 走 optimize 会被静默降到 8-bit，optimize 需要据此**放弃**
+        /// 同格式重编码（见 <c>ImageOptimizer.SourceTraits</c>）。公开 API 暂不暴露。
+        /// </remarks>
+        internal bool Is16Bit { get; }
 
         internal static string GetFormatName(ImageFormatKind kind) => kind switch
         {

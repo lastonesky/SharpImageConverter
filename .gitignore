@@ -119,6 +119,10 @@ StyleCopReport.xml
 
 
 examples/
+# 例外：examples/ 下的 8 个文件是**刻意入库的测试语料**（clone 后要能跑语料测试）。
+# 反选必须写在忽略规则之后，且先反选目录再反选内容——否则 git 不会进入被忽略的目录。
+!examples/
+!examples/**
 .workbuddy/
 
 # A/B performance harness working data (corpus, per-run CSVs, built binaries)
