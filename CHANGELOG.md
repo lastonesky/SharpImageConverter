@@ -47,6 +47,47 @@
 - CLI 选项解析的 `StartsWith(".")`/`StartsWith(prefix)` 改 `char` 重载或
   `StringComparison.Ordinal`，GIF 帧号格式化改用 `CultureInfo.InvariantCulture`，
   `Program` 标记 `sealed`。
+- **`ImageFrame` 保存 PNG 时 alpha 被静默丢弃**：`SaveAsPng` 一律走
+  `GetRgb24Pixels()`，Rgba32/Bgra32 帧的 alpha 直接消失。现按像素格式分流：
+  32 位帧用颜色类型 6（Bgra32 先换字节序），像素全不透明时
+  `PngWriter.WriteRgba` 会自动降回颜色类型 2，**产物与按 RGB24 写逐字节一致**。
+- **`ImageFrame.Save` 不认 `.webp`**：落进 `default` 抛 `NotSupportedException`，
+  而 `LoadWebp` 是有的、`Configuration.Load` 也能读 WebP。现补
+  `SaveAsWebp(path|stream, quality)`，带 alpha 的帧走 RGBA 编码路径。
+- **`GifEncoder.Encode(ImageFrame)` 不校验像素格式**：量化按「3 字节/像素」直接切
+  缓冲区，传入 32 位帧会按错误步长取样，产出错位花屏而不报错。现显式要求 RGB24
+  （`ArgumentException`，附修复提示）；`ImageFrame.SaveAsGif` 内部照旧自动规范化。
+
+### API
+- **新增 `Image.Identify(string|Stream) → ImageInfo`**：只读文件头，给出格式、宽高、
+  帧数（GIF 真实帧数）与是否渐进式 JPEG，**不解码像素**；未知格式抛
+  `NotSupportedException`、头损坏抛 `InvalidDataException`，不返回 `Width=0` 的默认值。
+  可 Seek 的流解析后位置还原，便于紧接着解码。
+- **`Image` / `Configuration` 新增 Stream 重载**：`Load(Stream)`、`LoadRgba32(Stream)`、
+  `Save(image, Stream, extension)`，可以完全在内存里转格式，不必落临时文件。
+  流必须可 Seek（嗅探要回到起点），不可 Seek 请用 `ImageFrame.Load(Stream)`。
+- **格式嗅探合一**：新增 `Core/ImageHeaderReader`（`Sniff` + `TryReadInfo`）作为唯一实现，
+  `ImageFrame.Load`、`ImageOptimizer.DetectFormat`、`MemoryGuard.TryReadDimensions`
+  全部改为调用它；`MemoryGuard` 里那份 250 行私有副本（五个 `TryReadXxx`）已删除。
+  `ImageOptimizer.ImageKind` 并入公开的 `Core.ImageFormatKind`，`Image.Identify` 直接复用。
+  新增格式现在只需改 `ImageHeaderReader` 与注册表各一处。
+  顺带修正：GIF 嗅探要求完整的 `GIF87a`/`GIF89a`（此前只看前 3 字节）、PNG 要求 8 字节
+  签名含 `\r\n\x1a\n`、BMP 负高度（自下而上）取绝对值。
+
+### CLI
+- **`Main` 由 `void` 改为 `int`，退出码可判定**：`0` 成功 / `1` 处理失败（含目录批量中
+  有文件失败）/ `2` 用法错误（未知参数、输入不存在、无参数）。此前无论成败一律 exit 0，
+  脚本无法判断结果。
+- **新增 `--help` / `-h` / `-?` 与 `--version`**：在「把 `args[0]` 当输入路径」之前处理，
+  `sic --help` 不再报「输入文件不存在: --help」。版本号取自库程序集，截掉 SourceLink 的
+  commit 后缀。
+- **未知参数不再被静默吞掉**：此前 `sic in.png out.png --打错 某个值` 会把 `某个值`
+  当成输出路径并写出去，命令行看起来"成功"。现在报「未知参数」并返回 2，也不产生文件。
+- **目录批量的失败不再只有计数**：`ProcessDirectory` 的裸 `catch` 改为打印
+  `文件名: 异常类型: 消息` 到 stderr；失败数经返回值传到退出码。
+- `CliOptions` 从 `Program.cs` 抽到 `Cli/CliOptions.cs`（只放字段与默认值，
+  解析逻辑仍留在 `ParseOptions`）；顺带删掉 `ProcessDirectory` 里两个分支都做
+  `success++` 的死逻辑。
 
 ### 文档
 - **README / README.en 与产物对齐**：目标框架此前写 `net8.0;net10.0`，实际只有
