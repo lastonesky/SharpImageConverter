@@ -82,6 +82,19 @@ namespace SharpImageConverter.Core
         /// <param name="stream">输出数据流</param>
         /// <param name="image">Rgb24 图像</param>
         void EncodeRgb24(Stream stream, Image<Rgb24> image);
+
+        /// <summary>
+        /// 按 <see cref="SaveOptions"/> 保存 Rgb24 图像到指定流。
+        /// </summary>
+        /// <remarks>
+        /// 默认实现忽略选项、退化为 <see cref="EncodeRgb24(Stream, Image{Rgb24})"/>——
+        /// 只有真正有可调参数的格式（JPEG / WebP）才需要重写它。
+        /// 这里用默认接口实现而不是新增抽象方法：已有的第三方编码器不必改就能编译。
+        /// </remarks>
+        /// <param name="stream">输出数据流</param>
+        /// <param name="image">Rgb24 图像</param>
+        /// <param name="options">保存选项</param>
+        void EncodeRgb24(Stream stream, Image<Rgb24> image, SaveOptions options) => EncodeRgb24(stream, image);
     }
 
     /// <summary>
@@ -102,6 +115,15 @@ namespace SharpImageConverter.Core
         /// <param name="stream">输出数据流</param>
         /// <param name="image">Rgba32 图像</param>
         void EncodeRgba32(Stream stream, Image<Rgba32> image);
+
+        /// <summary>
+        /// 按 <see cref="SaveOptions"/> 保存 Rgba32 图像到指定流。
+        /// </summary>
+        /// <remarks>默认实现忽略选项，理由同 <see cref="IImageEncoder"/>。</remarks>
+        /// <param name="stream">输出数据流</param>
+        /// <param name="image">Rgba32 图像</param>
+        /// <param name="options">保存选项</param>
+        void EncodeRgba32(Stream stream, Image<Rgba32> image, SaveOptions options) => EncodeRgba32(stream, image);
     }
 
     /// <summary>

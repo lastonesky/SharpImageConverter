@@ -26,11 +26,30 @@ public sealed class JpegEncoderAdapter : IImageEncoder
 
     public void EncodeRgb24(string path, Image<Rgb24> image)
     {
-        JpegEncoder.Encode(image, path, new JpegEncoderOptions(Quality, Subsample420, KeepMetadata, EnableDiagnostics));
+        JpegEncoder.Encode(image, path, CurrentOptions());
     }
 
     public void EncodeRgb24(Stream stream, Image<Rgb24> image)
     {
-        JpegEncoder.Encode(image, stream, new JpegEncoderOptions(Quality, Subsample420, KeepMetadata, EnableDiagnostics));
+        JpegEncoder.Encode(image, stream, CurrentOptions());
     }
+
+    /// <summary>
+    /// 按 <see cref="SaveOptions.Jpeg"/> 编码；未提供时用本实例的属性。
+    /// </summary>
+    /// <remarks>
+    /// 走选项而不是改本实例属性：<see cref="Configuration.Default"/> 里的编码器是进程级单例，
+    /// 逐次保存改它的 <see cref="Quality"/> 会让并发保存互相踩。
+    /// </remarks>
+    /// <param name="stream">输出数据流</param>
+    /// <param name="image">Rgb24 图像</param>
+    /// <param name="options">保存选项</param>
+    public void EncodeRgb24(Stream stream, Image<Rgb24> image, SaveOptions options)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        JpegEncoder.Encode(image, stream, options.Jpeg ?? CurrentOptions());
+    }
+
+    private JpegEncoderOptions CurrentOptions()
+        => new(Quality, Subsample420, KeepMetadata, EnableDiagnostics);
 }

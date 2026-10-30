@@ -193,7 +193,20 @@ Image.Save(image, output, ".webp");       // 按扩展名选编码器，全程�
 // 不可 Seek 的流（网络/Socket）：用 ImageFrame，它会把已读部分缓存起来
 using var network = new MemoryStream();   // 示例：任意只读流
 var frame = ImageFrame.Load(network);     // 支持 requireComplete: true 严格模式
-new ImageFrame(frame.Width, frame.Height, frame.Pixels).SaveAsWebp("out.webp");
+frame.SaveAsWebp("out.webp", quality: 80f);
+```
+
+- 两套图像载体互转（零拷贝，共享像素缓冲区与元数据）：
+
+```csharp
+using SharpImageConverter;
+using SharpImageConverter.Core;
+
+ImageFrame frame = image.ToFrame();       // 不复制像素，只包一层
+Image<Rgb24> back = frame.ToImage<Rgb24>(); // 帧是 Rgb24 时直接复用同一缓冲区
+
+// 需要换格式（BGR 系帧、Gray8）时显式转换，转换会真的复制并做 SIMD 换序
+ImageFrame rgb = bgraFrame.ToRgb24();
 ```
 
 - 智能有损压缩（TinyPNG 式，保持原格式）：

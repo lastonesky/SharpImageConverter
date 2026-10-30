@@ -176,6 +176,28 @@ namespace SharpImageConverter.Formats.Webp
         {
             WebpCodec.EncodeRgbToStream(stream, image.Buffer, image.Width, image.Height, Options);
         }
+
+        /// <summary>
+        /// 按 <see cref="SaveOptions.WebpQuality"/> 编码；未提供时用本实例的质量。
+        /// </summary>
+        /// <remarks>
+        /// 逐次保存改本实例的 <see cref="Quality"/> 会污染
+        /// <see cref="Configuration.Default"/> 里的共享编码器，所以选项按调用传入。
+        /// </remarks>
+        /// <param name="stream">输出流</param>
+        /// <param name="image">输入图像</param>
+        /// <param name="options">保存选项</param>
+        public void EncodeRgb24(Stream stream, Image<Rgb24> image, SaveOptions options)
+        {
+            ArgumentNullException.ThrowIfNull(options);
+            WebpCodec.EncodeRgbToStream(stream, image.Buffer, image.Width, image.Height, Effective(options));
+        }
+
+        /// <summary>把 <see cref="SaveOptions.WebpQuality"/> 套到本实例的其余参数上。</summary>
+        private WebpEncoderOptions Effective(SaveOptions options)
+            => options.WebpQuality is { } q
+                ? new WebpEncoderOptions(q, Options.ConcurrencyStrategy, Options.Method, Options.Lossless)
+                : Options;
     }
 
     /// <summary>
@@ -223,6 +245,24 @@ namespace SharpImageConverter.Formats.Webp
         {
             WebpCodec.EncodeRgbaToStream(stream, image.Buffer, image.Width, image.Height, Options);
         }
+
+        /// <summary>
+        /// 按 <see cref="SaveOptions.WebpQuality"/> 编码；未提供时用本实例的质量。
+        /// </summary>
+        /// <param name="stream">输出流</param>
+        /// <param name="image">输入图像</param>
+        /// <param name="options">保存选项</param>
+        public void EncodeRgba32(Stream stream, Image<Rgba32> image, SaveOptions options)
+        {
+            ArgumentNullException.ThrowIfNull(options);
+            WebpCodec.EncodeRgbaToStream(stream, image.Buffer, image.Width, image.Height, Effective(options));
+        }
+
+        /// <summary>把 <see cref="SaveOptions.WebpQuality"/> 套到本实例的其余参数上。</summary>
+        private WebpEncoderOptions Effective(SaveOptions options)
+            => options.WebpQuality is { } q
+                ? new WebpEncoderOptions(q, Options.ConcurrencyStrategy, Options.Method, Options.Lossless)
+                : Options;
     }
 
     public static class WebpAnimationEncoder

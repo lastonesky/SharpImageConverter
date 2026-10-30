@@ -40,6 +40,38 @@ namespace SharpImageConverter.Core
         }
 
         /// <summary>
+        /// 零拷贝转成 <see cref="ImageFrame"/>（共享像素缓冲区与元数据实例）。
+        /// </summary>
+        /// <remarks>
+        /// 两个模型长期并存且分工固定：本类型保留「编译期像素类型」与处理管线，
+        /// <see cref="ImageFrame"/> 负责流式加载、BGR 互操作与统一的保存链路。
+        /// 转换只包装缓冲区、不复制像素，因此任一侧改像素另一侧立刻可见。
+        /// <see cref="Gray8"/> 没有对应的 <see cref="ImagePixelFormat"/>，会抛
+        /// <see cref="NotSupportedException"/>（灰度写盘走 <c>Configuration.SaveGray8</c>）。
+        /// </remarks>
+        /// <returns>共享同一缓冲区与元数据的图像帧</returns>
+        /// <exception cref="NotSupportedException">当前像素类型没有对应的帧格式</exception>
+        public ImageFrame ToFrame()
+        {
+            ImagePixelFormat format;
+            if (typeof(TPixel) == typeof(Rgb24))
+            {
+                format = ImagePixelFormat.Rgb24;
+            }
+            else if (typeof(TPixel) == typeof(Rgba32))
+            {
+                format = ImagePixelFormat.Rgba32;
+            }
+            else
+            {
+                throw new NotSupportedException(
+                    $"像素类型 {typeof(TPixel).Name} 没有对应的 ImagePixelFormat"
+                    + "（帧支持 Rgb24 / Rgba32；Gray8 请用 Configuration.SaveGray8）");
+            }
+            return new ImageFrame(Width, Height, Buffer, format, Metadata);
+        }
+
+        /// <summary>
         /// 更新图像的尺寸与像素缓冲区
         /// </summary>
         /// <param name="width">新宽度</param>

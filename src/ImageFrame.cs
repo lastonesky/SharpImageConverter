@@ -472,61 +472,39 @@ public sealed class ImageFrame
     /// <summary>
     /// 保存图像到指定路径（根据扩展名选择格式）
     /// </summary>
+    /// <remarks>
+    /// 派发与编码全部交给 <see cref="Core.Configuration.Default"/>——这是唯一实现
+    /// （扩展名经注册表解析到编码器，alpha 帧优先走 RGBA 编码器）。
+    /// 此前这里自带一份 switch，与 <c>Configuration</c> 各写一套，于是
+    /// 「帧能读进来但写不出去」「存 JPEG 指定不了子采样/trellis」这类缺口反复出现。
+    /// </remarks>
     /// <param name="path">输出文件路径</param>
-    public void Save(string path)
-    {
-        string ext = Path.GetExtension(path).ToLowerInvariant();
-        switch (ext)
-        {
-            case ".bmp":
-                SaveAsBmp(path);
-                break;
-            case ".png":
-                SaveAsPng(path);
-                break;
-            case ".jpg":
-            case ".jpeg":
-                SaveAsJpeg(path);
-                break;
-            case ".gif":
-                SaveAsGif(path);
-                break;
-            case ".webp":
-                SaveAsWebp(path);
-                break;
-            default:
-                throw new NotSupportedException($"不支持的输出文件格式: {ext}（当前支持 {Core.ImageInfo.SupportedFormatList}）");
-        }
-    }
+    public void Save(string path) => Core.Configuration.Default.Save(this, path);
+
+    /// <summary>
+    /// 保存图像到指定路径（根据扩展名选择格式），可覆盖编码参数。
+    /// </summary>
+    /// <param name="path">输出文件路径</param>
+    /// <param name="options">保存选项；null 表示用已注册编码器的默认设置</param>
+    public void Save(string path, Core.SaveOptions? options) => Core.Configuration.Default.Save(this, path, options);
 
     /// <summary>
     /// 以 BMP 格式保存图像
     /// </summary>
     /// <param name="path">输出路径</param>
-    public void SaveAsBmp(string path)
-    {
-        using var fs = File.Create(path);
-        SaveAsBmp(fs);
-    }
+    public void SaveAsBmp(string path) => Core.Configuration.Default.SaveAs(this, path, ".bmp");
 
     /// <summary>
     /// 以 BMP 格式保存图像
     /// </summary>
     /// <param name="stream">输出流</param>
-    public void SaveAsBmp(Stream stream)
-    {
-        BmpWriter.Write24(stream, Width, Height, GetRgb24Pixels());
-    }
+    public void SaveAsBmp(Stream stream) => Core.Configuration.Default.Save(this, stream, ".bmp");
 
     /// <summary>
     /// 以 PNG 格式保存图像
     /// </summary>
     /// <param name="path">输出路径</param>
-    public void SaveAsPng(string path)
-    {
-        using var fs = File.Create(path);
-        SaveAsPng(fs);
-    }
+    public void SaveAsPng(string path) => Core.Configuration.Default.SaveAs(this, path, ".png");
 
     /// <summary>
     /// 以 PNG 格式保存图像。
@@ -539,47 +517,28 @@ public sealed class ImageFrame
     /// 此前这里一律先降成 RGB24，导致 alpha 静默丢弃。
     /// </remarks>
     /// <param name="stream">输出流</param>
-    public void SaveAsPng(Stream stream)
-    {
-        // 元数据不随 PNG 写出：与本方法历史行为一致（此前也不写），避免静默改变既有产物。
-        switch (PixelFormat)
-        {
-            case ImagePixelFormat.Rgba32:
-                PngWriter.WriteRgba(stream, Width, Height, Pixels);
-                break;
-            case ImagePixelFormat.Bgra32:
-            {
-                byte[] rgba = GC.AllocateUninitializedArray<byte>(Pixels.Length);
-                SimdHelper.SwapRgbaBgra32(Pixels, rgba);
-                PngWriter.WriteRgba(stream, Width, Height, rgba);
-                break;
-            }
-            default:
-                PngWriter.Write(stream, Width, Height, GetRgb24Pixels());
-                break;
-        }
-    }
+    public void SaveAsPng(Stream stream) => Core.Configuration.Default.Save(this, stream, ".png");
 
     /// <summary>
-    /// 以 JPEG 格式保存图像（默认质量 75）
+    /// 以 JPEG 格式保存图像。
     /// </summary>
+    /// <remarks>
+    /// 默认保留元数据（与 <c>Configuration.SaveRgb24</c> 一致）。此前两参与三参重载
+    /// 走 <c>JpegEncoder.Write</c> 的默认 <c>keepMetadata: false</c>，帧存 JPEG 会静默丢掉 EXIF，
+    /// 而同一个图走类型化保存却能保留——同一次「保存」有两种口径。
+    /// 需要丢弃元数据请用带 <c>keepMetadata</c> 的重载，或传
+    /// <see cref="Core.SaveOptions.Jpeg"/>。
+    /// </remarks>
     /// <param name="path">输出路径</param>
     /// <param name="quality">JPEG 质量（1-100）</param>
-    public void SaveAsJpeg(string path, int quality = 75)
-    {
-        using var fs = File.Create(path);
-        SaveAsJpeg(fs, quality);
-    }
+    public void SaveAsJpeg(string path, int quality = 75) => SaveAsJpeg(path, quality, true, true);
 
     /// <summary>
     /// 以 JPEG 格式保存图像（默认质量 75）
     /// </summary>
     /// <param name="stream">输出流</param>
     /// <param name="quality">JPEG 质量（1-100）</param>
-    public void SaveAsJpeg(Stream stream, int quality = 75)
-    {
-        JpegEncoder.Write(stream, Width, Height, GetRgb24Pixels(), quality);
-    }
+    public void SaveAsJpeg(Stream stream, int quality = 75) => SaveAsJpeg(stream, quality, true, true);
 
     /// <summary>
     /// 以 JPEG 格式保存图像（指定质量与采样方式）
@@ -587,11 +546,7 @@ public sealed class ImageFrame
     /// <param name="path">输出路径</param>
     /// <param name="quality">JPEG 质量（1-100）</param>
     /// <param name="subsample420">是否使用 4:2:0 子采样</param>
-    public void SaveAsJpeg(string path, int quality, bool subsample420)
-    {
-        using var fs = File.Create(path);
-        SaveAsJpeg(fs, quality, subsample420);
-    }
+    public void SaveAsJpeg(string path, int quality, bool subsample420) => SaveAsJpeg(path, quality, subsample420, true);
 
     /// <summary>
     /// 以 JPEG 格式保存图像（指定质量与采样方式）
@@ -599,49 +554,42 @@ public sealed class ImageFrame
     /// <param name="stream">输出流</param>
     /// <param name="quality">JPEG 质量（1-100）</param>
     /// <param name="subsample420">是否使用 4:2:0 子采样</param>
-    public void SaveAsJpeg(Stream stream, int quality, bool subsample420)
-    {
-        JpegEncoder.Write(stream, Width, Height, GetRgb24Pixels(), quality, subsample420);
-    }
+    public void SaveAsJpeg(Stream stream, int quality, bool subsample420) => SaveAsJpeg(stream, quality, subsample420, true);
 
+    /// <summary>
+    /// 以 JPEG 格式保存图像（指定质量、采样方式与是否保留元数据）
+    /// </summary>
+    /// <param name="path">输出路径</param>
+    /// <param name="quality">JPEG 质量（1-100）</param>
+    /// <param name="subsample420">是否使用 4:2:0 子采样</param>
+    /// <param name="keepMetadata">是否写出 EXIF/ICC 等元数据</param>
     public void SaveAsJpeg(string path, int quality, bool subsample420, bool keepMetadata)
-    {
-        using var fs = File.Create(path);
-        SaveAsJpeg(fs, quality, subsample420, keepMetadata);
-    }
+        => Core.Configuration.Default.SaveAs(this, path, ".jpg", JpegOptions(quality, subsample420, keepMetadata));
 
+    /// <summary>
+    /// 以 JPEG 格式保存图像（指定质量、采样方式与是否保留元数据）
+    /// </summary>
+    /// <param name="stream">输出流</param>
+    /// <param name="quality">JPEG 质量（1-100）</param>
+    /// <param name="subsample420">是否使用 4:2:0 子采样</param>
+    /// <param name="keepMetadata">是否写出 EXIF/ICC 等元数据</param>
     public void SaveAsJpeg(Stream stream, int quality, bool subsample420, bool keepMetadata)
-    {
-        JpegEncoder.Write(stream, Width, Height, GetRgb24Pixels(), quality, subsample420, Metadata, keepMetadata);
-    }
+        => Core.Configuration.Default.Save(this, stream, ".jpg", JpegOptions(quality, subsample420, keepMetadata));
+
+    private static Core.SaveOptions JpegOptions(int quality, bool subsample420, bool keepMetadata)
+        => new() { Jpeg = new JpegEncoderOptions(quality, subsample420, keepMetadata) };
 
     /// <summary>
     /// 以 GIF 格式保存图像
     /// </summary>
     /// <param name="path">输出路径</param>
-    public void SaveAsGif(string path)
-    {
-        using var fs = File.Create(path);
-        SaveAsGif(fs);
-    }
+    public void SaveAsGif(string path) => Core.Configuration.Default.SaveAs(this, path, ".gif");
 
     /// <summary>
     /// 以 GIF 格式保存图像
     /// </summary>
     /// <param name="stream">输出流</param>
-    public void SaveAsGif(Stream stream)
-    {
-        var encoder = new Formats.Gif.GifEncoder();
-        if (PixelFormat == ImagePixelFormat.Rgb24)
-        {
-            encoder.Encode(this, stream);
-        }
-        else
-        {
-            // 非 RGB24 帧先规范化为 RGB24（保留元数据），再交给 GIF 编码器
-            encoder.Encode(ToRgb24(), stream);
-        }
-    }
+    public void SaveAsGif(Stream stream) => Core.Configuration.Default.Save(this, stream, ".gif");
 
     /// <summary>
     /// 以 WebP 格式保存图像（默认质量 75）
@@ -653,10 +601,7 @@ public sealed class ImageFrame
     /// <param name="path">输出路径</param>
     /// <param name="quality">有损质量（0-100）</param>
     public void SaveAsWebp(string path, float quality = 75f)
-    {
-        using var fs = new FileStream(path, FileMode.Create, FileAccess.Write);
-        SaveAsWebp(fs, quality);
-    }
+        => Core.Configuration.Default.SaveAs(this, path, ".webp", new Core.SaveOptions { WebpQuality = quality });
 
     /// <summary>
     /// 以 WebP 格式保存图像（默认质量 75）
@@ -664,22 +609,7 @@ public sealed class ImageFrame
     /// <param name="stream">输出流</param>
     /// <param name="quality">有损质量（0-100）</param>
     public void SaveAsWebp(Stream stream, float quality = 75f)
-    {
-        if (PixelFormat == ImagePixelFormat.Rgba32 || PixelFormat == ImagePixelFormat.Bgra32)
-        {
-            var rgba = PixelFormat == ImagePixelFormat.Rgba32 ? this : ToRgba32();
-            var rgbaImage = new Image<Rgba32>(Width, Height, rgba.Pixels, Metadata);
-            var encRgba = new WebpEncoderAdapterRgba();
-            encRgba.Quality = quality;
-            encRgba.EncodeRgba32(stream, rgbaImage);
-            return;
-        }
-
-        var rgbImage = new Image<Rgb24>(Width, Height, GetRgb24Pixels(), Metadata);
-        var enc = new WebpEncoderAdapter();
-        enc.Quality = quality;
-        enc.EncodeRgb24(stream, rgbImage);
-    }
+        => Core.Configuration.Default.Save(this, stream, ".webp", new Core.SaveOptions { WebpQuality = quality });
 
     /// <summary>
     /// 按 EXIF 方向对图像进行旋转/翻转并返回新图像。
@@ -702,13 +632,43 @@ public sealed class ImageFrame
     }
 
     /// <summary>
-    /// 返回 RGB24 格式的图像帧，供各 Save 路径在编码前规范化使用。
-    /// 若当前已是 Rgb24 则直接返回原缓冲区（零分配）；
-    /// 否则通过 SIMD 转换生成新的 RGB24 缓冲区（不修改原帧）。
+    /// 零拷贝转成类型化图像 <see cref="Image{TPixel}"/>（共享像素缓冲区与元数据实例）。
     /// </summary>
-    private byte[] GetRgb24Pixels()
+    /// <remarks>
+    /// 只做「包装」不做「换格式」：帧是 Rgba32 就只接受 <see cref="Rgba32"/>，
+    /// 帧是 Bgr24/Bgra32 则没有对应像素类型（<see cref="ImagePixelFormat"/> 的 BGR 系
+    /// 在 <see cref="Core.Rgb24"/> / <see cref="Core.Rgba32"/> 之外没有 struct）。需要换格式请先调用
+    /// <see cref="ToRgb24"/> / <see cref="ToRgba32"/>，那会真的复制并做 SIMD 换序。
+    /// 反向转换见 <see cref="Core.Image{TPixel}.ToFrame"/>。
+    /// </remarks>
+    /// <typeparam name="T">像素类型（Rgb24 / Rgba32）</typeparam>
+    /// <returns>共享同一缓冲区与元数据的类型化图像</returns>
+    /// <exception cref="NotSupportedException"><typeparamref name="T"/> 没有对应的帧像素格式</exception>
+    /// <exception cref="InvalidOperationException">帧的像素格式与 <typeparamref name="T"/> 不一致</exception>
+    public Image<T> ToImage<T>() where T : struct, Core.IPixel
     {
-        return PixelFormat == ImagePixelFormat.Rgb24 ? Pixels : ToRgb24().Pixels;
+        ImagePixelFormat expected;
+        if (typeof(T) == typeof(Core.Rgb24))
+        {
+            expected = ImagePixelFormat.Rgb24;
+        }
+        else if (typeof(T) == typeof(Core.Rgba32))
+        {
+            expected = ImagePixelFormat.Rgba32;
+        }
+        else
+        {
+            throw new NotSupportedException(
+                $"像素类型 {typeof(T).Name} 没有对应的 ImagePixelFormat（帧只支持 Rgb24 / Rgba32）");
+        }
+
+        if (PixelFormat != expected)
+        {
+            throw new InvalidOperationException(
+                $"帧的像素格式是 {PixelFormat}，与请求的 {typeof(T).Name} 不一致；"
+                + "请先调用 ToRgb24() / ToRgba32() 规范化（BGR 系没有对应的像素类型）");
+        }
+        return new Image<T>(Width, Height, Pixels, Metadata);
     }
 
     /// <summary>

@@ -10,18 +10,6 @@ using SharpImageConverter.Core;
 namespace SharpImageConverter.Processing
 {
     /// <summary>
-    /// 图像处理器接口，用于对图像执行处理操作。
-    /// </summary>
-    public interface IImageProcessor
-    {
-        /// <summary>
-        /// 执行处理操作
-        /// </summary>
-        /// <param name="image">输入图像（Rgb24）</param>
-        void Execute(Image<Rgb24> image);
-    }
-
-    /// <summary>
     /// 图像处理上下文，提供 resize、灰度等处理方法。
     /// </summary>
     public sealed class ImageProcessingContext

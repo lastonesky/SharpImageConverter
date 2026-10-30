@@ -232,6 +232,22 @@ Image.Save(image, output, ".webp"); // encoder chosen by extension, no temp file
 
 Streams must be seekable; for non-seekable network streams use `ImageFrame.Load(stream, requireComplete)`.
 
+- Converting between the two pixel containers (zero-copy: buffer and metadata are shared):
+
+```csharp
+using SharpImageConverter;
+using SharpImageConverter.Core;
+
+ImageFrame frame = image.ToFrame();          // wraps the buffer, does not copy pixels
+Image<Rgb24> back = frame.ToImage<Rgb24>();  // Rgb24 frames reuse the very same buffer
+
+// Format changes (BGR frames, Gray8) are explicit and do copy + SIMD reorder
+ImageFrame rgb = bgraFrame.ToRgb24();
+```
+
+Saving has a single implementation (`Configuration.Save(ImageFrame, path|stream, ext, SaveOptions?)`);
+`ImageFrame.Save`/`SaveAs*` and `Configuration.SaveRgb24`/`SaveRgba32` all delegate to it.
+
 ## Command Line Interface (CLI)
 
 Located in the `Cli/` directory, providing convenient format conversion and simple processing capabilities.

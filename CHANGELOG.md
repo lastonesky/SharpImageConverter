@@ -1,5 +1,31 @@
 ## 未发布
 
+### API（含破坏性变更）
+
+- **保存链路收口到 `Configuration`，两套图像模型不再各写一套**：新增
+  `Configuration.Save(ImageFrame, path|stream, extension, SaveOptions?)` 作为**唯一**保存实现
+  （扩展名经注册表解析到编码器，带 alpha 的帧优先走该格式的 RGBA 编码器，格式表达不了 alpha 时降通道）。
+  `ImageFrame.Save`/`SaveAsBmp|Png|Jpeg|Gif|Webp` 的 12 个重载全部改为委托，`SaveRgb24`/`SaveRgba32`
+  也绕到同一实现——帧侧那套自带 `switch` 与直调 writer 的代码已删除。
+  行为变化（**破坏性**，本项目此前无外部使用者）：
+  - `ImageFrame.SaveAsJpeg(path, quality)` 与 `(path, quality, subsample420)` 现在**保留元数据**
+    （此前走 `JpegEncoder.Write` 的默认 `keepMetadata:false`，帧存 JPEG 会静默丢 EXIF，
+    而同一像素走类型化保存却能保留）。需要丢弃元数据请用四参重载或 `SaveOptions.Jpeg`。
+  - `ImageFrame.SaveAsPng` 现在写出 `ImageFrame.Metadata`（此前刻意不写）。
+  - `ImageFrame.Save(path)` 的未知扩展名报错改为 `Configuration` 的口径（附已注册扩展名列表）。
+  - 帧存 `.gif` 时 RGBA 帧走 RGBA 编码器（透明色保留），不再先降成 RGB24。
+- **新增 `SaveOptions`**（`Core/SaveOptions.cs`）：`Jpeg`（直接收 `JpegEncoderOptions`，
+  含 `OptimizeHuffman`/`TrellisQuantization`）与 `WebpQuality`。此前
+  `ImageFrame.SaveAsJpeg` 只能表达质量/子采样/是否保留元数据，trellis 与优化 Huffman 从帧侧根本传不进去。
+  选项按调用传入、不写回 `Configuration.Default` 里的共享编码器（逐次改 `Quality` 会让并发保存互相踩）。
+  为此 `IImageEncoder`/`IImageEncoderRgba` 增加了带 `SaveOptions` 的流式重载，**以默认接口方法实现**
+  （默认退化为两参版本），已有第三方编码器不必修改即可编译。
+- **新增跨模型零拷贝转换**：`Image<TPixel>.ToFrame()` 与 `ImageFrame.ToImage<T>()`，
+  共享像素缓冲区与元数据实例。只做包装不换格式：BGR 系帧没有对应像素类型、
+  `Gray8` 没有对应 `ImagePixelFormat`，两种情况都显式抛异常并提示先 `ToRgb24()/ToRgba32()`。
+- **删除 `IImageProcessor`**：全库 0 实现 0 引用，且**没有任何 API 接受它**
+  （签名是 `void Execute(Image<Rgb24>)`，外部实现了也无处可传），故不走 `[Obsolete]` 过渡直接删除。
+
 ### 构建
 - **`dotnet test` 切换到 .NET 10 SDK 的 MTP 模式**：.NET 10 SDK 起 Microsoft.Testing.Platform
   不再支持挂在 VSTest 目标上，`dotnet test` 全挂（CI 与本机同病）。`global.json` 只声明

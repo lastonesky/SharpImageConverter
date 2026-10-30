@@ -233,7 +233,7 @@ namespace SharpImageConverter.Core
         {
             ArgumentNullException.ThrowIfNull(image);
             ArgumentException.ThrowIfNullOrEmpty(path);
-            GetEncoderOrThrow(path).EncodeRgb24(path, image);
+            Save(image.ToFrame(), path);
         }
 
         /// <summary>
@@ -246,8 +246,87 @@ namespace SharpImageConverter.Core
         {
             ArgumentNullException.ThrowIfNull(image);
             ArgumentNullException.ThrowIfNull(stream);
-            GetEncoderByExtensionOrThrow(extension).EncodeRgb24(stream, image);
+            Save(image.ToFrame(), stream, extension);
         }
+
+        /// <summary>
+        /// 保存图像帧到指定路径（按扩展名经注册表选择编码器）。
+        /// </summary>
+        /// <remarks>
+        /// 这是**唯一**的保存实现：<see cref="ImageFrame.Save(string)"/> 与
+        /// <see cref="SaveRgb24(Image{Rgb24}, string)"/> 都委托到它，
+        /// 因此两种图像模型不会各自维护一套「扩展名 → 编码器」派发。
+        /// 带 alpha 的帧优先走该格式的 RGBA 编码器，格式表达不了 alpha（JPEG/BMP）时降通道。
+        /// </remarks>
+        /// <param name="frame">图像帧</param>
+        /// <param name="path">输出文件路径</param>
+        /// <param name="options">可选保存选项；null 表示用已注册编码器的默认设置</param>
+        /// <exception cref="NotSupportedException">扩展名未注册，或该格式没有对应编码器</exception>
+        public void Save(ImageFrame frame, string path, SaveOptions? options = null)
+        {
+            ArgumentNullException.ThrowIfNull(frame);
+            ArgumentException.ThrowIfNullOrEmpty(path);
+            using var fs = new FileStream(path, FileMode.Create, FileAccess.Write);
+            Save(frame, fs, Path.GetExtension(path), options);
+        }
+
+        /// <summary>
+        /// 保存图像帧到指定路径，**格式由 <paramref name="extension"/> 显式指定**
+        /// （不看 <paramref name="path"/> 的扩展名）。
+        /// </summary>
+        /// <param name="frame">图像帧</param>
+        /// <param name="path">输出文件路径</param>
+        /// <param name="extension">目标格式的扩展名（".png" 或 "png"）</param>
+        /// <param name="options">可选保存选项；null 表示用已注册编码器的默认设置</param>
+        /// <exception cref="NotSupportedException">扩展名未注册，或该格式没有对应编码器</exception>
+        public void SaveAs(ImageFrame frame, string path, string extension, SaveOptions? options = null)
+        {
+            ArgumentNullException.ThrowIfNull(frame);
+            ArgumentException.ThrowIfNullOrEmpty(path);
+            using var fs = new FileStream(path, FileMode.Create, FileAccess.Write);
+            Save(frame, fs, extension, options);
+        }
+
+        /// <summary>
+        /// 保存图像帧到流（按 <paramref name="extension"/> 经注册表选择编码器）。
+        /// </summary>
+        /// <param name="frame">图像帧</param>
+        /// <param name="stream">输出流（不负责关闭）</param>
+        /// <param name="extension">目标格式的扩展名（".png" 或 "png"）</param>
+        /// <param name="options">可选保存选项；null 表示用已注册编码器的默认设置</param>
+        /// <exception cref="NotSupportedException">扩展名未注册，或该格式没有对应编码器</exception>
+        public void Save(ImageFrame frame, Stream stream, string extension, SaveOptions? options = null)
+        {
+            ArgumentNullException.ThrowIfNull(frame);
+            ArgumentNullException.ThrowIfNull(stream);
+            options ??= EmptySaveOptions;
+
+            Type formatType = ResolveFormatTypeOrThrow(extension);
+            if (HasAlpha(frame.PixelFormat) && _encodersRgba.TryGetValue(formatType, out var encoderRgba))
+            {
+                encoderRgba.EncodeRgba32(stream, AsRgba32Image(frame.ToRgba32()), options);
+                return;
+            }
+            if (_encoders.TryGetValue(formatType, out var encoder))
+            {
+                encoder.EncodeRgb24(stream, AsRgb24Image(frame.ToRgb24()), options);
+                return;
+            }
+            throw new NotSupportedException($"格式 {formatType.Name} 未注册 Rgb24 编码器");
+        }
+
+        private static readonly SaveOptions EmptySaveOptions = new();
+
+        private static bool HasAlpha(ImagePixelFormat format)
+            => format is ImagePixelFormat.Rgba32 or ImagePixelFormat.Bgra32;
+
+        /// <summary>把帧的缓冲区（不复制）包成类型化图像，供已注册编码器使用。</summary>
+        private static Image<Rgb24> AsRgb24Image(ImageFrame frame)
+            => new(frame.Width, frame.Height, frame.Pixels, frame.Metadata);
+
+        /// <summary>把帧的缓冲区（不复制）包成类型化图像，供已注册编码器使用。</summary>
+        private static Image<Rgba32> AsRgba32Image(ImageFrame frame)
+            => new(frame.Width, frame.Height, frame.Pixels, frame.Metadata);
 
         public void SaveGray8(Image<Gray8> image, string path)
         {
@@ -354,15 +433,7 @@ namespace SharpImageConverter.Core
         {
             ArgumentNullException.ThrowIfNull(image);
             ArgumentException.ThrowIfNullOrEmpty(path);
-            Type? formatType = ResolveFormatTypeByExtension(path);
-            if (formatType != null && _encodersRgba.TryGetValue(formatType, out var enc))
-            {
-                enc.EncodeRgba32(path, image);
-                return;
-            }
-            // 目标格式不支持 alpha（JPEG / BMP），或该格式只注册了 Rgb24 编码器：降通道后按 Rgb24 保存
-            var rgb = new Image<Rgb24>(image.Width, image.Height, RgbaToRgb(image.Buffer), image.Metadata);
-            SaveRgb24(rgb, path);
+            Save(image.ToFrame(), path);
         }
 
         /// <summary>
@@ -375,29 +446,15 @@ namespace SharpImageConverter.Core
         {
             ArgumentNullException.ThrowIfNull(image);
             ArgumentNullException.ThrowIfNull(stream);
-            Type? formatType = ResolveFormatTypeByExtensionName(extension);
-            if (formatType != null && _encodersRgba.TryGetValue(formatType, out var enc))
-            {
-                enc.EncodeRgba32(stream, image);
-                return;
-            }
-            var rgb = new Image<Rgb24>(image.Width, image.Height, RgbaToRgb(image.Buffer), image.Metadata);
-            SaveRgb24(rgb, stream, extension);
+            Save(image.ToFrame(), stream, extension);
         }
 
         /// <summary>
-        /// 按输出路径的扩展名解析已注册的编码器；未注册的扩展名或缺失编码器时抛
-        /// <see cref="NotSupportedException"/>（而不是字典访问异常）。
-        /// </summary>
-        private IImageEncoder GetEncoderOrThrow(string path)
-            => GetEncoderByExtensionOrThrow(Path.GetExtension(path));
-
-        /// <summary>
-        /// 按扩展名解析已注册的编码器；未注册的扩展名或缺失编码器时抛
-        /// <see cref="NotSupportedException"/>（而不是字典访问异常）。
+        /// 按扩展名解析已注册的格式类型；未注册时抛 <see cref="NotSupportedException"/>
+        /// （而不是字典访问异常）。
         /// </summary>
         /// <param name="extension">扩展名（".png" 或 "png"）</param>
-        private IImageEncoder GetEncoderByExtensionOrThrow(string extension)
+        private Type ResolveFormatTypeOrThrow(string extension)
         {
             Type? formatType = ResolveFormatTypeByExtensionName(extension);
             if (formatType is null)
@@ -405,18 +462,8 @@ namespace SharpImageConverter.Core
                 throw new NotSupportedException(
                     $"不支持的输出格式：\"{extension}\"。已注册的扩展名：{string.Join("、", _formatTypeByExtension.Keys)}");
             }
-            if (_encoders.TryGetValue(formatType, out var encoder))
-            {
-                return encoder;
-            }
-            throw new NotSupportedException($"格式 {formatType.Name} 未注册 Rgb24 编码器");
+            return formatType;
         }
-
-        /// <summary>
-        /// 扩展名 → 已注册格式类型；扩展名未注册时返回 null。
-        /// </summary>
-        private Type? ResolveFormatTypeByExtension(string path)
-            => ResolveFormatTypeByExtensionName(Path.GetExtension(path));
 
         /// <summary>
         /// 扩展名 → 已注册格式类型；扩展名未注册时返回 null。

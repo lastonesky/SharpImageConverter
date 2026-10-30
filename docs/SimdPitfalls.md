@@ -29,7 +29,7 @@
 | 项 | 处置 |
 |---|---|
 | `SimdHelper.RoundDownToMultiple` 真死代码 | 已删 |
-| `IImageProcessor` 无实现（public API） | 保留作扩展点，不删（删除是破坏性变更） |
+| `IImageProcessor` 无实现（public API） | 已删（2026-10-30）：没有 API 接受它，声明实现者的破坏面在实践中为空 |
 | Resize 类缺 SIMD | 已补：Bicubic 3.6x、Bilinear 扩到 8 像素（+6~8%） |
 | `PackRgbaToRgb` 逐 12 字节三次写出 | 已改：主循环一次 16 字节存储 |
 | `AddBytesInPlace` 的 AdvSimd 分支逐行重复 | 已知的跨 ISA 抽象成本，无害 |

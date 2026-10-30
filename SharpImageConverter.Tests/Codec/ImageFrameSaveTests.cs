@@ -3,6 +3,7 @@ using System.IO;
 using SharpImageConverter;
 using SharpImageConverter.Core;
 using SharpImageConverter.Formats.Gif;
+using SharpImageConverter.Formats.Jpeg;
 using SharpImageConverter.Formats.Webp;
 using SharpImageConverter.Tests.Helpers;
 using Xunit;
@@ -307,6 +308,90 @@ namespace SharpImageConverter.Tests
             byte[] bytes = ms.ToArray();
             Assert.Equal("GIF89a", System.Text.Encoding.ASCII.GetString(bytes, 0, 6));
             Assert.Equal(0x3B, bytes[^1]); // trailer
+        }
+
+        /// <summary>
+        /// 帧保存与类型化保存现在共用同一条链路（<see cref="Configuration.Save(ImageFrame, Stream, string, SaveOptions?)"/>）：
+        /// 同一份像素 + 同一份元数据，两条 API 写 .jpg 必须逐字节相同。
+        /// </summary>
+        [Fact]
+        public void SaveAsJpeg_Default_Keeps_Metadata_Like_Typed_Path()
+        {
+            // 用带 EXIF 的真实语料：帧路径此前两参重载走 JpegEncoder.Write 的默认
+            // keepMetadata:false，帧存 JPEG 静默丢 EXIF，而类型化保存保留——同一次「保存」两种口径。
+            string src = Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "examples", "5_star_base.jpg");
+            if (!File.Exists(src)) return; // 语料缺失时跳过（与本目录其他用例一致）
+
+            var frame = ImageFrame.Load(src);
+            Assert.True(frame.Metadata.ExifRaw is { Length: > 0 }, "语料应当带 EXIF，否则本用例失去意义");
+
+            using var kept = new MemoryStream();
+            frame.SaveAsJpeg(kept, 75);
+            using var dropped = new MemoryStream();
+            frame.SaveAsJpeg(dropped, 75, subsample420: true, keepMetadata: false);
+            Assert.True(kept.Length > dropped.Length,
+                $"默认应保留 EXIF：保留 {kept.Length} 字节，丢弃 {dropped.Length} 字节");
+
+            var typed = new Image<Rgb24>(frame.Width, frame.Height, frame.Pixels, frame.Metadata);
+            using var typedMs = new MemoryStream();
+            Configuration.Default.SaveRgb24(typed, typedMs, ".jpg");
+            BufferAssert.EqualExact(typedMs.ToArray(), kept.ToArray());
+        }
+
+        /// <summary>
+        /// <see cref="SaveOptions.Jpeg"/> 必须真的传到编码器：同质量下开 trellis 的产物必然不同。
+        /// 此前 <see cref="ImageFrame.SaveAsJpeg(string, int)"/> 只能表达质量与子采样，
+        /// trellis / 优化 Huffman 这类参数从帧侧根本传不进去。
+        /// </summary>
+        [Fact]
+        public void SaveOptions_Jpeg_Reaches_Encoder()
+        {
+            byte[] rgb = CreateRgbGradient(64, 48);
+            var frame = new ImageFrame(64, 48, rgb);
+
+            using var plain = new MemoryStream();
+            Configuration.Default.Save(frame, plain, ".jpg",
+                new SaveOptions { Jpeg = new JpegEncoderOptions(80, true, true, false) });
+            using var trellis = new MemoryStream();
+            Configuration.Default.Save(frame, trellis, ".jpg",
+                new SaveOptions { Jpeg = new JpegEncoderOptions(80, true, true, false, optimizeHuffman: false, trellisQuantization: true) });
+
+            Assert.NotEqual(plain.ToArray(), trellis.ToArray());
+        }
+
+        /// <summary>
+        /// 逐次保存传的 WebP 质量不能写回 <see cref="Configuration.Default"/> 里的共享编码器：
+        /// 否则一次 q10 保存会污染同进程后续所有默认保存。
+        /// </summary>
+        [Fact]
+        public void SaveOptions_Webp_Does_Not_Pollute_Shared_Encoder()
+        {
+            byte[] rgb = CreateRgbGradient(64, 48);
+            var frame = new ImageFrame(64, 48, rgb);
+
+            using var before = new MemoryStream();
+            Configuration.Default.Save(frame, before, ".webp");
+            using var low = new MemoryStream();
+            Configuration.Default.Save(frame, low, ".webp", new SaveOptions { WebpQuality = 10f });
+            using var after = new MemoryStream();
+            Configuration.Default.Save(frame, after, ".webp");
+
+            BufferAssert.EqualExact(before.ToArray(), after.ToArray());
+            Assert.True(low.Length < before.Length,
+                $"q10 应小于默认 q75：{low.Length} vs {before.Length}");
+        }
+
+        /// <summary>
+        /// 未注册的扩展名要给出可操作消息（附已注册扩展名列表），而不是字典异常。
+        /// </summary>
+        [Fact]
+        public void Save_Frame_Unregistered_Extension_Throws_With_Hint()
+        {
+            var frame = new ImageFrame(4, 4, CreateRgbGradient(4, 4));
+            using var ms = new MemoryStream();
+            var ex = Assert.Throws<NotSupportedException>(() => Configuration.Default.Save(frame, ms, ".foo"));
+            Assert.Contains("不支持的输出格式", ex.Message, StringComparison.Ordinal);
+            Assert.Contains(".png", ex.Message, StringComparison.Ordinal);
         }
 
         private static byte[] CreateRgbGradient(int w, int h)
