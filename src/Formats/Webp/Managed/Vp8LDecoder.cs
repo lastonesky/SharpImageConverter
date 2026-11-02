@@ -1,3 +1,6 @@
+using System;
+using System.Runtime.InteropServices;
+
 namespace SharpImageConverter.Formats.Webp.Managed;
 
 /// <summary>
@@ -22,46 +25,83 @@ public static class Vp8LDecoder
     private const int DistanceAlphabetSize = 40;
 
     /// <summary>
-    /// 从 VP8L chunk 数据解码。
+    /// 从 VP8L chunk 数据解码到新分配的 RGBA 缓冲区。
     /// </summary>
     public static byte[] Decode(ReadOnlySpan<byte> data, out int width, out int height)
+    {
+        ParseHeader(data, out width, out height);
+        var result = new byte[checked(width * height * 4)];
+        DecodeInto(data, result, out _, out _);
+        return result;
+    }
+
+    /// <summary>
+    /// 从 VP8L chunk 数据解码，直接写入调用方提供的 RGBA 缓冲区。
+    /// </summary>
+    /// <remarks>
+    /// 解码期间把 <paramref name="dst"/> 的前 <c>width*height*4</c> 字节当作 ARGB
+    /// <see cref="uint"/> 工作区就地做逆变换，最后做一次 ARGB→RGBA 的原地字节交换。
+    /// 相比"先分配 uint[] 工作区再分配 byte[] 输出"，整幅内存占用减半
+    /// （143 MP 图像从约 1.09 GB 降到约 545 MB）。
+    /// </remarks>
+    /// <param name="data">VP8L chunk 负载（含 5 字节帧头）。</param>
+    /// <param name="dst">输出缓冲区，长度至少 width*height*4。</param>
+    /// <param name="width">输出宽度。</param>
+    /// <param name="height">输出高度。</param>
+    public static void DecodeInto(ReadOnlySpan<byte> data, Span<byte> dst, out int width, out int height)
     {
         if (data.Length < 5) throw new WebpBitstreamException("VP8L 数据过短（需要至少 5 字节帧头）");
 
         var reader = new LsbBitReader(data);
+        ReadHeader(ref reader, out width, out height);
 
-        // ---- 解析 VP8L 帧头（共 40 bits = 5 字节） ----
+        int pixelBytes = checked(width * height * 4);
+        if (dst.Length < pixelBytes)
+            throw new ArgumentException($"输出缓冲区不足：需要 {pixelBytes} 字节，实际 {dst.Length}", nameof(dst));
+
+        var argb = MemoryMarshal.Cast<byte, uint>(dst[..pixelBytes]);
+        var final = DecodeImageStreamCore(width, height, isLevel0: true, ref reader, argb);
+
+        if (final.Length != argb.Length)
+            throw new WebpBitstreamException($"解码输出像素数 {final.Length} 与预期 {argb.Length} 不符");
+        if (!final.Overlaps(argb))
+            final.CopyTo(argb);
+
+        // ARGB（内存字节序 B,G,R,A）→ RGBA（R,G,B,A），原地交换 R/B 两个通道。
+        for (int i = 0; i < argb.Length; i++)
+        {
+            uint p = argb[i];
+            argb[i] = (p & 0xFF00FF00u) | ((p >> 16) & 0xFFu) | ((p & 0xFFu) << 16);
+        }
+    }
+
+    /// <summary>只解析 VP8L 帧头拿宽高，不解码像素（用于预分配零拷贝输出缓冲区）。</summary>
+    public static void ReadSize(ReadOnlySpan<byte> data, out int width, out int height)
+        => ParseHeader(data, out width, out height);
+
+    /// <summary>解析 VP8L 5 字节帧头（可独立用于只取尺寸）。</summary>
+    private static void ParseHeader(ReadOnlySpan<byte> data, out int width, out int height)
+    {
+        if (data.Length < 5) throw new WebpBitstreamException("VP8L 数据过短（需要至少 5 字节帧头）");
+        var reader = new LsbBitReader(data);
+        ReadHeader(ref reader, out width, out height);
+    }
+
+    private static void ReadHeader(ref LsbBitReader reader, out int width, out int height)
+    {
+        // ---- VP8L 帧头：signature(8) + width-1(14) + height-1(14) + alpha(1) + version(3) ----
         byte signature = (byte)reader.ReadBits(8);
         if (signature != 0x2F) throw new WebpBitstreamException($"VP8L 签名错误：0x{signature:X2}（应为 0x2F）");
 
-        uint wBits = reader.ReadBits(14);
-        width = (int)wBits + 1;
-        uint hBits = reader.ReadBits(14);
-        height = (int)hBits + 1;
-
+        width = (int)reader.ReadBits(14) + 1;
+        height = (int)reader.ReadBits(14) + 1;
         if (width < 1 || height < 1 || width > MaxDimension || height > MaxDimension)
             throw new WebpBitstreamException($"VP8L 尺寸 {width}x{height} 超出规格");
 
-        int alphaUsed = (int)reader.ReadBits(1);
+        _ = reader.ReadBits(1); // alpha_used
         int version = (int)reader.ReadBits(3);
         if (version != 0)
             throw new WebpUnsupportedException($"VP8L version={version} 不支持（本实现只支持 version=0）");
-
-        // ---- 递归解码主图像 ----
-        var pixels = DecodeImageStream(width, height, isLevel0: true, ref reader);
-
-        // ---- 输出 ARGB → R,G,B,A 字节序列（与 libwebp WebPDecodeRGBAInto 对齐） ----
-        var result = new byte[pixels.Length * 4];
-        for (int i = 0; i < pixels.Length; i++)
-        {
-            uint p = pixels[i];
-            result[i * 4 + 0] = (byte)((p >> 16) & 0xFF); // R
-            result[i * 4 + 1] = (byte)((p >> 8) & 0xFF);  // G
-            result[i * 4 + 2] = (byte)(p & 0xFF);         // B
-            result[i * 4 + 3] = (byte)((p >> 24) & 0xFF); // A
-        }
-
-        return result;
     }
 
     /// <summary>
@@ -73,7 +113,9 @@ public static class Vp8LDecoder
         if (width < 1 || height < 1 || width > MaxDimension || height > MaxDimension)
             throw new WebpBitstreamException($"VP8L 裸流尺寸 {width}x{height} 超出规格");
         var reader = new LsbBitReader(data);
-        return DecodeImageStream(width, height, isLevel0: true, ref reader);
+        var buffer = new uint[checked(width * height)];
+        var span = DecodeImageStreamCore(width, height, isLevel0: true, ref reader, buffer);
+        return span.Length == buffer.Length ? buffer : span.ToArray();
     }
 
     /// <summary>
@@ -93,8 +135,11 @@ public static class Vp8LDecoder
     /// <summary>
     /// 递归解码：VP8L 的核心流程。对照 libwebp DecodeImageStream()。
     /// </summary>
-    private static uint[] DecodeImageStream(int xsize, int ysize, bool isLevel0,
-                                            ref LsbBitReader reader)
+    /// <param name="level0Dst">
+    /// 仅 level 0 使用：调用方提供的整幅工作区（ARGB）。长度不足时退化为内部新建。
+    /// </param>
+    private static Span<uint> DecodeImageStreamCore(int xsize, int ysize, bool isLevel0,
+                                                    ref LsbBitReader reader, Span<uint> level0Dst)
     {
         int transformXSize = xsize;
         int transformYSize = ysize;
@@ -118,7 +163,7 @@ public static class Vp8LDecoder
                         int bits = MIN_TRANSFORM_BITS + (int)reader.ReadBits(NUM_TRANSFORM_BITS);
                         int subX = SubSampleSize(transformXSize, bits);
                         int subY = SubSampleSize(transformYSize, bits);
-                        var dataPixels = DecodeImageStream(subX, subY, isLevel0: false, ref reader);
+                        var dataPixels = DecodeImageStreamCore(subX, subY, isLevel0: false, ref reader, default).ToArray();
                         transforms.Add(new TransformInfo(
                             (Vp8LTransforms.TransformType)type, bits,
                             transformXSize, transformYSize,
@@ -148,7 +193,7 @@ public static class Vp8LDecoder
                         // Color Indexing 只在水平方向 sub-sample（pack 索引），垂直方向保持 origY
                         int subX = SubSampleSize(origX, bitsPerPixel);
                         int subY = origY;
-                        var palettePixels = DecodeImageStream(numColors, 1, isLevel0: false, ref reader);
+                        var palettePixels = DecodeImageStreamCore(numColors, 1, isLevel0: false, ref reader, default).ToArray();
                         // 调色板按字节差分展开并补黑到尾（libwebp ExpandColorMap）。
                         uint[] palette = Vp8LTransforms.ExpandPalette(
                             palettePixels.AsSpan(0, numColors), numColors, bitsPerPixel);
@@ -193,7 +238,7 @@ public static class Vp8LDecoder
             huffmanPrecision = MIN_HUFFMAN_BITS + (int)reader.ReadBits(NUM_HUFFMAN_BITS);
             int huffXSize = SubSampleSize(transformXSize, huffmanPrecision);
             int huffYSize = SubSampleSize(transformYSize, huffmanPrecision);
-            huffmanImage = DecodeImageStream(huffXSize, huffYSize, isLevel0: false, ref reader);
+            huffmanImage = DecodeImageStreamCore(huffXSize, huffYSize, isLevel0: false, ref reader, default).ToArray();
             huffStride = huffXSize;
 
             // huffman image 的绿色字节存放 group id（libwebp: (pixel >> 8) & 0xffff）。
@@ -259,7 +304,10 @@ public static class Vp8LDecoder
 
         // ---- 4. 像素解码 ----
         int totalPixels = transformXSize * transformYSize;
-        var argb = new uint[totalPixels];
+        Span<uint> argb = (isLevel0 && level0Dst.Length >= totalPixels)
+            ? level0Dst[..totalPixels]
+            : new uint[totalPixels];
+
         DecodePixels(ref reader, tables, argb, colorCache, transformXSize,
                      huffmanImage, huffStride, huffmanPrecision, numHuffmanGroups);
 
@@ -273,28 +321,42 @@ public static class Vp8LDecoder
             {
                 case Vp8LTransforms.TransformType.Predictor:
                     if (transform.Data != null)
-                        Vp8LTransforms.ApplyPredictorInverse(argb.AsSpan(),
+                        Vp8LTransforms.ApplyPredictorInverse(argb,
                                                               transform.XSize, transform.YSize,
                                                               transform.Data, transform.Bits);
                     break;
                 case Vp8LTransforms.TransformType.CrossColor:
                     if (transform.Data != null)
-                        Vp8LTransforms.ApplyColorTransformInverse(argb.AsSpan(),
+                        Vp8LTransforms.ApplyColorTransformInverse(argb,
                                                                    transform.XSize, transform.YSize,
                                                                    transform.Data, transform.Bits);
                     break;
                 case Vp8LTransforms.TransformType.SubtractGreen:
-                    Vp8LTransforms.ApplySubtractGreenInverse(argb.AsSpan(),
+                    Vp8LTransforms.ApplySubtractGreenInverse(argb,
                                                              transform.XSize, transform.YSize);
                     break;
                 case Vp8LTransforms.TransformType.ColorIndexing:
                     if (transform.Data != null)
-                        argb = Vp8LTransforms.ApplyColorIndexingInverse(
-                            argb.AsSpan(),
+                    {
+                        var expanded = Vp8LTransforms.ApplyColorIndexingInverse(
+                            argb,
                             transform.SubXSize,  // src 宽度 = SubSampleSize(origWidth, bits)
                             transform.YSize,     // src 高度 = origHeight (ColorIndexing 只 sub-sample 水平)
                             transform.XSize, transform.YSize,
                             transform.Data, transform.Bits);
+
+                        // level 0 且工作区足够大时，把上采样结果摊回调用方缓冲区，
+                        // 保证整幅只存在一份（33% 体积的调色板图才走这条分支）。
+                        if (isLevel0 && level0Dst.Length >= expanded.Length)
+                        {
+                            expanded.AsSpan().CopyTo(level0Dst);
+                            argb = level0Dst[..expanded.Length];
+                        }
+                        else
+                        {
+                            argb = expanded;
+                        }
+                    }
                     break;
             }
         }

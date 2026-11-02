@@ -1,3 +1,5 @@
+using System;
+using System.Collections.Generic;
 using System.IO;
 
 namespace SharpImageConverter.Formats.Webp.Managed;
@@ -18,7 +20,9 @@ public sealed record WebpAnimation(int CanvasWidth, int CanvasHeight, int LoopCo
 /// 设计目标：
 /// - 与 libwebp 并存，独立命名空间，不影响现有互操作路径；
 /// - 返回标准化 RGBA 像素数据（R,G,B,A 每像素 4 字节），便于接入统一图像抽象层；
-/// - 遇到当前不支持的特性（有损 VP8）抛 <see cref="WebpUnsupportedException"/>，
+/// - 提供 <see cref="DecodeRgbaInto(ReadOnlySpan{byte}, Span{byte}, out int, out int)"/>
+///   零拷贝重载：直接把像素解到调用方的缓冲区，整幅图像只存在一份；
+/// - 遇到当前不支持的特性（有损 VP8、动图的 VP8 帧）抛 <see cref="WebpUnsupportedException"/>，
 ///   由调用方回退到 libwebp。
 /// </summary>
 public static class ManagedWebpDecoder
@@ -52,6 +56,51 @@ public static class ManagedWebpDecoder
     {
         var container = WebpContainer.Load(data);
         return DecodeRgbaFromContainer(container, out width, out height);
+    }
+
+    /// <summary>
+    /// 从完整字节数组解码（不复制输入文件，减少一次整文件分配）。
+    /// </summary>
+    public static byte[] DecodeRgba(byte[] data, out int width, out int height)
+    {
+        ArgumentNullException.ThrowIfNull(data);
+        var container = WebpContainer.Load(data);
+        return DecodeRgbaFromContainer(container, out width, out height);
+    }
+
+    /// <summary>
+    /// 从完整字节数组解码到调用方缓冲区（静态图零整幅拷贝）。
+    /// </summary>
+    public static void DecodeRgbaInto(byte[] data, Span<byte> dst, out int width, out int height)
+    {
+        ArgumentNullException.ThrowIfNull(data);
+        var container = WebpContainer.Load(data);
+        DecodeRgbaIntoContainer(container, dst, out width, out height);
+    }
+
+    /// <summary>
+    /// 解码 WebP 到调用方提供的 RGBA 缓冲区（静态图零整幅拷贝）。
+    /// </summary>
+    /// <remarks>
+    /// 动图会解码全部帧后把最后一帧画布复制到 <paramref name="dst"/>。
+    /// </remarks>
+    /// <param name="data">完整 WebP 文件字节。</param>
+    /// <param name="dst">输出缓冲区，长度至少 width*height*4。</param>
+    /// <param name="width">输出宽度。</param>
+    /// <param name="height">输出高度。</param>
+    public static void DecodeRgbaInto(ReadOnlySpan<byte> data, Span<byte> dst, out int width, out int height)
+    {
+        var container = WebpContainer.Load(data);
+        DecodeRgbaIntoContainer(container, dst, out width, out height);
+    }
+
+    /// <summary>
+    /// 解码 WebP 流到调用方提供的 RGBA 缓冲区。
+    /// </summary>
+    public static void DecodeRgbaInto(Stream stream, Span<byte> dst, out int width, out int height)
+    {
+        var container = WebpContainer.Load(stream);
+        DecodeRgbaIntoContainer(container, dst, out width, out height);
     }
 
     /// <summary>
@@ -95,28 +144,52 @@ public static class ManagedWebpDecoder
             return last.Rgba;
         }
 
-        var containerKind = container.Kind;
+        var primary = RequirePrimaryChunk(container);
+        EnsureVp8L(primary);
+        Vp8LDecoder.ReadSize(primary.GetData(container.RawData), out width, out height);
 
-        // 本批只实现 VP8L 无损解码。有损 VP8 抛 unsupported。
-        if (containerKind == WebpContainerKind.Vp8)
-            throw new WebpUnsupportedException("有损 VP8 格式暂不支持（下一批实现）");
+        var rgba = new byte[checked(width * height * 4)];
+        DecodeStaticInto(container, primary, rgba, width, height);
+        return rgba;
+    }
 
-        if (containerKind == WebpContainerKind.Unknown)
-            throw new WebpContainerException("无法识别的 WebP 文件类型");
+    private static void DecodeRgbaIntoContainer(WebpContainer container, Span<byte> dst, out int width, out int height)
+    {
+        if (container.IsAnimation)
+        {
+            var animation = DecodeAnimationFromContainer(container);
+            if (animation.Frames.Length == 0)
+                throw new WebpContainerException("动图缺少可解码的帧");
+            var last = animation.Frames[animation.Frames.Length - 1];
+            width = animation.CanvasWidth;
+            height = animation.CanvasHeight;
+            int need = checked(width * height * 4);
+            if (dst.Length < need)
+                throw new ArgumentException($"输出缓冲区不足：需要 {need} 字节，实际 {dst.Length}", nameof(dst));
+            last.Rgba.AsSpan().CopyTo(dst);
+            return;
+        }
 
-        // 获取主图像 chunk
-        var primary = container.GetPrimaryImageChunk();
-        if (!primary.HasValue)
-            throw new WebpContainerException("主图像 chunk 未找到");
+        var primary = RequirePrimaryChunk(container);
+        EnsureVp8L(primary);
+        Vp8LDecoder.ReadSize(primary.GetData(container.RawData), out width, out height);
 
-        if (primary.Value.Id == WebpChunkId.Vp8)
-            throw new WebpUnsupportedException("有损 VP8 格式暂不支持");
+        int required = checked(width * height * 4);
+        if (dst.Length < required)
+            throw new ArgumentException($"输出缓冲区不足：需要 {required} 字节，实际 {dst.Length}", nameof(dst));
 
-        if (primary.Value.Id != WebpChunkId.Vp8L)
-            throw new WebpContainerException($"主图像 chunk 类型未处理: {primary.Value.Id}");
+        DecodeStaticInto(container, primary, dst[..required], width, height);
+    }
 
-        // 先解码 VP8L 主图，尺寸以 VP8L 帧头为准
-        var rgba = Vp8LDecoder.Decode(primary.Value.GetData(container.RawData), out width, out height);
+    /// <summary>静态图（非动图）的主解码路径：VP8L 直接解到 dst，再叠 ALPH。</summary>
+    private static void DecodeStaticInto(WebpContainer container, WebpChunk primary, Span<byte> dst,
+                                         int width, int height)
+    {
+        EnsureVp8L(primary);
+
+        Vp8LDecoder.DecodeInto(primary.GetData(container.RawData), dst, out int decodedWidth, out int decodedHeight);
+        if (decodedWidth != width || decodedHeight != height)
+            throw new WebpContainerException($"VP8L 帧尺寸 {decodedWidth}x{decodedHeight} 与容器声明 {width}x{height} 不符");
 
         // 若存在 ALPH 独立 alpha 通道，用其覆盖每个像素的 A 字节
         var alph = container.FindChunk(WebpChunkId.Alph);
@@ -126,10 +199,30 @@ public static class ManagedWebpDecoder
             if (alpha.Length != width * height)
                 throw new WebpContainerException($"ALPH 通道长度 {alpha.Length} 与图像尺寸 {width}x{height} 不符");
             for (int i = 0; i < alpha.Length; i++)
-                rgba[i * 4 + 3] = alpha[i];
+                dst[i * 4 + 3] = alpha[i];
         }
+    }
 
-        return rgba;
+    /// <summary>主图像 chunk 必须是 VP8L；有损 VP8 走 libwebp。</summary>
+    private static void EnsureVp8L(WebpChunk primary)
+    {
+        if (primary.Id == WebpChunkId.Vp8)
+            throw new WebpUnsupportedException("有损 VP8 格式暂不支持（下一批实现）");
+        if (primary.Id != WebpChunkId.Vp8L)
+            throw new WebpContainerException($"主图像 chunk 类型未处理: {primary.Id}");
+    }
+
+    private static WebpChunk RequirePrimaryChunk(WebpContainer container)
+    {
+        if (container.Kind == WebpContainerKind.Unknown)
+            throw new WebpContainerException("无法识别的 WebP 文件类型");
+        if (container.Kind == WebpContainerKind.Vp8)
+            throw new WebpUnsupportedException("有损 VP8 格式暂不支持（下一批实现）");
+
+        var primary = container.GetPrimaryImageChunk();
+        if (!primary.HasValue)
+            throw new WebpContainerException("主图像 chunk 未找到");
+        return primary.Value;
     }
 
     private static WebpAnimation DecodeAnimationFromContainer(WebpContainer container)

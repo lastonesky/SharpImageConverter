@@ -158,6 +158,23 @@ public sealed class WebpContainer
     /// <summary>
     /// 从内存缓冲区直接解析。
     /// </summary>
+    /// <remarks>
+    /// 传入完整 <see cref="byte"/> 数组时不会复制数据（容器直接引用该数组）；只解析 chunk 目录，
+    /// 因此 24 MB 的 143 MP 文件不再多出一次整文件拷贝。
+    /// 传入的数组在容器生命周期内不应被修改。
+    /// </remarks>
+    public static WebpContainer Load(byte[] data)
+    {
+        ArgumentNullException.ThrowIfNull(data);
+        var c = new WebpContainer(data);
+        c.Parse();
+        return c;
+    }
+
+    /// <summary>
+    /// 从内存缓冲区直接解析（会复制一份；传入 <see cref="byte"/> 数组时请用
+    /// <see cref="Load(byte[])"/> 重载以避免整文件拷贝）。
+    /// </summary>
     public static WebpContainer Load(ReadOnlySpan<byte> data)
     {
         byte[] copy = data.ToArray();

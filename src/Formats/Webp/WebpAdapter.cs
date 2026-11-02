@@ -67,7 +67,9 @@ namespace SharpImageConverter.Formats.Webp
     {
         internal static byte[] DecodeRgbaFromStream(Stream stream, out int width, out int height)
         {
-            return WebpCodec.DecodeRgbaFromStream(stream, out width, out height);
+            // 按 WebpDecodePolicy 在纯托管实现与 libwebp 之间分派，
+            // 托管不支持的特性（有损 VP8 / 动图）在 Auto 下自动回退。
+            return WebpDecodeDispatch.DecodeRgba(stream, out width, out height);
         }
     }
 

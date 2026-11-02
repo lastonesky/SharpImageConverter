@@ -53,7 +53,11 @@
   - LZW 压缩；不写入透明度与动画元数据（延时、循环）
 
 ### WebP 支持
-- 读取/写入 WebP（通过 `runtimes/` 下的原生 `libwebp`）
+- 读取/写入 WebP（编码通过 `runtimes/` 下的原生 `libwebp`）
+- **解码可选纯 C# 实现**：VP8L 无损（含 ALPH 独立 alpha、VP8X 动图帧）由托管代码解码，
+  与 libwebp 逐像素一致；有损 VP8 与动图仍走 libwebp。环境变量 `SIC_WEBP_BACKEND`
+  取 `auto`（默认）/ `libwebp` / `managed`，`managed` 模式对不支持的特性直接报错而不回退；
+  `SIC_WEBP_TRACE=1` 可打印回退原因。也可在代码里设置 `WebpDecodePolicy.Backend`
 - 统一解码为 RGB24，再根据输出扩展名选择编码器写回
 - WebP 编码质量与并发策略可配置
 - WebP 实现依赖 Google 的 libwebp 及相关组件（BSD-3-Clause License），其版权与许可信息详见 `THIRD-PARTY-NOTICES.md`

@@ -50,7 +50,12 @@ This library was originally created to address several practical issues we encou
   - LZW compression; no transparency/animation metadata (delay, loop)
 
 ### WebP
-- Read/Write WebP via native libwebp under `runtimes/`
+- Read/Write WebP (encoding via native libwebp under `runtimes/`)
+- **Optional pure C# decoder**: VP8L lossless (including ALPH and VP8X animation frames) is decoded
+  in managed code and is bit-exact against libwebp; lossy VP8 and animations still use libwebp.
+  Env var `SIC_WEBP_BACKEND` accepts `auto` (default) / `libwebp` / `managed`; `managed` throws
+  instead of falling back for unsupported features, and `SIC_WEBP_TRACE=1` logs fallback reasons.
+  It can also be set in code via `WebpDecodePolicy.Backend`
 - Unified decode to RGB24; select encoder based on output file extension
 - WebP encode quality and concurrency strategy are configurable
 - WebP implementation relies on Google's libwebp and related components (BSD-3-Clause License); see `THIRD-PARTY-NOTICES.md` for copyright and license details

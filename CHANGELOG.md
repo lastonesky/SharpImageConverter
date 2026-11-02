@@ -1,5 +1,40 @@
 ## 未发布
 
+### WebP 托管解码接入与提速
+
+- **解码后端可在托管实现与 libwebp 之间切换**：新增 `Formats/Webp/WebpDecodeBackend.cs`
+  （`WebpDecodePolicy.Backend` + `WebpDecodeDispatch`）。环境变量 `SIC_WEBP_BACKEND=auto|libwebp|managed`
+  控制，默认 `auto`：VP8L 无损走纯 C# 实现，有损 VP8 与动图回退 libwebp；
+  `managed` 模式**不静默回退**，不支持的特性直接抛 `WebpUnsupportedException`（便于被测/被观测）；
+  `SIC_WEBP_TRACE=1` 时回退原因输出到 stderr。`WebpDecoderAdapter`/`WebpDecoderAdapterRgba`
+  改走 `WebpDecodeDispatch`，上层 API 与 CLI 无需改动。
+- **修掉托管解码的两处性能与内存瓶颈**（此前无损解码比 libwebp 慢 1.25~2.8 倍、噪声图 14.9 倍）：
+  - `LsbBitReader` 由「逐 bit 读 + 每次边界检查」改为 64 位缓冲 + 4 字节批量 refill，
+    新增 `PeekBits`/`SkipBits`；`ReadBits` 在缓冲内一次取完；
+  - `HuffmanTable.DecodeSymbol` 由「逐位读 + 每层线性扫码字」改为 8 bit 一级查找表
+    （`code` 按 MSB-first、位流 LSB-first，故按 `reverse(code, len)` 铺表），码长 > 8 才走慢路径。
+- **整幅内存减半**：新增 `Vp8LDecoder.DecodeInto` / `ManagedWebpDecoder.DecodeRgbaInto`，
+  直接把像素解到调用方缓冲区，ARGB 逆变换就地完成、最后原地做 ARGB→RGBA 字节交换；
+  另为 `WebpContainer.Load(byte[])` 与 `ManagedWebpDecoder.DecodeRgba(byte[])` 加了零拷贝重载
+  （此前每次解码都会 `data.ToArray()` 复制整个文件）。143 MP 无损图像的解码分配
+  **1117.7 MB → 550.9 MB**（输出本身 545.5 MB）。
+- 实测（同一进程、warm 5 / iter 10 取最小值，与 libwebp 1.6 对比，全部逐像素 **bit-exact**；
+  同机不同时段整体负载会让绝对值一起漂移 ±30%，**看同一行的比例**）：
+
+  | 场景 | libwebp | 托管（优化后） | 优化前 |
+  |---|---|---|---|
+  | 照片 1000×1000 无损 | 14.0 ms | 14.0 ms | 19.3 ms |
+  | 渐变 1920×1080 无损 | 16.1 ms | 16.0 ms | 17.1 ms |
+  | 噪声 1024×768 无损 | 9.8 ms | 9.2 ms | 101.8 ms |
+  | 143 MP 无损 | 1888 ms | 1905 ms | 2468 ms |
+
+- 动图在 `auto` 下**始终**走 libwebp：托管实现会把每帧解成整幅画布快照（内存与时序都与既有单图
+  解码不同），且 libwebp 的单图 API 本身解不了动图，替换只会改变失败/成功边界。
+- 新增 `SharpImageConverter.Tests/Codec/WebpDecodeBackendTests.cs`（8 个用例）：
+  `DecodeRgbaInto` 与 `DecodeRgba` 逐字节一致、不越界写尾部、缓冲区不足抛 `ArgumentException`；
+  Auto 无损走托管且与 libwebp 输出一致、Auto 有损回退、Managed 有损抛 `WebpUnsupportedException`、
+  Auto 动图行为与 libwebp 完全一致。
+
 ### API（含破坏性变更）
 
 - **保存链路收口到 `Configuration`，两套图像模型不再各写一套**：新增
