@@ -1,5 +1,6 @@
 using System;
 using SharpImageConverter.Formats.Webp.Managed;
+using SharpImageConverter.Metadata;
 
 namespace SharpImageConverter.Formats.Webp
 {
@@ -67,12 +68,15 @@ namespace SharpImageConverter.Formats.Webp
                     "托管 WebP 编码器目前只支持无损（VP8L），有损编码需要 libwebp 后端");
         }
 
-        /// <summary>按策略把 RGBA 无损编码成完整 WebP 字节。</summary>
-        public static byte[] EncodeLosslessRgba(ReadOnlySpan<byte> rgba, int width, int height, bool managed)
+        /// <summary>按策略把 RGBA 无损编码成完整 WebP 字节，并透传元数据。</summary>
+        public static byte[] EncodeLosslessRgba(ReadOnlySpan<byte> rgba, int width, int height,
+            bool managed, ImageMetadata? metadata = null)
         {
-            return managed
-                ? ManagedWebpEncoder.EncodeRgba(rgba, width, height)
-                : WebpCodec.EncodeLosslessRgbaForDispatch(rgba, width, height);
+            if (managed)
+                return ManagedWebpEncoder.EncodeRgba(rgba, width, height, metadata);
+
+            byte[] bytes = WebpCodec.EncodeLosslessRgbaForDispatch(rgba, width, height);
+            return WebpMetadataWriter.Apply(bytes, width, height, metadata);
         }
     }
 }

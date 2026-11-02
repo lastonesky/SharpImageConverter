@@ -466,7 +466,7 @@ public sealed class ImageFrame
     {
         var dec = new WebpDecoderAdapter();
         var img = dec.DecodeRgb24(stream);
-        return new ImageFrame(img.Width, img.Height, img.Buffer);
+        return new ImageFrame(img.Width, img.Height, img.Buffer, metadata: img.Metadata);
     }
 
     /// <summary>

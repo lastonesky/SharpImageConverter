@@ -1180,7 +1180,8 @@ internal static class Vp8LEncoder
     /// <summary>
     /// 确定性的 token 遍历器：同一输入、同一代价模型两次遍历产生完全一致的 token 序列
     /// （编码器先用第一遍统计频次，再用第二遍写位流）。
-    /// LZ77 用 hash 链保存同 hash 的历史位置，每次考察最多 <see cref="MaxChainCandidates"/> 个候选，
+    /// LZ77 用 hash 链保存同 hash 的历史位置，每次考察的候选数按图像尺寸自适应
+    /// （小图保留更多候选以稳住压缩率，大图减少无效深搜以降低耗时），
     /// 按"可被覆盖像素的码表代价 - copy 代价"选收益最大的一个。
     /// </summary>
     private sealed class TokenWalker
@@ -1191,7 +1192,6 @@ internal static class Vp8LEncoder
 
         /// <summary>自适应哈希表的位宽下限（512 项，128×128 以下的小图不再继续缩小）。</summary>
         private const int MinHashBits = 9;
-        private const int MaxChainCandidates = 32;
         private const int MinMatchLength = 3;
 
         private readonly uint[] _pixels;
@@ -1204,6 +1204,7 @@ internal static class Vp8LEncoder
         private readonly int _hashShift;
         private readonly int[] _chain;
         private readonly int _chainMask;
+        private readonly int _maxChainCandidates;
         private readonly uint[] _cache;
         private readonly int[] _distanceToPlaneCode;
         private int _pos;
@@ -1231,6 +1232,12 @@ internal static class Vp8LEncoder
             while (chainSize < wanted) chainSize <<= 1;
             _chain = useLz77 ? new int[chainSize] : System.Array.Empty<int>();
             _chainMask = chainSize - 1;
+
+            // 链深度按像素数自适应：小图候选便宜，保留 32 个以稳住压缩率；
+            // 大图深搜命中率下降，逐级缩减到 16 个。体积变化由 WebpLEncoderTests 的体积回归锁定。
+            _maxChainCandidates = useLz77
+                ? (_total < 1 << 16 ? 32 : _total < 1 << 20 ? 24 : 16)
+                : 0;
             _distanceToPlaneCode = useLz77 ? BuildDistanceToPlaneCode(width) : System.Array.Empty<int>();
             _cache = cacheBits > 0 ? new uint[1 << cacheBits] : System.Array.Empty<uint>();
         }
@@ -1312,7 +1319,7 @@ internal static class Vp8LEncoder
             int candidate = _hashHead[hash];
             int examined = 0;
 
-            while (candidate >= 0 && examined < MaxChainCandidates)
+            while (candidate >= 0 && examined < _maxChainCandidates)
             {
                 if (bestLength >= maxLength) break;
 

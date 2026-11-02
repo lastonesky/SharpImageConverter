@@ -7,6 +7,11 @@ namespace SharpImageConverter.Metadata
         public byte[]? ExifRaw { get; set; }
         public ExifMetadata? Exif { get; set; }
 
+        /// <summary>
+        /// XMP 原始 XML 字节（容器内原样保存，不做解析）。
+        /// </summary>
+        public byte[]? XmpRaw { get; set; }
+
         public byte[]? IccProfile { get; set; }
         public IccProfileKind IccProfileKind { get; set; } = IccProfileKind.Unknown;
 
@@ -34,6 +39,7 @@ namespace SharpImageConverter.Metadata
             Orientation = Orientation,
             ExifRaw = ExifRaw,
             Exif = Exif,
+            XmpRaw = XmpRaw,
             IccProfile = IccProfile,
             IccProfileKind = IccProfileKind,
             HorizontalDpi = HorizontalDpi,

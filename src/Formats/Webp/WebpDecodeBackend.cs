@@ -3,6 +3,7 @@ using System.Buffers;
 using System.IO;
 using SharpImageConverter.Formats.Png;
 using SharpImageConverter.Formats.Webp.Managed;
+using SharpImageConverter.Metadata;
 
 namespace SharpImageConverter.Formats.Webp
 {
@@ -63,11 +64,22 @@ namespace SharpImageConverter.Formats.Webp
     {
         /// <summary>把 WebP 流解码为 RGBA 字节（每像素 R,G,B,A）。</summary>
         public static byte[] DecodeRgba(Stream stream, out int width, out int height)
+            => DecodeRgba(stream, out width, out height, out _);
+
+        /// <summary>
+        /// 把 WebP 流解码为 RGBA 字节，同时从容器原样取出 ICCP / EXIF / XMP。
+        /// </summary>
+        public static byte[] DecodeRgba(Stream stream, out int width, out int height, out ImageMetadata? metadata)
         {
             ArgumentNullException.ThrowIfNull(stream);
 
             if (stream.CanSeek)
-                return DecodeRgba(ReadSeekable(stream), out width, out height);
+            {
+                byte[] data = ReadSeekable(stream);
+                var rgba = DecodeRgba(data, out width, out height);
+                metadata = ExtractMetadata(data);
+                return rgba;
+            }
 
             // 不可 Seek（网络流）：用池化缓冲收完，解码期间直接在该缓冲上做，避免 ToArray 再拷一份。
             byte[] poolBuf = ArrayPool<byte>.Shared.Rent(32 * 1024);
@@ -80,12 +92,40 @@ namespace SharpImageConverter.Formats.Webp
 
                 var seg = ms.GetBuffer();
                 if (seg.Count <= 0) throw new InvalidDataException("WebP 流数据为空");
-                return DecodeRgba(seg.Array!.AsSpan(seg.Offset, seg.Count), out width, out height);
+                byte[] data = seg.Array!.AsSpan(seg.Offset, seg.Count).ToArray();
+                var rgba = DecodeRgba(data, out width, out height);
+                metadata = ExtractMetadata(data);
+                return rgba;
             }
             finally
             {
                 ArrayPool<byte>.Shared.Return(poolBuf);
             }
+        }
+
+        /// <summary>
+        /// 从完整 WebP 字节中取出元数据 chunk（只透传原始字节，不解析内容）。
+        /// 容器结构异常时不影响解码结果，返回 null。
+        /// </summary>
+        internal static ImageMetadata? ExtractMetadata(byte[] data)
+        {
+            WebpContainer container;
+            try
+            {
+                container = WebpContainer.Load(data);
+            }
+            catch (WebpContainerException)
+            {
+                return null;
+            }
+
+            if (!container.HasIccProfile && !container.HasExif && !container.HasXmp) return null;
+
+            var metadata = new ImageMetadata();
+            if (container.HasIccProfile) metadata.IccProfile = container.IccProfile.ToArray();
+            if (container.HasExif) metadata.ExifRaw = container.Exif.ToArray();
+            if (container.HasXmp) metadata.XmpRaw = container.Xmp.ToArray();
+            return metadata;
         }
 
         /// <summary>把 WebP 字节解码为 RGBA 字节（每像素 R,G,B,A）。</summary>

@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using SharpImageConverter.Metadata;
 
 namespace SharpImageConverter.Formats.Webp.Managed;
 
@@ -31,13 +32,32 @@ public static class ManagedWebpEncoder
     }
 
     /// <summary>
+    /// 把 RGBA 像素编码为完整 WebP 字节（无损 VP8L），并原样写入元数据。
+    /// </summary>
+    /// <param name="rgba">像素数据，每像素 R,G,B,A 连续 4 字节。</param>
+    /// <param name="width">图像宽度（1..16384）。</param>
+    /// <param name="height">图像高度（1..16384）。</param>
+    /// <param name="metadata">需要透传的 ICCP / EXIF / XMP 原始字节；null 表示不写扩展 chunk。</param>
+    public static byte[] EncodeRgba(byte[] rgba, int width, int height, ImageMetadata? metadata)
+    {
+        ArgumentNullException.ThrowIfNull(rgba);
+        return EncodeRgba(rgba.AsSpan(), width, height, metadata);
+    }
+
+    /// <summary>
     /// 把 RGBA 像素编码为完整 WebP 字节（无损 VP8L）。
     /// </summary>
     public static byte[] EncodeRgba(ReadOnlySpan<byte> rgba, int width, int height)
+        => EncodeRgba(rgba, width, height, metadata: null);
+
+    /// <summary>
+    /// 把 RGBA 像素编码为完整 WebP 字节（无损 VP8L），并原样写入元数据。
+    /// </summary>
+    public static byte[] EncodeRgba(ReadOnlySpan<byte> rgba, int width, int height, ImageMetadata? metadata)
     {
         ValidateDimensions(width, height, rgba.Length);
         var vp8l = Vp8LEncoder.EncodeVp8L(rgba, width, height, Vp8LEncoderOptions.Auto);
-        return WrapInRiff(vp8l);
+        return WrapInRiff(vp8l, width, height, metadata);
     }
 
     /// <summary>
@@ -51,15 +71,33 @@ public static class ManagedWebpEncoder
     }
 
     /// <summary>
+    /// 把 RGBA 像素编码为 WebP 并写入流（无损 VP8L），同时写入元数据。
+    /// </summary>
+    public static void EncodeRgbaToStream(Stream stream, byte[] rgba, int width, int height,
+        ImageMetadata? metadata)
+    {
+        ArgumentNullException.ThrowIfNull(stream);
+        ArgumentNullException.ThrowIfNull(rgba);
+        EncodeRgbaToStream(stream, rgba.AsSpan(), width, height, metadata);
+    }
+
+    /// <summary>
     /// 把 RGBA 像素编码为 WebP 并写入流（无损 VP8L）。
     /// </summary>
     public static void EncodeRgbaToStream(Stream stream, ReadOnlySpan<byte> rgba, int width, int height)
+        => EncodeRgbaToStream(stream, rgba, width, height, metadata: null);
+
+    /// <summary>
+    /// 把 RGBA 像素编码为 WebP 并写入流（无损 VP8L），同时写入元数据。
+    /// </summary>
+    public static void EncodeRgbaToStream(Stream stream, ReadOnlySpan<byte> rgba, int width, int height,
+        ImageMetadata? metadata)
     {
         ArgumentNullException.ThrowIfNull(stream);
         ValidateDimensions(width, height, rgba.Length);
 
         var vp8l = Vp8LEncoder.EncodeVp8L(rgba, width, height, Vp8LEncoderOptions.Auto);
-        var riff = WrapInRiff(vp8l);
+        var riff = WrapInRiff(vp8l, width, height, metadata);
         stream.Write(riff, 0, riff.Length);
     }
 
@@ -67,11 +105,11 @@ public static class ManagedWebpEncoder
     /// 编码为完整 WebP（可指定编码特性，供测试与阶段对比使用）。
     /// </summary>
     internal static byte[] EncodeRgba(ReadOnlySpan<byte> rgba, int width, int height,
-        Vp8LEncoderOptions options)
+        Vp8LEncoderOptions options, ImageMetadata? metadata = null)
     {
         ValidateDimensions(width, height, rgba.Length);
         var vp8l = Vp8LEncoder.EncodeVp8L(rgba, width, height, options);
-        return WrapInRiff(vp8l);
+        return WrapInRiff(vp8l, width, height, metadata);
     }
 
     private static void ValidateDimensions(int width, int height, int rgbaLength)
@@ -88,7 +126,15 @@ public static class ManagedWebpEncoder
     /// <summary>
     /// 按 RIFF/WEBP 规范包装 VP8L chunk：
     /// riff_size = 4 ("WEBP") + 8 (chunk 头) + chunk_size + (chunk 奇数时为 1 字节 pad)。
+    /// 存在元数据时改为输出 VP8X 容器（ICCP 前置、EXIF/XMP 后置）。
     /// </summary>
+    private static byte[] WrapInRiff(ReadOnlySpan<byte> vp8lPayload, int width, int height,
+        ImageMetadata? metadata)
+    {
+        var simple = WrapInRiff(vp8lPayload);
+        return WebpMetadataWriter.Apply(simple, width, height, metadata);
+    }
+
     private static byte[] WrapInRiff(ReadOnlySpan<byte> vp8lPayload)
     {
         int chunkSize = vp8lPayload.Length;

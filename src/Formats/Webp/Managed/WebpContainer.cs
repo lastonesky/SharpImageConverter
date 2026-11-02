@@ -78,6 +78,9 @@ public sealed class WebpContainer
 {
     private readonly byte[] _data;
     private readonly List<WebpChunk> _chunks;
+    private WebpChunk? _iccp;
+    private WebpChunk? _exif;
+    private WebpChunk? _xmp;
 
     /// <summary>原始字节数据（文件头 + 所有 chunk）。</summary>
     public ReadOnlySpan<byte> RawData => _data;
@@ -105,6 +108,33 @@ public sealed class WebpContainer
 
     /// <summary>背景颜色（动图 ANIM chunk），BGRA 小端。</summary>
     public uint BackgroundColor { get; private set; }
+
+    /// <summary>VP8X flags 中的 ICCP 位（0x20）。</summary>
+    public bool HasIccProfileFlag { get; private set; }
+
+    /// <summary>VP8X flags 中的 EXIF 位（0x08）。</summary>
+    public bool HasExifFlag { get; private set; }
+
+    /// <summary>VP8X flags 中的 XMP 位（0x04）。</summary>
+    public bool HasXmpFlag { get; private set; }
+
+    /// <summary>是否实际存在 ICCP chunk。</summary>
+    public bool HasIccProfile => _iccp.HasValue;
+
+    /// <summary>是否实际存在 EXIF chunk。</summary>
+    public bool HasExif => _exif.HasValue;
+
+    /// <summary>是否实际存在 XMP chunk。</summary>
+    public bool HasXmp => _xmp.HasValue;
+
+    /// <summary>ICCP chunk 原始字节（不解析内容）；不存在时为空。</summary>
+    public ReadOnlySpan<byte> IccProfile => _iccp is { } c ? c.GetData(_data) : default;
+
+    /// <summary>EXIF chunk 原始字节（不解析内容）；不存在时为空。</summary>
+    public ReadOnlySpan<byte> Exif => _exif is { } c ? c.GetData(_data) : default;
+
+    /// <summary>XMP chunk 原始字节（不解析内容）；不存在时为空。</summary>
+    public ReadOnlySpan<byte> Xmp => _xmp is { } c ? c.GetData(_data) : default;
 
     private WebpContainer(byte[] data)
     {
@@ -271,6 +301,15 @@ public sealed class WebpContainer
                 case WebpChunkId.Alph:
                     HasAlphaChunk = true;
                     break;
+                case WebpChunkId.Iccp:
+                    _iccp ??= c;
+                    break;
+                case WebpChunkId.Exif:
+                    _exif ??= c;
+                    break;
+                case WebpChunkId.Xmp:
+                    _xmp ??= c;
+                    break;
             }
         }
 
@@ -292,6 +331,9 @@ public sealed class WebpContainer
         byte flags = span[0];
         IsAnimation = (flags & (byte)Vp8XFlags.Animation) != 0;
         HasAlpha = (flags & (byte)Vp8XFlags.Alpha) != 0;
+        HasIccProfileFlag = (flags & (byte)Vp8XFlags.Iccp) != 0;
+        HasExifFlag = (flags & (byte)Vp8XFlags.Exif) != 0;
+        HasXmpFlag = (flags & (byte)Vp8XFlags.Xmp) != 0;
 
         // width-1, height-1 均为 24bit LE（注意 reserved 3 字节必须在尺寸之前跳过）
         CanvasWidth = (span[4] | (span[5] << 8) | (span[6] << 16)) + 1;
@@ -334,6 +376,11 @@ public sealed class WebpContainer
         if (version != 0)
             throw new WebpUnsupportedException($"VP8L version={version} 不支持（本实现只支持 version=0）");
     }
+
+    /// <summary>
+    /// 按原始顺序返回容器中的全部 chunk（供容器重写/元数据注入使用）。
+    /// </summary>
+    internal IReadOnlyList<WebpChunk> Chunks => _chunks;
 
     /// <summary>
     /// 查找指定类型的 chunk（返回第一个匹配）。

@@ -247,7 +247,7 @@ public class WebpLEncoderTests
         {
             byte[] again = ManagedWebpEncoder.EncodeRgba(rgba, 96, 72);
             Assert.Equal(first.Length, again.Length);
-            AssertPixelExactBytes(first, again, "repeat #" + i);
+            AssertBytesEqual(first, again, "repeat #" + i);
         }
     }
 
@@ -300,6 +300,15 @@ public class WebpLEncoderTests
         Assert.Equal(w, lw);
         Assert.Equal(h, lh);
         AssertPixelExact(rgba, lib, label + " managed->libwebp");
+    }
+
+    private static void AssertBytesEqual(byte[] expected, byte[] actual, string label)
+    {
+        for (int i = 0; i < expected.Length; i++)
+        {
+            if (expected[i] != actual[i])
+                Assert.Fail($"{label}: 第 {i} 字节不同，期望 0x{expected[i]:X2}，实际 0x{actual[i]:X2}");
+        }
     }
 
     private static void AssertPixelExact(byte[] expected, byte[] actual, string label)
@@ -425,6 +434,23 @@ public class WebpLEncoderTests
                 px[o + 2] = (byte)(idx * 13);
                 px[o + 3] = 255;
             }
+        }
+        return px;
+    }
+
+    /// <summary>低色数但空间抖动：索引流本身不可压缩，用于确认剪枝不会误剪这类图。</summary>
+    private static byte[] Dithered(int w, int h, int numColors)
+    {
+        var colors = new byte[numColors][];
+        for (int i = 0; i < numColors; i++)
+            colors[i] = new byte[] { (byte)(i * 17), (byte)(i * 29 + 40), (byte)(i * 43 + 80), 255 };
+
+        var px = new byte[w * h * 4];
+        var rnd = new Random(101);
+        for (int i = 0; i < w * h; i++)
+        {
+            int idx = rnd.Next(numColors);
+            Array.Copy(colors[idx], 0, px, i * 4, 4);
         }
         return px;
     }

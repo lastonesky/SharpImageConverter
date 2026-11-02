@@ -66,10 +66,14 @@ namespace SharpImageConverter.Formats.Webp
     internal static class WebpStreamDecoder
     {
         internal static byte[] DecodeRgbaFromStream(Stream stream, out int width, out int height)
+            => DecodeRgbaFromStream(stream, out width, out height, out _);
+
+        internal static byte[] DecodeRgbaFromStream(Stream stream, out int width, out int height,
+            out Metadata.ImageMetadata? metadata)
         {
             // 按 WebpDecodePolicy 在纯托管实现与 libwebp 之间分派，
             // 托管不支持的特性（有损 VP8 / 动图）在 Auto 下自动回退。
-            return WebpDecodeDispatch.DecodeRgba(stream, out width, out height);
+            return WebpDecodeDispatch.DecodeRgba(stream, out width, out height, out metadata);
         }
     }
 
@@ -97,11 +101,11 @@ namespace SharpImageConverter.Formats.Webp
         /// <returns>RGB24 图像</returns>
         public Image<Rgb24> DecodeRgb24(Stream stream)
         {
-            var rgba = WebpStreamDecoder.DecodeRgbaFromStream(stream, out int width, out int height);
+            var rgba = WebpStreamDecoder.DecodeRgbaFromStream(stream, out int width, out int height, out var metadata);
             var rgb = new byte[width * height * 3];
             // 复用已有的 SSSE3 打包实现（原为逐像素标量循环）
             SimdHelper.PackRgbaToRgb(rgba, rgb);
-            return new Image<Rgb24>(width, height, rgb);
+            return new Image<Rgb24>(width, height, rgb, metadata);
         }
     }
 
@@ -128,8 +132,8 @@ namespace SharpImageConverter.Formats.Webp
         /// <returns>RGBA32 图像</returns>
         public Image<Rgba32> DecodeRgba32(Stream stream)
         {
-            var rgba = WebpStreamDecoder.DecodeRgbaFromStream(stream, out int width, out int height);
-            return new Image<Rgba32>(width, height, rgba);
+            var rgba = WebpStreamDecoder.DecodeRgbaFromStream(stream, out int width, out int height, out var metadata);
+            return new Image<Rgba32>(width, height, rgba, metadata);
         }
     }
 
@@ -176,7 +180,7 @@ namespace SharpImageConverter.Formats.Webp
         /// <param name="image">输入图像</param>
         public void EncodeRgb24(Stream stream, Image<Rgb24> image)
         {
-            WebpCodec.EncodeRgbToStream(stream, image.Buffer, image.Width, image.Height, Options);
+            WebpCodec.EncodeRgbToStream(stream, image.Buffer, image.Width, image.Height, Options, image.Metadata);
         }
 
         /// <summary>
@@ -192,7 +196,8 @@ namespace SharpImageConverter.Formats.Webp
         public void EncodeRgb24(Stream stream, Image<Rgb24> image, SaveOptions options)
         {
             ArgumentNullException.ThrowIfNull(options);
-            WebpCodec.EncodeRgbToStream(stream, image.Buffer, image.Width, image.Height, Effective(options));
+            WebpCodec.EncodeRgbToStream(stream, image.Buffer, image.Width, image.Height, Effective(options),
+                image.Metadata);
         }
 
         /// <summary>把 <see cref="SaveOptions.WebpQuality"/> 套到本实例的其余参数上。</summary>
@@ -245,7 +250,7 @@ namespace SharpImageConverter.Formats.Webp
         /// <param name="image">输入图像</param>
         public void EncodeRgba32(Stream stream, Image<Rgba32> image)
         {
-            WebpCodec.EncodeRgbaToStream(stream, image.Buffer, image.Width, image.Height, Options);
+            WebpCodec.EncodeRgbaToStream(stream, image.Buffer, image.Width, image.Height, Options, image.Metadata);
         }
 
         /// <summary>
@@ -257,7 +262,8 @@ namespace SharpImageConverter.Formats.Webp
         public void EncodeRgba32(Stream stream, Image<Rgba32> image, SaveOptions options)
         {
             ArgumentNullException.ThrowIfNull(options);
-            WebpCodec.EncodeRgbaToStream(stream, image.Buffer, image.Width, image.Height, Effective(options));
+            WebpCodec.EncodeRgbaToStream(stream, image.Buffer, image.Width, image.Height, Effective(options),
+                image.Metadata);
         }
 
         /// <summary>把 <see cref="SaveOptions.WebpQuality"/> 套到本实例的其余参数上。</summary>
@@ -309,7 +315,8 @@ namespace SharpImageConverter.Formats.Webp
                 durations[fi] = d < 10 ? 10 : d;
             }
 
-            WebpCodec.EncodeAnimatedRgbaToStream(stream, rgbaFrames, width, height, durations, loopCount, options);
+            WebpCodec.EncodeAnimatedRgbaToStream(stream, rgbaFrames, width, height, durations, loopCount, options,
+                frames[0].Metadata);
         }
     }
 }

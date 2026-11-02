@@ -4,6 +4,8 @@ using System.IO;
 using System.Runtime.InteropServices;
 using System.Runtime.CompilerServices;
 using System.Runtime.ExceptionServices;
+using SharpImageConverter.Metadata;
+using SharpImageConverter.Formats.Webp.Managed;
 
 namespace SharpImageConverter.Formats.Webp
 {
@@ -153,6 +155,15 @@ namespace SharpImageConverter.Formats.Webp
             using var ms = new MemoryStream();
             EncodeWithConfigToStream(ms, pixels, width, height, stride, hasAlpha, quality, method, lossless, exact);
             return ms.ToArray();
+        }
+
+        /// <summary>与 <see cref="EncodeWithConfig"/> 相同，但串行获取全局编码锁。</summary>
+        private static byte[] EncodeWithConfigLocked(ReadOnlySpan<byte> pixels, int width, int height, int stride, bool hasAlpha, float quality, int method, bool lossless, bool exact)
+        {
+            lock (EncodeLock)
+            {
+                return EncodeWithConfig(pixels, width, height, stride, hasAlpha, quality, method, lossless, exact);
+            }
         }
 
         private static void EncodeWithConfigToStream(Stream stream, ReadOnlySpan<byte> pixels, int width, int height, int stride, bool hasAlpha, float quality, int method = 3, bool lossless = false, bool exact = true)
@@ -386,7 +397,8 @@ namespace SharpImageConverter.Formats.Webp
         internal static byte[] EncodeLosslessRgbaForDispatch(ReadOnlySpan<byte> rgba, int width, int height)
             => EncodeLosslessRgbaDirect(rgba, width, height);
 
-        public static byte[] EncodeRgba(byte[] rgba, int width, int height, WebpEncoderOptions options)
+        public static byte[] EncodeRgba(byte[] rgba, int width, int height, WebpEncoderOptions options,
+            ImageMetadata? metadata = null)
         {
             try
             {
@@ -398,12 +410,15 @@ namespace SharpImageConverter.Formats.Webp
                     if (options.Lossless)
                     {
                         result = WebpEncodeDispatch.EncodeLosslessRgba(
-                            rgba, width, height, WebpEncodeDispatch.ShouldEncodeLosslessManaged());
+                            rgba, width, height, WebpEncodeDispatch.ShouldEncodeLosslessManaged(), metadata);
                         return;
                     }
 
                     WebpEncodeDispatch.EnsureSupportsLossy();
-                    result = EncodeWithConfig(rgba, width, height, width * 4, true, options.Quality, options.Method, false, false);
+                    byte[] encoded = EncodeWithConfig(rgba, width, height, width * 4, true, options.Quality,
+                        options.Method, false, false);
+                    // 有损产物由 libwebp 生成；元数据由托管容器层原样附加（ICCP 前置、EXIF/XMP 后置）。
+                    result = WebpMetadataWriter.Apply(encoded, width, height, metadata);
                 });
                 return result!;
             }
@@ -417,14 +432,16 @@ namespace SharpImageConverter.Formats.Webp
             }
         }
 
-        public static byte[] EncodeRgb(byte[] rgb, int width, int height, WebpEncoderOptions options)
+        public static byte[] EncodeRgb(byte[] rgb, int width, int height, WebpEncoderOptions options,
+            ImageMetadata? metadata = null)
         {
             try
             {
                 byte[]? result = null;
                 ExecuteWithConcurrency(options.ConcurrencyStrategy, () =>
                 {
-                    result = EncodeWithConfig(rgb, width, height, width * 3, false, options.Quality, options.Method, options.Lossless, false);
+                    byte[] encoded = EncodeWithConfig(rgb, width, height, width * 3, false, options.Quality, options.Method, options.Lossless, false);
+                    result = WebpMetadataWriter.Apply(encoded, width, height, metadata);
                 });
                 return result!;
             }
@@ -480,7 +497,8 @@ namespace SharpImageConverter.Formats.Webp
             }
         }
 
-        public static void EncodeRgbaToStream(Stream stream, ReadOnlySpan<byte> rgba, int width, int height, WebpEncoderOptions options)
+        public static void EncodeRgbaToStream(Stream stream, ReadOnlySpan<byte> rgba, int width, int height,
+            WebpEncoderOptions options, ImageMetadata? metadata = null)
         {
             ArgumentNullException.ThrowIfNull(stream);
             if (rgba.Length != checked(width * height * 4)) throw new ArgumentException("RGBA 像素长度不匹配", nameof(rgba));
@@ -489,11 +507,23 @@ namespace SharpImageConverter.Formats.Webp
                 if (options.Lossless)
                 {
                     byte[] bytes = WebpEncodeDispatch.EncodeLosslessRgba(
-                        rgba, width, height, WebpEncodeDispatch.ShouldEncodeLosslessManaged());
+                        rgba, width, height, WebpEncodeDispatch.ShouldEncodeLosslessManaged(), metadata);
                     stream.Write(bytes, 0, bytes.Length);
                     return;
                 }
                 WebpEncodeDispatch.EnsureSupportsLossy();
+                if (WebpMetadataWriter.HasMetadata(metadata))
+                {
+                    // 需要重写容器以插入元数据，只能先拿到完整字节。
+                    byte[] encoded = options.ConcurrencyStrategy == WebpConcurrencyStrategy.Parallel
+                        ? EncodeWithConfig(rgba, width, height, width * 4, true, options.Quality,
+                            options.Method, false, false)
+                        : EncodeWithConfigLocked(rgba, width, height, width * 4, true, options.Quality,
+                            options.Method, false, false);
+                    byte[] wrapped = WebpMetadataWriter.Apply(encoded, width, height, metadata);
+                    stream.Write(wrapped, 0, wrapped.Length);
+                    return;
+                }
                 if (options.ConcurrencyStrategy == WebpConcurrencyStrategy.Parallel)
                 {
                     EncodeWithConfigToStream(stream, rgba, width, height, width * 4, true, options.Quality, options.Method, false, false);
@@ -516,12 +546,24 @@ namespace SharpImageConverter.Formats.Webp
             }
         }
 
-        public static void EncodeRgbToStream(Stream stream, ReadOnlySpan<byte> rgb, int width, int height, WebpEncoderOptions options)
+        public static void EncodeRgbToStream(Stream stream, ReadOnlySpan<byte> rgb, int width, int height,
+            WebpEncoderOptions options, ImageMetadata? metadata = null)
         {
             ArgumentNullException.ThrowIfNull(stream);
             if (rgb.Length != checked(width * height * 3)) throw new ArgumentException("RGB 像素长度不匹配", nameof(rgb));
             try
             {
+                if (WebpMetadataWriter.HasMetadata(metadata))
+                {
+                    byte[] encoded = options.ConcurrencyStrategy == WebpConcurrencyStrategy.Parallel
+                        ? EncodeWithConfig(rgb, width, height, width * 3, false, options.Quality,
+                            options.Method, options.Lossless, false)
+                        : EncodeWithConfigLocked(rgb, width, height, width * 3, false, options.Quality,
+                            options.Method, options.Lossless, false);
+                    byte[] wrapped = WebpMetadataWriter.Apply(encoded, width, height, metadata);
+                    stream.Write(wrapped, 0, wrapped.Length);
+                    return;
+                }
                 if (options.ConcurrencyStrategy == WebpConcurrencyStrategy.Parallel)
                 {
                     EncodeWithConfigToStream(stream, rgb, width, height, width * 3, false, options.Quality, options.Method, options.Lossless, false);
@@ -549,7 +591,8 @@ namespace SharpImageConverter.Formats.Webp
             return EncodeAnimatedRgba(rgbaFrames, width, height, frameDurationsMs, loopCount, new WebpEncoderOptions(quality, WebpConcurrencyStrategy.Auto));
         }
 
-        public static byte[] EncodeAnimatedRgba(byte[][] rgbaFrames, int width, int height, int[] frameDurationsMs, int loopCount, WebpEncoderOptions options)
+        public static byte[] EncodeAnimatedRgba(byte[][] rgbaFrames, int width, int height, int[] frameDurationsMs, int loopCount, WebpEncoderOptions options,
+            ImageMetadata? metadata = null)
         {
             ArgumentNullException.ThrowIfNull(rgbaFrames, nameof(rgbaFrames));
             ArgumentNullException.ThrowIfNull(frameDurationsMs, nameof(frameDurationsMs));
@@ -564,7 +607,7 @@ namespace SharpImageConverter.Formats.Webp
                 {
                     if (rgbaFrames.Length == 1)
                     {
-                        result = EncodeRgba(rgbaFrames[0], width, height, options);
+                        result = EncodeRgba(rgbaFrames[0], width, height, options, metadata);
                         return;
                     }
 
@@ -628,7 +671,8 @@ namespace SharpImageConverter.Formats.Webp
                             {
                                 var bytes = new byte[len];
                                 new ReadOnlySpan<byte>((void*)assembled.bytes, len).CopyTo(bytes);
-                                result = bytes;
+                                // 动图元数据只写在 VP8X 层，不进入 ANMF。
+                                result = WebpMetadataWriter.Apply(bytes, width, height, metadata);
                             }
                         }
                         finally
@@ -663,7 +707,8 @@ namespace SharpImageConverter.Formats.Webp
             EncodeAnimatedRgbaToStream(stream, rgbaFrames, width, height, frameDurationsMs, loopCount, new WebpEncoderOptions(quality, WebpConcurrencyStrategy.Auto));
         }
 
-        public static void EncodeAnimatedRgbaToStream(Stream stream, byte[][] rgbaFrames, int width, int height, int[] frameDurationsMs, int loopCount, WebpEncoderOptions options)
+        public static void EncodeAnimatedRgbaToStream(Stream stream, byte[][] rgbaFrames, int width, int height, int[] frameDurationsMs, int loopCount, WebpEncoderOptions options,
+            ImageMetadata? metadata = null)
         {
             ArgumentNullException.ThrowIfNull(stream);
             ArgumentNullException.ThrowIfNull(rgbaFrames, nameof(rgbaFrames));
@@ -678,7 +723,7 @@ namespace SharpImageConverter.Formats.Webp
                 {
                     if (rgbaFrames.Length == 1)
                     {
-                        EncodeRgbaToStream(stream, rgbaFrames[0], width, height, options);
+                        EncodeRgbaToStream(stream, rgbaFrames[0], width, height, options, metadata);
                         return;
                     }
 
@@ -740,7 +785,11 @@ namespace SharpImageConverter.Formats.Webp
                             int len = checked((int)assembled.size);
                             unsafe
                             {
-                                stream.Write(new ReadOnlySpan<byte>((void*)assembled.bytes, len));
+                                var bytes = new byte[len];
+                                new ReadOnlySpan<byte>((void*)assembled.bytes, len).CopyTo(bytes);
+                                // 动图元数据只写在 VP8X 层，不进入 ANMF。
+                                byte[] wrapped = WebpMetadataWriter.Apply(bytes, width, height, metadata);
+                                stream.Write(wrapped, 0, wrapped.Length);
                             }
                         }
                         finally
