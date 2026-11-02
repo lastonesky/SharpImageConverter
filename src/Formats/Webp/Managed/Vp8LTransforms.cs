@@ -66,7 +66,7 @@ internal static class Vp8LTransforms
     /// 14 种 predictor 函数（对照 libwebp VP8LPredictor0_C ~ VP8LPredictor13_C）。
     /// left = out[x-1]（已处理的输出像素），top = 上一行输出像素数组。
     /// </summary>
-    private static uint Predictor(int mode, uint left, uint topCur, uint topLeft, uint topRight) => mode switch
+    internal static uint Predictor(int mode, uint left, uint topCur, uint topLeft, uint topRight) => mode switch
     {
         0 => 0xFF000000,                              // black
         1 => left,                                     // left

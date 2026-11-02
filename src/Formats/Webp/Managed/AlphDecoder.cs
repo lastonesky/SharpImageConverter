@@ -5,7 +5,10 @@ namespace SharpImageConverter.Formats.Webp.Managed;
 /// ALPH chunk 由 1 字节头部 + 负载组成，头部按位划分：
 /// bits 0~1 = 压缩方式（0=原始未压缩字节，1=去掉 5 字节头的 VP8L 裸位流，2/3 为保留值）；
 /// bits 2~3 = 过滤方式（0=none，1=horizontal，2=vertical，3=gradient）；
-/// bits 4~5 = 预处理方式（非 0 表示 level reduction，本实现不支持）；
+/// bits 4~5 = 预处理方式（0=none，1=encoder 端 level reduction，2/3 为保留值）。
+/// 注意：level reduction 是编码端的**有损**预处理（把 alpha 量化到更少的级别），
+/// libwebp 解码器只校验取值、不做任何恢复，直接按解码出的 alpha 使用；
+/// 本实现与 libwebp 保持一致，否则无法逐像素对拍。
 /// bits 6~7 = 保留位（必须为 0）。
 /// 压缩方式 1 时，每个像素的 alpha 取自 VP8L 解码像素的 GREEN 字节（bits 8~15）。
 /// </summary>
@@ -36,9 +39,10 @@ internal static class AlphDecoder
 
         if (reserved != 0)
             throw new WebpBitstreamException($"ALPH 头部保留位非零：0x{header:X2}");
-        if (preprocessing != 0)
-            throw new WebpUnsupportedException(
-                $"ALPH 预处理方式 {preprocessing} 不支持：本实现不支持 level reduction（alpha 去噪级别预处理）");
+        // libwebp 的 ALPHInit 对 preprocessing > ALPHA_PREPROCESSED_LEVELS(1) 返回
+        // VP8_STATUS_BITSTREAM_ERROR；合法值 0/1 在解码阶段的处理完全相同。
+        if (preprocessing > 1)
+            throw new WebpBitstreamException($"ALPH 预处理方式 {preprocessing} 为保留值（合法值 0/1）");
 
         var payload = data.Slice(1);
         int pixelCount = width * height;

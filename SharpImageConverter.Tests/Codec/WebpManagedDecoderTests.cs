@@ -8,7 +8,8 @@ namespace SharpImageConverter.Tests.Codec;
 /// <summary>
 /// 纯 C# WebP 解码器（ManagedWebpDecoder）与 libwebp 的 bit-exact 对拍测试。
 /// 覆盖：LSB 位序、VP8L 帧头、无变换最简流、RIFF 容器（静态图与动图结构）。
-/// 说明：本批只验收 VP8L 无损；有损 VP8 与动图帧像素解码留待下一轮。
+/// 说明：VP8L 无损要求 bit-exact；有损 VP8 只验证“能解码、尺寸正确”，
+/// 与 libwebp 的逐像素对齐由 Vp8* 解码器自带的测试负责。
 /// </summary>
 public class WebpManagedDecoderTests
 {
@@ -650,16 +651,20 @@ public class WebpManagedDecoderTests
         PixelAssert.Equal(expected, decoded, w, h);
     }
 
-    /// <summary>ALPH 预处理（level reduction）未实现，必须显式抛 Unsupported。</summary>
+    /// <summary>
+    /// ALPH 预处理（level reduction）在解码端不做逆运算（libwebp 也只校验取值），
+    /// 因此 preprocessing=1 不再被判为不支持；此处缺少 alpha 数据，应按位流错误报告。
+    /// 合法的 preprocessing=1（compression 0/1）解码见 WebpAlphPreprocessingTests。
+    /// </summary>
     [Fact]
-    public void Alph_Preprocessing_ThrowsUnsupported()
+    public void Alph_PreprocessingWithoutData_ThrowsBitstream()
     {
         const int w = 8, h = 8;
         byte[] main = SolidRgba(w, h, 10, 20, 30, 255);
-        byte[] payload = { 0x10 }; // preprocessing=1
+        byte[] payload = { 0x10 }; // preprocessing=1，但没有任何 alpha 数据
 
         byte[] webp = BuildAlphContainer(w, h, main, payload);
-        Assert.Throws<WebpUnsupportedException>(
+        Assert.Throws<WebpBitstreamException>(
             () => ManagedWebpDecoder.DecodeRgba(webp, out _, out _));
     }
 
@@ -676,9 +681,9 @@ public class WebpManagedDecoderTests
             () => ManagedWebpDecoder.DecodeRgba(webp, out _, out _));
     }
 
-    /// <summary>有损 VP8 当前未实现，必须抛 Unsupported 而不是静默返回错误像素。</summary>
+    /// <summary>有损 VP8 关键帧已由托管解码器支持：应返回正确尺寸的 RGBA，而非抛 Unsupported。</summary>
     [Fact]
-    public void Lossy_Vp8_ThrowsUnsupported()
+    public void Lossy_Vp8_DecodesToRgba()
     {
         const int w = 16, h = 16;
         byte[] webp = WebpCodec.EncodeRgba(
@@ -687,8 +692,11 @@ public class WebpManagedDecoderTests
 
         Assert.True(webp.Length > 16);
         Assert.Equal("VP8 ", Encoding.ASCII.GetString(webp, 12, 4));
-        Assert.Throws<WebpUnsupportedException>(
-            () => ManagedWebpDecoder.DecodeRgba(webp, out _, out _));
+
+        byte[] px = ManagedWebpDecoder.DecodeRgba(webp, out int dw, out int dh);
+        Assert.Equal(w, dw);
+        Assert.Equal(h, dh);
+        Assert.Equal(w * h * 4, px.Length);
     }
 
     // ==================================================================

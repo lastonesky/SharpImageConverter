@@ -382,6 +382,10 @@ namespace SharpImageConverter.Formats.Webp
             }
         }
 
+        /// <summary>供编码策略分派使用：强制走 libwebp 的无损入口。</summary>
+        internal static byte[] EncodeLosslessRgbaForDispatch(ReadOnlySpan<byte> rgba, int width, int height)
+            => EncodeLosslessRgbaDirect(rgba, width, height);
+
         public static byte[] EncodeRgba(byte[] rgba, int width, int height, WebpEncoderOptions options)
         {
             try
@@ -390,10 +394,16 @@ namespace SharpImageConverter.Formats.Webp
                 ExecuteWithConcurrency(options.ConcurrencyStrategy, () =>
                 {
                     // libwebp 的 config 路径在 lossless=1 时实测仍会做近无损预处理（像素差 1~5）。
-                    // 直接调用 WebPEncodeLosslessRGBA 走官方无损入口，像素严格可逆。
-                    result = options.Lossless
-                        ? EncodeLosslessRgbaDirect(rgba, width, height)
-                        : EncodeWithConfig(rgba, width, height, width * 4, true, options.Quality, options.Method, false, false);
+                    // 无损统一走官方无损入口：默认由托管 VP8L 编码器完成，可用策略强制走 libwebp。
+                    if (options.Lossless)
+                    {
+                        result = WebpEncodeDispatch.EncodeLosslessRgba(
+                            rgba, width, height, WebpEncodeDispatch.ShouldEncodeLosslessManaged());
+                        return;
+                    }
+
+                    WebpEncodeDispatch.EnsureSupportsLossy();
+                    result = EncodeWithConfig(rgba, width, height, width * 4, true, options.Quality, options.Method, false, false);
                 });
                 return result!;
             }
@@ -478,10 +488,12 @@ namespace SharpImageConverter.Formats.Webp
             {
                 if (options.Lossless)
                 {
-                    byte[] bytes = EncodeLosslessRgbaDirect(rgba, width, height);
+                    byte[] bytes = WebpEncodeDispatch.EncodeLosslessRgba(
+                        rgba, width, height, WebpEncodeDispatch.ShouldEncodeLosslessManaged());
                     stream.Write(bytes, 0, bytes.Length);
                     return;
                 }
+                WebpEncodeDispatch.EnsureSupportsLossy();
                 if (options.ConcurrencyStrategy == WebpConcurrencyStrategy.Parallel)
                 {
                     EncodeWithConfigToStream(stream, rgba, width, height, width * 4, true, options.Quality, options.Method, false, false);
