@@ -7,7 +7,7 @@ namespace SharpImageConverter.Formats.Webp;
 /// </summary>
 public enum WebpContainerKind
 {
-    /// <summary>单帧 VP8 有损（本批不支持解码）。</summary>
+    /// <summary>单帧 VP8 有损（关键帧；非关键帧按 RFC 9649 拒绝）。</summary>
     Vp8,
     /// <summary>单帧 VP8L 无损。</summary>
     Vp8L,

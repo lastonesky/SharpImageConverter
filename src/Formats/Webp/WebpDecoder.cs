@@ -24,9 +24,16 @@ public sealed record WebpAnimation(int CanvasWidth, int CanvasHeight, int LoopCo
 /// - 返回标准化 RGBA 像素数据（R,G,B,A 每像素 4 字节），便于接入统一图像抽象层；
 /// - 提供 <see cref="DecodeRgbaInto(ReadOnlySpan{byte}, Span{byte}, out int, out int)"/>
 ///   零拷贝重载：直接把像素解到调用方的缓冲区，整幅图像只存在一份；
-/// - 遇到无法解码的输入时抛 <see cref="WebpUnsupportedException"/>（当前仅剩
-///   ALPH level-reduction 与 VP8 非关键帧两类）。这两类都是**格式层面不受支持**，
-///   没有可回退的实现；调用方应把它当成「输入不可解码」处理，而不是重试其它后端。
+/// - 遇到无法解码的输入时抛 <see cref="WebpUnsupportedException"/>，兜底清单：
+///   VP8 非关键帧（RFC 9649 规定有损 WebP 只有帧内编码，任何实现都解不出来）、
+///   VP8 关键帧被标记 <c>show_frame=0</c>、ALPH 的保留压缩方式（非 0/1）、
+///   VP8L <c>version≠0</c>、动图画布超出 16383，以及只在单图/流式入口出现的动图输入。
+///   这些都是**格式或入口层面不受支持**，没有可回退的实现；调用方应把它当成
+///   「输入不可解码」处理，而不是重试其它后端。
+///
+/// 不支持清单已随实现推进多次收缩（ALPH 的 <c>preprocessing</c> 0/1、ALPH 四种预测滤波、
+/// VP8 4×4 帧内预测都已支持），修改此处时请一并核对 <c>WebpUnsupportedException</c> 的
+/// 实际抛出点，不要凭印象写。
 /// </summary>
 public static class WebpDecoder
 {

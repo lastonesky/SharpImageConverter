@@ -13,10 +13,15 @@ namespace SharpImageConverter.Formats.Webp
         Parallel = 2
     }
 
-    public readonly struct WebpEncoderOptions
+    /// <remarks>
+    /// 声明为 <c>record</c> 只为拿到 <c>with</c> 表达式：适配器上的每个单值 setter 都要
+    /// 「只改自己那一项、其余原样带过」，手写构造参数会在新增字段时静默丢值
+    /// （历史上 <see cref="Lossless"/> 就这样在三个 setter 里被重置成 false）。
+    /// </remarks>
+    public readonly record struct WebpEncoderOptions
     {
-        public float Quality { get; }
-        public WebpConcurrencyStrategy ConcurrencyStrategy { get; }
+        public float Quality { get; init; }
+        public WebpConcurrencyStrategy ConcurrencyStrategy { get; init; }
 
         /// <summary>
         /// 历史参数（原 libwebp <c>config.method</c>，0~6）。
@@ -26,12 +31,12 @@ namespace SharpImageConverter.Formats.Webp
         /// <c>--webp-method</c> 参数面继续可编译/可解析。编码器的努力程度由
         /// <see cref="Vp8LEncoderOptions.Auto"/> 的候选集与有损 VP8 的固定流程决定。
         /// </remarks>
-        public int Method { get; }
+        public int Method { get; init; }
 
         /// <summary>
         /// 是否使用无损 WebP（VP8L）。此时 <see cref="Quality"/> 不参与编码（无损没有画质档）。
         /// </summary>
-        public bool Lossless { get; }
+        public bool Lossless { get; init; }
 
         public WebpEncoderOptions(
             float quality,
@@ -145,19 +150,19 @@ namespace SharpImageConverter.Formats.Webp
         public float Quality
         {
             get => Options.Quality;
-            set => Options = new WebpEncoderOptions(value, Options.ConcurrencyStrategy, Options.Method);
+            set => Options = Options with { Quality = value };
         }
 
         public WebpConcurrencyStrategy ConcurrencyStrategy
         {
             get => Options.ConcurrencyStrategy;
-            set => Options = new WebpEncoderOptions(Options.Quality, value, Options.Method);
+            set => Options = Options with { ConcurrencyStrategy = value };
         }
 
         public int Method
         {
             get => Options.Method;
-            set => Options = new WebpEncoderOptions(Options.Quality, Options.ConcurrencyStrategy, value);
+            set => Options = Options with { Method = value };
         }
 
         /// <summary>
@@ -200,9 +205,7 @@ namespace SharpImageConverter.Formats.Webp
 
         /// <summary>把 <see cref="SaveOptions.WebpQuality"/> 套到本实例的其余参数上。</summary>
         private WebpEncoderOptions Effective(SaveOptions options)
-            => options.WebpQuality is { } q
-                ? new WebpEncoderOptions(q, Options.ConcurrencyStrategy, Options.Method, Options.Lossless)
-                : Options;
+            => options.WebpQuality is { } q ? Options with { Quality = q } : Options;
     }
 
     /// <summary>
@@ -215,19 +218,19 @@ namespace SharpImageConverter.Formats.Webp
         public float Quality
         {
             get => Options.Quality;
-            set => Options = new WebpEncoderOptions(value, Options.ConcurrencyStrategy, Options.Method);
+            set => Options = Options with { Quality = value };
         }
 
         public WebpConcurrencyStrategy ConcurrencyStrategy
         {
             get => Options.ConcurrencyStrategy;
-            set => Options = new WebpEncoderOptions(Options.Quality, value, Options.Method);
+            set => Options = Options with { ConcurrencyStrategy = value };
         }
 
         public int Method
         {
             get => Options.Method;
-            set => Options = new WebpEncoderOptions(Options.Quality, Options.ConcurrencyStrategy, value);
+            set => Options = Options with { Method = value };
         }
 
         /// <summary>
@@ -266,9 +269,7 @@ namespace SharpImageConverter.Formats.Webp
 
         /// <summary>把 <see cref="SaveOptions.WebpQuality"/> 套到本实例的其余参数上。</summary>
         private WebpEncoderOptions Effective(SaveOptions options)
-            => options.WebpQuality is { } q
-                ? new WebpEncoderOptions(q, Options.ConcurrencyStrategy, Options.Method, Options.Lossless)
-                : Options;
+            => options.WebpQuality is { } q ? Options with { Quality = q } : Options;
     }
 
     public static class WebpAnimationEncoder

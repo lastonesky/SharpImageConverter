@@ -66,8 +66,6 @@ UI 截图偏 70~100（ui 各档在 100 时 −11.4/−13.5/−12.1/−12.5%）�
 3. **CLI `--webp-lossless` 与 `SaveOptions.WebpLossless`**：编码器支持无损，但入口未暴露。
 4. **动图解码改按帧流式**：当前每帧 `canvas.ToArray()`，内存 O(帧数 × 画布)。
 5. **静态 VP8X canvas 尺寸与帧尺寸交叉校验**。
-6. **`WebpEncoderAdapter(.Rgba)` 的三个 setter 丢失 `Lossless`**。
-7. **文档漂移**：`WebpDecoder` 类注释、`WebpContainer.Vp8` 枚举注释与实现不符。
 
 ## 5. 踩过的坑
 
@@ -77,6 +75,20 @@ UI 截图偏 70~100（ui 各档在 100 时 −11.4/−13.5/−12.1/−12.5%）�
   定位方法是给布尔编/解码器加位级 trace（记录 `(bit, prob, 语法段)`），第 1364 位处
   编码端用 `p[0][3][0]=56`、解码端用 `p[1][9][4]=197`，由此反推出「解码端多读了一位」。
   现已把模式树抽成 `Vp8ModeTree` 单一实现，并加全组合往返测试。
+
+- **单值 setter 手写构造参数会静默丢字段**：`WebpEncoderOptions` 有四项目，而
+  `WebpEncoderAdapter(.Rgba)` 的 Quality / Method / ConcurrencyStrategy 三个 setter
+  各自写 `new WebpEncoderOptions(...)`，末尾的 `lossless` 有默认值 `false`，编译期
+  毫无提示。后果是 `adapter.Lossless = true` 之后只要再设一次 `Quality`，产物就从
+  VP8L 静默退回 VP8 有损——字节数变了，但没有任何异常或警告。现在 setter 统一用
+  `Options with { ... }`（`WebpEncoderOptions` 为此改成 `readonly record struct`），
+  `WebpEncoderOptionsTests` 对 6 条 setter 逐个固定「其余字段不变」。
+
+- **文档漂移是真实的回归源**：`WebpDecoder` 类头一度写着「仅剩 ALPH level-reduction
+  与 VP8 非关键帧两类不支持」，而 ALPH 的 `preprocessing` 0/1 早已支持、四种预测滤波
+  后来也补齐了。`WebpContainerKind.Vp8` 的注释同样停在「本批不支持解码」。这类注释
+  会误导调用方把正常输入当损坏数据，现在改为按 `WebpUnsupportedException` 的实际抛出点
+  列举，并注明「修改时请核对抛出点，不要凭印象写」。
 - **i4x4 的重建与模式选择必须逐块交错**：子块 n 的预测要读已重建的 n−1 / n−4，
   不能先算完 16 个子块的 SSE 再统一变换（那不成立）。因此「先判定再选路」不可能省掉
   被否决宏块的重复工作。

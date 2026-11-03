@@ -1,5 +1,24 @@
 ## 未发布
 
+### WebP：修掉适配器 setter 丢失 `Lossless` 与两处注释漂移
+
+三个此前只记录、未修的真实缺陷：
+
+- **`WebpEncoderAdapter` / `WebpEncoderAdapterRgba` 的单值 setter 会静默重置 `Lossless`**。
+  `WebpEncoderOptions` 有四项目，三个 setter 各自手写 `new WebpEncoderOptions(...)`，
+  末尾 `lossless` 参数有默认值 `false`，编译期毫无提示。于是
+  `adapter.Lossless = true; adapter.Quality = 80f;` 会让产物从 VP8L 无损静默退回
+  VP8 有损——无异常、无警告，只有字节数变化。
+  修法：`WebpEncoderOptions` 改为 `readonly record struct`，setter 统一用
+  `Options with { ... }`，新增字段不会再被漏掉。新增 `WebpEncoderOptionsTests`
+  对 6 条 setter 逐个固定「只改自己那一项」。**该测试经反向验证有效**：把 Quality
+  setter 还原成旧写法后 3 项立即失败。
+- **`WebpDecoder` 类头注释过时**：原写「当前仅剩 ALPH level-reduction 与 VP8 非关键帧
+  两类不支持」，而 ALPH 的 `preprocessing` 0/1 早已支持、四种预测滤波也已补齐。
+  现改为按 `WebpUnsupportedException` 的实际抛出点列举，并注明修改时需核对抛出点。
+- **`WebpContainerKind.Vp8` 枚举注释过时**：「本批不支持解码」与现状不符（VP8 关键帧
+  静态图是主要支持路径）。
+
 ### WebP 编解码 SIMD 化与有损编码提速
 
 此前 WebP 编解码核内**没有任何 SIMD**。插桩测得 4.19MP 上的分布是：有损解码 74ms
