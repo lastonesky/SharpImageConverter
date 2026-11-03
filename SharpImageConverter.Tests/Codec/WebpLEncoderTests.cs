@@ -1,12 +1,13 @@
 using System;
+using System.IO;
 using Xunit;
+using SharpImageConverter;
 using SharpImageConverter.Formats.Webp;
-using SharpImageConverter.Formats.Webp.Managed;
 
 namespace SharpImageConverter.Tests.Codec;
 
 /// <summary>
-/// 托管 VP8L 编码器（<see cref="ManagedWebpEncoder"/>）的合法性、round-trip 与压缩率回归。
+/// 托管 VP8L 编码器（<see cref="WebpEncoder"/>）的合法性、round-trip 与压缩率回归。
 ///
 /// 合法性口径：编码结果必须能被真实 libwebp 解码（<see cref="WebpCodec.DecodeRgba"/>），
 /// 且与原始 RGBA 逐像素 bit-exact；同时用自己的托管解码器再解一遍做交叉验证。
@@ -76,6 +77,17 @@ public class WebpLEncoderTests
         AssertRoundTrip(opaque, 64, 64, Vp8LEncoderOptions.Full, "opaque (full)");
     }
 
+    /// <summary>
+    /// 大于 512 像素的强线性相关图像：cross-color 的"整幅共用一张系数表"候选在
+    /// 1 个 tile 覆盖不了整幅图时必须把系数重复铺满系数图像，否则会越界。
+    /// </summary>
+    [Fact]
+    public void CrossColor_FullImageCandidate_LargerThanSingleTile_RoundTrip()
+    {
+        var gradient = Gradient(640, 480);
+        AssertRoundTrip(gradient, 640, 480, Vp8LEncoderOptions.Full, "640x480 gradient (full)");
+    }
+
     [Fact]
     public void ColorIndexing_RoundTrip_BitExact()
     {
@@ -128,20 +140,20 @@ public class WebpLEncoderTests
     // ==================================================================
 
     [Fact]
-    public void LibWebpLossless_ManagedDecoder_Regression()
+    public void LibWebpLossless_DecoderRegression()
     {
         foreach (var sample in Samples())
         {
             byte[] webp = WebpCodec.EncodeLosslessRgbaForDispatch(sample.Rgba, sample.W, sample.H);
 
-            byte[] managed = ManagedWebpDecoder.DecodeRgba(webp, out int mw, out int mh);
+            byte[] csharp = WebpDecoder.DecodeRgba(webp, out int mw, out int mh);
             Assert.Equal(sample.W, mw);
             Assert.Equal(sample.H, mh);
 
             // libwebp 无损编码默认 exact=0，会把 alpha=0 像素的 RGB 清零，
             // 因此这里以“同一个流、libwebp 解码器输出”为基准，逐一字节对比托管解码器。
             byte[] lib = WebpCodec.DecodeRgba(webp, out _, out _);
-            AssertPixelExact(lib, managed, sample.Name + " libwebp->managed");
+            AssertPixelExact(lib, csharp, sample.Name + " libwebp->csharp");
         }
     }
 
@@ -154,7 +166,7 @@ public class WebpLEncoderTests
     {
         byte[] rgba = Palette(97, 65);
         int w = 97, h = 65;
-        byte[] webp = ManagedWebpEncoder.EncodeRgba(rgba, w, h);
+        byte[] webp = WebpEncoder.EncodeRgba(rgba, w, h);
 
         Assert.Equal((byte)'R', webp[0]);
         Assert.Equal((byte)'I', webp[1]);
@@ -190,7 +202,7 @@ public class WebpLEncoderTests
 
     /// <summary>
     /// 候选剪枝（低色数 + 调色板已压到 ≤0.5 字节/像素时跳过空间变换搜索）
-    /// 不得改变最终选择：把 <see cref="ManagedWebpEncoder"/> 的自动路径与
+    /// 不得改变最终选择：把 <see cref="WebpEncoder"/> 的自动路径与
     /// "逐个候选全量编码后取最小"逐一对比，要求体积完全相同。
     /// </summary>
     [Fact]
@@ -206,7 +218,7 @@ public class WebpLEncoderTests
 
         foreach (var (name, rgba, w, h) in samples)
         {
-            int auto = ManagedWebpEncoder.EncodeRgba(rgba, w, h).Length;
+            int auto = WebpEncoder.EncodeRgba(rgba, w, h).Length;
 
             // 与 EncodeBest 的候选集合一一对应（顺序无关，取最小即可）。
             var candidates = new[]
@@ -224,7 +236,7 @@ public class WebpLEncoderTests
             int smallest = int.MaxValue;
             foreach (var options in candidates)
             {
-                int size = ManagedWebpEncoder.EncodeRgba(rgba, w, h, options).Length;
+                int size = WebpEncoder.EncodeRgba(rgba, w, h, options).Length;
                 if (size < smallest) smallest = size;
             }
 
@@ -241,11 +253,11 @@ public class WebpLEncoderTests
     public void RepeatedEncoding_IsDeterministic()
     {
         byte[] rgba = Photo(96, 72, seed: 31);
-        byte[] first = ManagedWebpEncoder.EncodeRgba(rgba, 96, 72);
+        byte[] first = WebpEncoder.EncodeRgba(rgba, 96, 72);
 
         for (int i = 0; i < 100; i++)
         {
-            byte[] again = ManagedWebpEncoder.EncodeRgba(rgba, 96, 72);
+            byte[] again = WebpEncoder.EncodeRgba(rgba, 96, 72);
             Assert.Equal(first.Length, again.Length);
             AssertBytesEqual(first, again, "repeat #" + i);
         }
@@ -260,9 +272,9 @@ public class WebpLEncoderTests
     {
         foreach (var sample in Samples())
         {
-            int literal = ManagedWebpEncoder.EncodeRgba(sample.Rgba, sample.W, sample.H,
+            int literal = WebpEncoder.EncodeRgba(sample.Rgba, sample.W, sample.H,
                 Vp8LEncoderOptions.LiteralOnly).Length;
-            int full = ManagedWebpEncoder.EncodeRgba(sample.Rgba, sample.W, sample.H).Length;
+            int full = WebpEncoder.EncodeRgba(sample.Rgba, sample.W, sample.H).Length;
 
             // 结构化图像（照片/渐变/调色板）上，变换 + color cache + LZ77 必须比纯 literal 小。
             // 噪声/纯色图不保证：噪声没有可利用结构，纯色小图会被变换头与子图像开销反超。
@@ -289,17 +301,17 @@ public class WebpLEncoderTests
 
     private static void AssertRoundTrip(byte[] rgba, int w, int h, Vp8LEncoderOptions options, string label)
     {
-        byte[] webp = ManagedWebpEncoder.EncodeRgba(rgba, w, h, options);
+        byte[] webp = WebpEncoder.EncodeRgba(rgba, w, h, options);
 
-        byte[] managed = ManagedWebpDecoder.DecodeRgba(webp, out int mw, out int mh);
+        byte[] csharp = WebpDecoder.DecodeRgba(webp, out int mw, out int mh);
         Assert.Equal(w, mw);
         Assert.Equal(h, mh);
-        AssertPixelExact(rgba, managed, label + " managed->managed");
+        AssertPixelExact(rgba, csharp, label + " csharp->csharp");
 
         byte[] lib = WebpCodec.DecodeRgba(webp, out int lw, out int lh);
         Assert.Equal(w, lw);
         Assert.Equal(h, lh);
-        AssertPixelExact(rgba, lib, label + " managed->libwebp");
+        AssertPixelExact(rgba, lib, label + " csharp->libwebp");
     }
 
     private static void AssertBytesEqual(byte[] expected, byte[] actual, string label)
@@ -506,21 +518,37 @@ public class WebpLEncoderTests
         > 255 => 255,
         _ => (byte)Math.Round(v),
     };
+
+    /// <summary>
+    /// 真实照片的 VP8L 往返：托管编码 → libwebp 解码必须逐像素等于原图。
+    /// 真实照片会触发大调色板、长距离反向引用与各向异性残差，是合成图覆盖不到的路径。
+    /// </summary>
+    [Fact]
+    public void CSharp_Lossless_RealPhoto_RoundTripsThroughLibWebP()
+    {
+        string path = Path.Combine(AppContext.BaseDirectory,
+            "..", "..", "..", "..", "examples", "Amish-Noka-Dresser.jpg");
+        var frame = ImageFrame.Load(path).ToRgba32();
+
+        AssertRoundTrip(frame.Pixels, frame.Width, frame.Height,
+            new Vp8LEncoderOptions(true, true, true, useColorIndexing: true, autoPredictor: true),
+            "real photo");
+    }
 }
 
 /// <summary>
-/// 编码后端分派（<see cref="WebpEncodePolicy"/>）：Auto 无损走托管、Managed 拒绝有损、
+/// 编码后端分派（<see cref="WebpEncodePolicy"/>）：Auto 无损走托管、CSharp 拒绝有损、
 /// LibWebp 强制走原生。
 /// </summary>
 [Collection("WebpEncodePolicy")]
 public class WebpEncodeBackendTests
 {
     [Fact]
-    public void Managed_Lossless_ProducesLibWebpDecodableFile()
+    public void CSharp_Lossless_ProducesLibWebpDecodableFile()
     {
         var (rgba, w, h) = (PhotoSample(64, 48), 64, 48);
 
-        byte[] webp = WithEncodeBackend(WebpEncodeBackend.Managed,
+        byte[] webp = WithEncodeBackend(WebpEncodeBackend.CSharp,
             () => WebpCodec.EncodeRgba(rgba, w, h, new WebpEncoderOptions(75f, WebpConcurrencyStrategy.Serial, 6, lossless: true)));
 
         byte[] lib = WebpCodec.DecodeRgba(webp, out int lw, out int lh);
@@ -530,16 +558,16 @@ public class WebpEncodeBackendTests
     }
 
     [Fact]
-    public void Auto_Lossless_MatchesManagedOutput()
+    public void Auto_Lossless_MatchesCSharpOutput()
     {
         var (rgba, w, h) = (PhotoSample(48, 40), 48, 40);
 
-        byte[] managed = WithEncodeBackend(WebpEncodeBackend.Managed,
-            () => ManagedWebpEncoder.EncodeRgba(rgba, w, h));
+        byte[] csharp = WithEncodeBackend(WebpEncodeBackend.CSharp,
+            () => WebpEncoder.EncodeRgba(rgba, w, h));
         byte[] auto = WithEncodeBackend(WebpEncodeBackend.Auto,
             () => WebpCodec.EncodeRgba(rgba, w, h, new WebpEncoderOptions(75f, WebpConcurrencyStrategy.Serial, 6, lossless: true)));
 
-        Assert.Equal(managed, auto);
+        Assert.Equal(csharp, auto);
     }
 
     [Fact]
@@ -555,13 +583,35 @@ public class WebpEncodeBackendTests
     }
 
     [Fact]
-    public void Managed_Lossy_ThrowsUnsupported()
+    public void CSharp_Lossy_Opaque_ProducesLibWebpDecodableFile()
     {
         var (rgba, w, h) = (PhotoSample(32, 32), 32, 32);
 
+        byte[] webp = WithEncodeBackend(WebpEncodeBackend.CSharp,
+            () => WebpCodec.EncodeRgba(rgba, w, h,
+                new WebpEncoderOptions(75f, WebpConcurrencyStrategy.Serial, 6, lossless: false)));
+
+        // 合法性判据：真实 libwebp 必须能解出正确尺寸。
+        byte[] lib = WebpCodec.DecodeRgba(webp, out int lw, out int lh);
+        Assert.Equal(w, lw);
+        Assert.Equal(h, lh);
+
+        // 同一码流在托管解码器下必须与 libwebp 只存在 ±1 取整差异（alpha 必须一致）。
+        byte[] csharp = WebpDecoder.DecodeRgba(webp, out int mw, out int mh);
+        Assert.Equal(w, mw);
+        Assert.Equal(h, mh);
+        AssertNearPixel(lib, csharp, "csharp lossy libwebp->csharp");
+    }
+
+    [Fact]
+    public void CSharp_Lossy_Alpha_ThrowsUnsupported()
+    {
+        var rgba = PhotoSample(16, 16);
+        rgba[3] = 0; // 第一个像素非不透明
+
         Assert.Throws<WebpUnsupportedException>(() =>
-            WithEncodeBackend(WebpEncodeBackend.Managed,
-                () => WebpCodec.EncodeRgba(rgba, w, h,
+            WithEncodeBackend(WebpEncodeBackend.CSharp,
+                () => WebpCodec.EncodeRgba(rgba, 16, 16,
                     new WebpEncoderOptions(75f, WebpConcurrencyStrategy.Serial, 6, lossless: false))));
     }
 
@@ -593,6 +643,24 @@ public class WebpEncodeBackendTests
                 px[o + 3] = 255;
             }
         return px;
+    }
+
+    /// <summary>
+    /// 有损码流的两个解码器对比：RGB 允许 ±1 取整差异，alpha 必须一致。
+    /// </summary>
+    private static void AssertNearPixel(byte[] expected, byte[] actual, string label)
+    {
+        Assert.Equal(expected.Length, actual.Length);
+        int maxDiff = 0;
+        for (int i = 0; i < expected.Length; i++)
+        {
+            int d = Math.Abs(expected[i] - actual[i]);
+            if (i % 4 == 3)
+                Assert.Equal(expected[i], actual[i]);
+            maxDiff = Math.Max(maxDiff, i % 4 == 3 ? 0 : d);
+        }
+
+        Assert.True(maxDiff <= 1, $"{label}: RGB 最大差 {maxDiff} 超过 ±1");
     }
 }
 

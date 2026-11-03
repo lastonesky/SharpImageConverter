@@ -1,4 +1,4 @@
-namespace SharpImageConverter.Formats.Webp.Managed;
+namespace SharpImageConverter.Formats.Webp;
 
 /// <summary>
 /// WebP RIFF chunk 类型（FourCC 字面量）。

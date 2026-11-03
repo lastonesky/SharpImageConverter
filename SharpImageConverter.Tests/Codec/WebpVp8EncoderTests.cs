@@ -1,5 +1,5 @@
 using Xunit;
-using SharpImageConverter.Formats.Webp.Managed;
+using SharpImageConverter.Formats.Webp;
 
 namespace SharpImageConverter.Tests.Codec;
 
@@ -167,5 +167,98 @@ public class WebpVp8EncoderTests
                 Assert.InRange((int)dst[i], expected - 3, expected + 3);
             }
         }
+    }
+
+    // ==================================================================
+    //  T1：托管 VP8 编码 → libwebp / 托管解码一致性
+    // ==================================================================
+
+    public static IEnumerable<object[]> EncodeCases()
+    {
+        (string name, int w, int h, float q)[] cases =
+        {
+            ("16x16", 16, 16, 75f),
+            ("32x24", 32, 24, 75f),
+            ("17x13", 17, 13, 75f),
+            ("64x48-q95", 64, 48, 95f),
+            ("64x48-q30", 64, 48, 30f),
+            ("16x16-q20", 16, 16, 20f),
+            ("16x16-q30", 16, 16, 30f),
+            ("16x16-q40", 16, 16, 40f),
+            ("16x16-q50", 16, 16, 50f),
+            ("32x24-q30", 32, 24, 30f),
+            ("32x24-q50", 32, 24, 50f),
+        };
+        foreach (var c in cases)
+            yield return new object[] { c.name, c.w, c.h, c.q };
+    }
+
+    /// <summary>
+    /// 主判据：托管编码器产出的码流必须能被真实 libwebp 解码，且同一码流在 libwebp 与托管
+    /// 解码器下只允许 RGB ±1 的取整差异，alpha 必须一致。
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(EncodeCases))]
+    public void Vp8Encode_DecodesIdenticallyInLibWebpAndCSharp(
+        string name, int w, int h, float quality)
+    {
+        byte[] rgba = MakePhoto(w, h);
+        byte[] webp = WebpEncoder.EncodeLossyRgba(rgba, w, h, quality);
+
+        byte[] csharp = WebpDecoder.DecodeRgba(webp, out int mw, out int mh);
+        byte[] lib = WebpCodec.DecodeRgba(webp, out int lw, out int lh);
+
+        Assert.Equal(w, lw);
+        Assert.Equal(h, lh);
+        Assert.Equal(w, mw);
+        Assert.Equal(h, mh);
+
+        int maxRgbDiff = 0, firstBad = -1;
+        for (int i = 0; i < lib.Length; i++)
+        {
+            if (i % 4 == 3)
+            {
+                Assert.Equal(lib[i], csharp[i]);
+                continue;
+            }
+
+            int d = Math.Abs(lib[i] - csharp[i]);
+            if (d > 1 && firstBad < 0) firstBad = i;
+            maxRgbDiff = Math.Max(maxRgbDiff, d);
+        }
+
+        Assert.True(firstBad < 0,
+            $"{name}: 同一码流两解码器 RGB 差超过 ±1（最大 {maxRgbDiff}，首个差异字节 {firstBad}）");
+
+        // 保真下限：证明码流不是“两解码器一致地解出垃圾”。低质量下阈值放宽到 15dB。
+        double mse = 0;
+        for (int i = 0; i < rgba.Length; i++)
+        {
+            if (i % 4 == 3) continue;
+            double d = lib[i] - rgba[i];
+            mse += d * d;
+        }
+        mse /= (w * h * 3);
+        double psnr = 10 * Math.Log10(255.0 * 255.0 / Math.Max(mse, 1e-9));
+        Assert.True(psnr >= 15.0, $"{name}: PSNR {psnr:F1}dB 低于 15dB，码流保真异常");
+    }
+
+    private static byte[] MakePhoto(int w, int h)
+    {
+        var rgba = new byte[w * h * 4];
+        for (int y = 0; y < h; y++)
+        {
+            for (int x = 0; x < w; x++)
+            {
+                int o = (y * w + x) * 4;
+                double nx = (double)x / Math.Max(1, w - 1);
+                double ny = (double)y / Math.Max(1, h - 1);
+                rgba[o] = (byte)Math.Clamp(90 + 130 * nx + 20 * Math.Sin(9 * nx * Math.PI), 0, 255);
+                rgba[o + 1] = (byte)Math.Clamp(70 + 150 * ny + 25 * Math.Cos(7 * ny * Math.PI), 0, 255);
+                rgba[o + 2] = (byte)Math.Clamp(120 + 80 * (nx + ny) / 2 + 30 * Math.Sin(5 * (nx + ny) * Math.PI), 0, 255);
+                rgba[o + 3] = 255;
+            }
+        }
+        return rgba;
     }
 }

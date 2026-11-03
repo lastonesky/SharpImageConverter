@@ -1,4 +1,4 @@
-namespace SharpImageConverter.Formats.Webp.Managed;
+namespace SharpImageConverter.Formats.Webp;
 
 /// <summary>
 /// VP8L 的 Huffman 码长读取，严格对照 libwebp 的 ReadHuffmanCode / ReadHuffmanCodeLengths 实现。

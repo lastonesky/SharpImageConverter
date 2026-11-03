@@ -1,17 +1,16 @@
 using System.Text;
 using Xunit;
 using SharpImageConverter.Formats.Webp;
-using SharpImageConverter.Formats.Webp.Managed;
 
 namespace SharpImageConverter.Tests.Codec;
 
 /// <summary>
-/// 纯 C# WebP 解码器（ManagedWebpDecoder）与 libwebp 的 bit-exact 对拍测试。
+/// 纯 C# WebP 解码器（WebpDecoder）与 libwebp 的 bit-exact 对拍测试。
 /// 覆盖：LSB 位序、VP8L 帧头、无变换最简流、RIFF 容器（静态图与动图结构）。
 /// 说明：VP8L 无损要求 bit-exact；有损 VP8 只验证“能解码、尺寸正确”，
 /// 与 libwebp 的逐像素对齐由 Vp8* 解码器自带的测试负责。
 /// </summary>
-public class WebpManagedDecoderTests
+public class WebpDecoderTests
 {
     // ==================================================================
     //  1. 位流读取器：锁定 LSB-first 位序与边界行为
@@ -173,10 +172,10 @@ public class WebpManagedDecoderTests
         Assert.Equal(64, container.CanvasWidth);
         Assert.Equal(48, container.CanvasHeight);
 
-        var managed = ManagedWebpDecoder.DecodeRgba(webp, out int mw, out int mh);
+        var csharp = WebpDecoder.DecodeRgba(webp, out int mw, out int mh);
         Assert.Equal(lw, mw);
         Assert.Equal(lh, mh);
-        PixelAssert.Equal(lib, managed, mw, mh);
+        PixelAssert.Equal(lib, csharp, mw, mh);
     }
 
     /// <summary>
@@ -198,10 +197,10 @@ public class WebpManagedDecoderTests
         Assert.True(transparent, "测试数据应包含非不透明像素");
         Assert.Equal(transparent, container.HasAlpha);
 
-        var managed = ManagedWebpDecoder.DecodeRgba(webp, out int mw, out int mh);
+        var csharp = WebpDecoder.DecodeRgba(webp, out int mw, out int mh);
         Assert.Equal(lw, mw);
         Assert.Equal(lh, mh);
-        PixelAssert.Equal(lib, managed, mw, mh);
+        PixelAssert.Equal(lib, csharp, mw, mh);
     }
 
     /// <summary>
@@ -237,10 +236,10 @@ public class WebpManagedDecoderTests
         Assert.Equal(w, lw);
         Assert.Equal(h, lh);
 
-        var managed = ManagedWebpDecoder.DecodeRgba(webp, out int mw, out int mh);
+        var csharp = WebpDecoder.DecodeRgba(webp, out int mw, out int mh);
         Assert.Equal(w, mw);
         Assert.Equal(h, mh);
-        PixelAssert.Equal(lib, managed, mw, mh);
+        PixelAssert.Equal(lib, csharp, mw, mh);
     }
 
     // ==================================================================
@@ -267,11 +266,11 @@ public class WebpManagedDecoderTests
         Assert.Equal(h, lh);
         PixelAssert.Equal(expected, lib, lw, lh);
 
-        byte[] managed = ManagedWebpDecoder.DecodeRgba(webp, out int mw, out int mh);
+        byte[] csharp = WebpDecoder.DecodeRgba(webp, out int mw, out int mh);
         Assert.Equal(w, mw);
         Assert.Equal(h, mh);
-        PixelAssert.Equal(expected, managed, mw, mh);
-        PixelAssert.Equal(lib, managed, mw, mh);
+        PixelAssert.Equal(expected, csharp, mw, mh);
+        PixelAssert.Equal(lib, csharp, mw, mh);
     }
 
     /// <summary>
@@ -288,10 +287,10 @@ public class WebpManagedDecoderTests
         byte[] lib = WebpCodec.DecodeRgba(webp, out int lw, out int lh);
         PixelAssert.Equal(expected, lib, lw, lh);
 
-        byte[] managed = ManagedWebpDecoder.DecodeRgba(webp, out int mw, out int mh);
+        byte[] csharp = WebpDecoder.DecodeRgba(webp, out int mw, out int mh);
         Assert.Equal(w, mw);
         Assert.Equal(h, mh);
-        PixelAssert.Equal(expected, managed, mw, mh);
+        PixelAssert.Equal(expected, csharp, mw, mh);
     }
 
     /// <summary>libwebp 无损编码的纯色图，逐像素与 libwebp 解码结果对齐。</summary>
@@ -305,11 +304,11 @@ public class WebpManagedDecoderTests
         Assert.True(IsVp8L(webp), "libwebp 无损编码应生成 VP8L 格式");
 
         byte[] lib = WebpCodec.DecodeRgba(webp, out int lw, out int lh);
-        byte[] managed = ManagedWebpDecoder.DecodeRgba(webp, out int mw, out int mh);
+        byte[] csharp = WebpDecoder.DecodeRgba(webp, out int mw, out int mh);
 
         Assert.Equal(lw, mw);
         Assert.Equal(lh, mh);
-        PixelAssert.Equal(lib, managed, mw, mh);
+        PixelAssert.Equal(lib, csharp, mw, mh);
     }
 
     [Fact]
@@ -328,7 +327,7 @@ public class WebpManagedDecoderTests
         }
 
         byte[] webp = EncodeLossless(rgba, w, h);
-        byte[] decoded = ManagedWebpDecoder.DecodeRgba(webp, out int dw, out int dh);
+        byte[] decoded = WebpDecoder.DecodeRgba(webp, out int dw, out int dh);
         Assert.Equal(w, dw);
         Assert.Equal(h, dh);
 
@@ -351,7 +350,7 @@ public class WebpManagedDecoderTests
         }
 
         byte[] webp = EncodeLossless(rgba, w, h);
-        byte[] decoded = ManagedWebpDecoder.DecodeRgba(webp, out int dw, out int dh);
+        byte[] decoded = WebpDecoder.DecodeRgba(webp, out int dw, out int dh);
 
         byte[] libwebpDecoded = WebpCodec.DecodeRgba(webp, out int lw, out int lh);
         Assert.Equal(lw, dw);
@@ -378,7 +377,7 @@ public class WebpManagedDecoderTests
         }
 
         byte[] webp = EncodeLossless(rgba, w, h);
-        byte[] decoded = ManagedWebpDecoder.DecodeRgba(webp, out int dw, out int dh);
+        byte[] decoded = WebpDecoder.DecodeRgba(webp, out int dw, out int dh);
 
         byte[] libwebpDecoded = WebpCodec.DecodeRgba(webp, out int lw, out int lh);
         Assert.Equal(lw, dw);
@@ -391,7 +390,7 @@ public class WebpManagedDecoderTests
     {
         var rgba = new byte[] { 255, 100, 150, 200 };
         byte[] webp = EncodeLossless(rgba, 1, 1);
-        byte[] decoded = ManagedWebpDecoder.DecodeRgba(webp, out int dw, out int dh);
+        byte[] decoded = WebpDecoder.DecodeRgba(webp, out int dw, out int dh);
 
         byte[] libwebpDecoded = WebpCodec.DecodeRgba(webp, out int lw, out int lh);
         Assert.Equal(lw, dw);
@@ -412,7 +411,7 @@ public class WebpManagedDecoderTests
         byte[] webp = EncodeLossless(rgba, w, h);
 
         byte[] libwebpDecoded = WebpCodec.DecodeRgba(webp, out int lw, out int lh);
-        byte[] decoded = ManagedWebpDecoder.DecodeRgba(webp, out int dw, out int dh);
+        byte[] decoded = WebpDecoder.DecodeRgba(webp, out int dw, out int dh);
 
         Assert.Equal(lw, dw);
         Assert.Equal(lh, dh);
@@ -436,7 +435,7 @@ public class WebpManagedDecoderTests
         byte[] webp = EncodeLossless(rgba, w, h);
 
         byte[] libwebpDecoded = WebpCodec.DecodeRgba(webp, out int lw, out int lh);
-        byte[] decoded = ManagedWebpDecoder.DecodeRgba(webp, out int dw, out int dh);
+        byte[] decoded = WebpDecoder.DecodeRgba(webp, out int dw, out int dh);
 
         Assert.Equal(lw, dw);
         Assert.Equal(lh, dh);
@@ -458,11 +457,11 @@ public class WebpManagedDecoderTests
         byte[] webp = EncodeLossless(PhotoLikeRgba(w, h, seed: 2024), w, h);
 
         byte[] lib = WebpCodec.DecodeRgba(webp, out int lw, out int lh);
-        byte[] managed = ManagedWebpDecoder.DecodeRgba(webp, out int mw, out int mh);
+        byte[] csharp = WebpDecoder.DecodeRgba(webp, out int mw, out int mh);
 
         Assert.Equal(lw, mw);
         Assert.Equal(lh, mh);
-        PixelAssert.Equal(lib, managed, mw, mh);
+        PixelAssert.Equal(lib, csharp, mw, mh);
     }
 
     /// <summary>
@@ -487,11 +486,11 @@ public class WebpManagedDecoderTests
 
         byte[] webp = EncodeLossless(rgba, w, h);
         byte[] lib = WebpCodec.DecodeRgba(webp, out int lw, out int lh);
-        byte[] managed = ManagedWebpDecoder.DecodeRgba(webp, out int mw, out int mh);
+        byte[] csharp = WebpDecoder.DecodeRgba(webp, out int mw, out int mh);
 
         Assert.Equal(lw, mw);
         Assert.Equal(lh, mh);
-        PixelAssert.Equal(lib, managed, mw, mh);
+        PixelAssert.Equal(lib, csharp, mw, mh);
     }
 
     /// <summary>
@@ -505,11 +504,11 @@ public class WebpManagedDecoderTests
 
         byte[] webp = EncodeLossless(rgba, w, h);
         byte[] lib = WebpCodec.DecodeRgba(webp, out int lw, out int lh);
-        byte[] managed = ManagedWebpDecoder.DecodeRgba(webp, out int mw, out int mh);
+        byte[] csharp = WebpDecoder.DecodeRgba(webp, out int mw, out int mh);
 
         Assert.Equal(lw, mw);
         Assert.Equal(lh, mh);
-        PixelAssert.Equal(lib, managed, mw, mh);
+        PixelAssert.Equal(lib, csharp, mw, mh);
     }
 
     /// <summary>512×512 大图：触发多组 meta-Huffman（每 tile 一张表）。</summary>
@@ -520,11 +519,11 @@ public class WebpManagedDecoderTests
         byte[] webp = EncodeLossless(PhotoLikeRgba(w, h, seed: 5150), w, h);
 
         byte[] lib = WebpCodec.DecodeRgba(webp, out int lw, out int lh);
-        byte[] managed = ManagedWebpDecoder.DecodeRgba(webp, out int mw, out int mh);
+        byte[] csharp = WebpDecoder.DecodeRgba(webp, out int mw, out int mh);
 
         Assert.Equal(lw, mw);
         Assert.Equal(lh, mh);
-        PixelAssert.Equal(lib, managed, mw, mh);
+        PixelAssert.Equal(lib, csharp, mw, mh);
     }
 
     /// <summary>极端宽高比 1×N：所有像素在同一行，predictor 首行/末列边界全部命中。</summary>
@@ -535,11 +534,11 @@ public class WebpManagedDecoderTests
         byte[] webp = EncodeLossless(PhotoLikeRgba(w, h, seed: 7), w, h);
 
         byte[] lib = WebpCodec.DecodeRgba(webp, out int lw, out int lh);
-        byte[] managed = ManagedWebpDecoder.DecodeRgba(webp, out int mw, out int mh);
+        byte[] csharp = WebpDecoder.DecodeRgba(webp, out int mw, out int mh);
 
         Assert.Equal(w, mw);
         Assert.Equal(h, mh);
-        PixelAssert.Equal(lib, managed, mw, mh);
+        PixelAssert.Equal(lib, csharp, mw, mh);
     }
 
     /// <summary>极端宽高比 N×1：只有首行，predictor 首行规则全覆盖。</summary>
@@ -550,11 +549,11 @@ public class WebpManagedDecoderTests
         byte[] webp = EncodeLossless(PhotoLikeRgba(w, h, seed: 8), w, h);
 
         byte[] lib = WebpCodec.DecodeRgba(webp, out int lw, out int lh);
-        byte[] managed = ManagedWebpDecoder.DecodeRgba(webp, out int mw, out int mh);
+        byte[] csharp = WebpDecoder.DecodeRgba(webp, out int mw, out int mh);
 
         Assert.Equal(w, mw);
         Assert.Equal(h, mh);
-        PixelAssert.Equal(lib, managed, mw, mh);
+        PixelAssert.Equal(lib, csharp, mw, mh);
     }
 
     // ---- ALPH 独立 alpha 通道（合成进 VP8L 结果） ----
@@ -575,7 +574,7 @@ public class WebpManagedDecoderTests
         alpha.CopyTo(payload, 1);
 
         byte[] webp = BuildAlphContainer(w, h, main, payload);
-        byte[] decoded = ManagedWebpDecoder.DecodeRgba(webp, out int dw, out int dh);
+        byte[] decoded = WebpDecoder.DecodeRgba(webp, out int dw, out int dh);
 
         Assert.Equal(w, dw);
         Assert.Equal(h, dh);
@@ -611,7 +610,7 @@ public class WebpManagedDecoderTests
         deltas.CopyTo(payload, 1);
 
         byte[] webp = BuildAlphContainer(w, h, main, payload);
-        byte[] decoded = ManagedWebpDecoder.DecodeRgba(webp, out int dw, out int dh);
+        byte[] decoded = WebpDecoder.DecodeRgba(webp, out int dw, out int dh);
 
         var expected = (byte[])main.Clone();
         for (int i = 0; i < alpha.Length; i++)
@@ -643,7 +642,7 @@ public class WebpManagedDecoderTests
         bare.CopyTo(payload, 1);
 
         byte[] webp = BuildAlphContainer(w, h, main, payload);
-        byte[] decoded = ManagedWebpDecoder.DecodeRgba(webp, out int dw, out int dh);
+        byte[] decoded = WebpDecoder.DecodeRgba(webp, out int dw, out int dh);
 
         var expected = (byte[])main.Clone();
         for (int i = 0; i < w * h; i++)
@@ -665,7 +664,7 @@ public class WebpManagedDecoderTests
 
         byte[] webp = BuildAlphContainer(w, h, main, payload);
         Assert.Throws<WebpBitstreamException>(
-            () => ManagedWebpDecoder.DecodeRgba(webp, out _, out _));
+            () => WebpDecoder.DecodeRgba(webp, out _, out _));
     }
 
     /// <summary>ALPH 头部保留位非零应视为损坏文件。</summary>
@@ -678,7 +677,7 @@ public class WebpManagedDecoderTests
 
         byte[] webp = BuildAlphContainer(w, h, main, payload);
         Assert.Throws<WebpBitstreamException>(
-            () => ManagedWebpDecoder.DecodeRgba(webp, out _, out _));
+            () => WebpDecoder.DecodeRgba(webp, out _, out _));
     }
 
     /// <summary>有损 VP8 关键帧已由托管解码器支持：应返回正确尺寸的 RGBA，而非抛 Unsupported。</summary>
@@ -693,7 +692,7 @@ public class WebpManagedDecoderTests
         Assert.True(webp.Length > 16);
         Assert.Equal("VP8 ", Encoding.ASCII.GetString(webp, 12, 4));
 
-        byte[] px = ManagedWebpDecoder.DecodeRgba(webp, out int dw, out int dh);
+        byte[] px = WebpDecoder.DecodeRgba(webp, out int dw, out int dh);
         Assert.Equal(w, dw);
         Assert.Equal(h, dh);
         Assert.Equal(w * h * 4, px.Length);
@@ -806,7 +805,7 @@ public class WebpManagedDecoderTests
             frames, w, h, durations, loopCount: 3,
             new WebpEncoderOptions(75f, lossless: true));
 
-        var animation = ManagedWebpDecoder.DecodeAnimation(webp);
+        var animation = WebpDecoder.DecodeAnimation(webp);
         Assert.Equal(w, animation.CanvasWidth);
         Assert.Equal(h, animation.CanvasHeight);
         Assert.Equal(3, animation.LoopCount);
@@ -824,7 +823,7 @@ public class WebpManagedDecoderTests
         }
 
         // DecodeRgba 对动图返回末帧画布
-        byte[] last = ManagedWebpDecoder.DecodeRgba(webp, out int dw, out int dh);
+        byte[] last = WebpDecoder.DecodeRgba(webp, out int dw, out int dh);
         Assert.Equal(w, dw);
         Assert.Equal(h, dh);
         PixelAssert.Equal(frames[^1], last, w, h);
@@ -859,7 +858,7 @@ public class WebpManagedDecoderTests
         byte[] webp = EncodeLossless(RandomRgba(16, 16, seed: 99), 16, 16);
         byte[] truncated = webp.AsSpan(0, webp.Length / 2).ToArray();
 
-        Assert.ThrowsAny<WebpException>(() => ManagedWebpDecoder.DecodeRgba(truncated, out _, out _));
+        Assert.ThrowsAny<WebpException>(() => WebpDecoder.DecodeRgba(truncated, out _, out _));
     }
 
     [Fact]
@@ -874,7 +873,7 @@ public class WebpManagedDecoderTests
         BitConverter.GetBytes(10u).CopyTo(bad, 16);
         bad[20] = 0x2F; // signature
 
-        Assert.ThrowsAny<WebpException>(() => ManagedWebpDecoder.DecodeRgba(bad, out _, out _));
+        Assert.ThrowsAny<WebpException>(() => WebpDecoder.DecodeRgba(bad, out _, out _));
     }
 
     [Fact]
@@ -883,7 +882,7 @@ public class WebpManagedDecoderTests
         byte[] webp = EncodeLossless(RandomRgba(16, 16, seed: 77), 16, 16);
         byte[] corrupted = webp.AsSpan(0, webp.Length - 5).ToArray();
 
-        Assert.ThrowsAny<WebpException>(() => ManagedWebpDecoder.DecodeRgba(corrupted, out _, out _));
+        Assert.ThrowsAny<WebpException>(() => WebpDecoder.DecodeRgba(corrupted, out _, out _));
     }
 
     // ==================================================================

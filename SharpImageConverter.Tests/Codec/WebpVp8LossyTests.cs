@@ -1,7 +1,7 @@
 using System.Runtime.InteropServices;
 using Xunit;
+using SharpImageConverter;
 using SharpImageConverter.Formats.Webp;
-using SharpImageConverter.Formats.Webp.Managed;
 
 namespace SharpImageConverter.Tests.Codec;
 
@@ -59,7 +59,7 @@ public class WebpVp8LossyTests
 
     public static IEnumerable<object[]> LossyCases()
     {
-        int[] qualities = { 50, 75, 95 };
+        int[] qualities = { 10, 20, 30, 50, 75, 95 };
         (string name, int w, int h, Func<int, int, byte[]> gen)[] images =
         {
             ("photo32",   32,  32,  MakePhotoLike),
@@ -81,7 +81,7 @@ public class WebpVp8LossyTests
         byte[] webp = WebpCodec.EncodeRgba(rgba, w, h, quality);
 
         byte[] expected = WebpCodec.DecodeRgba(webp, out int ew, out int eh);
-        byte[] actual = ManagedWebpDecoder.DecodeRgba(webp, out int aw, out int ah);
+        byte[] actual = WebpDecoder.DecodeRgba(webp, out int aw, out int ah);
 
         Assert.Equal(ew, aw);
         Assert.Equal(eh, ah);
@@ -154,7 +154,50 @@ public class WebpVp8LossyTests
     {
         byte[] rgba = gen(w, h);
         byte[] webp = WebpCodec.EncodeRgba(rgba, w, h, quality);
+        AssertYuvMatchesLibwebp(webp, w, h, name, quality);
+    }
 
+    /// <summary>
+    /// 非偶数（含奇数与 1 像素）尺寸：VP8 的宏块网格、色度平面按 ceil(w/2)/ceil(h/2)
+    /// 取整，边缘处理最容易出错，因此单独覆盖。
+    /// </summary>
+    public static IEnumerable<object[]> OddSizeCases()
+    {
+        int[] qualities = { 50, 75, 95 };
+        (int w, int h)[] sizes = { (1, 1), (3, 2), (17, 13), (31, 17), (33, 7), (101, 63), (127, 5) };
+        foreach (int q in qualities)
+            foreach (var (w, h) in sizes)
+                yield return new object[] { w, h, q };
+    }
+
+    [Theory]
+    [MemberData(nameof(OddSizeCases))]
+    public void Lossy_OddDimensions_YuvPlanesMatchLibwebp(int w, int h, float quality)
+    {
+        byte[] rgba = MakePhotoLike(w, h);
+        byte[] webp = WebpCodec.EncodeRgba(rgba, w, h, quality);
+        AssertYuvMatchesLibwebp(webp, w, h, $"odd{w}x{h}", quality);
+    }
+
+    /// <summary>
+    /// 真实照片（examples/Amish-Noka-Dresser.jpg）：低/中/高质量都由 libwebp 编码，
+    /// 托管解码器的 Y/U/V 必须逐像素一致。真实照片的系数分布远比合成图复杂。
+    /// </summary>
+    [Theory]
+    [InlineData(20f)]
+    [InlineData(50f)]
+    [InlineData(85f)]
+    public void Lossy_RealPhoto_YuvPlanesMatchLibwebp(float quality)
+    {
+        string path = Path.Combine(AppContext.BaseDirectory,
+            "..", "..", "..", "..", "examples", "Amish-Noka-Dresser.jpg");
+        var frame = ImageFrame.Load(path).ToRgba32();
+        byte[] webp = WebpCodec.EncodeRgba(frame.Pixels, frame.Width, frame.Height, quality);
+        AssertYuvMatchesLibwebp(webp, frame.Width, frame.Height, "photo-real", quality);
+    }
+
+    private static void AssertYuvMatchesLibwebp(byte[] webp, int w, int h, string caseName, float quality)
+    {
         IntPtr yPtr = WebPDecodeYUV(webp, (nuint)webp.Length, out int lw, out int lh,
             out IntPtr uPtr, out IntPtr vPtr, out int stride, out int uvStride);
         Assert.NotEqual(IntPtr.Zero, yPtr);
@@ -177,10 +220,12 @@ public class WebpVp8LossyTests
 
         Assert.Equal(lw, decoded.Width);
         Assert.Equal(lh, decoded.Height);
+        Assert.Equal(w, lw);
+        Assert.Equal(h, lh);
 
-        AssertPlaneEqual("Y", ly, decoded.Y, lw, lh, name, quality);
-        AssertPlaneEqual("U", lu, decoded.U, (lw + 1) / 2, (lh + 1) / 2, name, quality);
-        AssertPlaneEqual("V", lv, decoded.V, (lw + 1) / 2, (lh + 1) / 2, name, quality);
+        AssertPlaneEqual("Y", ly, decoded.Y, lw, lh, caseName, quality);
+        AssertPlaneEqual("U", lu, decoded.U, (lw + 1) / 2, (lh + 1) / 2, caseName, quality);
+        AssertPlaneEqual("V", lv, decoded.V, (lw + 1) / 2, (lh + 1) / 2, caseName, quality);
     }
 
     private static void AssertPlaneEqual(string plane, byte[] expected, byte[] actual, int w, int h,
@@ -232,7 +277,7 @@ public class WebpVp8LossyTests
             0, 0, 0, 0,
         };
         byte[] webp = BuildRiff(("VP8 ", vp8));
-        Assert.Throws<WebpUnsupportedException>(() => ManagedWebpDecoder.DecodeRgba(webp, out _, out _));
+        Assert.Throws<WebpUnsupportedException>(() => WebpDecoder.DecodeRgba(webp, out _, out _));
     }
 
     [Fact]
@@ -259,8 +304,8 @@ public class WebpVp8LossyTests
 
         byte[] webp = BuildRawRiff(Chunk("VP8X", vp8x), Chunk("ANIM", anim), anmf);
 
-        Assert.Throws<WebpUnsupportedException>(() => ManagedWebpDecoder.DecodeRgba(webp, out _, out _));
-        Assert.Throws<WebpUnsupportedException>(() => ManagedWebpDecoder.DecodeAnimation(webp));
+        Assert.Throws<WebpUnsupportedException>(() => WebpDecoder.DecodeRgba(webp, out _, out _));
+        Assert.Throws<WebpUnsupportedException>(() => WebpDecoder.DecodeAnimation(webp));
     }
 
     // ==================================================================
@@ -277,10 +322,10 @@ public class WebpVp8LossyTests
         for (int len = 30; len < webp.Length - 1; len += Math.Max(1, (webp.Length - 30) / 12))
         {
             var truncated = webp.AsSpan(0, len).ToArray();
-            Assert.ThrowsAny<Exception>(() => ManagedWebpDecoder.DecodeRgba(truncated, out _, out _));
+            Assert.ThrowsAny<Exception>(() => WebpDecoder.DecodeRgba(truncated, out _, out _));
             try
             {
-                ManagedWebpDecoder.DecodeRgba(truncated, out _, out _);
+                WebpDecoder.DecodeRgba(truncated, out _, out _);
                 Assert.Fail("截断流必须抛异常");
             }
             catch (Exception ex) when (ex is WebpContainerException or WebpBitstreamException or WebpUnsupportedException)

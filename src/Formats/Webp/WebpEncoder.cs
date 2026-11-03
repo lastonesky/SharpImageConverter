@@ -2,20 +2,23 @@ using System;
 using System.IO;
 using SharpImageConverter.Metadata;
 
-namespace SharpImageConverter.Formats.Webp.Managed;
+namespace SharpImageConverter.Formats.Webp;
 
 /// <summary>
-/// 纯 C# WebP 编码器入口（仅无损 VP8L）。
+/// 纯 C# WebP 编码器入口（无损 VP8L + 有损 VP8 关键帧）。
 ///
 /// 输出完整的 RIFF/WEBP 容器：<c>RIFF</c> + 文件大小 + <c>WEBP</c> +
-/// <c>VP8L</c> chunk（chunk 大小为 VP8L 负载长度，奇数长度补 1 字节填充）。
+/// <c>VP8L</c> 或 <c>VP8 </c> chunk（chunk 大小为负载长度，奇数长度补 1 字节填充）。
 ///
-/// 默认使用 <see cref="Vp8LEncoderOptions.Auto"/>：在空间变换（subtract-green /
+/// 无损默认使用 <see cref="Vp8LEncoderOptions.Auto"/>：在空间变换（subtract-green /
 /// cross-color / per-tile predictor）与调色板（color indexing）两条路线中、
 /// 各自与 color cache / LZ77 组合的若干候选里选输出最小的一个，全部候选都可被
 /// libwebp 解码且与原始 RGBA 逐像素 bit-exact。
+///
+/// 有损走 <see cref="Vp8Encoder"/>（VP8 关键帧）；ALPH 编码尚未实现，
+/// 输入带非不透明 alpha 时抛 <see cref="WebpUnsupportedException"/>。
 /// </summary>
-public static class ManagedWebpEncoder
+public static class WebpEncoder
 {
     private const uint Vp8LMaxPixelsPerDimension = 16384;
 
@@ -57,7 +60,7 @@ public static class ManagedWebpEncoder
     {
         ValidateDimensions(width, height, rgba.Length);
         var vp8l = Vp8LEncoder.EncodeVp8L(rgba, width, height, Vp8LEncoderOptions.Auto);
-        return WrapInRiff(vp8l, width, height, metadata);
+        return WrapInRiff(vp8l, WebpChunkId.Vp8L, width, height, metadata);
     }
 
     /// <summary>
@@ -97,7 +100,7 @@ public static class ManagedWebpEncoder
         ValidateDimensions(width, height, rgba.Length);
 
         var vp8l = Vp8LEncoder.EncodeVp8L(rgba, width, height, Vp8LEncoderOptions.Auto);
-        var riff = WrapInRiff(vp8l, width, height, metadata);
+        var riff = WrapInRiff(vp8l, WebpChunkId.Vp8L, width, height, metadata);
         stream.Write(riff, 0, riff.Length);
     }
 
@@ -109,7 +112,81 @@ public static class ManagedWebpEncoder
     {
         ValidateDimensions(width, height, rgba.Length);
         var vp8l = Vp8LEncoder.EncodeVp8L(rgba, width, height, options);
-        return WrapInRiff(vp8l, width, height, metadata);
+        return WrapInRiff(vp8l, WebpChunkId.Vp8L, width, height, metadata);
+    }
+
+    // ==================================================================
+    //  有损 VP8
+    // ==================================================================
+
+    /// <summary>
+    /// 把 RGBA 像素编码为完整 WebP 字节（有损 VP8 关键帧）。
+    /// </summary>
+    /// <param name="rgba">像素数据，每像素 R,G,B,A 连续 4 字节；alpha 必须全为 255。</param>
+    /// <param name="width">图像宽度（1..16383）。</param>
+    /// <param name="height">图像高度（1..16383）。</param>
+    /// <param name="quality">质量（0..100，越大越清晰、体积越大）。</param>
+    public static byte[] EncodeLossyRgba(byte[] rgba, int width, int height, float quality)
+    {
+        ArgumentNullException.ThrowIfNull(rgba);
+        return EncodeLossyRgba(rgba.AsSpan(), width, height, quality, metadata: null);
+    }
+
+    /// <summary>
+    /// 把 RGBA 像素编码为完整 WebP 字节（有损 VP8 关键帧）。
+    /// </summary>
+    public static byte[] EncodeLossyRgba(ReadOnlySpan<byte> rgba, int width, int height, float quality)
+        => EncodeLossyRgba(rgba, width, height, quality, metadata: null);
+
+    /// <summary>
+    /// 把 RGBA 像素编码为完整 WebP 字节（有损 VP8 关键帧），并原样写入元数据。
+    /// </summary>
+    public static byte[] EncodeLossyRgba(ReadOnlySpan<byte> rgba, int width, int height, float quality,
+        ImageMetadata? metadata)
+    {
+        ValidateLossyDimensions(width, height, rgba.Length);
+        EnsureOpaqueAlpha(rgba, width, height);
+        var vp8 = Vp8Encoder.Encode(rgba, width, height, quality);
+        return WrapInRiff(vp8, WebpChunkId.Vp8, width, height, metadata);
+    }
+
+    /// <summary>
+    /// 把 RGBA 像素编码为 WebP 并写入流（有损 VP8 关键帧），同时写入元数据。
+    /// </summary>
+    public static void EncodeLossyRgbaToStream(Stream stream, ReadOnlySpan<byte> rgba, int width, int height,
+        float quality, ImageMetadata? metadata = null)
+    {
+        ArgumentNullException.ThrowIfNull(stream);
+        byte[] riff = EncodeLossyRgba(rgba, width, height, quality, metadata);
+        stream.Write(riff, 0, riff.Length);
+    }
+
+    /// <summary>
+    /// 校验有损编码的输入尺寸/像素长度。VP8 关键帧宽高为 14 位且取值范围 1..16383。
+    /// </summary>
+    private static void ValidateLossyDimensions(int width, int height, int rgbaLength)
+    {
+        if (width < 1 || width > Vp8Encoder.MaxDimension)
+            throw new ArgumentOutOfRangeException(nameof(width),
+                $"VP8 宽度必须在 1..{Vp8Encoder.MaxDimension} 之间");
+        if (height < 1 || height > Vp8Encoder.MaxDimension)
+            throw new ArgumentOutOfRangeException(nameof(height),
+                $"VP8 高度必须在 1..{Vp8Encoder.MaxDimension} 之间");
+        if (rgbaLength != checked(width * height * 4))
+            throw new ArgumentException("RGBA 像素长度与尺寸不匹配", nameof(rgbaLength));
+    }
+
+    /// <summary>
+    /// 有损 VP8 路径不做 ALPH 编码，alpha 必须全为不透明，否则明确抛不支持。
+    /// </summary>
+    private static void EnsureOpaqueAlpha(ReadOnlySpan<byte> rgba, int width, int height)
+    {
+        int pixels = width * height;
+        for (int i = 0; i < pixels; i++)
+        {
+            if (rgba[i * 4 + 3] != 255)
+                throw new WebpUnsupportedException("有损 VP8 编码暂不支持带 alpha 的图像（ALPH 编码未实现）");
+        }
     }
 
     private static void ValidateDimensions(int width, int height, int rgbaLength)
@@ -124,20 +201,20 @@ public static class ManagedWebpEncoder
     }
 
     /// <summary>
-    /// 按 RIFF/WEBP 规范包装 VP8L chunk：
+    /// 按 RIFF/WEBP 规范包装图像 chunk：
     /// riff_size = 4 ("WEBP") + 8 (chunk 头) + chunk_size + (chunk 奇数时为 1 字节 pad)。
     /// 存在元数据时改为输出 VP8X 容器（ICCP 前置、EXIF/XMP 后置）。
     /// </summary>
-    private static byte[] WrapInRiff(ReadOnlySpan<byte> vp8lPayload, int width, int height,
+    private static byte[] WrapInRiff(ReadOnlySpan<byte> payload, WebpChunkId chunkId, int width, int height,
         ImageMetadata? metadata)
     {
-        var simple = WrapInRiff(vp8lPayload);
+        var simple = WrapInRiff(payload, chunkId);
         return WebpMetadataWriter.Apply(simple, width, height, metadata);
     }
 
-    private static byte[] WrapInRiff(ReadOnlySpan<byte> vp8lPayload)
+    private static byte[] WrapInRiff(ReadOnlySpan<byte> payload, WebpChunkId chunkId)
     {
-        int chunkSize = vp8lPayload.Length;
+        int chunkSize = payload.Length;
         int paddedChunkSize = chunkSize + (chunkSize & 1);
         int fileSize = checked(4 + 8 + paddedChunkSize);
         int totalLength = fileSize + 8;
@@ -152,12 +229,13 @@ public static class ManagedWebpEncoder
         result[9] = (byte)'E';
         result[10] = (byte)'B';
         result[11] = (byte)'P';
-        result[12] = (byte)'V';
-        result[13] = (byte)'P';
-        result[14] = (byte)'8';
-        result[15] = (byte)'L';
+        uint fourCc = (uint)chunkId;
+        result[12] = (byte)fourCc;
+        result[13] = (byte)(fourCc >> 8);
+        result[14] = (byte)(fourCc >> 16);
+        result[15] = (byte)(fourCc >> 24);
         WriteLittleEndian32(result, 16, (uint)chunkSize);
-        vp8lPayload.CopyTo(result.AsSpan(20));
+        payload.CopyTo(result.AsSpan(20));
         // 奇数长度时第 paddedChunkSize 字节保持 0，即 RIFF 规范要求的填充字节。
         return result;
     }

@@ -1,4 +1,4 @@
-namespace SharpImageConverter.Formats.Webp.Managed;
+namespace SharpImageConverter.Formats.Webp;
 
 /// <summary>
 /// VP8 有损关键帧（intra-only）解码结果：三个 YUV420 平面，按紧凑行距存放（无 padding）。
@@ -551,7 +551,8 @@ internal sealed class Vp8Decoder
             {
                 DecodeMacroblock(tokenBr, mbX, mbY);
                 if (tokenBr.Eof)
-                    throw new WebpBitstreamException("VP8 token 分区提前结束");
+                    throw new WebpBitstreamException(
+                        $"VP8 token 分区提前结束（宏块 {mbX},{mbY}）");
             }
 
             // 对应 VP8InitScanline：清空左侧上下文。

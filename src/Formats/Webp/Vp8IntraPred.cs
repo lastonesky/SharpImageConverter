@@ -4,7 +4,7 @@
 // 坐标约定与 C 代码一致：off 为当前块左上角下标，stride 为行距；
 // C 中 dst[-BPS] 对应此处的 dst[off - stride]，dst[-1] 对应 dst[off - 1]。
 
-namespace SharpImageConverter.Formats.Webp.Managed;
+namespace SharpImageConverter.Formats.Webp;
 
 internal static class Vp8IntraPred
 {

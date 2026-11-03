@@ -1,4 +1,4 @@
-namespace SharpImageConverter.Formats.Webp.Managed;
+namespace SharpImageConverter.Formats.Webp;
 
 /// <summary>
 /// WebP 纯 C# 解码实现抛出的异常基类。

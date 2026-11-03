@@ -1,4 +1,4 @@
-namespace SharpImageConverter.Formats.Webp.Managed;
+namespace SharpImageConverter.Formats.Webp;
 
 /// <summary>
 /// libwebp VP8 解码常量表（逐字转录自 libwebp C 源码，用于位精确对拍）。

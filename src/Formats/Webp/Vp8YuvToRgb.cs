@@ -1,4 +1,4 @@
-namespace SharpImageConverter.Formats.Webp.Managed;
+namespace SharpImageConverter.Formats.Webp;
 
 /// <summary>
 /// YUV420 → RGBA 转换，逐字移植 libwebp 的 fancy upsampling 解码输出路径：

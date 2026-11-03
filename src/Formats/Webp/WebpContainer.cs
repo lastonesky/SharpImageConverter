@@ -1,6 +1,6 @@
 using System.IO;
 
-namespace SharpImageConverter.Formats.Webp.Managed;
+namespace SharpImageConverter.Formats.Webp;
 
 /// <summary>
 /// WebP 容器类型：静态图（含或不含 VP8X）或动图。

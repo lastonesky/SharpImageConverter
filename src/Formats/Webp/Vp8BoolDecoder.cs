@@ -1,4 +1,4 @@
-namespace SharpImageConverter.Formats.Webp.Managed;
+namespace SharpImageConverter.Formats.Webp;
 
 /// <summary>
 /// VP8 布尔算术解码器（Bool Decoder），有损 VP8 的帧头与 token 分区均使用。

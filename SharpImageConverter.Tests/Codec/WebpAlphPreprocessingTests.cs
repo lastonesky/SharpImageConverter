@@ -1,7 +1,6 @@
 using System.Text;
 using Xunit;
 using SharpImageConverter.Formats.Webp;
-using SharpImageConverter.Formats.Webp.Managed;
 
 namespace SharpImageConverter.Tests.Codec;
 
@@ -74,7 +73,7 @@ public class WebpAlphPreprocessingTests
         byte[] patched = PatchAlphPreprocessing(webp, 1);
 
         byte[] expected = WebpCodec.DecodeRgba(patched, out int ew, out int eh);
-        byte[] actual = ManagedWebpDecoder.DecodeRgba(patched, out int aw, out int ah);
+        byte[] actual = WebpDecoder.DecodeRgba(patched, out int aw, out int ah);
         Assert.Equal(ew, aw);
         Assert.Equal(eh, ah);
         Assert.Equal(w, aw);
@@ -97,13 +96,13 @@ public class WebpAlphPreprocessingTests
 
         byte[] webp = PatchAlphPreprocessing(WebpCodec.EncodeRgba(rgba, w, h, 75f), 2);
         Assert.Throws<WebpBitstreamException>(
-            () => ManagedWebpDecoder.DecodeRgba(webp, out _, out _));
+            () => WebpDecoder.DecodeRgba(webp, out _, out _));
     }
 
     private static void AssertAlphaBitExact(byte[] webp, int w, int h, byte[] expectedAlpha)
     {
         byte[] expected = WebpCodec.DecodeRgba(webp, out int ew, out int eh);
-        byte[] actual = ManagedWebpDecoder.DecodeRgba(webp, out int aw, out int ah);
+        byte[] actual = WebpDecoder.DecodeRgba(webp, out int aw, out int ah);
         Assert.Equal(ew, aw);
         Assert.Equal(eh, ah);
         Assert.Equal(w, aw);

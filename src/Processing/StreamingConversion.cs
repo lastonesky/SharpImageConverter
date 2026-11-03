@@ -7,6 +7,7 @@ using SharpImageConverter.Formats.Gif;
 using SharpImageConverter.Formats.Jpeg;
 using SharpImageConverter.Formats.Png;
 using SharpImageConverter.Formats.Webp;
+using SharpImageConverter.Formats.Webp.Unmanaged;
 
 namespace SharpImageConverter.Processing
 {

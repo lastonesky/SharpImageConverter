@@ -13,9 +13,9 @@
     新增 `PeekBits`/`SkipBits`；`ReadBits` 在缓冲内一次取完；
   - `HuffmanTable.DecodeSymbol` 由「逐位读 + 每层线性扫码字」改为 8 bit 一级查找表
     （`code` 按 MSB-first、位流 LSB-first，故按 `reverse(code, len)` 铺表），码长 > 8 才走慢路径。
-- **整幅内存减半**：新增 `Vp8LDecoder.DecodeInto` / `ManagedWebpDecoder.DecodeRgbaInto`，
+- **整幅内存减半**：新增 `Vp8LDecoder.DecodeInto` / `WebpDecoder.DecodeRgbaInto`，
   直接把像素解到调用方缓冲区，ARGB 逆变换就地完成、最后原地做 ARGB→RGBA 字节交换；
-  另为 `WebpContainer.Load(byte[])` 与 `ManagedWebpDecoder.DecodeRgba(byte[])` 加了零拷贝重载
+  另为 `WebpContainer.Load(byte[])` 与 `WebpDecoder.DecodeRgba(byte[])` 加了零拷贝重载
   （此前每次解码都会 `data.ToArray()` 复制整个文件）。143 MP 无损图像的解码分配
   **1117.7 MB → 550.9 MB**（输出本身 545.5 MB）。
 - 实测（同一进程、warm 5 / iter 10 取最小值，与 libwebp 1.6 对比，全部逐像素 **bit-exact**；

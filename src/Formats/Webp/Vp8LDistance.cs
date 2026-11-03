@@ -1,4 +1,4 @@
-namespace SharpImageConverter.Formats.Webp.Managed;
+namespace SharpImageConverter.Formats.Webp;
 
 /// <summary>
 /// VP8L LZ77 反向引用距离/长度映射，严格对照 libwebp GetCopyDistance / GetCopyLength / PlaneCodeToDistance。

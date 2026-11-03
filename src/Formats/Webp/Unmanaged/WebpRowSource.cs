@@ -3,7 +3,7 @@ using System.Buffers.Binary;
 using System.IO;
 using SharpImageConverter.Core;
 
-namespace SharpImageConverter.Formats.Webp
+namespace SharpImageConverter.Formats.Webp.Unmanaged
 {
     /// <summary>
     /// WebP 逐行源：用 libwebp 的增量解码 API 边喂数据边取行。
@@ -44,7 +44,7 @@ namespace SharpImageConverter.Formats.Webp
                 throw new InsufficientMemoryException(
                     $"无法分配 WebP 流式输出缓冲（{Width}x{Height}x4 字节）");
             }
-            _decoder = WebpCodec.CreateIncrementalRgbaDecoder(Width, Height, _output, _outputStride);
+            _decoder = LibWebpCodec.CreateIncrementalRgbaDecoder(Width, Height, _output, _outputStride);
             if (_decoder == IntPtr.Zero)
             {
                 System.Runtime.InteropServices.NativeMemory.Free((void*)_output);
@@ -86,7 +86,7 @@ namespace SharpImageConverter.Formats.Webp
                 Pump();
             }
 
-            IntPtr pointer = WebpCodec.GetIncrementalRgba(_decoder, out _lastY, out int width, out int height, out _stride);
+            IntPtr pointer = LibWebpCodec.GetIncrementalRgba(_decoder, out _lastY, out int width, out int height, out _stride);
             if (pointer == IntPtr.Zero || width != Width || height != Height || _nextRow >= _lastY)
             {
                 throw new InvalidDataException("WebP incremental decode returned no row");
@@ -122,12 +122,12 @@ namespace SharpImageConverter.Formats.Webp
                 {
                     _finished = true;
                     // 最后一轮：再取一次已解码行
-                    IntPtr last = WebpCodec.GetIncrementalRgba(_decoder, out _lastY, out _, out _, out _stride);
+                    IntPtr last = LibWebpCodec.GetIncrementalRgba(_decoder, out _lastY, out _, out _, out _stride);
                     _ = last;
                     return;
                 }
 
-                var status = WebpCodec.AppendIncremental(_decoder, _chunk.AsSpan(0, read));
+                var status = LibWebpCodec.AppendIncremental(_decoder, _chunk.AsSpan(0, read));
                 if (status is not (VP8StatusCode.VP8_STATUS_OK
                     or VP8StatusCode.VP8_STATUS_SUSPENDED
                     or VP8StatusCode.VP8_STATUS_NOT_ENOUGH_DATA))
@@ -135,7 +135,7 @@ namespace SharpImageConverter.Formats.Webp
                     throw new InvalidDataException($"WebP incremental decode failed: {status}");
                 }
 
-                IntPtr pointer = WebpCodec.GetIncrementalRgba(_decoder, out _lastY, out int width, out int height, out _stride);
+                IntPtr pointer = LibWebpCodec.GetIncrementalRgba(_decoder, out _lastY, out int width, out int height, out _stride);
                 if (pointer != IntPtr.Zero)
                 {
                     if (width != Width || height != Height) throw new InvalidDataException("WebP dimensions changed during decode");
@@ -150,7 +150,7 @@ namespace SharpImageConverter.Formats.Webp
 
         public void Dispose()
         {
-            WebpCodec.DeleteIncrementalDecoder(_decoder);
+            LibWebpCodec.DeleteIncrementalDecoder(_decoder);
             _decoder = IntPtr.Zero;
             if (_output != IntPtr.Zero) System.Runtime.InteropServices.NativeMemory.Free((void*)_output);
             _stream.Dispose();

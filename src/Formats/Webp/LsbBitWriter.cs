@@ -1,6 +1,6 @@
 using System;
 
-namespace SharpImageConverter.Formats.Webp.Managed;
+namespace SharpImageConverter.Formats.Webp;
 
 /// <summary>
 /// LSB-first 位流写入器，与 <see cref="LsbBitReader"/> 对称，供 VP8L 编码器使用。

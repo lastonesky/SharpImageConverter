@@ -1,7 +1,7 @@
 using System;
 using System.Collections.Generic;
 
-namespace SharpImageConverter.Formats.Webp.Managed;
+namespace SharpImageConverter.Formats.Webp;
 
 /// <summary>
 /// VP8L 的规范 Huffman 码表（编码端）。

@@ -1,4 +1,4 @@
-namespace SharpImageConverter.Formats.Webp.Managed;
+namespace SharpImageConverter.Formats.Webp;
 
 /// <summary>
 /// ALPH chunk 解码器：独立 alpha 通道（用于有损 VP8 图像，无损 VP8L 自带 alpha）。

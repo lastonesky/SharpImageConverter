@@ -1,4 +1,4 @@
-namespace SharpImageConverter.Formats.Webp.Managed;
+namespace SharpImageConverter.Formats.Webp;
 
 /// <summary>
 /// VP8 逆变换：4×4 逆 DCT（叠加到像素）与 4×4 逆 Walsh-Hadamard（Y2 块 DC 系数）。

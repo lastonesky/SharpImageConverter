@@ -1,4 +1,4 @@
-namespace SharpImageConverter.Formats.Webp.Managed;
+namespace SharpImageConverter.Formats.Webp;
 
 /// <summary>
 /// VP8 正向变换：4×4 正 DCT 与 4×4 正 Walsh-Hadamard（Y2 块）。

@@ -1,7 +1,7 @@
 using System;
 using System.Buffers.Binary;
 
-namespace SharpImageConverter.Formats.Webp.Managed;
+namespace SharpImageConverter.Formats.Webp;
 
 /// <summary>
 /// LSB-first 位流读取器，VP8L 无损格式使用。

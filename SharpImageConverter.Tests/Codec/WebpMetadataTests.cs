@@ -6,7 +6,6 @@ using System.Text;
 using Xunit;
 using SharpImageConverter.Core;
 using SharpImageConverter.Formats.Webp;
-using SharpImageConverter.Formats.Webp.Managed;
 using SharpImageConverter.Metadata;
 
 namespace SharpImageConverter.Tests.Codec;
@@ -27,16 +26,16 @@ public class WebpMetadataTests
     // ==================================================================
 
     [Fact]
-    public void StaticLossless_Managed_RoundTripsMetadata_AndFlagsMatchChunks()
+    public void StaticLossless_RoundTripsMetadata_AndFlagsMatchChunks()
     {
         int w = 64, h = 48;
         var rgba = Photo(w, h, 123);
         for (int i = 0; i < w * h; i++) rgba[i * 4 + 3] = (byte)(i % 3 == 0 ? 128 : 255);
 
         var metadata = CreateMetadata();
-        byte[] webp = ManagedWebpEncoder.EncodeRgba(rgba, w, h, metadata);
+        byte[] webp = WebpEncoder.EncodeRgba(rgba, w, h, metadata);
 
-        AssertContainer(webp, metadata, expectAnimation: false, expectAlpha: true, "managed lossless");
+        AssertContainer(webp, metadata, expectAnimation: false, expectAlpha: true, "csharp lossless");
 
         // 真实 libwebp 解码校验：带扩展 chunk 的文件仍是合法 WebP，像素 bit-exact。
         byte[] lib = WebpCodec.DecodeRgba(webp, out int lw, out int lh);
@@ -51,8 +50,8 @@ public class WebpMetadataTests
         Assert.Equal(metadata.XmpRaw, decoded.Metadata.XmpRaw);
 
         // 再编码 -> chunk 字节完全一致，且仍能解码。
-        byte[] reencoded = ManagedWebpEncoder.EncodeRgba(decoded.Buffer, decoded.Width, decoded.Height, decoded.Metadata);
-        AssertContainer(reencoded, metadata, expectAnimation: false, expectAlpha: true, "managed lossless re-encode");
+        byte[] reencoded = WebpEncoder.EncodeRgba(decoded.Buffer, decoded.Width, decoded.Height, decoded.Metadata);
+        AssertContainer(reencoded, metadata, expectAnimation: false, expectAlpha: true, "csharp lossless re-encode");
         Assert.Equal(rgba, WebpCodec.DecodeRgba(reencoded, out _, out _));
     }
 
@@ -65,10 +64,10 @@ public class WebpMetadataTests
 
         var metadata = CreateMetadata();
         var ms = new MemoryStream();
-        ManagedWebpEncoder.EncodeRgbaToStream(ms, rgba, w, h, metadata);
+        WebpEncoder.EncodeRgbaToStream(ms, rgba, w, h, metadata);
         byte[] webp = ms.ToArray();
 
-        AssertContainer(webp, metadata, expectAnimation: false, expectAlpha: false, "managed stream");
+        AssertContainer(webp, metadata, expectAnimation: false, expectAlpha: false, "csharp stream");
         Assert.Equal(rgba, WebpCodec.DecodeRgba(webp, out _, out _));
     }
 
@@ -250,7 +249,7 @@ public class WebpMetadataTests
         int w = 48, h = 32;
         var rgba = Photo(w, h, 21);
 
-        byte[] webp = ManagedWebpEncoder.EncodeRgba(rgba, w, h);
+        byte[] webp = WebpEncoder.EncodeRgba(rgba, w, h);
         var container = WebpContainer.Load(webp);
 
         Assert.Equal(WebpContainerKind.Vp8L, container.Kind);
@@ -264,7 +263,7 @@ public class WebpMetadataTests
 
         // 全空元数据对象与 null 必须产出完全相同的字节。
         var empty = new ImageMetadata();
-        Assert.Equal(webp, ManagedWebpEncoder.EncodeRgba(rgba, w, h, empty));
+        Assert.Equal(webp, WebpEncoder.EncodeRgba(rgba, w, h, empty));
     }
 
     [Fact]
@@ -295,7 +294,7 @@ public class WebpMetadataTests
     {
         int w = 16, h = 12;
         var rgba = Photo(w, h, 41);
-        byte[] webp = ManagedWebpEncoder.EncodeRgba(rgba, w, h);
+        byte[] webp = WebpEncoder.EncodeRgba(rgba, w, h);
 
         var decoded = new WebpDecoderAdapterRgba().DecodeRgba32(new MemoryStream(webp));
         Assert.Null(decoded.Metadata.IccProfile);

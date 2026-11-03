@@ -1,12 +1,11 @@
 using System.Runtime.InteropServices;
 using Xunit;
 using SharpImageConverter.Formats.Webp;
-using SharpImageConverter.Formats.Webp.Managed;
 
 namespace SharpImageConverter.Tests.Codec;
 
 /// <summary>
-/// 托管动图（ManagedWebpDecoder.DecodeAnimation）的 ANMF blend / dispose 语义，
+/// 托管动图（WebpDecoder.DecodeAnimation）的 ANMF blend / dispose 语义，
 /// 与 libwebp 的 WebPAnimDecoder 逐帧逐像素对拍（bit-exact）。
 /// 测试夹具用 libwebp 编码每个子帧的 VP8L 位流，再手工拼装 ANMF，
 /// 因此 libwebp 能完整解码这些文件，参考结果就是 libwebp 的合成结果。
@@ -86,16 +85,16 @@ public class WebpAnimationCompositingTests
         };
 
         byte[] webp = BuildAnimation(cw, ch, frames);
-        var animation = ManagedWebpDecoder.DecodeAnimation(webp);
+        var animation = WebpDecoder.DecodeAnimation(webp);
 
-        byte[] last = ManagedWebpDecoder.DecodeRgba(webp, out int w, out int h);
+        byte[] last = WebpDecoder.DecodeRgba(webp, out int w, out int h);
         Assert.Equal(cw, w);
         Assert.Equal(ch, h);
         PixelAssert.Equal(animation.Frames[^1].Rgba, last, w, h);
     }
 
     [Fact]
-    public void Animation_OutOfCanvasFrame_RejectedByManagedAndLibWebp()
+    public void Animation_OutOfCanvasFrame_RejectedByBothBackends()
     {
         const int cw = 16, ch = 16;
         // 帧矩形 x=14,w=6 → 20 > 16，违反 RFC 9649 §2.7.1.1（帧矩形必须完全位于画布内）
@@ -106,7 +105,7 @@ public class WebpAnimationCompositingTests
 
         byte[] webp = BuildAnimation(cw, ch, frames);
 
-        Assert.Throws<WebpContainerException>(() => ManagedWebpDecoder.DecodeAnimation(webp));
+        Assert.Throws<WebpContainerException>(() => WebpDecoder.DecodeAnimation(webp));
         // libwebp 的 demux 同样判定文件非法，WebPAnimDecoderNewInternal 返回 NULL。
         Assert.False(LibWebpAnimDecoder.TryDecode(webp, out _, out _, out _));
     }
@@ -115,10 +114,10 @@ public class WebpAnimationCompositingTests
     {
         byte[] webp = BuildAnimation(canvasWidth, canvasHeight, frames);
 
-        var managed = ManagedWebpDecoder.DecodeAnimation(webp);
-        Assert.Equal(canvasWidth, managed.CanvasWidth);
-        Assert.Equal(canvasHeight, managed.CanvasHeight);
-        Assert.Equal(frames.Length, managed.Frames.Length);
+        var csharp = WebpDecoder.DecodeAnimation(webp);
+        Assert.Equal(canvasWidth, csharp.CanvasWidth);
+        Assert.Equal(canvasHeight, csharp.CanvasHeight);
+        Assert.Equal(frames.Length, csharp.Frames.Length);
 
         Assert.True(LibWebpAnimDecoder.TryDecode(webp, out int lw, out int lh, out byte[][] lib), "libwebp 解码失败");
         Assert.Equal(canvasWidth, lw);
@@ -127,7 +126,7 @@ public class WebpAnimationCompositingTests
 
         for (int i = 0; i < frames.Length; i++)
         {
-            var frame = managed.Frames[i];
+            var frame = csharp.Frames[i];
             Assert.Equal(frames[i].X, frame.X);
             Assert.Equal(frames[i].Y, frame.Y);
             Assert.Equal(frames[i].W, frame.Width);

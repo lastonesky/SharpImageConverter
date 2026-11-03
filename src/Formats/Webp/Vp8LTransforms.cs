@@ -1,4 +1,4 @@
-namespace SharpImageConverter.Formats.Webp.Managed;
+namespace SharpImageConverter.Formats.Webp;
 
 /// <summary>
 /// VP8L 四种逆变换实现，严格对照 libwebp lossless.c / vp8l_dec.c。

@@ -2,7 +2,6 @@ using System;
 using System.Buffers;
 using System.IO;
 using SharpImageConverter.Formats.Png;
-using SharpImageConverter.Formats.Webp.Managed;
 using SharpImageConverter.Metadata;
 
 namespace SharpImageConverter.Formats.Webp
@@ -17,13 +16,13 @@ namespace SharpImageConverter.Formats.Webp
         LibWebp = 1,
 
         /// <summary>强制纯 C# 托管实现；不支持的特性直接抛异常，不静默回退。</summary>
-        Managed = 2,
+        CSharp = 2,
     }
 
     /// <summary>
     /// WebP 解码后端策略。
     ///
-    /// 环境变量 <c>SIC_WEBP_BACKEND</c>：<c>auto</c>（默认）/ <c>libwebp</c> / <c>managed</c>。
+    /// 环境变量 <c>SIC_WEBP_BACKEND</c>：<c>auto</c>（默认）/ <c>libwebp</c> / <c>csharp</c>。
     /// 环境变量 <c>SIC_WEBP_TRACE=1</c>：托管解码失败并回退 libwebp 时向 stderr 打一行原因，便于线上观测。
     ///
     /// 动图在 <see cref="WebpDecodeBackend.Auto"/> 下始终走 libwebp：托管实现会把全部帧解成
@@ -47,7 +46,7 @@ namespace SharpImageConverter.Formats.Webp
 
         private static WebpDecodeBackend Parse(string? value) => value?.Trim().ToLowerInvariant() switch
         {
-            "managed" or "csharp" or "native-csharp" => WebpDecodeBackend.Managed,
+            "csharp" or "managed" or "native-csharp" => WebpDecodeBackend.CSharp,
             "libwebp" or "interop" or "off" => WebpDecodeBackend.LibWebp,
             _ => WebpDecodeBackend.Auto,
         };
@@ -137,8 +136,8 @@ namespace SharpImageConverter.Formats.Webp
             {
                 case WebpDecodeBackend.LibWebp:
                     return WebpCodec.DecodeRgba(data, out width, out height);
-                case WebpDecodeBackend.Managed:
-                    return ManagedWebpDecoder.DecodeRgba(data, out width, out height);
+                case WebpDecodeBackend.CSharp:
+                    return WebpDecoder.DecodeRgba(data, out width, out height);
                 default:
                     return DecodeAuto(data, out width, out height);
             }
@@ -150,15 +149,15 @@ namespace SharpImageConverter.Formats.Webp
             {
                 case WebpDecodeBackend.LibWebp:
                     return WebpCodec.DecodeRgba(data, out width, out height);
-                case WebpDecodeBackend.Managed:
-                    return ManagedWebpDecoder.DecodeRgba(data, out width, out height);
+                case WebpDecodeBackend.CSharp:
+                    return WebpDecoder.DecodeRgba(data, out width, out height);
                 default:
                     // 动图：既有单图解码语义来自 libwebp（首帧），托管实现返回最后一帧，故不参与自动分派。
                     if (LooksAnimated(data))
                         return WebpCodec.DecodeRgba(data, out width, out height);
                     try
                     {
-                        return ManagedWebpDecoder.DecodeRgba(data, out width, out height);
+                        return WebpDecoder.DecodeRgba(data, out width, out height);
                     }
                     catch (WebpException ex)
                     {
@@ -176,7 +175,7 @@ namespace SharpImageConverter.Formats.Webp
 
             try
             {
-                return ManagedWebpDecoder.DecodeRgba(data, out width, out height);
+                return WebpDecoder.DecodeRgba(data, out width, out height);
             }
             catch (WebpException ex)
             {

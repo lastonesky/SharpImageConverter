@@ -2,7 +2,7 @@ using System;
 using System.Collections.Generic;
 using SharpImageConverter.Metadata;
 
-namespace SharpImageConverter.Formats.Webp.Managed;
+namespace SharpImageConverter.Formats.Webp;
 
 /// <summary>
 /// 把 ICCP / EXIF / XMP 原始字节原样写入 WebP 容器，并维护 VP8X flags。

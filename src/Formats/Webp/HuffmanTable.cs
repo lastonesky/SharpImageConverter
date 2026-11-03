@@ -1,6 +1,6 @@
 using System;
 
-namespace SharpImageConverter.Formats.Webp.Managed;
+namespace SharpImageConverter.Formats.Webp;
 
 /// <summary>
 /// Huffman 解码表：从码字长度列表构建，并支持查表解码。

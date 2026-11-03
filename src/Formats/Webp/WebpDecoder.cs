@@ -2,7 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 
-namespace SharpImageConverter.Formats.Webp.Managed;
+namespace SharpImageConverter.Formats.Webp;
 
 /// <summary>动图的一帧：Rgba 是该帧显示完成后的整幅画布快照（CanvasWidth × CanvasHeight, R,G,B,A）。</summary>
 public sealed record WebpFrame(byte[] Rgba, int X, int Y, int Width, int Height, int DurationMs);
@@ -28,7 +28,7 @@ public sealed record WebpAnimation(int CanvasWidth, int CanvasHeight, int LoopCo
 ///   由调用方回退到 libwebp；VP8 非关键帧同样抛该异常，但它不属于 WebP（RFC 9649 要求有损
 ///   WebP 为 VP8 帧内编码、ANMF 帧数据为关键帧），libwebp 也无法解码，回退不会成功。
 /// </summary>
-public static class ManagedWebpDecoder
+public static class WebpDecoder
 {
     /// <summary>
     /// 解码 WebP 文件到 RGBA 像素缓冲区（动图返回最后一帧的整幅画布）。
