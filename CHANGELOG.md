@@ -1,5 +1,47 @@
 ## 未发布
 
+### WebP 编解码 SIMD 化与有损编码提速
+
+此前 WebP 编解码核内**没有任何 SIMD**。插桩测得 4.19MP 上的分布是：有损解码 74ms
+（其中环内滤波 28ms）、YUV→RGB 17ms、无损解码 82ms（Huffman 50 / 逆变换 26）、
+有损编码 350ms（模式选择 135 / 残差与变换 148）。本轮按热点顺序补齐，全部保持
+**产物或解码像素逐字节一致**。
+
+- **VP8 环内滤波**（`Vp8LoopFilter`）：`DoFilter2/4/6`、`NeedsFilter/NeedsFilter2`
+  改为 `Vector128<short>` 8 通道批量处理，`sclip/clip` 用 min/max 等价表达；
+  访存分两形态——`vstride==1` 走连续 8 字节，`hstride==1` 先转置到 `stackalloc`
+  再整块读写。`size<8` 的尾巴仍走标量副本。
+- **YUV→RGB 与 fancy upsampling**（`Vp8YuvToRgb`）：定点式在 16 位通道上批量算，
+  `MulHi` 拆成 `hi*256+lo` 恒等式避免溢出；8 个 RGBA 像素靠 6 张 pshufb 索引表拼装；
+  双线性上采样的四式同批向量化。顺带修掉向量块推进后未同步 `tlUv/lUv` 的取样本逻辑
+  与行基址传参错误（这两处只在奇数宽/多行图上暴露）。
+- **VP8L 逆变换**（`Vp8LTransforms`）：
+  - predictor 按 tile 模式派发——与 left 无关的 0/2/3/4/8/9 整块并行，mode 1 用
+    4 像素 Hillis-Steele 字节前缀和（进位逐块接力），依赖 left 的 5/6/7/10/11/12/13
+    把 switch 提到循环外并按模式专用循环、`left` 用寄存器接力；
+  - cross-color 在 32 位通道上做 sbyte 乘 + 算术右移 + mod 256 加；
+  - subtract-green 用 pshufb 把 G 复刻到 B/R 槽位后整块字节加；
+  - color indexing 的 `bits=0` 主流路径改无检查查表，AVX2 一次 gather 8 个色。
+- **有损编码的模式选择**（`Vp8Encoder`）：新增 `BlockSse4x4` 直接从平面算 4×4 的
+  残差平方和（两行一次，宽到 ushort 相减相乘再宽到 int 累加），不再把残差写进
+  `_residual` 中转；新增 `ResidualBlock4x4` 作为残差计算的内侧快路径。贴边块仍走
+  原来的逐像素钳制路径，钳制规则逐字一致。
+
+实测（同进程交错 A/B，比值取中位；编码侧交替先后顺序以抵消冷缓存偏差）：
+
+| 场景 | 加速比 |
+| --- | --- |
+| 有损解码 2048×2048（q30 / q75 / q95 / 带 alpha） | 0.449 / 0.476 / 0.590 / 0.454 |
+| 无损解码 2048×2048 | 88.86 → 67.02 ms（0.752） |
+| 有损编码 2048×2048（q30 / q75 / src.png 内容 q75） | 0.639 / 0.665 / 0.716 |
+
+4.19MP 单测的逆变换耗时（改前 → 改后）：subtract-green 4.87→1.63、
+cross-color 11.90→5.73、predictor 35.31→19.68、color indexing 13.39→7.05 ms。
+
+**未做**（都有实测依据）：DCT4x4 向量化（单测 38.6 ns/块，整幅仅约 15ms、占 4%，
+且水平 pass 需要 4×4 转置，净收益低于 4%）；量化的整除换定点倒数（只快 1~2%，
+插桩显示量化段耗时也没变，瓶颈不在 idiv）。
+
 ### WebP 动图：CLI 通路打通
 
 - **WebP 动图作为输入时，转换路径此前全部抛 `WebpUnsupportedException`**（单图解码入口显式拒绝动图，
