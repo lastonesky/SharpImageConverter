@@ -8,7 +8,9 @@ namespace SharpImageConverter.Formats.Webp;
 /// </summary>
 public static class Vp8LDecoder
 {
-    private const int MaxDimension = 16383; // 14-bit 最大尺寸 - 1
+    // VP8L 宽高各为 14 位且解码为 ReadBits(14)+1，规范允许的最大边长是 16384
+    //（注意与有损 VP8 的 16383 上限不同）。此前误写 16383，会拒绝合法的 16384 宽高。
+    private const int MaxDimension = 16384;
     private const int NumLiteralCodes = 256;
     private const int NumLengthCodes = 24;
     private const int MIN_TRANSFORM_BITS = 2;

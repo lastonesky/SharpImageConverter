@@ -64,6 +64,15 @@ public class WebpLEncoderTests
     }
 
     [Fact]
+    public void StageB_Full_MaxDimension16384_RoundTrip_BitExact()
+    {
+        // VP8L 宽/高各 14 位且解码为 ReadBits(14)+1，规范允许的最大边长是 16384
+        //（与有损 VP8 的 16383 上限不同）。解码端曾误用 16383 拒绝合法流。
+        AssertRoundTrip(Photo(16384, 1, seed: 7), 16384, 1, Vp8LEncoderOptions.Full, "16384x1 (full)");
+        AssertRoundTrip(Photo(1, 16384, seed: 11), 1, 16384, Vp8LEncoderOptions.Full, "1x16384 (full)");
+    }
+
+    [Fact]
     public void StageB_Full_AlphaVariants_RoundTrip_BitExact()
     {
         var transparentGradient = AlphaGradient(64, 48);
