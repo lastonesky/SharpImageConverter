@@ -1,5 +1,24 @@
 ## 未发布
 
+### WebP 动图：CLI 通路打通
+
+- **WebP 动图作为输入时，转换路径此前全部抛 `WebpUnsupportedException`**（单图解码入口显式拒绝动图，
+  只有 `--optimize` 走「跳过压缩、原样拷贝」分支）。现按输出格式分派：
+  - `--to webp` / `--to gif`：保留全部帧、每帧时长与循环次数；
+  - 输出为静态格式（PNG/JPEG/BMP）：取首帧，并明确提示其余帧未保留以及保留动画该用什么参数。
+- **新增 `--anim-frames`**（`--gif-frames` 的等价别名，后者保留以兼容既有脚本）：
+  把 WebP 动图拆成单帧序列。原先 `--gif-frames` 只认 `.gif` 输入。
+- **`WebpAnimationEncoder.EncodeRgba32`**：新增保留 alpha 的动图编码入口。
+  库层的动图编码（`WebpAnimationWriter.Encode`）本来就支持 alpha，
+  但 CLI 侧的 RGB24 入口无法表达透明，详见下方「修复」段的 alpha 丢失条目。
+- 动图编码器本身经黑盒验证**无需修改**：`WebpAnimationWriter.Encode` 编出的位流
+  与 libwebp `WebPAnimDecoder` 逐帧逐字节一致（无损档，含混合 blend / dispose 组合），
+  帧矩形裁剪取最小变化框并按 2 像素对齐，时长与循环次数（0 = 无限、65535）均正确传递。
+  ANMF 的 Duration = 0 是**合法**的：RFC 9649 §2.7.1.1 明确「the interpretation of the
+  Frame Duration of 0 (and often <= 10) is defined by the implementation」，libwebp 同样返回 0 ms。
+- 回归测试 `Tests/Cli/CliAnimationTests.cs`（5 例）：WebP→WebP / WebP→GIF 保留帧数与时长、
+  WebP→静帧取首帧并给出提示、GIF→WebP 保留 alpha、`--anim-frames` 拆帧。
+
 ### WebP 托管解码接入与提速
 
 - **WebP 解码统一走纯 C# 实现**：`Formats/Webp/WebpDecodeBackend.cs` 保留
@@ -92,6 +111,41 @@
   分析器根本没开」）。清点与决策依据见 `docs/Review-2026-10-30.md` §5.2。
 
 ### 修复
+- **GIF 编码器在「颜色丰富 + 含透明」时调色板越界**（`Formats/Gif/GifEncoder.cs`）。
+  GIF 的调色板最多 256 项（2^8），而带透明的编码要用掉索引 0 放透明色，
+  所以量化颜色最多只能有 255 种。此前两个量化器都固定产出最多 256 色，
+  满色时调色板需要 1 + 256 = 257 个槽位，写调色板时抛
+  `ArgumentException: Destination array was not long enough`。
+  静帧（`EncodeRgba`）与动图（`EncodeAnimationRgba`）走同一条路径，两者都中招。
+  现给 `OctreeQuantizer.Quantize` / `Quantizer.Quantize` 加可选的 `maxColors` 参数
+  （默认 256，不改变既有行为），编码器在带透明时传 255。
+  回归测试 `Tests/Codec/GifAlphaPaletteTests.cs`（6 例，含「测试素材确实产出满 256 色」
+  的兜底断言，防止换图案后越界不再触发而测试假通过）。
+- **GIF → WebP 动图转换把透明通道整个丢掉**（`Cli/Program.Process.cs`）。
+  CLI 走 `DecodeAnimationRgb24` + `EncodeRgb24`，而 GIF 的透明索引信息只存在于 alpha 通道，
+  实测 32×32 的透明背景动图转出后 1024/1024 像素全部变成 alpha=255。
+  现改走 `DecodeAnimationRgba32` + 新增的 `WebpAnimationEncoder.EncodeRgba32`（保留 alpha）。
+  带操作（resize / grayscale）时 alpha 通道复制成灰度图与 RGB 一起走同一套操作，
+  因为 resize 实现逐通道独立，尺寸天然一致；grayscale 对 (A,A,A) 是恒等变换。
+
+- **ALPH 逆滤波按错误的语义实现，cwebp 等产出的带 alpha 有损 WebP 会解错整幅 alpha**
+  （`Formats/Webp/AlphDecoder.cs`）。libwebp 的 alpha 过滤是**跨行**的：
+  `HorizontalUnfilter_C` 的 pred 初值取「上一行首像素」（首行取 0）并逐像素滚动，
+  `VerticalUnfilter_C` 在首行直接退化为 horizontal。旧实现把两者都写成「按行独立、从 0 起算」，
+  于是 vertical 过滤的整幅 alpha 从第一行起累积错位、horizontal 过滤每行 x=0 错位并连带整行。
+  实测 `gradient_alpha.png`（256×200）解 cwebp 默认（`alpha_filtering=fast`，实际选到 vertical）
+  的输出有 12,750/51,200 像素 alpha 错、Δ 最大 255，RGB 不受影响；自家编码器只写 `filter=0`，
+  所以往返测试与 libwebp 对拍都没暴露。
+  修好后 4 种过滤方式（none/horizontal/vertical/gradient）与 libwebp 解码逐像素一致；
+  `gradient` 档 libwebp 几乎不选用，改为用 libwebp 的前向过滤语义自造 ALPH 流做黑盒覆盖。
+- **`--webp-method` 变成静默无效的选项**（移除 libwebp 后端后遗留）：CLI 仍然解析它，
+  但现在会明确提示「纯 C# 编码器没有 effort 档位，产物与耗时均不受影响」，帮助文本同步改写；
+  `WebpEncoderOptions.Method` 的文档改为「保留参数、不参与编码」，并去掉只对 libwebp 有意义的
+  `quality>=75 且 method==4 时降为 3` 归一化与 `SIC_WEBP_ALLOW_M4_HIGHQ`。
+  `WebpOptimizer` 里「m6 产物不达标就退回 m3 重试」的一整轮编码也一并删除——两者是同一实现，
+  重试得到的字节完全相同，只会白付一次全图编码。
+- **文档里残留「回退 libwebp」的表述**（`WebpDecoder` 类注释、`WebpEncoderOptions.Lossless`、
+  `Vp8Decoder` 非关键帧分支）：纯 C# 是唯一实现，这些描述会误导调用方以为异常后还有后备路径。
 - **`Configuration` 的格式注册表此前是装饰性的**：`SaveRgb24`/`SaveRgba32` 按
   `typeof(JpegFormat)` 之类的硬编码分发，注册自定义格式后保存依旧
   `NotSupportedException`。现改为查 `_formatTypeByExtension` → `_encoders`，

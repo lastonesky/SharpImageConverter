@@ -20,13 +20,13 @@ public sealed record WebpAnimation(int CanvasWidth, int CanvasHeight, int LoopCo
 ///   输出每帧显示完成后的整幅画布快照）。
 ///
 /// 设计目标：
-/// - 与 libwebp 并存，独立命名空间，不影响现有互操作路径；
+/// - 纯托管实现，不依赖任何 native 库；解码结果与 libwebp 逐像素一致（对照在测试工程）；
 /// - 返回标准化 RGBA 像素数据（R,G,B,A 每像素 4 字节），便于接入统一图像抽象层；
 /// - 提供 <see cref="DecodeRgbaInto(ReadOnlySpan{byte}, Span{byte}, out int, out int)"/>
 ///   零拷贝重载：直接把像素解到调用方的缓冲区，整幅图像只存在一份；
-/// - 遇到当前不支持的特性（ALPH level-reduction）抛 <see cref="WebpUnsupportedException"/>，
-///   由调用方回退到 libwebp；VP8 非关键帧同样抛该异常，但它不属于 WebP（RFC 9649 要求有损
-///   WebP 为 VP8 帧内编码、ANMF 帧数据为关键帧），libwebp 也无法解码，回退不会成功。
+/// - 遇到无法解码的输入时抛 <see cref="WebpUnsupportedException"/>（当前仅剩
+///   ALPH level-reduction 与 VP8 非关键帧两类）。这两类都是**格式层面不受支持**，
+///   没有可回退的实现；调用方应把它当成「输入不可解码」处理，而不是重试其它后端。
 /// </summary>
 public static class WebpDecoder
 {

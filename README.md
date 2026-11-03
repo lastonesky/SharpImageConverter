@@ -278,7 +278,9 @@ sic - - --to jpg < in.png > out.jpg   # 两端都是管道
   （如 `识别到 TIFF，但当前只支持 JPEG / PNG / BMP / GIF / WebP`），而不是笼统的「未知图像格式」。
 
 特殊情况：
-- GIF → WebP：当输入为动图 GIF、输出扩展名为 `.webp` 时，会编码为动图 WebP（尽量保留帧间隔与循环次数）
+- GIF → WebP：当输入为动图 GIF、输出扩展名为 `.webp` 时，会编码为动图 WebP（尽量保留帧间隔与循环次数，透明通道也一并保留）。
+- WebP 动图输入：输出为 `.webp` 或 `.gif` 时保留全部帧、帧间隔与循环次数；输出为静态格式（PNG/JPEG/BMP）时只取首帧，并明确提示其余帧未保留。
+- 动图拆帧：`--gif-frames` / `--anim-frames` 可把 GIF 或 WebP 动图拆成单帧序列（文件名带序号后缀）。
 
 - 基本用法：`dotnet run -- <输入文件或文件夹> [输出路径] [操作] [选项]`
 - 图像操作参数：
@@ -294,7 +296,7 @@ sic - - --to jpg < in.png > out.jpg   # 两端都是管道
   - `--stream`：JPEG 优先走流式解码路径（非 JPEG 自动回退常规解码）。注意：仅 marker/segment 头解析为异步读取，熵编码数据解码阶段为同步阻塞读取（受限于解码器结构，见 `JpegDecoder.DecodeFromStreamAsync` 的文档注释）。
   - `--jpeg-debug`：打印 JPEG 编码配置与耗时信息。
 - GIF/灰度相关：
-  - `--gif-frames`：GIF 拆帧导出。
+  - `--gif-frames` / `--anim-frames`：动图拆帧导出（GIF 与 WebP 动图都支持）。
   - `--gif-debug`：打印 GIF 编解码的分阶段耗时（量化、LZW、像素展开等）与吞吐（Mpx/s）。
   - `--gif-bench N`：对 GIF 编解码重复 N 次（默认 5）并输出各阶段的最小/中位/平均耗时，用于对比优化前后的差异；该选项只做测量、不产出文件。
   - `--jpeg-progressive`：普通 JPEG 转换输出 progressive（SOF2）；默认是 baseline。

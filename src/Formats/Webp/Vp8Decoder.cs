@@ -191,7 +191,7 @@ internal sealed class Vp8Decoder
             // RFC 9649 §2.1：WebP 的有损压缩使用 VP8 帧内（intra-frame）编码，ANMF 帧数据
             // 必须是 VP8 关键帧。非关键帧不属于 WebP 的合法输入，libwebp 同样以
             // VP8_STATUS_UNSUPPORTED_FEATURE（"Not a key frame."）显式拒绝，故这里是规范要求的
-            // 拒绝路径，而不是待实现的功能；回退 libwebp 也不会成功。
+            // 拒绝路径，而不是待实现的功能——任何实现都不可能把它解出来。
             throw new WebpUnsupportedException(
                 "VP8 非关键帧（inter frame）不属于 WebP：RFC 9649 规定有损 WebP 仅使用 VP8 帧内编码、" +
                 "ANMF 帧数据必须为 VP8 关键帧（libwebp 亦拒绝此类输入）");

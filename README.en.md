@@ -291,7 +291,9 @@ Not supported when writing to stdout: directory input, `--gif-frames`, `--json`
   (e.g. `TIFF detected, but only JPEG / PNG / BMP / GIF / WebP are supported`) instead of a vague "unknown format".
 
 Special cases:
-- GIF → WebP: when input is animated GIF and output extension is `.webp`, encodes animated WebP (preserving frame timing and loop count where possible)
+- GIF → WebP: when input is animated GIF and output extension is `.webp`, encodes animated WebP (preserving frame timing and loop count where possible, including the alpha channel)
+- Animated WebP input: output to `.webp` or `.gif` keeps every frame plus its duration and loop count; output to a still format (PNG/JPEG/BMP) keeps the first frame only and says so explicitly
+- Frame extraction: `--gif-frames` / `--anim-frames` splits an animated GIF or WebP into a numbered image sequence
 
 ### Operations
 - `resize:WxH` : Force resize to specified width (W) and height (H)
@@ -304,7 +306,7 @@ Special cases:
 - `--subsample 420|444` : Set JPEG chroma subsampling, default 420
 - `--keep-metadata` : When recompressing JPEG, try to preserve basic EXIF/ICC metadata
 - `--jpeg-debug` : Enable JPEG decoding debug output
-- `--gif-frames` : Export animated GIF frames as individual images for inspection/debugging
+- `--gif-frames` / `--anim-frames` : Export animated GIF or WebP frames as individual images for inspection/debugging
 - `--gif-debug` : Print per-phase GIF encode/decode timings (quantize, LZW, pixel expand, ...) and throughput (Mpx/s)
 - `--gif-bench N` : Repeat GIF encode/decode N times (default 5) and report min/median/avg per phase, for comparing before/after optimizations; measurement only, writes no file
 - `--jpeg-progressive` : write progressive JPEG (SOF2) for normal conversion; default is baseline

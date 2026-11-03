@@ -22,6 +22,18 @@ public enum GifQuantizerKind
 /// </summary>
 public class GifEncoder
 {
+    /// <summary>GIF 调色板最多 256 项（2^8）。</summary>
+    private const int MaxQuantizeColors = 256;
+
+    /// <summary>
+    /// 带透明时量化颜色的上限：要给透明索引预留 1 个槽位，所以实际颜色只能有 255 种。
+    /// </summary>
+    /// <remarks>
+    /// 少了这个限制，量化器产出满 256 色时，调色板需要 1（透明）+ 256 = 257 个槽位，
+    /// 超出 GIF 格式上限，写调色板时会数组越界。
+    /// </remarks>
+    private const int MaxQuantizeColorsWithAlpha = 255;
+
     private readonly byte[] _headerBuf = new byte[1024];
 
     /// <summary>
@@ -630,9 +642,18 @@ public class GifEncoder
     /// </summary>
     private (byte[] Palette, byte[] Indices) QuantizePixels(ReadOnlySpan<byte> pixels, int width, int height)
     {
+        return QuantizePixels(pixels, width, height, MaxQuantizeColors);
+    }
+
+    /// <summary>
+    /// 量化像素，限制调色板颜色数上限。
+    /// </summary>
+    /// <param name="maxColors">颜色数上限（1..256）。</param>
+    private (byte[] Palette, byte[] Indices) QuantizePixels(ReadOnlySpan<byte> pixels, int width, int height, int maxColors)
+    {
         return QuantizerKind == GifQuantizerKind.WuFloydSteinberg
-            ? Quantizer.Quantize(pixels, width, height, EnableDithering)
-            : OctreeQuantizer.Quantize(pixels, width, height, EnableDithering, DitherStrength);
+            ? Quantizer.Quantize(pixels, width, height, EnableDithering, maxColors)
+            : OctreeQuantizer.Quantize(pixels, width, height, EnableDithering, DitherStrength, maxColors);
     }
 
     private static int GetColorDepth(int count)
@@ -684,7 +705,7 @@ public class GifEncoder
             }
         }
 
-        var (pal, indsOpaque) = QuantizePixels(opaque, width, height);
+        var (pal, indsOpaque) = QuantizePixels(opaque, width, height, MaxQuantizeColorsWithAlpha);
         int palCount = pal.Length / 3;
         depth = GetColorDepth(palCount + 1);
         int actualSize = 1 << (depth + 1);

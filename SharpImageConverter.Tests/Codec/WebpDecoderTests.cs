@@ -597,12 +597,16 @@ public class WebpDecoderTests
         var deltas = new byte[w * h];
         for (int y = 0; y < h; y++)
         {
+            // libwebp 的 horizontal 过滤是跨行的：每行的 pred 初值取「上一行首像素」
+            // （首行取 0），之后逐像素滚动。之前这里按「每行独立、从 0 起算」构造，
+            // 与被测实现的错误语义相同，导致样例自身掩盖了 bug。
+            int pred = y == 0 ? 0 : alpha[(y - 1) * w];
             for (int x = 0; x < w; x++)
             {
-                alpha[y * w + x] = (byte)(x * 6 + y);
-                deltas[y * w + x] = x == 0
-                    ? alpha[y * w + x]
-                    : (byte)(alpha[y * w + x] - alpha[y * w + x - 1]);
+                int idx = y * w + x;
+                alpha[idx] = (byte)(x * 6 + y);
+                deltas[idx] = (byte)(alpha[idx] - pred);
+                pred = alpha[idx];
             }
         }
 

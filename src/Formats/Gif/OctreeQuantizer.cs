@@ -94,6 +94,15 @@ public sealed class OctreeQuantizer
     private readonly byte[] _mapLut = new byte[HistVolume]; // 5-bit 立方 → 调色板索引
     private int _leafCount;
 
+    /// <summary>
+    /// 本次量化的调色板颜色数上限（1..256）。
+    /// </summary>
+    /// <remarks>
+    /// 默认 <see cref="MaxColors"/>。需要给透明索引预留槽位时必须降到 255：
+    /// GIF 的调色板最多 256 项，而带透明的编码要用掉 1 项（索引 0）放透明色。
+    /// </remarks>
+    private int _maxColors = MaxColors;
+
     public OctreeQuantizer()
     {
         for (int i = 0; i < Bits; i++)
@@ -105,8 +114,16 @@ public sealed class OctreeQuantizer
     /// </summary>
     public static (byte[] Palette, byte[] Indices) Quantize(byte[] pixels, int width, int height, bool enableDithering = true, int ditherStrength = 8)
     {
-        var q = new OctreeQuantizer { DitherStrength = ditherStrength };
-        return q.QuantizeInternal(pixels.AsSpan(), width, height, enableDithering);
+        return Quantize(pixels.AsSpan(), width, height, enableDithering, ditherStrength);
+    }
+
+    /// <summary>
+    /// 对 RGB24 像素进行八叉树量化并（可选）Bayer 抖动，生成 ≤256 色调色板与像素索引。
+    /// </summary>
+    /// <param name="maxColors">调色板颜色数上限（1..256）。默认 256；需要给透明索引预留槽位时传 255。</param>
+    public static (byte[] Palette, byte[] Indices) Quantize(byte[] pixels, int width, int height, bool enableDithering, int ditherStrength, int maxColors)
+    {
+        return Quantize(pixels.AsSpan(), width, height, enableDithering, ditherStrength, maxColors);
     }
 
     /// <summary>
@@ -114,7 +131,18 @@ public sealed class OctreeQuantizer
     /// </summary>
     public static (byte[] Palette, byte[] Indices) Quantize(ReadOnlySpan<byte> pixels, int width, int height, bool enableDithering = true, int ditherStrength = 8)
     {
-        var q = new OctreeQuantizer { DitherStrength = ditherStrength };
+        return Quantize(pixels, width, height, enableDithering, ditherStrength, MaxColors);
+    }
+
+    /// <summary>
+    /// 对 RGB24 像素（ReadOnlySpan，适合 NativeBufferOwner 等非托管源）进行量化。
+    /// </summary>
+    /// <param name="maxColors">调色板颜色数上限（1..256）。默认 256；需要给透明索引预留槽位时传 255。</param>
+    public static (byte[] Palette, byte[] Indices) Quantize(ReadOnlySpan<byte> pixels, int width, int height, bool enableDithering, int ditherStrength, int maxColors)
+    {
+        ArgumentOutOfRangeException.ThrowIfLessThan(maxColors, 1);
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(maxColors, MaxColors);
+        var q = new OctreeQuantizer { DitherStrength = ditherStrength, _maxColors = maxColors };
         return q.QuantizeInternal(pixels, width, height, enableDithering);
     }
 
@@ -385,12 +413,12 @@ public sealed class OctreeQuantizer
 
     /// <summary>
     /// 自底向上归约：反复把「最深一层里像素数最少」的可归约节点剪枝（合并其全部子树叶），
-    /// 直到叶子数 ≤ <see cref="MaxColors"/>。每个内部节点已在插入时累计了整棵子树的
+    /// 直到叶子数 ≤ <see cref="_maxColors"/>。每个内部节点已在插入时累计了整棵子树的
     /// 像素和与 RGB 和，故剪枝后其代表色（RSum/PixelCount）自然就是合并后的均值，无需重新累加。
     /// </summary>
     private void Reduce()
     {
-        while (_leafCount > MaxColors)
+        while (_leafCount > _maxColors)
         {
             int node = FindReducible();
             if (node < 0) break;

@@ -87,19 +87,31 @@ internal static class AlphDecoder
             case 0: // none
                 break;
 
-            case 1: // horizontal：out[x] = out[x] + out[x-1]
+            case 1: // horizontal：out[x] = pred + in[x]，pred 从「上一行首像素」起，逐像素滚动
+                // libwebp 的 HorizontalUnfilter_C 签名是 (prev, in, out, width)，
+                // pred 初值为 prev[0]（首行为 0）——也就是说每一行都以上一行首像素为起点，
+                // 而不是每行各自从 0 开始累积。按 0 起算会把 x=0 与其后所有像素整体错位。
                 for (int y = 0; y < height; y++)
                 {
                     int rowStart = y * width;
-                    for (int x = 1; x < width; x++)
+                    int pred = y == 0 ? 0 : alpha[rowStart - width];
+                    for (int x = 0; x < width; x++)
                     {
                         int idx = rowStart + x;
-                        alpha[idx] = (byte)(alpha[idx] + alpha[idx - 1]);
+                        pred = (byte)(pred + alpha[idx]);
+                        alpha[idx] = (byte)pred;
                     }
                 }
                 break;
 
-            case 2: // vertical：out[x] = out[x] + prevRow[x]
+            case 2: // vertical：out[x] = out[x] + prevRow[x]；首行没有 prev，退化为 horizontal
+                // libwebp 的 VerticalUnfilter_C 在 prev == NULL 时直接调 HorizontalUnfilter_C，
+                // 即「首行必须按水平逆滤波」。漏掉这一步时，libwebp 编码的垂直过滤流首行
+                // 残差会被当成原值向下累积，整幅 alpha 都会解错（实测 cwebp 默认
+                // alpha_filtering=fast 就会选到 vertical）。
+                for (int x = 1; x < width; x++)
+                    alpha[x] = (byte)(alpha[x] + alpha[x - 1]);
+
                 for (int y = 1; y < height; y++)
                 {
                     int rowStart = y * width;

@@ -1,4 +1,4 @@
-﻿using System;
+﻿﻿using System;
 using SharpImageConverter.Core;
 using SharpImageConverter;
 using System.IO;
@@ -15,30 +15,21 @@ namespace SharpImageConverter.Formats.Webp
 
     public readonly struct WebpEncoderOptions
     {
-        private static readonly bool AllowM4HighQuality =
-            Environment.GetEnvironmentVariable("SIC_WEBP_ALLOW_M4_HIGHQ") == "1";
-
         public float Quality { get; }
         public WebpConcurrencyStrategy ConcurrencyStrategy { get; }
 
         /// <summary>
-        /// libwebp 的 <c>config.method</c>（0~6）：越大越慢、体积越小，默认 3。
+        /// 历史参数（原 libwebp <c>config.method</c>，0~6）。
         /// </summary>
         /// <remarks>
-        /// 2048²（4.19 MP）/ q80 实测单次编码：method 2 = 147.5 ms / 70,838 B、
-        /// method 3 = 501.7 ms / 67,784 B、method 4 = 490.9 ms / 67,818 B、
-        /// method 6 = 579.4 ms / 64,872 B。悬崖在 2→3 之间：≥3 才走完整 RD 优化。
-        /// 默认取 3（不取 4）的原因：libwebp 1.6.0 的 method 4 在 &gt;140 MP 且有质量相关悬崖
-        /// （143 MP 实测 q75：m3 7.8 s / 1,597,784 B vs m4 26.3 s / 1,655,814 B，m4 更慢还更大；
-        /// q40/q65 不触发），且在 7 个样本（1~143 MP，含真实照片）上 m3 体积均 ≤ m4。
-        /// 因此构造时强制：<b>quality ≥ 75 且 method == 4 时降为 3</b>，避免调用方误用。
-        /// 详见 docs 与 .perf/results。
+        /// 纯 C# 编码器没有 effort 档位，<b>本值不会影响产物</b>；保留只为让既有调用方与
+        /// <c>--webp-method</c> 参数面继续可编译/可解析。编码器的努力程度由
+        /// <see cref="Vp8LEncoderOptions.Auto"/> 的候选集与有损 VP8 的固定流程决定。
         /// </remarks>
         public int Method { get; }
 
         /// <summary>
-        /// 是否使用无损 WebP。无损路径直通 libwebp 的 <c>WebPEncodeLosslessRGBA</c>，
-        /// 此时 <see cref="Quality"/> / <see cref="Method"/> 不参与编码参数（仅保留给调用方读取）。
+        /// 是否使用无损 WebP（VP8L）。此时 <see cref="Quality"/> 不参与编码（无损没有画质档）。
         /// </summary>
         public bool Lossless { get; }
 
@@ -50,10 +41,6 @@ namespace SharpImageConverter.Formats.Webp
         {
             if (quality < 0f || quality > 100f) throw new ArgumentOutOfRangeException(nameof(quality));
             if (method is < 0 or > 6) throw new ArgumentOutOfRangeException(nameof(method));
-            // 实测 m4 在 143 MP / q75 有 3.4 倍悬崖且体积更大；高质量档直接降回 m3。
-            // 无损模式下 quality 是“压缩努力”而非画质档，但 m4 的悬崖是 libwebp 内部实现问题，
-            // 同样避开更稳妥。SIC_WEBP_ALLOW_M4_HIGHQ=1 仅用于复现/诊断。
-            if (method == 4 && quality >= 75f && !AllowM4HighQuality) method = 3;
             Quality = quality;
             ConcurrencyStrategy = concurrencyStrategy;
             Method = method;
@@ -321,6 +308,68 @@ namespace SharpImageConverter.Formats.Webp
                 // 复用已有的 SSSE3 展开实现（原为逐像素标量循环）
                 SimdHelper.ExpandRgbToRgba(frame.Buffer, rgba);
                 rgbaFrames[fi] = rgba;
+
+                int d = frameDurationsMs[fi];
+                durations[fi] = d < 10 ? 10 : d;
+            }
+
+            WebpCodec.EncodeAnimatedRgbaToStream(stream, rgbaFrames, width, height, durations, loopCount, options,
+                frames[0].Metadata);
+        }
+
+        /// <summary>
+        /// 编码 RGBA 动图（保留 alpha 通道）。
+        /// </summary>
+        /// <remarks>
+        /// 与 <see cref="EncodeRgb24(Stream, IReadOnlyList{Image{Rgb24}}, IReadOnlyList{int}, int, WebpEncoderOptions)"/>
+        /// 的区别只在像素来源：这里直接使用每帧的 RGBA 数据，不做 RGB→RGBA 展开，
+        /// 因此半透明与全透明像素都会原样进入 ANMF 的 ALPH 子块。
+        /// <para>
+        /// GIF 动图转 WebP 时必须走这个入口：GIF 的透明索引信息只存在于 alpha 通道，
+        /// 用 Rgb24 路径会把透明背景变成不透明（实测整幅 4096 像素全部 alpha=255）。
+        /// </para>
+        /// </remarks>
+        public static void EncodeRgba32(string path, IReadOnlyList<Image<Rgba32>> frames, IReadOnlyList<int> frameDurationsMs, int loopCount, float quality = 75f)
+        {
+            using var fs = new FileStream(path, FileMode.Create, FileAccess.Write);
+            EncodeRgba32(fs, frames, frameDurationsMs, loopCount, quality);
+        }
+
+        /// <summary>
+        /// 编码 RGBA 动图（保留 alpha 通道）到流。
+        /// </summary>
+        public static void EncodeRgba32(Stream stream, IReadOnlyList<Image<Rgba32>> frames, IReadOnlyList<int> frameDurationsMs, int loopCount, float quality = 75f)
+        {
+            EncodeRgba32(stream, frames, frameDurationsMs, loopCount, new WebpEncoderOptions(quality, WebpConcurrencyStrategy.Auto));
+        }
+
+        /// <summary>
+        /// 编码 RGBA 动图（保留 alpha 通道）到流。
+        /// </summary>
+        public static void EncodeRgba32(Stream stream, IReadOnlyList<Image<Rgba32>> frames, IReadOnlyList<int> frameDurationsMs, int loopCount, WebpEncoderOptions options)
+        {
+            ArgumentNullException.ThrowIfNull(stream, nameof(stream));
+            ArgumentNullException.ThrowIfNull(frames, nameof(frames));
+            ArgumentNullException.ThrowIfNull(frameDurationsMs, nameof(frameDurationsMs));
+
+            if (frames.Count == 0) throw new ArgumentOutOfRangeException(nameof(frames));
+            if (frames.Count != frameDurationsMs.Count) throw new ArgumentException("帧与时长数量不一致");
+
+            int width = frames[0].Width;
+            int height = frames[0].Height;
+
+            var rgbaFrames = new byte[frames.Count][];
+            var durations = new int[frames.Count];
+
+            for (int fi = 0; fi < frames.Count; fi++)
+            {
+                var frame = frames[fi];
+                if (frame.Width != width || frame.Height != height) throw new ArgumentException("所有帧必须具有相同的宽高");
+                if (frame.Buffer.Length != checked(width * height * 4))
+                    throw new ArgumentException($"第 {fi} 帧的 RGBA 数据长度与宽高不匹配", nameof(frames));
+
+                // 帧数据按引用传递：WebpCodec 只读不改，不需要再复制一份。
+                rgbaFrames[fi] = frame.Buffer;
 
                 int d = frameDurationsMs[fi];
                 durations[fi] = d < 10 ? 10 : d;

@@ -1,4 +1,4 @@
-# 智能有损压缩（`SharpImageConverter.Compression`）
+﻿# 智能有损压缩（`SharpImageConverter.Compression`）
 
 TinyPNG 式的「丢进去就能小很多、肉眼几乎看不出差别」能力。
 默认输入 JPG / PNG / GIF / WebP / BMP，输出**同格式**（BMP 例外，转 PNG）的最小版本；
@@ -413,8 +413,14 @@ PSNR/感知段（~70 ms）还贵。现按「块行」分片并行（SSIM 块互�
 ### WebP / BMP
 
 - **动画 WebP 同格式 optimize 直接保留原图**（解码只取首帧），跨格式转换会在方案里标注。
-- WebP：同样做质量搜索。当前策略（2026-10-17）：
-  - **产出档按尺寸**：≤20 MP 用 `method 6`（实测体积小于 m3，耗时 +5%~14%），
+- WebP：同样做质量搜索。
+
+  > **2026-11-03 现状**：编解码已全部改为纯 C# 实现，`method` 档位（其中的 m2/m3/m6 与
+  > `SIC_WEBP_ALLOW_M4_HIGHQ`）**不再影响产物**，`--webp-method` 仍被接受但会打印提示。
+  > 下面 2026-10-17 那一组数字是 libwebp 后端时期的历史实测，仅作参考，不代表当前行为。
+  > 当前搜索仍是「q40 锚点 + 4 点小网格 + 二分」，候选之间用真实字节数比较。
+
+  - **产出档按尺寸**（历史）：≤20 MP 用 `method 6`（实测体积小于 m3，耗时 +5%~14%），
     >20 MP 用 `method 3`（143 MP 上 m6 反而更大）。
   - **搜索用 q40 锚点 + 4 点小网格 + 二分**（`SearchQualityAnchored`）：锚点达标只在 (min,40] 找，
     不达标才进 (40,95]。143 MP 的候选数从 19 压到 8。
@@ -422,8 +428,8 @@ PSNR/感知段（~70 ms）还贵。现按「块行」分片并行（SSIM 块互�
     （143 MP 从 q40 降到 q34 只省 7.8% 却多花 ~15 s）。需要极限体积时显式
     `--opt-webp-min 20 --opt-webp-large-min 20`。
   - **无损候选**：不透明、≤20 MP、唯一色数 ≤4096 时编码一次无损 WebP 与有损结果比体积。
-    无损必须走 `WebPEncodeLosslessRGBA` 直通；`WebPConfig.lossless=1` 的配置路径实测仍有
-    1~5 的像素误差（ffmpeg 解码同样如此），不是真无损。
+    现走纯 C# VP8L 编码器（真无损，往返逐字节一致）；libwebp 时期 `WebPConfig.lossless=1`
+    的配置路径有 1~5 的像素误差（ffmpeg 解码同样如此），这条限制已不适用。
   - m6 与 m2/m3 画质不完全一致：边界上 m6 不达标时先同 q 退回 m3，再升 q。
   - `WebpMinQuality`（默认 20，可用 `--opt-webp-min` 调整）。
   搜索期用 libwebp 的便宜档 `method 2`（比 `method 3` 便宜约一个数量级），赢家再按 `method 3` 补编一次 ——
@@ -634,7 +640,7 @@ CLI 路由条件：显式给了 `--to`，或输出路径带一个与源格式不
 |---|---|---|
 | `.jpg` / `.jpeg` | 质量二分搜索（4:2:0 → 4:2:2/4:4:4 回退）+ 按图优化 Huffman 表 | alpha 按 `OptimizeOptions.MatteColor`（默认白）合成到背景 |
 | `.png` | 调色板量化二分搜索，必要时回退无损真彩色重写 | 保留 alpha |
-| `.webp` | 质量搜索，下界 40；搜索期 `method 2`、赢家补 `method 3` | 保留 alpha（此前同格式优化只走 RGB） |
+| `.webp` | 质量搜索，下界 40（`method` 档位已随 native 后端移除，不影响产物） | 保留 alpha（此前同格式优化只走 RGB） |
 | `.gif` | 单帧调色板降色搜索 | 静态图；透明像素保留（索引 0 预留） |
 | `.bmp` | 无损真彩色直写 | BMP 无压缩，写明「该格式无压缩」 |
 

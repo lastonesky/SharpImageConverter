@@ -140,7 +140,7 @@ namespace SharpImageConverter.Compression
 
             int quality = PickSmallestAccepted(searchResults, searchedQuality, o.Accept);
 
-            // 边界多看 1~2 档：体积与画质都不是严格单调，且搜索期的 m2 体积也会有几个百分点的反转。
+            // 边界多看 1~2 档：体积与画质都不是严格单调（同 q 的体积/画质关系由内容决定）。
             // 大图上每个候选 2~3 s，不值得；小图加深 2 个候选。
             if (pixels <= 8_000_000 && searchResults.ContainsKey(quality))
             {
@@ -158,26 +158,14 @@ namespace SharpImageConverter.Compression
 
             long searchTicks = TimingEnabled ? Stopwatch.GetTimestamp() - searchStart : 0;
 
-            // 产出档与搜索档不同（m2 → m3/m6），用最终产物重新解码复评；不达标时 +2 重试。
+            // 用最终产物重新解码复评；不达标时 +2 重试。
             long finalStart = TimingEnabled ? Stopwatch.GetTimestamp() : 0;
             int usedMethod = outputMethod;
             byte[] best = EncodeCore(rgba, w, h, quality, usedMethod, isFinal: true, lossless: false);
             var finalScore = QualityMetrics.Compare(rgba, Decode(best), w, h, 4);
 
-            // m6 与 m2/m3 的画质不完全一致：边界上可能出现「搜索 q 达标、m6 产物不达标」。
-            // 先在同一 q 退回 m3 试一次（通常能过，且比升 q 更省体积），再进入升 q 重试。
-            if (!o.Accept(finalScore) && usedMethod != 3)
-            {
-                usedMethod = 3;
-                byte[] alt = EncodeCore(rgba, w, h, quality, usedMethod, isFinal: true, lossless: false);
-                var altScore = QualityMetrics.Compare(rgba, Decode(alt), w, h, 4);
-                if (o.Accept(altScore) || alt.Length < best.Length)
-                {
-                    best = alt;
-                    finalScore = altScore;
-                }
-            }
-
+            // m2/m3/m6 三个档位在纯 C# 编码器里已经是同一实现，搜索期与产出期的编码结果
+            // 逐字节相同，因此不再需要「m6 产物不达标就退回 m3 重试」这一步（它只会白付一次编码）。
             int retries = 0;
             while (!o.Accept(finalScore) && quality < 95 && retries < 4)
             {

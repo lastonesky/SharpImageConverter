@@ -34,6 +34,15 @@ public sealed class Quantizer : IDisposable
     private readonly long[] _vmb;
     private readonly double[] _m2;
 
+    /// <summary>
+    /// 本次量化的调色板颜色数上限（1..256）。
+    /// </summary>
+    /// <remarks>
+    /// 默认 <see cref="MaxColors"/>。需要给透明索引预留槽位时必须降到 255：
+    /// GIF 的调色板最多 256 项，而带透明的编码要用掉 1 项（索引 0）放透明色。
+    /// </remarks>
+    private int _maxColors = MaxColors;
+
     private struct Box
     {
         public int r0, r1;
@@ -61,8 +70,16 @@ public sealed class Quantizer : IDisposable
     /// <returns>调色板与像素索引</returns>
     public static (byte[] Palette, byte[] Indices) Quantize(byte[] pixels, int width, int height, bool enableDithering = true)
     {
-        using var q = new Quantizer();
-        return q.QuantizeInternal(pixels.AsSpan(), width, height, enableDithering);
+        return Quantize(pixels.AsSpan(), width, height, enableDithering, MaxColors);
+    }
+
+    /// <summary>
+    /// 对图像进行高质量量化，生成调色板并支持抖动处理。
+    /// </summary>
+    /// <param name="maxColors">调色板颜色数上限（1..256）。默认 256；需要给透明索引预留槽位时传 255。</param>
+    public static (byte[] Palette, byte[] Indices) Quantize(byte[] pixels, int width, int height, bool enableDithering, int maxColors)
+    {
+        return Quantize(pixels.AsSpan(), width, height, enableDithering, maxColors);
     }
 
     /// <summary>
@@ -70,7 +87,18 @@ public sealed class Quantizer : IDisposable
     /// </summary>
     public static (byte[] Palette, byte[] Indices) Quantize(ReadOnlySpan<byte> pixels, int width, int height, bool enableDithering = true)
     {
-        using var q = new Quantizer();
+        return Quantize(pixels, width, height, enableDithering, MaxColors);
+    }
+
+    /// <summary>
+    /// 对图像进行高质量量化（ReadOnlySpan 重载，适合 NativeBufferOwner 等非托管源）。
+    /// </summary>
+    /// <param name="maxColors">调色板颜色数上限（1..256）。默认 256；需要给透明索引预留槽位时传 255。</param>
+    public static (byte[] Palette, byte[] Indices) Quantize(ReadOnlySpan<byte> pixels, int width, int height, bool enableDithering, int maxColors)
+    {
+        ArgumentOutOfRangeException.ThrowIfLessThan(maxColors, 1);
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(maxColors, MaxColors);
+        using var q = new Quantizer { _maxColors = maxColors };
         return q.QuantizeInternal(pixels, width, height, enableDithering);
     }
 
@@ -90,11 +118,12 @@ public sealed class Quantizer : IDisposable
         Box[] cube = new Box[MaxColors];
         cube[0].r0 = cube[0].g0 = cube[0].b0 = 0;
         cube[0].r1 = cube[0].g1 = cube[0].b1 = SIZE - 1;
-        
+
         double[] vv = new double[MaxColors];
         int next = 0;
         int actualK = 1;
-        for (int i = 1; i < MaxColors; i++)
+        // 上限取 _maxColors：每次成功分裂使颜色数 +1，所以循环到 i == _maxColors - 1 就够了。
+        for (int i = 1; i < _maxColors; i++)
         {
             if (Split(ref cube[next], ref cube[i]))
             {

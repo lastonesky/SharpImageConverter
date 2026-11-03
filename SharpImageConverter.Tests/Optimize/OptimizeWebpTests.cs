@@ -138,15 +138,42 @@ namespace SharpImageConverter.Tests
         }
 
         [Theory]
-        [InlineData(74.9f, 4, 4)]
-        [InlineData(75f, 4, 3)]
-        [InlineData(90f, 4, 3)]
-        [InlineData(90f, 3, 3)]
-        [InlineData(90f, 5, 5)]
-        public void WebpEncoderOptions_Method4_IsDowngradedAtHighQuality(float quality, int requested, int expected)
+        [InlineData(74.9f, 4)]
+        [InlineData(75f, 4)]
+        [InlineData(90f, 4)]
+        [InlineData(90f, 0)]
+        [InlineData(90f, 6)]
+        public void WebpEncoderOptions_MethodIsReservedAndKeptAsIs(float quality, int requested)
         {
+            // 纯 C# 编码器没有 effort 档位：method 只是兼容参数，既不做 4→3 降级也不再影响产物。
             var options = new WebpEncoderOptions(quality, WebpConcurrencyStrategy.Auto, requested);
-            Assert.Equal(expected, options.Method);
+            Assert.Equal(requested, options.Method);
+        }
+
+        [Fact]
+        public void WebpEncoderOptions_MethodHasNoEffectOnOutput()
+        {
+            const int w = 48, h = 32;
+            var rgba = new byte[w * h * 4];
+            for (int i = 0; i < w * h; i++)
+            {
+                rgba[i * 4] = (byte)(i * 7);
+                rgba[i * 4 + 1] = (byte)(i * 11);
+                rgba[i * 4 + 2] = (byte)(i * 13);
+                rgba[i * 4 + 3] = (byte)(200 + (i % 56));
+            }
+
+            var outputs = new List<byte[]>();
+            foreach (int method in new[] { 0, 2, 3, 4, 6 })
+            {
+                using var ms = new MemoryStream();
+                new WebpEncoderAdapterRgba { Options = new WebpEncoderOptions(70, WebpConcurrencyStrategy.Auto, method) }
+                    .EncodeRgba32(ms, new Image<Rgba32>(w, h, rgba));
+                outputs.Add(ms.ToArray());
+            }
+
+            foreach (var bytes in outputs)
+                Assert.True(outputs[0].AsSpan().SequenceEqual(bytes), "不同 method 的产物必须逐字节一致");
         }
 
         [Fact]

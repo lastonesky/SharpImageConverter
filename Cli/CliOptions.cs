@@ -36,7 +36,12 @@ internal sealed class CliOptions(string inputPath)
     /// <summary>是否保留元数据（EXIF/ICC）。</summary>
     public bool KeepMetadata { get; set; }
 
-    /// <summary>是否把 GIF 动画拆成单帧序列。</summary>
+    /// <summary>
+    /// 是否把动图（GIF / WebP）拆成单帧序列导出。
+    /// </summary>
+    /// <remarks>
+    /// 选项名保留 <c>--gif-frames</c> 以兼容既有脚本，同时新增等价的 <c>--anim-frames</c>。
+    /// </remarks>
     public bool GifFrames { get; set; }
 
     /// <summary>GIF 编码是否启用抖动。</summary>

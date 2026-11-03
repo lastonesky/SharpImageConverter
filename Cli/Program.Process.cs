@@ -242,8 +242,8 @@ sealed partial class Program
             return true;
         }
 
-        // GIF 动画帧导出为单张图片序列
-        if (options.GifFrames && inExt == ".gif")
+        // 动图帧导出为单张图片序列（GIF 与 WebP 动图）
+        if (options.GifFrames && (inExt == ".gif" || (inExt == ".webp" && IsAnimatedWebp(options.InputPath))))
         {
             ExportGifFrames(options, reporter);
             return false;
@@ -256,7 +256,7 @@ sealed partial class Program
             return true;
         }
 
-        ProcessWithOps(options, inExt);
+        ProcessWithOps(options, inExt, reporter);
         return true;
     }
 
@@ -267,6 +267,14 @@ sealed partial class Program
         string dir = Path.GetDirectoryName(baseOut) ?? ".";
         string nameNoExt = Path.GetFileNameWithoutExtension(baseOut);
         string ext = NormalizeOutputExtension(Path.GetExtension(baseOut));
+
+        string inExt = Path.GetExtension(options.InputPath).ToLowerInvariant();
+        if (inExt == ".webp")
+        {
+            ExportWebpAnimationFrames(options, reporter, dir, nameNoExt, ext);
+            return;
+        }
+
         var gifDec = CreateGifDecoder(options);
         var frames = gifDec.DecodeAllFrames(options.InputPath);
         int digits = Math.Max(3, frames.Count.ToString(CultureInfo.InvariantCulture).Length);
@@ -279,6 +287,56 @@ sealed partial class Program
         }
 
         reporter.Info($"✅ 导出 GIF 动画帧: 共 {frames.Count} 帧");
+    }
+
+    /// <summary>
+    /// 把 WebP 动图拆成单帧序列导出。
+    /// </summary>
+    /// <remarks>
+    /// WebP 动图的每帧都是整幅画布快照（已按 blend / dispose 合成），
+    /// 所以导出的帧与播放器看到的画面一致。
+    /// </remarks>
+    static void ExportWebpAnimationFrames(CliOptions options, CliReporter reporter, string dir, string nameNoExt, string ext)
+    {
+        var anim = WebpDecoder.DecodeAnimation(File.ReadAllBytes(options.InputPath));
+        if (anim.Frames.Length == 0)
+            throw new InvalidDataException("WebP 动图没有可解码的帧");
+
+        int digits = Math.Max(3, anim.Frames.Length.ToString(CultureInfo.InvariantCulture).Length);
+        for (int i = 0; i < anim.Frames.Length; i++)
+        {
+            string idx = i.ToString(CultureInfo.InvariantCulture).PadLeft(digits, '0');
+            string path = Path.Combine(dir, $"{nameNoExt}_{idx}{ext}");
+            var frame = new Image<Rgba32>(anim.CanvasWidth, anim.CanvasHeight, anim.Frames[i].Rgba);
+            SaveAnimationFrameRgba(frame, path, ext, options);
+        }
+
+        reporter.Info($"✅ 导出 WebP 动画帧: 共 {anim.Frames.Length} 帧");
+    }
+
+    /// <summary>
+    /// 保存单帧动画画面。支持透明通道的格式（PNG / WebP）保留 alpha，JPEG/BMP 走 RGB。
+    /// </summary>
+    static void SaveAnimationFrameRgba(Image<Rgba32> frame, string path, string ext, CliOptions options)
+    {
+        if (ext is ".jpg" or ".jpeg")
+        {
+            int q = options.JpegQuality ?? 75;
+            var rgb = new Image<Rgb24>(frame.Width, frame.Height, RgbaToRgb(frame.Buffer), frame.Metadata);
+            var optionsJpeg = new JpegEncoderOptions(q, JpegSubsamplingOf(options), keepMetadata: false, enableDiagnostics: false, optimizeHuffman: false, trellisQuantization: options.JpegTrellis);
+            EncodeJpegWithOptions(rgb, path, optionsJpeg, options.JpegProgressive);
+            return;
+        }
+
+        if (ext == ".bmp")
+        {
+            var rgb = new Image<Rgb24>(frame.Width, frame.Height, RgbaToRgb(frame.Buffer), frame.Metadata);
+            Image.Save(rgb, path);
+            return;
+        }
+
+        // PNG / WebP：保留 alpha
+        Image.Save(frame, path);
     }
 
     static void SaveGifFrame(Image<Rgb24> frame, string path, string ext, CliOptions options)
@@ -313,6 +371,13 @@ sealed partial class Program
         if (inExt == ".gif" && outExt == ".webp")
         {
             ConvertGifToWebp(options);
+            return;
+        }
+
+        // WebP 动图输入：按输出格式分派（动图 -> 动图 / 动图 -> 静帧）
+        if (inExt == ".webp" && IsAnimatedWebp(options.InputPath))
+        {
+            ConvertWebpAnimation(options, outExt, reporter);
             return;
         }
 
@@ -355,7 +420,7 @@ sealed partial class Program
         SaveRgbaWithOptions(rgbaImage, outputPath, options);
     }
 
-    static void ProcessWithOps(CliOptions options, string inExt)
+    static void ProcessWithOps(CliOptions options, string inExt, CliReporter reporter)
     {
         // 有操作时默认输出后缀：优先取 --to，否则 BMP
         options.OutputPath = EnsureOutputPath(options.InputPath, options.OutputPath, options.OutputExtension ?? ".bmp");
@@ -366,6 +431,13 @@ sealed partial class Program
         if (inExt == ".gif" && outExt == ".webp")
         {
             ProcessGifToWebpWithOps(options);
+            return;
+        }
+
+        // WebP 动图输入（带操作）：动图 -> 动图 / 动图 -> 静帧
+        if (inExt == ".webp" && IsAnimatedWebp(options.InputPath))
+        {
+            ConvertWebpAnimation(options, outExt, reporter);
             return;
         }
 
@@ -393,12 +465,103 @@ sealed partial class Program
         SaveRgbWithOptions(image, outputPath, options);
     }
 
+    /// <summary>
+    /// 判断输入是否为 WebP 动图（VP8X 的 ANIMATION 标志）。
+    /// </summary>
+    /// <remarks>
+    /// 只读 RIFF/WEBP 头与 VP8X 的 flags 字节（偏移 20，bit1 = ANIMATION），不解码像素。
+    /// 头部不完整或不是 WebP 时按「非动图」处理，后续单图解码路径会给出更具体的错误。
+    /// </remarks>
+    static bool IsAnimatedWebp(string path)
+    {
+        try
+        {
+            using var fs = File.OpenRead(path);
+            Span<byte> head = stackalloc byte[21];
+            if (fs.ReadAtLeast(head, head.Length, throwOnEndOfStream: false) < head.Length) return false;
+            if (head[0] != (byte)'R' || head[1] != (byte)'I' || head[2] != (byte)'F' || head[3] != (byte)'F') return false;
+            if (head[8] != (byte)'W' || head[9] != (byte)'E' || head[10] != (byte)'B' || head[11] != (byte)'P') return false;
+            if (head[12] != (byte)'V' || head[13] != (byte)'P' || head[14] != (byte)'8' || head[15] != (byte)'X') return false;
+            return (head[20] & 0x02) != 0;
+        }
+        catch (IOException)
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// WebP 动图转换：
+    /// 输出为 .webp / .gif 时保留全部帧、时长与循环次数；其他格式只取首帧并明确告知。
+    /// </summary>
+    static void ConvertWebpAnimation(CliOptions options, string outExt, CliReporter reporter)
+    {
+        string outputPath = options.OutputPath ?? throw new InvalidOperationException("输出路径为空");
+
+        byte[] bytes = File.ReadAllBytes(options.InputPath);
+        var anim = WebpDecoder.DecodeAnimation(bytes);
+
+        if (anim.Frames.Length == 0)
+            throw new InvalidDataException("WebP 动图没有可解码的帧");
+
+        var durations = anim.Frames.Select(f => f.DurationMs).ToList();
+        int loop = anim.LoopCount;
+        float quality = options.JpegQuality.HasValue ? options.JpegQuality.Value : 75f;
+
+        // 带操作时逐帧处理（alpha 一并保留，尺寸随之改变）
+        List<Image<Rgba32>> frames;
+        if (options.Operations.Count > 0)
+        {
+            frames = anim.Frames
+                .Select(f => ApplyOpsToRgba(
+                    new Image<Rgba32>(anim.CanvasWidth, anim.CanvasHeight, f.Rgba), options.Operations))
+                .ToList();
+        }
+        else
+        {
+            frames = anim.Frames
+                .Select(f => new Image<Rgba32>(anim.CanvasWidth, anim.CanvasHeight, f.Rgba))
+                .ToList();
+        }
+
+        if (outExt == ".webp")
+        {
+            WebpAnimationEncoder.EncodeRgba32(outputPath, frames, durations, loop, quality);
+            reporter.Info($"✅ WebP 动图: {frames.Count} 帧 {frames[0].Width}x{frames[0].Height}，循环 {loop} 次");
+            return;
+        }
+
+        if (outExt == ".gif")
+        {
+            var gifEnc = new GifEncoder
+            {
+                EnableDithering = options.Dithering,
+                QuantizerKind = ParseGifQuantizer(options.GifQuantizer),
+                DitherStrength = options.GifDitherStrength,
+            };
+            var rgbaBuffers = frames.Select(f => f.Buffer).ToList();
+            using (var fs = File.Create(outputPath))
+            {
+                gifEnc.EncodeAnimationRgba(frames[0].Width, frames[0].Height, rgbaBuffers, durations, loop, fs);
+            }
+            reporter.Info($"✅ GIF 动图: {frames.Count} 帧 {frames[0].Width}x{frames[0].Height}，循环 {loop} 次");
+            return;
+        }
+
+        // 静态格式：只取首帧，并说明其余帧的去处
+        var first = frames[0];
+        reporter.Info($"⚠️ 输入是 {frames.Count} 帧的 WebP 动图，{outExt} 只能存一张，已取首帧；" +
+                     "如需保留动画请用 --to webp 或 --to gif");
+        var rgbaImage = new Image<Rgba32>(first.Width, first.Height, first.Buffer);
+        SaveRgbaWithOptions(rgbaImage, outputPath, options);
+    }
+
     static void ConvertGifToWebp(CliOptions options)
     {
         string outputPath = options.OutputPath ?? throw new InvalidOperationException("输出路径为空");
         var gifDec = CreateGifDecoder(options);
         GifAnimation anim;
-        using (var fs = File.OpenRead(options.InputPath)) anim = gifDec.DecodeAnimationRgb24(fs);
+        using (var fs = File.OpenRead(options.InputPath)) anim = gifDec.DecodeAnimationRgba32(fs);
 
         if (anim.Frames.Count == 0)
         {
@@ -416,29 +579,70 @@ sealed partial class Program
 
         int loop = anim.LoopCount;
         float qWebp = options.JpegQuality.HasValue ? options.JpegQuality.Value : 75f;
-        WebpAnimationEncoder.EncodeRgb24(outputPath, anim.Frames, anim.FrameDurationsMs, loop, qWebp);
+        // 必须走 RGBA 路径：GIF 的透明索引只存在于 alpha 通道，走 Rgb24 会把透明背景变成不透明。
+        WebpAnimationEncoder.EncodeRgba32(outputPath, anim.RgbaFrames!, anim.FrameDurationsMs, loop, qWebp);
     }
-
     static void ProcessGifToWebpWithOps(CliOptions options)
     {
         string outputPath = options.OutputPath ?? throw new InvalidOperationException("输出路径为空");
         var gifDec = CreateGifDecoder(options);
         GifAnimation anim;
-        using (var fs = File.OpenRead(options.InputPath)) anim = gifDec.DecodeAnimationRgb24(fs);
+        using (var fs = File.OpenRead(options.InputPath)) anim = gifDec.DecodeAnimationRgba32(fs);
 
-        var processed = new List<Image<Rgb24>>(anim.Frames.Count);
-        for (int i = 0; i < anim.Frames.Count; i++)
+        var processed = new List<Image<Rgba32>>(anim.RgbaFrames!.Count);
+        for (int i = 0; i < anim.RgbaFrames.Count; i++)
         {
-            var frame = anim.Frames[i];
-            ImageExtensions.Mutate(frame, ctx =>
-            {
-                foreach (var a in options.Operations) a(ctx);
-            });
-            processed.Add(frame);
+            processed.Add(ApplyOpsToRgba(anim.RgbaFrames[i], options.Operations));
         }
 
         float qWebpOps = options.JpegQuality.HasValue ? options.JpegQuality.Value : 75f;
-        WebpAnimationEncoder.EncodeRgb24(outputPath, processed, anim.FrameDurationsMs, anim.LoopCount, qWebpOps);
+        WebpAnimationEncoder.EncodeRgba32(outputPath, processed, anim.FrameDurationsMs, anim.LoopCount, qWebpOps);
+    }
+
+    /// <summary>
+    /// 对 RGBA 帧应用 CLI 操作，同时保住 alpha 通道。
+    /// </summary>
+    /// <remarks>
+    /// CLI 的操作管线只作用于 <see cref="Image{Rgb24}"/>（resize / grayscale）。这里把 alpha
+    /// 单独复制成一张「灰度图」（R=G=B=A），与 RGB 一起走同一套操作——因为所有 resize 实现
+    /// 都是逐通道独立的，alpha 用同一算法缩放后尺寸天然一致；grayscale 对 (A,A,A) 是恒等变换，
+    /// 不会破坏 alpha。最后按新尺寸把两者合回去。
+    /// </remarks>
+    static Image<Rgba32> ApplyOpsToRgba(Image<Rgba32> frame, IReadOnlyList<Action<ImageProcessingContext>> ops)
+    {
+        if (ops.Count == 0) return frame;
+
+        int width = frame.Width, height = frame.Height;
+        var rgba = frame.Buffer;
+
+        // RGB：丢弃 alpha 做操作
+        var rgb = new Image<Rgb24>(width, height, RgbaToRgb(rgba), frame.Metadata);
+        // Alpha：复制成灰度图走同样的操作
+        var alphaGray = new Image<Rgb24>(width, height, new byte[width * height * 3], frame.Metadata);
+        for (int p = 0; p < width * height; p++)
+        {
+            byte a = rgba[p * 4 + 3];
+            alphaGray.Buffer[p * 3 + 0] = a;
+            alphaGray.Buffer[p * 3 + 1] = a;
+            alphaGray.Buffer[p * 3 + 2] = a;
+        }
+
+        foreach (var op in ops)
+        {
+            ImageExtensions.Mutate(rgb, op);
+            ImageExtensions.Mutate(alphaGray, op);
+        }
+
+        int newWidth = rgb.Width, newHeight = rgb.Height;
+        var outRgba = new byte[newWidth * newHeight * 4];
+        for (int p = 0; p < newWidth * newHeight; p++)
+        {
+            outRgba[p * 4 + 0] = rgb.Buffer[p * 3 + 0];
+            outRgba[p * 4 + 1] = rgb.Buffer[p * 3 + 1];
+            outRgba[p * 4 + 2] = rgb.Buffer[p * 3 + 2];
+            outRgba[p * 4 + 3] = alphaGray.Buffer[p * 3 + 0];
+        }
+        return new Image<Rgba32>(newWidth, newHeight, outRgba, frame.Metadata);
     }
 
     static string EnsureOutputPath(string inputPath, string? outputPath, string defaultExtension)

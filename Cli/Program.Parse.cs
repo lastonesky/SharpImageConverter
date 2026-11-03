@@ -19,7 +19,8 @@ sealed partial class Program
                 else options.UnknownArguments.Add(a);
                 continue;
             }
-            if (string.Equals(a, "--gif-frames", StringComparison.OrdinalIgnoreCase))
+            if (string.Equals(a, "--gif-frames", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(a, "--anim-frames", StringComparison.OrdinalIgnoreCase))
             {
                 options.GifFrames = true;
                 continue;
@@ -280,7 +281,13 @@ sealed partial class Program
             }
             if (TryParseNamedInt(args, ref i, "--webp-method", out int? webpMethod))
             {
-                if (webpMethod is >= 0 and <= 6) options.WebpMethod = webpMethod;
+                // 纯 C# 编码器没有 effort 档位，该参数不再影响产物。仍然解析（而不是当成
+                // 未知参数跳过）是因为 CLI 的未知参数会把它后面的值当输出路径，破坏调用方脚本。
+                if (webpMethod is >= 0 and <= 6)
+                {
+                    options.WebpMethod = webpMethod;
+                    Console.Error.WriteLine("⚠️ --webp-method 已无效果：纯 C# WebP 编码器没有 effort 档位，产物与耗时均不受影响");
+                }
                 else Console.Error.WriteLine($"⚠️ --webp-method 取值需为 0~6，已忽略: {webpMethod}");
                 continue;
             }
