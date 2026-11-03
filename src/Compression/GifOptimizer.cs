@@ -170,7 +170,7 @@ namespace SharpImageConverter.Compression
             // 因此不做「颜色够少就只走无损」的短路，统一进入阶梯搜索继续降色。
             int[] ladder = ImageOptimizer.BuildColorLadder(o.MaxColors);
 
-            // 候选并行：GIF 的量化 / 映射 / LZW 编码全是单线程，与 PNG 的 deflate、WebP 的 libwebp 同构，
+            // 候选并行：GIF 的量化 / 映射 / LZW 编码全是单线程，与 PNG 的 deflate、WebP 编码同构，
             // 候选级并行因此是唯一的多核杠杆（24 核单文件时串行只用 1 个核）。
             // 并行度按内存预算夹（单候选峰值 ≈ 索引 1 B/px + 还原缓冲 4 B/px）。
             int variantCount = o.EnableDithering ? 2 : 1;

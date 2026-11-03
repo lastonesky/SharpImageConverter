@@ -1,6 +1,7 @@
 using System.Text;
 using Xunit;
 using SharpImageConverter.Formats.Webp;
+using SharpImageConverter.Tests.Helpers;
 
 namespace SharpImageConverter.Tests.Codec;
 
@@ -30,7 +31,7 @@ public class WebpAlphPreprocessingTests
             opaque[o + 3] = 255;
         }
 
-        byte[] vp8File = WebpCodec.EncodeRgba(opaque, w, h, 75f);
+        byte[] vp8File = LibWebpTestCodec.EncodeRgba(opaque, w, h, 75f);
         var vp8Container = WebpContainer.Load(vp8File);
         var vp8 = vp8Container.FindChunk(WebpChunkId.Vp8);
         Assert.True(vp8.HasValue);
@@ -64,7 +65,7 @@ public class WebpAlphPreprocessingTests
             rgba[o + 3] = (byte)((x * 19 + y * 23) & 0xFF);
         }
 
-        byte[] webp = WebpCodec.EncodeRgba(rgba, w, h, 75f);
+        byte[] webp = LibWebpTestCodec.EncodeRgba(rgba, w, h, 75f);
         var container = WebpContainer.Load(webp);
         Assert.True(container.FindChunk(WebpChunkId.Alph).HasValue, "libwebp 应输出 ALPH chunk");
         Assert.Equal(1, (byte)(container.FindChunk(WebpChunkId.Alph)!.Value.GetData(container.RawData)[0] & 0x03));
@@ -72,7 +73,7 @@ public class WebpAlphPreprocessingTests
         // 只把 preprocessing 改成 1，其余保留了 libwebp 生成的 VP8L 压缩 alpha 数据
         byte[] patched = PatchAlphPreprocessing(webp, 1);
 
-        byte[] expected = WebpCodec.DecodeRgba(patched, out int ew, out int eh);
+        byte[] expected = LibWebpTestCodec.DecodeRgba(patched, out int ew, out int eh);
         byte[] actual = WebpDecoder.DecodeRgba(patched, out int aw, out int ah);
         Assert.Equal(ew, aw);
         Assert.Equal(eh, ah);
@@ -94,14 +95,14 @@ public class WebpAlphPreprocessingTests
             rgba[i + 3] = 128;
         }
 
-        byte[] webp = PatchAlphPreprocessing(WebpCodec.EncodeRgba(rgba, w, h, 75f), 2);
+        byte[] webp = PatchAlphPreprocessing(LibWebpTestCodec.EncodeRgba(rgba, w, h, 75f), 2);
         Assert.Throws<WebpBitstreamException>(
             () => WebpDecoder.DecodeRgba(webp, out _, out _));
     }
 
     private static void AssertAlphaBitExact(byte[] webp, int w, int h, byte[] expectedAlpha)
     {
-        byte[] expected = WebpCodec.DecodeRgba(webp, out int ew, out int eh);
+        byte[] expected = LibWebpTestCodec.DecodeRgba(webp, out int ew, out int eh);
         byte[] actual = WebpDecoder.DecodeRgba(webp, out int aw, out int ah);
         Assert.Equal(ew, aw);
         Assert.Equal(eh, ah);

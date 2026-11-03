@@ -3,6 +3,7 @@ using System.IO;
 using Xunit;
 using SharpImageConverter.Core;
 using SharpImageConverter.Formats.Webp;
+using SharpImageConverter.Tests.Helpers;
 
 namespace SharpImageConverter.Tests.Codec;
 
@@ -11,8 +12,8 @@ namespace SharpImageConverter.Tests.Codec;
 /// （<see cref="WebpDecoder.DecodeRgbaInto(ReadOnlySpan{byte}, Span{byte}, out int, out int)}）的回归测试。
 ///
 /// 覆盖：
-/// - Auto 模式下无损/有损都走托管，动图回退 libwebp；
-/// - CSharp 模式下有损直接解码（不再抛 Unsupported，也不静默回退）；
+/// - Auto 与 CSharp 都走纯 C# 托管解码，并与 libwebp 黑盒对拍；
+/// - 动图不进入单图解码入口，Auto/CSharp 统一抛 <see cref="WebpUnsupportedException"/>；
 /// - DecodeRgbaInto 与 DecodeRgba 逐字节一致，且不越界写调用方缓冲区。
 /// </summary>
 [Collection("WebpDecodePolicy")]
@@ -74,7 +75,7 @@ public class WebpDecodeBackendTests
         var (rgba, w, h) = SampleImage(48, 40, seed: 4);
         byte[] webp = EncodeLossless(rgba, w, h);
 
-        byte[] expected = WithBackend(WebpDecodeBackend.LibWebp, () => DecodeViaAdapter(webp, out _, out _));
+        byte[] expected = LibWebpTestCodec.DecodeRgba(webp, out _, out _);
 
         int aw = 0, ah = 0;
         byte[] actual = WithBackend(WebpDecodeBackend.Auto, () =>
@@ -147,9 +148,9 @@ public class WebpDecodeBackendTests
     }
 
     [Fact]
-    public void Auto_Animation_KeepsExistingLibWebpBehavior()
+    public void Auto_AndCSharp_Animation_ThrowsUnsupported()
     {
-        // 两帧纯色动图（libwebp 动图编码默认走有损 VP8 帧）
+        // 两帧纯色动图（编码走纯 C# 动图写入器）
         var frames = new[]
         {
             new Image<Rgb24>(16, 16, Solid(16, 16, 200, 30, 30)),
@@ -161,26 +162,11 @@ public class WebpDecodeBackendTests
 
         Assert.True(WebpContainer.Load(webp).IsAnimation);
 
-        // 动图不参与 Auto 的托管分派：托管实现会把所有帧解成整幅快照（内存/语义都与既有单图解码不同），
-        // 因此 Auto 必须与 LibWebp 保持完全一致的行为——包括"单图 API 解不了动图"这个既有结果。
-        var libwebpError = Record.Exception(() => WithBackend(WebpDecodeBackend.LibWebp,
+        // 单图解码入口不支持动图：Auto 与 CSharp 行为一致，都不静默返回“最后一帧”。
+        Assert.Throws<WebpUnsupportedException>(() => WithBackend(WebpDecodeBackend.Auto,
             () => DecodeViaAdapter(webp, out _, out _)));
-        var autoError = Record.Exception(() => WithBackend(WebpDecodeBackend.Auto,
+        Assert.Throws<WebpUnsupportedException>(() => WithBackend(WebpDecodeBackend.CSharp,
             () => DecodeViaAdapter(webp, out _, out _)));
-
-        Assert.NotNull(libwebpError);
-        Assert.NotNull(autoError);
-        Assert.Equal(libwebpError.GetType(), autoError.GetType());
-    }
-
-    [Fact]
-    public void LibWebpBackend_StillDecodesLossless()
-    {
-        var (rgba, w, h) = SampleImage(20, 20, seed: 7);
-        byte[] webp = EncodeLossless(rgba, w, h);
-
-        byte[] px = WithBackend(WebpDecodeBackend.LibWebp, () => DecodeViaAdapter(webp, out _, out _));
-        Assert.Equal(w * h * 4, px.Length);
     }
 
     // ==================================================================

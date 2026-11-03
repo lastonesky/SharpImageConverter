@@ -16,16 +16,11 @@ namespace SharpImageConverter.Compression
     internal static class WebpOptimizer
     {
         /// <summary>
-        /// 搜索期的 libwebp <c>method</c>（便宜档，只用来给候选排序）。
+        /// 搜索期 method 档位（保留以兼容既有参数面；纯 C# 编码器当前不读取 method，不影响产物）。
         /// </summary>
-        /// <remarks>
-        /// method 2 相对 method 4 便宜一个数量级（4.19 MP / q80 单次编码 147.5 vs 490.9 ms，
-        /// 体积比 1.045x），而搜索只需要「候选之间谁更小」的相对次序。
-        /// 赢家确定后再按产出档补编一次，产物不受搜索档影响。
-        /// </remarks>
         private const int SearchMethod = 2;
 
-        /// <summary>小图产出档：method 6 在 ≤20 MP 上体积最小，耗时只多约 5%~14%。</summary>
+        /// <summary>小图产出档（保留以兼容既有参数面，纯 C# 编码器当前不读取）。</summary>
         private const int SmallImageMethod = 6;
 
         /// <summary>method 6 的像素上限；超过后 143 MP 上 m6 反而比 m3 大，且更慢。</summary>
@@ -75,10 +70,8 @@ namespace SharpImageConverter.Compression
             byte[] EncodeCore(byte[] source, int sw, int sh, int q, int method, bool isFinal, bool lossless)
             {
                 using var ms = new MemoryStream();
-                // 搜索期多个候选会并发进入 libwebp。WebpCodec 默认走 EncodeLock（针对「线程安全未知」的
-                // 保守闸门），那把锁会把候选并行**完全串行化**（实测 2405 → 2407 ms，×1.00，等于白并行），
-                // 故这里显式声明 Parallel 绕过它。并发一致性由「逐质量串行基线 vs 高并发多轮 md5 比对」
-                // 验证通过后才启用。
+                // 搜索期多个候选会并发进入纯 C# WebP 编码器；编解码实现无共享可变状态，候选可安全并行。
+                // 这里继续显式声明 Parallel 只是为了让并发策略在调用面保持可见（策略值本身不再影响实现）。
                 var encoder = new WebpEncoderAdapterRgba
                 {
                     Options = new WebpEncoderOptions(q, WebpConcurrencyStrategy.Parallel, method, lossless),
@@ -194,9 +187,10 @@ namespace SharpImageConverter.Compression
                 retries++;
             }
 
-            // 低色数/图形类：无损 WebP 常常比有损 q40 更小。只对 ≤20 MP、不透明且唯一色数不多的图尝试，
-            // 避免 143 MP 照片白付一次无损编码；透明像素的 RGB 在 WebP 无损入口下可能不被保留，
-            // 因此带 alpha 的图暂不参与无损候选（仍走有损 + 4 通道画质判定）。
+            // 低色数/图形类：无损 WebP 常常比有损更小。只对 ≤20 MP、不透明且唯一色数不多的图尝试，
+            // 避免大图白付一次无损编码；透明像素的 RGB 在 WebP 无损入口下可能不被保留，
+            // 因此带 alpha 的图不参与无损候选（仍走有损 + 4 通道画质判定）。
+            // 有损候选不达标时不再退到无损：见下方 return 前的 finalScore 判定（由调用方按 o.Accept 处理）。
             bool lossless = false;
             if (o.WebpTryLossless && pixels <= o.WebpLosslessMaxPixels && SimdHelper.IsOpaqueRgba(rgba))
             {

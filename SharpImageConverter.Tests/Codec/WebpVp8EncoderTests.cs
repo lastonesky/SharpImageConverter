@@ -1,5 +1,6 @@
 using Xunit;
 using SharpImageConverter.Formats.Webp;
+using SharpImageConverter.Tests.Helpers;
 
 namespace SharpImageConverter.Tests.Codec;
 
@@ -116,6 +117,58 @@ public class WebpVp8EncoderTests
     }
 
     [Fact]
+    public void ForwardWht_RandomDc_RoundTripsThroughInverseWht()
+    {
+        // 逆 WHT 的输出布局：block b 的 DC 槽位 = 64·(b>>2) + 16·(b&3)。
+        // 正向 WHT 必须是逆变换的伴随，否则非零 AC 时 16 个块的 DC 会错位
+        // （旧实现即在此处按块行 1↔2 互换，平图无法暴露）。
+        var rng = new Random(20251103);
+        for (int trial = 0; trial < 200; trial++)
+        {
+            int[] dc = new int[16];
+            for (int i = 0; i < 16; i++)
+                dc[i] = rng.Next(-1024, 1025);
+
+            Span<int> coeffs = stackalloc int[16];
+            Vp8ForwardTransform.Wht4x4(dc, coeffs);
+
+            short[] input = new short[16];
+            for (int i = 0; i < 16; i++)
+                input[i] = (short)coeffs[i];
+            short[] output = new short[256];
+            Vp8Idct.TransformWHT(input, output);
+
+            for (int block = 0; block < 16; block++)
+            {
+                int got = output[64 * (block >> 2) + 16 * (block & 3)];
+                Assert.InRange(got, dc[block] - 1, dc[block] + 1);
+            }
+        }
+    }
+
+    [Fact]
+    public void ForwardWht_SingleBlockDc_KeepsPosition()
+    {
+        // 只在块 (row=2, col=1) 有 DC：正向→逆向后该 DC 必须回到同一块，其它块为 0。
+        int[] dc = new int[16];
+        dc[2 * 4 + 1] = 96;
+        Span<int> coeffs = stackalloc int[16];
+        Vp8ForwardTransform.Wht4x4(dc, coeffs);
+
+        short[] input = new short[16];
+        for (int i = 0; i < 16; i++)
+            input[i] = (short)coeffs[i];
+        short[] output = new short[256];
+        Vp8Idct.TransformWHT(input, output);
+
+        for (int block = 0; block < 16; block++)
+        {
+            int got = output[64 * (block >> 2) + 16 * (block & 3)];
+            Assert.Equal(block == 9 ? 96 : 0, got);
+        }
+    }
+
+    [Fact]
     public void ForwardWht_ConstantDc_RoundTripsThroughInverseWht()
     {
         int[] values = { 37, -12, 5 };
@@ -206,7 +259,7 @@ public class WebpVp8EncoderTests
         byte[] webp = WebpEncoder.EncodeLossyRgba(rgba, w, h, quality);
 
         byte[] csharp = WebpDecoder.DecodeRgba(webp, out int mw, out int mh);
-        byte[] lib = WebpCodec.DecodeRgba(webp, out int lw, out int lh);
+        byte[] lib = LibWebpTestCodec.DecodeRgba(webp, out int lw, out int lh);
 
         Assert.Equal(w, lw);
         Assert.Equal(h, lh);
@@ -230,7 +283,10 @@ public class WebpVp8EncoderTests
         Assert.True(firstBad < 0,
             $"{name}: 同一码流两解码器 RGB 差超过 ±1（最大 {maxRgbDiff}，首个差异字节 {firstBad}）");
 
-        // 保真下限：证明码流不是“两解码器一致地解出垃圾”。低质量下阈值放宽到 15dB。
+        // 保真下限：证明码流不是“两解码器一致地解出垃圾”。
+        // 这一组是 16×16~64×48 的合成小图，色度被 4:2:0 降采样后本身就无法支撑高 PSNR
+        // （真实照片的严格门槛见 Lossy_RealPhoto_MatchesLibWebpQualityAndSize，那里按
+        //  q75/90/95 要求与 libwebp 的 PSNR 差 ≤2dB、体积 ≤1.5×）。
         double mse = 0;
         for (int i = 0; i < rgba.Length; i++)
         {
@@ -240,7 +296,139 @@ public class WebpVp8EncoderTests
         }
         mse /= (w * h * 3);
         double psnr = 10 * Math.Log10(255.0 * 255.0 / Math.Max(mse, 1e-9));
-        Assert.True(psnr >= 15.0, $"{name}: PSNR {psnr:F1}dB 低于 15dB，码流保真异常");
+        Assert.True(psnr >= 20.0, $"{name}: PSNR {psnr:F1}dB 低于 20dB，码流保真异常");
+    }
+
+    // ==================================================================
+    //  T1b：真实照片与 libwebp 的质量/体积对拍（q75 / q90 / q95）
+    // ==================================================================
+
+    public static IEnumerable<object[]> RealPhotoLossyCases()
+    {
+        string[] files = { "Amish-Noka-Dresser.jpg", "5_star_base.jpg", "video-001.rgb.jpeg" };
+        float[] qualities = { 75f, 90f, 95f };
+        foreach (string file in files)
+            foreach (float q in qualities)
+                yield return new object[] { file, q };
+    }
+
+    /// <summary>
+    /// 真实照片验收：同质量档位下，纯 C# 编码器的 PSNR 与 libwebp 差距 ≤2dB，体积 ≤1.5×。
+    /// 质量一律用 libwebp 解码器测量（编码端问题不会被自家解码器掩盖）；
+    /// 同一码流再用托管解码器解一次，要求与 libwebp 逐通道差 ≤1。
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(RealPhotoLossyCases))]
+    public void Lossy_RealPhoto_MatchesLibWebpQualityAndSize(string file, float quality)
+    {
+        string path = Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "examples", file);
+        var frame = ImageFrame.Load(path).ToRgba32();
+        byte[] rgba = frame.Pixels;
+        int w = frame.Width;
+        int h = frame.Height;
+
+        byte[] ours = WebpEncoder.EncodeLossyRgba(rgba, w, h, quality);
+        byte[] reference = LibWebpTestCodec.EncodeRgba(rgba, w, h, quality);
+
+        double ourPsnr = RgbPsnr(rgba, LibWebpTestCodec.DecodeRgba(ours, out _, out _), w, h);
+        double libPsnr = RgbPsnr(rgba, LibWebpTestCodec.DecodeRgba(reference, out _, out _), w, h);
+
+        Assert.True(libPsnr - ourPsnr <= 2.0,
+            $"{file} q{quality}: PSNR {ourPsnr:F2}dB 比 libwebp {libPsnr:F2}dB 低 {libPsnr - ourPsnr:F2}dB（要求 ≤2dB）");
+        Assert.True(ours.Length <= reference.Length * 1.5,
+            $"{file} q{quality}: 体积 {ours.Length} 字节是 libwebp {reference.Length} 字节的 " +
+            $"{(double)ours.Length / reference.Length:F2}×（要求 ≤1.5×）");
+
+        // 自产码流的双解码器一致性：托管解码器与 libwebp 只允许 ±1 的取整差。
+        byte[] csharpDecoded = WebpDecoder.DecodeRgba(ours, out int cw, out int ch);
+        byte[] libDecoded = LibWebpTestCodec.DecodeRgba(ours, out int lw, out int lh);
+        Assert.Equal(w, cw);
+        Assert.Equal(h, ch);
+        Assert.Equal(w, lw);
+        Assert.Equal(h, lh);
+        for (int i = 0; i < libDecoded.Length; i++)
+        {
+            if (i % 4 == 3)
+            {
+                Assert.Equal(libDecoded[i], csharpDecoded[i]);
+                continue;
+            }
+            Assert.InRange(csharpDecoded[i], libDecoded[i] - 1, libDecoded[i] + 1);
+        }
+    }
+
+    /// <summary>
+    /// 平滑渐变（q75）验收：这类内容在无环内滤波时块边界伪影显著（曾落后约 3.7dB），
+    /// 用于锁定滤波写入帧头并被解码端应用的收益；判据与照片一致（≤2dB、≤1.5×）。
+    /// </summary>
+    [Fact]
+    public void Lossy_SmoothGradient_MatchesLibWebpQuality()
+    {
+        const int w = 640;
+        const int h = 480;
+        const float quality = 75f;
+        byte[] rgba = MakeSmoothGradient(w, h);
+
+        byte[] ours = WebpEncoder.EncodeLossyRgba(rgba, w, h, quality);
+        byte[] reference = LibWebpTestCodec.EncodeRgba(rgba, w, h, quality);
+
+        double ourPsnr = RgbPsnr(rgba, LibWebpTestCodec.DecodeRgba(ours, out _, out _), w, h);
+        double libPsnr = RgbPsnr(rgba, LibWebpTestCodec.DecodeRgba(reference, out _, out _), w, h);
+
+        Assert.True(libPsnr - ourPsnr <= 2.0,
+            $"平滑渐变 q{quality}: PSNR {ourPsnr:F2}dB 比 libwebp {libPsnr:F2}dB 低 {libPsnr - ourPsnr:F2}dB（要求 ≤2dB）");
+        Assert.True(ours.Length <= reference.Length * 1.5,
+            $"平滑渐变 q{quality}: 体积 {ours.Length} 字节是 libwebp {reference.Length} 字节的 " +
+            $"{(double)ours.Length / reference.Length:F2}×（要求 ≤1.5×）");
+
+        byte[] csharpDecoded = WebpDecoder.DecodeRgba(ours, out int cw, out int ch);
+        byte[] libDecoded = LibWebpTestCodec.DecodeRgba(ours, out int lw, out int lh);
+        Assert.Equal(w, cw);
+        Assert.Equal(h, ch);
+        Assert.Equal(w, lw);
+        Assert.Equal(h, lh);
+        for (int i = 0; i < libDecoded.Length; i++)
+        {
+            if (i % 4 == 3)
+            {
+                Assert.Equal(libDecoded[i], csharpDecoded[i]);
+                continue;
+            }
+            Assert.InRange(csharpDecoded[i], libDecoded[i] - 1, libDecoded[i] + 1);
+        }
+    }
+
+    private static byte[] MakeSmoothGradient(int w, int h)
+    {
+        var rgba = new byte[w * h * 4];
+        for (int y = 0; y < h; y++)
+        {
+            for (int x = 0; x < w; x++)
+            {
+                int o = (y * w + x) * 4;
+                rgba[o] = (byte)(x * 255 / (w - 1));
+                rgba[o + 1] = (byte)(y * 255 / (h - 1));
+                rgba[o + 2] = (byte)((x + y) * 255 / (w + h - 2));
+                rgba[o + 3] = 255;
+            }
+        }
+        return rgba;
+    }
+
+    private static double RgbPsnr(byte[] a, byte[] b, int w, int h)
+    {
+        double mse = 0;
+        for (int i = 0; i < w * h; i++)
+        {
+            int o = i * 4;
+            for (int c = 0; c < 3; c++)
+            {
+                double d = a[o + c] - b[o + c];
+                mse += d * d;
+            }
+        }
+        mse /= w * h * 3;
+        return mse <= 0 ? double.PositiveInfinity : 10 * Math.Log10(255.0 * 255.0 / mse);
     }
 
     private static byte[] MakePhoto(int w, int h)

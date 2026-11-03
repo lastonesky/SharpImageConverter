@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using Xunit;
 using SharpImageConverter.Formats.Webp;
+using SharpImageConverter.Tests.Helpers;
 
 namespace SharpImageConverter.Tests.Codec;
 
@@ -63,7 +64,7 @@ public class WebpAlphEncodeTests
         AssertAlphaEquals(rgba, csharp, name, "C#");
 
         // ---- 真实 libwebp 解码：同样能解、alpha 一致、RGB 与 C# 仅 ±1 ----
-        byte[] lib = WebpCodec.DecodeRgba(webp, out int lw, out int lh);
+        byte[] lib = LibWebpTestCodec.DecodeRgba(webp, out int lw, out int lh);
         Assert.Equal(w, lw);
         Assert.Equal(h, lh);
         AssertAlphaEquals(rgba, lib, name, "libwebp");

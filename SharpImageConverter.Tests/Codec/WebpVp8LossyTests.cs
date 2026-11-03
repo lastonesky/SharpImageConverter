@@ -2,6 +2,7 @@ using System.Runtime.InteropServices;
 using Xunit;
 using SharpImageConverter;
 using SharpImageConverter.Formats.Webp;
+using SharpImageConverter.Tests.Helpers;
 
 namespace SharpImageConverter.Tests.Codec;
 
@@ -78,9 +79,9 @@ public class WebpVp8LossyTests
     public void Lossy_KeyFrame_MatchesLibwebp(string name, int w, int h, float quality, Func<int, int, byte[]> gen)
     {
         byte[] rgba = gen(w, h);
-        byte[] webp = WebpCodec.EncodeRgba(rgba, w, h, quality);
+        byte[] webp = LibWebpTestCodec.EncodeRgba(rgba, w, h, quality);
 
-        byte[] expected = WebpCodec.DecodeRgba(webp, out int ew, out int eh);
+        byte[] expected = LibWebpTestCodec.DecodeRgba(webp, out int ew, out int eh);
         byte[] actual = WebpDecoder.DecodeRgba(webp, out int aw, out int ah);
 
         Assert.Equal(ew, aw);
@@ -153,7 +154,7 @@ public class WebpVp8LossyTests
     public void Lossy_KeyFrame_YuvPlanesMatchLibwebp(string name, int w, int h, float quality, Func<int, int, byte[]> gen)
     {
         byte[] rgba = gen(w, h);
-        byte[] webp = WebpCodec.EncodeRgba(rgba, w, h, quality);
+        byte[] webp = LibWebpTestCodec.EncodeRgba(rgba, w, h, quality);
         AssertYuvMatchesLibwebp(webp, w, h, name, quality);
     }
 
@@ -175,7 +176,7 @@ public class WebpVp8LossyTests
     public void Lossy_OddDimensions_YuvPlanesMatchLibwebp(int w, int h, float quality)
     {
         byte[] rgba = MakePhotoLike(w, h);
-        byte[] webp = WebpCodec.EncodeRgba(rgba, w, h, quality);
+        byte[] webp = LibWebpTestCodec.EncodeRgba(rgba, w, h, quality);
         AssertYuvMatchesLibwebp(webp, w, h, $"odd{w}x{h}", quality);
     }
 
@@ -192,7 +193,7 @@ public class WebpVp8LossyTests
         string path = Path.Combine(AppContext.BaseDirectory,
             "..", "..", "..", "..", "examples", "Amish-Noka-Dresser.jpg");
         var frame = ImageFrame.Load(path).ToRgba32();
-        byte[] webp = WebpCodec.EncodeRgba(frame.Pixels, frame.Width, frame.Height, quality);
+        byte[] webp = LibWebpTestCodec.EncodeRgba(frame.Pixels, frame.Width, frame.Height, quality);
         AssertYuvMatchesLibwebp(webp, frame.Width, frame.Height, "photo-real", quality);
     }
 
@@ -316,7 +317,7 @@ public class WebpVp8LossyTests
     public void Lossy_TruncatedFile_ThrowsControlledException()
     {
         byte[] rgba = MakePhotoLike(32, 32);
-        byte[] webp = WebpCodec.EncodeRgba(rgba, 32, 32, 75f);
+        byte[] webp = LibWebpTestCodec.EncodeRgba(rgba, 32, 32, 75f);
 
         // 从 30 字节起逐步截断：每次都必须抛 Webp*Exception，不得其它异常/崩溃
         for (int len = 30; len < webp.Length - 1; len += Math.Max(1, (webp.Length - 30) / 12))
@@ -339,7 +340,7 @@ public class WebpVp8LossyTests
     public void Vp8Decoder_TruncatedChunk_ThrowsBitstreamException()
     {
         byte[] rgba = MakePhotoLike(32, 32);
-        byte[] webp = WebpCodec.EncodeRgba(rgba, 32, 32, 75f);
+        byte[] webp = LibWebpTestCodec.EncodeRgba(rgba, 32, 32, 75f);
 
         // 提取 VP8 chunk 数据
         var container = WebpContainer.Load(webp);

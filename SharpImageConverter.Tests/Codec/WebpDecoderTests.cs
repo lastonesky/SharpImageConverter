@@ -1,6 +1,7 @@
 using System.Text;
 using Xunit;
 using SharpImageConverter.Formats.Webp;
+using SharpImageConverter.Tests.Helpers;
 
 namespace SharpImageConverter.Tests.Codec;
 
@@ -141,7 +142,7 @@ public class WebpDecoderTests
         const int w = 32, h = 32;
         byte[] webp = EncodeLossless(GradientRgba(w, h, opaque: true), w, h);
 
-        var lib = WebpCodec.DecodeRgba(webp, out int lw, out int lh);
+        var lib = LibWebpTestCodec.DecodeRgba(webp, out int lw, out int lh);
         var container = WebpContainer.Load(webp);
 
         Assert.Equal(WebpContainerKind.Vp8L, container.Kind);
@@ -164,7 +165,7 @@ public class WebpDecoderTests
         const int w = 64, h = 48;
         byte[] webp = EncodeLossless(RandomRgba(w, h, seed: 7), w, h);
 
-        var lib = WebpCodec.DecodeRgba(webp, out int lw, out int lh);
+        var lib = LibWebpTestCodec.DecodeRgba(webp, out int lw, out int lh);
         var container = WebpContainer.Load(webp);
 
         Assert.Equal(lw, container.CanvasWidth);
@@ -187,7 +188,7 @@ public class WebpDecoderTests
         const int w = 64, h = 48;
         byte[] webp = EncodeLossless(AlphaGradientRgba(w, h), w, h);
 
-        var lib = WebpCodec.DecodeRgba(webp, out int lw, out int lh);
+        var lib = LibWebpTestCodec.DecodeRgba(webp, out int lw, out int lh);
         var container = WebpContainer.Load(webp);
 
         Assert.Equal(lw, container.CanvasWidth);
@@ -232,7 +233,7 @@ public class WebpDecoderTests
         Assert.False(container.HasAlpha);
         Assert.Single(container.FindAllChunks(WebpChunkId.Exif));
 
-        var lib = WebpCodec.DecodeRgba(webp, out int lw, out int lh);
+        var lib = LibWebpTestCodec.DecodeRgba(webp, out int lw, out int lh);
         Assert.Equal(w, lw);
         Assert.Equal(h, lh);
 
@@ -261,7 +262,7 @@ public class WebpDecoderTests
         byte[] expected = SolidRgba(w, h, r, g, b, a);
 
         // oracle：libwebp 也必须接受同一个位流
-        byte[] lib = WebpCodec.DecodeRgba(webp, out int lw, out int lh);
+        byte[] lib = LibWebpTestCodec.DecodeRgba(webp, out int lw, out int lh);
         Assert.Equal(w, lw);
         Assert.Equal(h, lh);
         PixelAssert.Equal(expected, lib, lw, lh);
@@ -284,7 +285,7 @@ public class WebpDecoderTests
         byte[] webp = BuildMinimalVp8L(w, h, r, g, b, a, alphaUsed: true);
 
         byte[] expected = SolidRgba(w, h, r, g, b, a);
-        byte[] lib = WebpCodec.DecodeRgba(webp, out int lw, out int lh);
+        byte[] lib = LibWebpTestCodec.DecodeRgba(webp, out int lw, out int lh);
         PixelAssert.Equal(expected, lib, lw, lh);
 
         byte[] csharp = WebpDecoder.DecodeRgba(webp, out int mw, out int mh);
@@ -303,7 +304,7 @@ public class WebpDecoderTests
         byte[] webp = EncodeLossless(rgba, w, h);
         Assert.True(IsVp8L(webp), "libwebp 无损编码应生成 VP8L 格式");
 
-        byte[] lib = WebpCodec.DecodeRgba(webp, out int lw, out int lh);
+        byte[] lib = LibWebpTestCodec.DecodeRgba(webp, out int lw, out int lh);
         byte[] csharp = WebpDecoder.DecodeRgba(webp, out int mw, out int mh);
 
         Assert.Equal(lw, mw);
@@ -352,7 +353,7 @@ public class WebpDecoderTests
         byte[] webp = EncodeLossless(rgba, w, h);
         byte[] decoded = WebpDecoder.DecodeRgba(webp, out int dw, out int dh);
 
-        byte[] libwebpDecoded = WebpCodec.DecodeRgba(webp, out int lw, out int lh);
+        byte[] libwebpDecoded = LibWebpTestCodec.DecodeRgba(webp, out int lw, out int lh);
         Assert.Equal(lw, dw);
         Assert.Equal(lh, dh);
 
@@ -379,7 +380,7 @@ public class WebpDecoderTests
         byte[] webp = EncodeLossless(rgba, w, h);
         byte[] decoded = WebpDecoder.DecodeRgba(webp, out int dw, out int dh);
 
-        byte[] libwebpDecoded = WebpCodec.DecodeRgba(webp, out int lw, out int lh);
+        byte[] libwebpDecoded = LibWebpTestCodec.DecodeRgba(webp, out int lw, out int lh);
         Assert.Equal(lw, dw);
         Assert.Equal(lh, dh);
         PixelAssert.Equal(libwebpDecoded, decoded, dw, dh);
@@ -392,7 +393,7 @@ public class WebpDecoderTests
         byte[] webp = EncodeLossless(rgba, 1, 1);
         byte[] decoded = WebpDecoder.DecodeRgba(webp, out int dw, out int dh);
 
-        byte[] libwebpDecoded = WebpCodec.DecodeRgba(webp, out int lw, out int lh);
+        byte[] libwebpDecoded = LibWebpTestCodec.DecodeRgba(webp, out int lw, out int lh);
         Assert.Equal(lw, dw);
         Assert.Equal(lh, dh);
         PixelAssert.Equal(libwebpDecoded, decoded, 1, 1);
@@ -410,7 +411,7 @@ public class WebpDecoderTests
 
         byte[] webp = EncodeLossless(rgba, w, h);
 
-        byte[] libwebpDecoded = WebpCodec.DecodeRgba(webp, out int lw, out int lh);
+        byte[] libwebpDecoded = LibWebpTestCodec.DecodeRgba(webp, out int lw, out int lh);
         byte[] decoded = WebpDecoder.DecodeRgba(webp, out int dw, out int dh);
 
         Assert.Equal(lw, dw);
@@ -434,7 +435,7 @@ public class WebpDecoderTests
 
         byte[] webp = EncodeLossless(rgba, w, h);
 
-        byte[] libwebpDecoded = WebpCodec.DecodeRgba(webp, out int lw, out int lh);
+        byte[] libwebpDecoded = LibWebpTestCodec.DecodeRgba(webp, out int lw, out int lh);
         byte[] decoded = WebpDecoder.DecodeRgba(webp, out int dw, out int dh);
 
         Assert.Equal(lw, dw);
@@ -456,7 +457,7 @@ public class WebpDecoderTests
         const int w = 256, h = 192;
         byte[] webp = EncodeLossless(PhotoLikeRgba(w, h, seed: 2024), w, h);
 
-        byte[] lib = WebpCodec.DecodeRgba(webp, out int lw, out int lh);
+        byte[] lib = LibWebpTestCodec.DecodeRgba(webp, out int lw, out int lh);
         byte[] csharp = WebpDecoder.DecodeRgba(webp, out int mw, out int mh);
 
         Assert.Equal(lw, mw);
@@ -485,7 +486,7 @@ public class WebpDecoderTests
         }
 
         byte[] webp = EncodeLossless(rgba, w, h);
-        byte[] lib = WebpCodec.DecodeRgba(webp, out int lw, out int lh);
+        byte[] lib = LibWebpTestCodec.DecodeRgba(webp, out int lw, out int lh);
         byte[] csharp = WebpDecoder.DecodeRgba(webp, out int mw, out int mh);
 
         Assert.Equal(lw, mw);
@@ -503,7 +504,7 @@ public class WebpDecoderTests
         byte[] rgba = PaletteRgba(w, h);
 
         byte[] webp = EncodeLossless(rgba, w, h);
-        byte[] lib = WebpCodec.DecodeRgba(webp, out int lw, out int lh);
+        byte[] lib = LibWebpTestCodec.DecodeRgba(webp, out int lw, out int lh);
         byte[] csharp = WebpDecoder.DecodeRgba(webp, out int mw, out int mh);
 
         Assert.Equal(lw, mw);
@@ -518,7 +519,7 @@ public class WebpDecoderTests
         const int w = 512, h = 512;
         byte[] webp = EncodeLossless(PhotoLikeRgba(w, h, seed: 5150), w, h);
 
-        byte[] lib = WebpCodec.DecodeRgba(webp, out int lw, out int lh);
+        byte[] lib = LibWebpTestCodec.DecodeRgba(webp, out int lw, out int lh);
         byte[] csharp = WebpDecoder.DecodeRgba(webp, out int mw, out int mh);
 
         Assert.Equal(lw, mw);
@@ -533,7 +534,7 @@ public class WebpDecoderTests
         const int w = 1, h = 256;
         byte[] webp = EncodeLossless(PhotoLikeRgba(w, h, seed: 7), w, h);
 
-        byte[] lib = WebpCodec.DecodeRgba(webp, out int lw, out int lh);
+        byte[] lib = LibWebpTestCodec.DecodeRgba(webp, out int lw, out int lh);
         byte[] csharp = WebpDecoder.DecodeRgba(webp, out int mw, out int mh);
 
         Assert.Equal(w, mw);
@@ -548,7 +549,7 @@ public class WebpDecoderTests
         const int w = 256, h = 1;
         byte[] webp = EncodeLossless(PhotoLikeRgba(w, h, seed: 8), w, h);
 
-        byte[] lib = WebpCodec.DecodeRgba(webp, out int lw, out int lh);
+        byte[] lib = LibWebpTestCodec.DecodeRgba(webp, out int lw, out int lh);
         byte[] csharp = WebpDecoder.DecodeRgba(webp, out int mw, out int mh);
 
         Assert.Equal(w, mw);
@@ -685,7 +686,7 @@ public class WebpDecoderTests
     public void Lossy_Vp8_DecodesToRgba()
     {
         const int w = 16, h = 16;
-        byte[] webp = WebpCodec.EncodeRgba(
+        byte[] webp = LibWebpTestCodec.EncodeRgba(
             GradientRgba(w, h, opaque: true), w, h,
             new WebpEncoderOptions(75f, lossless: false));
 
@@ -740,7 +741,7 @@ public class WebpDecoderTests
             SolidRgba(w, h, 0, 0, 255, 255),
         };
 
-        byte[] webp = WebpCodec.EncodeAnimatedRgba(
+        byte[] webp = LibWebpTestCodec.EncodeAnimatedRgba(
             frames, w, h, durations, loopCount,
             new WebpEncoderOptions(75f, lossless: true));
 
@@ -801,7 +802,7 @@ public class WebpDecoderTests
             SolidRgba(w, h, 12, 200, 96, 255),
         };
 
-        byte[] webp = WebpCodec.EncodeAnimatedRgba(
+        byte[] webp = LibWebpTestCodec.EncodeAnimatedRgba(
             frames, w, h, durations, loopCount: 3,
             new WebpEncoderOptions(75f, lossless: true));
 
@@ -890,7 +891,7 @@ public class WebpDecoderTests
     // ==================================================================
 
     private static byte[] EncodeLossless(byte[] rgba, int w, int h)
-        => WebpCodec.EncodeRgba(rgba, w, h, new WebpEncoderOptions(75f, lossless: true));
+        => LibWebpTestCodec.EncodeRgba(rgba, w, h, new WebpEncoderOptions(75f, lossless: true));
 
     /// <summary>R,G,B,A 排列的纯色图。</summary>
     private static byte[] SolidRgba(int w, int h, byte r, byte g, byte b, byte a)

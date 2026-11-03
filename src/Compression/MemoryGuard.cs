@@ -156,7 +156,7 @@ namespace SharpImageConverter.Compression
                 ImageFormatKind.Png => pixels * 8,
                 // 单帧：RGB 3 + 画布/索引约 5；动画按帧数放大
                 ImageFormatKind.Gif => pixels * 8 * frames,
-                // RGBA 输出 4 + libwebp 内部约 4
+                // RGBA 输出 4 + WebP 编码器内部约 4
                 ImageFormatKind.Webp => pixels * 8,
                 ImageFormatKind.Bmp => pixels * 4,
                 _ => pixels * 8,

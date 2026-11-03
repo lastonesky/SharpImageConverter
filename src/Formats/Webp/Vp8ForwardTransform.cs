@@ -56,16 +56,8 @@ internal static class Vp8ForwardTransform
         }
     }
 
-    // 逆 WHT 的两个 4×4 Hadamard 核（与 Vp8Idct.TransformWHT 的运算顺序一致）。
-    // Mv 为第一遍（列方向）的核，Hp 为第二遍（行方向）的核。
-    private static readonly int[] Mv =
-    {
-        1, 1, 1, 1,
-        1, -1, 1, -1,
-        1, -1, -1, 1,
-        1, 1, -1, -1,
-    };
-
+    // 逆 WHT 的 4×4 Hadamard 核（与 Vp8Idct.TransformWHT 的运算顺序一致）。
+    // Hp 对称（Hpᵀ = Hp）且列正交、模长平方为 4，因此 Hp·Hp = 4·I。
     private static readonly int[] Hp =
     {
         1, 1, 1, 1,
@@ -76,13 +68,16 @@ internal static class Vp8ForwardTransform
 
     /// <summary>
     /// 4×4 正 WHT：输入 16 个亮度块的 DC 系数（块光栅顺序），输出 Y2 块的 16 个系数。
-    /// 由 <c>逆WHT = (1/8)·Mv·X·Hpᵀ</c> 得伴随正向 <c>C = (1/2)·Mvᵀ·X·Hp</c>。
+    /// 逆 WHT 为 <c>A = (1/8)·Hp·X·Hp</c>，其伴随 <c>Aᵀ = (1/8)·Hp·f·Hp</c> 满足
+    /// <c>AᵀA = (1/64)·Hp·Hp·X·Hp·Hp = (1/4)·X</c>，故正向必须取 <c>C = 4·Aᵀ = (1/2)·Hp·f·Hp</c>。
+    /// 若误用另一个 Hadamard 变体（例如 <c>Mvᵀ</c>），结果只会对常值矩阵成立，
+    /// 非零 AC 时会把 16 个块的 DC 在块行之间错位。
     /// </summary>
     internal static void Wht4x4(ReadOnlySpan<int> dc, Span<int> coeffs)
     {
         Span<int> tmp = stackalloc int[16];
 
-        // 第一遍：沿行方向用 Hp（Hp 对称，Hpᵀ = Hp）。
+        // 第一遍：X·Hp（沿列方向），即 tmp[i][j] = Σ_l X[i][l]·Hp[l][j]。
         for (int i = 0; i < 4; i++)
         {
             int o = i * 4;
@@ -95,14 +90,14 @@ internal static class Vp8ForwardTransform
             }
         }
 
-        // 第二遍：沿列方向用 Mvᵀ（列 a 取 Mv 的第 a 列），最后除以 2。
+        // 第二遍：Hp·X（沿行方向），最后除以 2。
         for (int a = 0; a < 4; a++)
         {
             for (int j = 0; j < 4; j++)
             {
                 int s = 0;
                 for (int i = 0; i < 4; i++)
-                    s += Mv[i * 4 + a] * tmp[i * 4 + j];
+                    s += Hp[a * 4 + i] * tmp[i * 4 + j];
                 coeffs[a * 4 + j] = (s + 1) >> 1;
             }
         }

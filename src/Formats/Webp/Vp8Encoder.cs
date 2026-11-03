@@ -7,14 +7,19 @@ namespace SharpImageConverter.Formats.Webp;
 /// <list type="bullet">
 /// <item>16×16 帧内预测（DC / TM / V / H），按预测 SSE 选择模式；</item>
 /// <item>4×4 正向 DCT + Y2 正向 WHT，标量与 <see cref="Vp8Idct"/> 严格互逆；</item>
-/// <item>固定 q index（由外部 quality 单调映射），无概率更新；</item>
+/// <item>固定 q index（由外部 quality 单调映射）；token 概率按本帧统计量做一次更新（两遍编码）；</item>
 /// <item>intra 模式下全平面的残差 token 编码（EOB / 零游程 / 类别码）；</item>
 /// <item>使用解码器完全相同的逆变换变体做重建，保证后续宏块预测与解码端一致；</item>
-/// <item>环内滤波关闭（filter level = 0）。</item>
+/// <item>按 q index 估计环内滤波强度并写入帧头，重建输出行按解码端完全相同的顺序滤波
+///   （仅宏块边界，16×16 模式不启用宏块内部边界）。</item>
 /// </list>
 ///
 /// 位流布局：<c>[frame tag 3][start code 3][w 2][h 2][partition0][token partition]</c>，
 /// 单 token 分区，因此不写分区大小表。输出为 <c>VP8 </c> chunk 的载荷（不含 chunk 头）。
+///
+/// 两遍编码：第一遍只统计 1056 个 token 概率节点的 0/1 次数（不写 token 位），
+/// 第二遍用统计得到的概率写位流并在帧头写出更新项。两遍的量化与重建路径完全确定，
+/// 符号序列因此一致；重建平面在第二遍开始前由宏块网格整体覆盖，无需清空。
 ///
 /// 实例持有整帧缓冲区，非线程安全；每次编码创建独立实例。
 /// </summary>
@@ -47,6 +52,17 @@ internal sealed class Vp8Encoder
     private readonly byte[] _reconU;
     private readonly byte[] _reconV;
 
+    /// <summary>
+    /// 滤波后的重建输出平面（与解码端 <c>_outY/_outU/_outV</c> 同布局、无 padding）。
+    /// 与 <see cref="_reconY"/> 分离：帧内预测读取未滤波的重建，滤波器只作用于输出，
+    /// 这与解码端的处理顺序一致，因此编码端输出与解码端逐像素相同。
+    /// </summary>
+    private readonly byte[] _outY;
+    private readonly byte[] _outU;
+    private readonly byte[] _outV;
+    private readonly int _strideOutY;
+    private readonly int _strideOutUv;
+
     private readonly int _baseQ;
     private readonly int _y1Dc;
     private readonly int _y1Ac;
@@ -55,8 +71,33 @@ internal sealed class Vp8Encoder
     private readonly int _uvDc;
     private readonly int _uvAc;
 
-    private readonly Vp8BoolEncoder _part0;
-    private readonly Vp8BoolEncoder _tokens;
+    private Vp8BoolEncoder _part0;
+    private Vp8BoolEncoder _tokens;
+
+    /// <summary>当前生效的 token 概率表（第一遍为默认表，第二遍为统计更新后的表）。</summary>
+    private byte[,,,] _probs;
+
+    /// <summary>第一遍只统计符号频次：为 true 时 token 位不写入、只累加计数。</summary>
+    private bool _statsOnly;
+
+    /// <summary>1056 个 token 概率节点各自写 0 / 写 1 的次数（[type, band, ctx, node]）。</summary>
+    private readonly int[,,,] _count0 = new int[4, 8, 3, 11];
+    private readonly int[,,,] _count1 = new int[4, 8, 3, 11];
+
+    /// <summary>概率估计的最小样本数：低于此值沿用默认表，避免小图过拟合。</summary>
+    private const int MinProbSamples = 16;
+
+    /// <summary>
+    /// 色度 DC 量化 delta（相对 base_q）。色度块只有 8×8、且人眼对色度误差更敏感，
+    /// 因此色度用比亮度更细的量化；取值与 libwebp 黑盒观测一致（dc=-2）。
+    /// </summary>
+    private const int UvDcDeltaQ = -2;
+
+    /// <summary>色度 AC 量化 delta（相对 base_q），见 <see cref="UvDcDeltaQ"/>（ac=-4）。</summary>
+    private const int UvAcDeltaQ = -4;
+
+    /// <summary>环内滤波强度（0..63）。0 表示不滤波。</summary>
+    private readonly int _filterLevel;
 
     // 非零上下文（与解码端 ParseResiduals 的簿记完全一致）。
     private readonly int[] _mbNz;
@@ -102,20 +143,30 @@ internal sealed class Vp8Encoder
         _reconU = new byte[_strideUv * (Pad * 2 + _mbH * 8)];
         _reconV = new byte[_strideUv * (Pad * 2 + _mbH * 8)];
 
+        _strideOutY = _mbW * 16;
+        _strideOutUv = _mbW * 8;
+        _outY = new byte[_strideOutY * (_mbH * 16)];
+        _outU = new byte[_strideOutUv * (_mbH * 8)];
+        _outV = new byte[_strideOutUv * (_mbH * 8)];
+
         InitReconBoundaries();
         Vp8Yuv.ToYuv420(rgba, width, height, _srcY, _srcU, _srcV);
 
         int q = Math.Clamp(baseQ, 0, 127);
         _baseQ = q;
+        _filterLevel = EstimateFilterLevel(q);
         _y1Dc = Vp8Tables.DcQuantTable[q];
         _y1Ac = Vp8Tables.AcQuantTable[q];
         _y2Dc = _y1Dc * 2;
         _y2Ac = Math.Max(8, (Vp8Tables.AcQuantTable[q] * 101581) >> 16);
-        _uvDc = Vp8Tables.DcQuantTable[Math.Clamp(q, 0, 117)];
-        _uvAc = Vp8Tables.AcQuantTable[q];
+        // 色度量化的 delta 必须与写入帧头的值一致（解码端按同一公式重建量化步长）。
+        _uvDc = Vp8Tables.DcQuantTable[Math.Clamp(q + UvDcDeltaQ, 0, 117)];
+        _uvAc = Vp8Tables.AcQuantTable[Math.Clamp(q + UvAcDeltaQ, 0, 127)];
 
         _part0 = new Vp8BoolEncoder(1024);
         _tokens = new Vp8BoolEncoder(1024);
+
+        _probs = CopyDefaultProbs();
 
         _mbNz = new int[_mbW];
         _mbNzDc = new int[_mbW];
@@ -140,7 +191,71 @@ internal sealed class Vp8Encoder
             throw new ArgumentException("RGBA 数据长度与宽高不匹配", nameof(rgba));
 
         var encoder = new Vp8Encoder(rgba, width, height, QualityToQIndex(quality));
+
+        // 第一遍：统计 token 概率频次（重建与量化路径不变，只是不写 token 位）。
+        encoder.ResetForPass(encoder._probs, statsOnly: true);
+        encoder.Run();
+
+        // 第二遍：用本帧统计得到的概率写位流。
+        encoder.ResetForPass(encoder.AdaptProbabilities(), statsOnly: false);
         return encoder.Run();
+    }
+
+    private static byte[,,,] CopyDefaultProbs()
+    {
+        var src = Vp8Tables.CoeffsProba0;
+        var dst = new byte[4, 8, 3, 11];
+        for (int t = 0; t < 4; t++)
+            for (int b = 0; b < 8; b++)
+                for (int c = 0; c < 3; c++)
+                    for (int n = 0; n < 11; n++)
+                        dst[t, b, c, n] = src[t, b, c, n];
+        return dst;
+    }
+
+    /// <summary>
+    /// 由第一遍的 0/1 频次估计概率：<c>p(0) = count0 / total</c>，映射到 1..254。
+    /// 样本不足 <see cref="MinProbSamples"/> 的节点沿用默认表。
+    /// </summary>
+    private byte[,,,] AdaptProbabilities()
+    {
+        var def = Vp8Tables.CoeffsProba0;
+        var dst = new byte[4, 8, 3, 11];
+        for (int t = 0; t < 4; t++)
+            for (int b = 0; b < 8; b++)
+                for (int c = 0; c < 3; c++)
+                    for (int n = 0; n < 11; n++)
+                    {
+                        int c0 = _count0[t, b, c, n];
+                        int c1 = _count1[t, b, c, n];
+                        int total = c0 + c1;
+                        int p = def[t, b, c, n];
+                        if (total >= MinProbSamples)
+                        {
+                            int est = (int)(((long)c0 * 255 + total / 2) / total);
+                            p = Math.Clamp(est, 1, 254);
+                        }
+                        dst[t, b, c, n] = (byte)p;
+                    }
+        return dst;
+    }
+
+    /// <summary>重置逐帧状态，准备新的一遍编码；重建网格会在编码时被整体覆盖。</summary>
+    private void ResetForPass(byte[,,,] probs, bool statsOnly)
+    {
+        _probs = probs;
+        _statsOnly = statsOnly;
+        _part0 = new Vp8BoolEncoder(1024);
+        _tokens = new Vp8BoolEncoder(1024);
+
+        _leftNz = 0;
+        _leftNzDc = 0;
+        Array.Clear(_mbNz);
+        Array.Clear(_mbNzDc);
+        _anyCoefficient = false;
+        _y2Nz = 0;
+
+        InitReconBoundaries();
     }
 
     /// <summary>
@@ -152,6 +267,19 @@ internal sealed class Vp8Encoder
         int q = (int)Math.Round(Math.Clamp(quality, 0f, 100f));
         int index = 127 - (q * 127 + 50) / 100;
         return Math.Clamp(index, 0, 127);
+    }
+
+    /// <summary>
+    /// q index → 环内滤波强度（0..63）。量化越粗，块边界伪影越明显，滤波越强；
+    /// 该映射只影响解码后的重建输出，不参与模式决策，因此可独立于 RD 标定。
+    /// 标定依据（真实照片 + 合成渐变扫描）：q≈6（quality 95）取 2、q≈13（90）取 4、
+    /// q≈32（75）取 16；更粗的量化收益饱和，上限 16 以免过度模糊细节。
+    /// </summary>
+    private static int EstimateFilterLevel(int q)
+    {
+        if (q >= 24)
+            return Math.Min(16, (q + 1) / 2);
+        return Math.Max(2, (q + 1) / 3);
     }
 
     private byte[] Run()
@@ -166,11 +294,68 @@ internal sealed class Vp8Encoder
             // 对应解码端 VP8InitScanline：行末清空左侧 nz 上下文。
             _leftNz = 0;
             _leftNzDc = 0;
+
+            // 第一遍只统计概率，滤波不参与任何编码决策，跳过以免重复工作。
+            if (!_statsOnly)
+                FilterRow(mbY);
         }
 
         byte[] part0 = _part0.Finish();
         byte[] tokens = _tokens.Finish();
         return AssembleFrame(part0, tokens);
+    }
+
+    /// <summary>
+    /// 对刚编码完的宏块行做环内滤波，与解码端 <see cref="Vp8Decoder"/> 的 FilterRow 完全同序：
+    /// 先把未滤波的重建行拷到输出平面，再按宏块从左到右依次处理水平（左邻）与垂直（上邻）边界。
+    /// 16×16 帧内模式不启用宏块内部边界（解码端 <c>_fInner[s, 0]</c> 恒为 false），
+    /// 因此这里只滤宏块边界，滤波后的输出与解码端逐像素一致。
+    /// </summary>
+    private void FilterRow(int mbY)
+    {
+        int yBase = mbY * 16 * _strideOutY;
+        int uvBase = mbY * 8 * _strideOutUv;
+
+        int srcY = (Pad + mbY * 16) * _strideY + Pad;
+        int rowBytes = _mbW * 16;
+        for (int j = 0; j < 16; j++)
+            Array.Copy(_reconY, srcY + j * _strideY, _outY, yBase + j * _strideOutY, rowBytes);
+
+        int srcUv = (Pad + mbY * 8) * _strideUv + Pad;
+        int uvRowBytes = _mbW * 8;
+        for (int j = 0; j < 8; j++)
+        {
+            Array.Copy(_reconU, srcUv + j * _strideUv, _outU, uvBase + j * _strideOutUv, uvRowBytes);
+            Array.Copy(_reconV, srcUv + j * _strideUv, _outV, uvBase + j * _strideOutUv, uvRowBytes);
+        }
+
+        if (_filterLevel == 0)
+            return;
+
+        // PrecomputeFilterStrengths（sharpness=0、无 lf delta、无分段）：
+        // ilevel = level，limit = 2·level + ilevel = 3·level，hev 阈值按 level 分档。
+        int ilevel = _filterLevel;
+        int limit = 3 * _filterLevel;
+        int hevThresh = _filterLevel >= 40 ? 2 : (_filterLevel >= 15 ? 1 : 0);
+
+        for (int mbX = 0; mbX < _mbW; mbX++)
+        {
+            int offY = yBase + mbX * 16;
+            int offUv = uvBase + mbX * 8;
+
+            if (mbX > 0)
+            {
+                Vp8LoopFilter.HFilter16(_outY, offY, _strideOutY, limit + 4, ilevel, hevThresh);
+                Vp8LoopFilter.HFilter8(_outU, offUv, _strideOutUv, limit + 4, ilevel, hevThresh);
+                Vp8LoopFilter.HFilter8(_outV, offUv, _strideOutUv, limit + 4, ilevel, hevThresh);
+            }
+            if (mbY > 0)
+            {
+                Vp8LoopFilter.VFilter16(_outY, offY, _strideOutY, limit + 4, ilevel, hevThresh);
+                Vp8LoopFilter.VFilter8(_outU, offUv, _strideOutUv, limit + 4, ilevel, hevThresh);
+                Vp8LoopFilter.VFilter8(_outV, offUv, _strideOutUv, limit + 4, ilevel, hevThresh);
+            }
+        }
     }
 
     // ==================================================================
@@ -186,30 +371,47 @@ internal sealed class Vp8Encoder
         // 分段：关闭（所有宏块使用 base_q）。
         _part0.PutBitUniform(0); // segmentation_enabled
 
-        // 滤波：simple 标志位（level=0 时不生效），level=0，sharpness=0，无 delta。
-        _part0.PutBitUniform(0); // filter_type
-        _part0.PutLiteral(0, 6); // loop_filter_level
+        // 滤波：normal 型（simple=0），sharpness=0，不写 ref/mode lf delta。
+        // 头部字段顺序依据 RFC 6386 §9.4，与解码端 ParseFilterHeader 逐项对应。
+        _part0.PutBitUniform(0); // filter_type：0 = normal
+        _part0.PutLiteral(_filterLevel, 6); // loop_filter_level
         _part0.PutLiteral(0, 3); // sharpness_level
         _part0.PutBitUniform(0); // loop_filter_adj_enable
 
         _part0.PutLiteral(0, 2); // log2_nbr_of_dct_partitions = 1 个分区
 
-        // 量化：base_q + 5 个 delta 标志（全 0）。
+        // 量化：base_q + 5 个 delta（亮度全 0，色度按 UvDcDeltaQ / UvAcDeltaQ 变细）。
+        // PutSignedBits 自身写“是否非零”标志，语义与解码端的 GetSignedValue(4) 一致。
         _part0.PutLiteral(_baseQ, 7);
-        for (int i = 0; i < 5; i++)
-            _part0.PutBitUniform(0);
+        _part0.PutSignedBits(0, 4); // y1_dc_delta_q
+        _part0.PutSignedBits(0, 4); // y2_dc_delta_q
+        _part0.PutSignedBits(0, 4); // y2_ac_delta_q
+        _part0.PutSignedBits(UvDcDeltaQ, 4);
+        _part0.PutSignedBits(UvAcDeltaQ, 4);
 
         _part0.PutBitUniform(0); // refresh_entropy_probs = 0
 
-        // 1056 个 token 概率更新位：全 0，沿用默认概率表。
-        // 注意：每位必须用 CoeffsUpdateProba 对应的概率编码，不能用等概率 128，
-        // 否则解码端的 range/value 从这一节开始就与编码端失步（RFC 6386 §13.4）。
+        // 1056 个 token 概率更新项：与默认表相同的节点写 0（沿用默认），
+        // 其余写 1 + 8 位新概率（RFC 6386 §13.4）。标志位必须用 CoeffsUpdateProba 编码，
+        // 不能用等概率 128，否则解码端从这一节开始就与编码端失步。
         var updateProba = Vp8Tables.CoeffsUpdateProba;
+        var defaultProba = Vp8Tables.CoeffsProba0;
         for (int t = 0; t < 4; t++)
             for (int b = 0; b < 8; b++)
                 for (int c = 0; c < 3; c++)
                     for (int p = 0; p < 11; p++)
-                        _part0.PutBit(0, updateProba[t, b, c, p]);
+                    {
+                        int np = _probs[t, b, c, p];
+                        if (np == defaultProba[t, b, c, p])
+                        {
+                            _part0.PutBit(0, updateProba[t, b, c, p]);
+                        }
+                        else
+                        {
+                            _part0.PutBit(1, updateProba[t, b, c, p]);
+                            _part0.PutLiteral(np, 8);
+                        }
+                    }
 
         _part0.PutBitUniform(1); // mb_no_coeff_skip
         _part0.PutLiteral(128, 8); // prob_skip_false
@@ -578,7 +780,7 @@ internal sealed class Vp8Encoder
     /// <summary>
     /// 按解码端 GetCoeffs 的逆过程写一个 4×4 块的量化系数（扫描序）。
     /// </summary>
-    private static void WriteCoeffs(Vp8BoolEncoder bw, int type, int ctx, int first, ReadOnlySpan<int> scan)
+    private void WriteCoeffs(Vp8BoolEncoder bw, int type, int ctx, int first, ReadOnlySpan<int> scan)
     {
         byte[] bands = Vp8Tables.Bands;
         int last = -1;
@@ -599,33 +801,33 @@ internal sealed class Vp8Encoder
         {
             if (last < n)
             {
-                bw.PutBit(0, Prob(type, band, curCtx, 0));
+                PutCoeffBit(bw, type, band, curCtx, 0, 0);
                 return;
             }
 
-            bw.PutBit(1, Prob(type, band, curCtx, 0));
+            PutCoeffBit(bw, type, band, curCtx, 0, 1);
 
             // 零游程：每遇到 0 写一个 p[1]=0；遇到非零写 p[1]=1。
             while (scan[n] == 0)
             {
-                bw.PutBit(0, Prob(type, band, curCtx, 1));
+                PutCoeffBit(bw, type, band, curCtx, 1, 0);
                 n++;
                 band = bands[n];
                 curCtx = 0;
             }
-            bw.PutBit(1, Prob(type, band, curCtx, 1));
+            PutCoeffBit(bw, type, band, curCtx, 1, 1);
 
             int value = scan[n];
             int magnitude = Math.Abs(value);
             int nextCtx;
             if (magnitude == 1)
             {
-                bw.PutBit(0, Prob(type, band, curCtx, 2));
+                PutCoeffBit(bw, type, band, curCtx, 2, 0);
                 nextCtx = 1;
             }
             else
             {
-                bw.PutBit(1, Prob(type, band, curCtx, 2));
+                PutCoeffBit(bw, type, band, curCtx, 2, 1);
                 nextCtx = 2;
                 PutLargeValue(bw, type, band, curCtx, magnitude);
             }
@@ -641,36 +843,36 @@ internal sealed class Vp8Encoder
     }
 
     /// <summary>对应解码端 GetLargeValue 的逆过程（幅值 ≥ 2）。</summary>
-    private static void PutLargeValue(Vp8BoolEncoder bw, int type, int band, int ctx, int magnitude)
+    private void PutLargeValue(Vp8BoolEncoder bw, int type, int band, int ctx, int magnitude)
     {
         if (magnitude <= 4)
         {
-            bw.PutBit(0, Prob(type, band, ctx, 3));
+            PutCoeffBit(bw, type, band, ctx, 3, 0);
             if (magnitude == 2)
             {
-                bw.PutBit(0, Prob(type, band, ctx, 4));
+                PutCoeffBit(bw, type, band, ctx, 4, 0);
             }
             else
             {
-                bw.PutBit(1, Prob(type, band, ctx, 4));
-                bw.PutBit(magnitude == 4 ? 1 : 0, Prob(type, band, ctx, 5));
+                PutCoeffBit(bw, type, band, ctx, 4, 1);
+                PutCoeffBit(bw, type, band, ctx, 5, magnitude == 4 ? 1 : 0);
             }
             return;
         }
 
-        bw.PutBit(1, Prob(type, band, ctx, 3));
+        PutCoeffBit(bw, type, band, ctx, 3, 1);
 
         if (magnitude <= 10)
         {
-            bw.PutBit(0, Prob(type, band, ctx, 6));
+            PutCoeffBit(bw, type, band, ctx, 6, 0);
             if (magnitude <= 6)
             {
-                bw.PutBit(0, Prob(type, band, ctx, 7));
+                PutCoeffBit(bw, type, band, ctx, 7, 0);
                 bw.PutBit(magnitude == 6 ? 1 : 0, 159);
             }
             else
             {
-                bw.PutBit(1, Prob(type, band, ctx, 7));
+                PutCoeffBit(bw, type, band, ctx, 7, 1);
                 if (magnitude <= 8)
                 {
                     bw.PutBit(0, 165);
@@ -685,12 +887,12 @@ internal sealed class Vp8Encoder
             return;
         }
 
-        bw.PutBit(1, Prob(type, band, ctx, 6));
+        PutCoeffBit(bw, type, band, ctx, 6, 1);
 
         int cat = magnitude <= 18 ? 0 : magnitude <= 34 ? 1 : magnitude <= 66 ? 2 : 3;
         int bit1 = cat >= 2 ? 1 : 0;
-        bw.PutBit(bit1, Prob(type, band, ctx, 8));
-        bw.PutBit(cat & 1, Prob(type, band, ctx, 9 + bit1));
+        PutCoeffBit(bw, type, band, ctx, 8, bit1);
+        PutCoeffBit(bw, type, band, ctx, 9 + bit1, cat & 1);
 
         int extra = magnitude - (3 + (8 << cat));
         ReadOnlySpan<byte> table = cat switch
@@ -704,8 +906,19 @@ internal sealed class Vp8Encoder
             bw.PutBit((extra >> i) & 1, table[k]);
     }
 
-    private static int Prob(int type, int band, int ctx, int index) =>
-        Vp8Tables.CoeffsProba0[type, band, ctx, index];
+    /// <summary>
+    /// 写一个可更新的 token 概率节点：第一遍只累加频次；第二遍按当前概率表写位。
+    /// </summary>
+    private void PutCoeffBit(Vp8BoolEncoder bw, int type, int band, int ctx, int node, int bit)
+    {
+        if (_statsOnly)
+        {
+            if (bit == 0) _count0[type, band, ctx, node]++;
+            else _count1[type, band, ctx, node]++;
+            return;
+        }
+        bw.PutBit(bit, _probs[type, band, ctx, node]);
+    }
 
     private static int NonZeroLength(ReadOnlySpan<int> scan, int first)
     {

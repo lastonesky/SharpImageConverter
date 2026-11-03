@@ -7,13 +7,13 @@ using System.Runtime.ExceptionServices;
 using SharpImageConverter.Metadata;
 using SharpImageConverter.Formats.Webp;
 
-namespace SharpImageConverter.Formats.Webp.Unmanaged
+namespace SharpImageConverter.Tests.Helpers
 {
     /// <summary>
-    /// libwebp 原生后端实现：全部 P/Invoke、原生结构体与原生编解码调用集中在此。
-    /// 公共入口（策略分派与默认纯 C# 实现）位于 <see cref="WebpCodec"/>。
+    /// 测试专用 libwebp 原生对拍助手：全部 P/Invoke、原生结构体与原生编解码调用集中在此。
+    /// 生产代码不再引用本类；它只作为黑盒基准存在于测试工程。
     /// </summary>
-    internal static unsafe partial class LibWebpCodec
+    internal static unsafe partial class LibWebpTestCodec
     {
         private static readonly object EncodeLock = new object();
         private sealed class WebPWriterState
@@ -410,6 +410,38 @@ namespace SharpImageConverter.Formats.Webp.Unmanaged
         internal static byte[] EncodeLosslessRgbaForDispatch(ReadOnlySpan<byte> rgba, int width, int height)
             => EncodeLosslessRgbaDirect(rgba, width, height);
 
+        /// <summary>用 libwebp 编码单帧（动图帧/单帧动图的对拍基准）。</summary>
+        private static byte[] EncodeFrameWithConfig(byte[] rgba, int width, int height, WebpEncoderOptions options,
+            ImageMetadata? metadata = null)
+        {
+            byte[] encoded = options.Lossless
+                ? EncodeLosslessRgbaDirect(rgba, width, height)
+                : EncodeWithConfig(rgba, width, height, width * 4, true, options.Quality, options.Method, false, false);
+            return WebpMetadataWriter.Apply(encoded, width, height, metadata);
+        }
+
+        public static byte[] EncodeRgba(byte[] rgba, int width, int height, WebpEncoderOptions options,
+            ImageMetadata? metadata = null)
+        {
+            try
+            {
+                byte[]? result = null;
+                ExecuteWithConcurrency(options.ConcurrencyStrategy, () =>
+                {
+                    result = EncodeFrameWithConfig(rgba, width, height, options, metadata);
+                });
+                return result!;
+            }
+            catch (DllNotFoundException ex)
+            {
+                throw new InvalidOperationException("未能加载 WebP 原生库，请检查 runtimes 目录或平台匹配。", ex);
+            }
+            catch (EntryPointNotFoundException ex)
+            {
+                throw new InvalidOperationException("WebP 原生库版本不兼容，缺少所需入口点。", ex);
+            }
+        }
+
         public static byte[] EncodeRgb(byte[] rgb, int width, int height, WebpEncoderOptions options,
             ImageMetadata? metadata = null)
         {
@@ -536,7 +568,7 @@ namespace SharpImageConverter.Formats.Webp.Unmanaged
                 {
                     if (rgbaFrames.Length == 1)
                     {
-                        result = WebpCodec.EncodeRgba(rgbaFrames[0], width, height, options, metadata);
+                        result = EncodeFrameWithConfig(rgbaFrames[0], width, height, options, metadata);
                         return;
                     }
 
@@ -564,7 +596,7 @@ namespace SharpImageConverter.Formats.Webp.Unmanaged
                             int duration = frameDurationsMs[i];
                             if (duration < 10) duration = 10;
 
-                            byte[] encoded = WebpCodec.EncodeRgba(rgba, width, height, options);
+                            byte[] encoded = EncodeFrameWithConfig(rgba, width, height, options);
 
                             unsafe
                             {
@@ -652,7 +684,8 @@ namespace SharpImageConverter.Formats.Webp.Unmanaged
                 {
                     if (rgbaFrames.Length == 1)
                     {
-                        WebpCodec.EncodeRgbaToStream(stream, rgbaFrames[0], width, height, options, metadata);
+                        byte[] single = EncodeFrameWithConfig(rgbaFrames[0], width, height, options, metadata);
+                        stream.Write(single, 0, single.Length);
                         return;
                     }
 
@@ -680,7 +713,7 @@ namespace SharpImageConverter.Formats.Webp.Unmanaged
                             int duration = frameDurationsMs[i];
                             if (duration < 10) duration = 10;
 
-                            byte[] encoded = WebpCodec.EncodeRgba(rgba, width, height, options);
+                            byte[] encoded = EncodeFrameWithConfig(rgba, width, height, options);
 
                             unsafe
                             {

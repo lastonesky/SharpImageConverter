@@ -347,7 +347,7 @@ namespace SharpImageConverter.Compression
         /// optimize 搜索期「并行评估候选」的并行度上限。
         /// </summary>
         /// <remarks>
-        /// 只在候选内编码是单线程的路径上用（PNG 的 deflate、WebP 的 libwebp）。
+        /// 只在候选内编码是单线程的路径上用（PNG 的 deflate、WebP 编码）。
         /// JPEG 不适用：它的编码器内部已经是并行流水线，外层再并行只会超订。
         /// 按内存预算夹上限，避免目录批量时与外层并行度叠加爆内存。
         /// </remarks>

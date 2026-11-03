@@ -29,7 +29,8 @@
     <Compile Include="../tools/streamnet/NetworkSim.cs" Link="Helpers/NetworkSim.cs" />
   </ItemGroup>
   <ItemGroup>
-    <None Include="../src/runtimes/**/*.*">
+    <!-- 测试专用 libwebp 对拍基准：native 库只存在于测试输出，生产包不再携带。 -->
+    <None Include="../src/runtimes/**/*.*" Link="%(Filename)%(Extension)">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
   </ItemGroup>

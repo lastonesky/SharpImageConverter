@@ -7,7 +7,6 @@ using SharpImageConverter.Formats.Bmp;
 using SharpImageConverter.Formats.Jpeg;
 using SharpImageConverter.Formats.Png;
 using SharpImageConverter.Formats.Webp;
-using SharpImageConverter.Formats.Webp.Unmanaged;
 using SharpImageConverter.Formats.Gif;
 using SharpImageConverter.Processing;
 using Xunit;

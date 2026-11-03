@@ -1,6 +1,7 @@
 using System.Runtime.InteropServices;
 using Xunit;
 using SharpImageConverter.Formats.Webp;
+using SharpImageConverter.Tests.Helpers;
 
 namespace SharpImageConverter.Tests.Codec;
 
@@ -205,7 +206,7 @@ public class WebpAnimationCompositingTests
 
     private static byte[] EncodeVp8LChunk(byte[] rgba, int w, int h)
     {
-        byte[] file = WebpCodec.EncodeRgba(rgba, w, h, new WebpEncoderOptions(75f, lossless: true));
+        byte[] file = LibWebpTestCodec.EncodeRgba(rgba, w, h, new WebpEncoderOptions(75f, lossless: true));
         var container = WebpContainer.Load(file);
         var chunk = container.FindChunk(WebpChunkId.Vp8L);
         Assert.True(chunk.HasValue, "libwebp 未输出 VP8L chunk");

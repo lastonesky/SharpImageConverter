@@ -9,56 +9,37 @@ namespace SharpImageConverter.Formats.Webp
     /// <summary>WebP 解码实现选择。</summary>
     public enum WebpDecodeBackend
     {
-        /// <summary>默认：能用纯托管就用（无损/VP8L），不支持的特性自动回退 libwebp。</summary>
+        /// <summary>默认：纯 C# 托管实现。</summary>
         Auto = 0,
 
-        /// <summary>强制 libwebp 原生实现（既有行为）。</summary>
-        LibWebp = 1,
-
         /// <summary>强制纯 C# 托管实现；不支持的特性直接抛异常，不静默回退。</summary>
-        CSharp = 2,
+        CSharp = 1,
     }
 
     /// <summary>
     /// WebP 解码后端策略。
     ///
-    /// 环境变量 <c>SIC_WEBP_BACKEND</c>：<c>auto</c>（默认）/ <c>libwebp</c> / <c>csharp</c>。
-    /// 环境变量 <c>SIC_WEBP_TRACE=1</c>：托管解码失败并回退 libwebp 时向 stderr 打一行原因，便于线上观测。
-    ///
-    /// 动图在 <see cref="WebpDecodeBackend.Auto"/> 下始终走 libwebp：托管实现会把全部帧解成
-    /// 整幅画布快照（内存与时序都与既有单图解码不同），不适合作为透明替换。
+    /// 环境变量 <c>SIC_WEBP_BACKEND</c>：<c>auto</c>（默认）/ <c>csharp</c>。
+    /// 纯 C# 是唯一实现，两个取值行为一致，保留枚举只为兼容既有调用方。
     /// </summary>
     public static class WebpDecodePolicy
     {
-        private static readonly bool s_trace;
-
         static WebpDecodePolicy()
         {
             Backend = Parse(Environment.GetEnvironmentVariable("SIC_WEBP_BACKEND"));
-            s_trace = Environment.GetEnvironmentVariable("SIC_WEBP_TRACE") == "1";
         }
 
         /// <summary>当前生效的后端（测试可覆盖；进程内全局，非线程本地）。</summary>
         public static WebpDecodeBackend Backend { get; set; }
 
-        /// <summary>回退时是否输出诊断信息。</summary>
-        internal static bool TraceEnabled => s_trace;
-
         private static WebpDecodeBackend Parse(string? value) => value?.Trim().ToLowerInvariant() switch
         {
             "csharp" or "managed" or "native-csharp" => WebpDecodeBackend.CSharp,
-            "libwebp" or "interop" or "off" => WebpDecodeBackend.LibWebp,
             _ => WebpDecodeBackend.Auto,
         };
-
-        internal static void TraceFallback(string reason)
-        {
-            if (!s_trace) return;
-            Console.Error.WriteLine($"[sic:webp] 托管解码不可用，回退 libwebp：{reason}");
-        }
     }
 
-    /// <summary>按策略在托管实现与 libwebp 之间分派解码。</summary>
+    /// <summary>纯 C# 解码入口（保留原分派层签名，便于适配器平滑迁移）。</summary>
     internal static class WebpDecodeDispatch
     {
         /// <summary>把 WebP 流解码为 RGBA 字节（每像素 R,G,B,A）。</summary>
@@ -132,61 +113,15 @@ namespace SharpImageConverter.Formats.Webp
         {
             ArgumentNullException.ThrowIfNull(data);
 
-            switch (WebpDecodePolicy.Backend)
-            {
-                case WebpDecodeBackend.LibWebp:
-                    return WebpCodec.DecodeRgba(data, out width, out height);
-                case WebpDecodeBackend.CSharp:
-                    return WebpDecoder.DecodeRgba(data, out width, out height);
-                default:
-                    return DecodeAuto(data, out width, out height);
-            }
-        }
-
-        private static byte[] DecodeRgba(ReadOnlySpan<byte> data, out int width, out int height)
-        {
-            switch (WebpDecodePolicy.Backend)
-            {
-                case WebpDecodeBackend.LibWebp:
-                    return WebpCodec.DecodeRgba(data, out width, out height);
-                case WebpDecodeBackend.CSharp:
-                    return WebpDecoder.DecodeRgba(data, out width, out height);
-                default:
-                    // 动图：既有单图解码语义来自 libwebp（首帧），托管实现返回最后一帧，故不参与自动分派。
-                    if (LooksAnimated(data))
-                        return WebpCodec.DecodeRgba(data, out width, out height);
-                    try
-                    {
-                        return WebpDecoder.DecodeRgba(data, out width, out height);
-                    }
-                    catch (WebpException ex)
-                    {
-                        WebpDecodePolicy.TraceFallback(ex.Message);
-                        return WebpCodec.DecodeRgba(data, out width, out height);
-                    }
-            }
-        }
-
-        private static byte[] DecodeAuto(byte[] data, out int width, out int height)
-        {
-            // 动图：同上，保持 libwebp 的既有语义。
+            // 单图解码入口保持既有语义：动图不走这里，避免调用方拿到“最后一帧”而误以为是静态图。
             if (LooksAnimated(data))
-                return WebpCodec.DecodeRgba(data, out width, out height);
+                throw new WebpUnsupportedException("单图解码入口不支持动图 WebP");
 
-            try
-            {
-                return WebpDecoder.DecodeRgba(data, out width, out height);
-            }
-            catch (WebpException ex)
-            {
-                WebpDecodePolicy.TraceFallback(ex.Message);
-                return WebpCodec.DecodeRgba(data, out width, out height);
-            }
+            return WebpDecoder.DecodeRgba(data, out width, out height);
         }
 
         /// <summary>
         /// 快速判断是否为动图：只读 RIFF/WEBP 头与 VP8X 的 flags 字节（偏移 20，bit1 = ANIMATION）。
-        /// 比完整解析容器便宜，且 Auto 分派不必为判类型额外解析一遍。
         /// </summary>
         private static bool LooksAnimated(ReadOnlySpan<byte> data)
         {

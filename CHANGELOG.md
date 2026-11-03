@@ -2,11 +2,12 @@
 
 ### WebP 托管解码接入与提速
 
-- **解码后端可在托管实现与 libwebp 之间切换**：新增 `Formats/Webp/WebpDecodeBackend.cs`
-  （`WebpDecodePolicy.Backend` + `WebpDecodeDispatch`）。环境变量 `SIC_WEBP_BACKEND=auto|libwebp|managed`
-  控制，默认 `auto`：VP8L 无损走纯 C# 实现，有损 VP8 与动图回退 libwebp；
-  `managed` 模式**不静默回退**，不支持的特性直接抛 `WebpUnsupportedException`（便于被测/被观测）；
-  `SIC_WEBP_TRACE=1` 时回退原因输出到 stderr。`WebpDecoderAdapter`/`WebpDecoderAdapterRgba`
+- **WebP 解码统一走纯 C# 实现**：`Formats/Webp/WebpDecodeBackend.cs` 保留
+  `WebpDecodePolicy.Backend` 与 `WebpDecodeDispatch` 作为既有调用方的兼容入口，
+  `auto`（默认）与 `csharp` 行为一致（`managed` 为 `csharp` 的别名），环境变量
+  `SIC_WEBP_BACKEND` 只接受这两个取值。有损 VP8、VP8L 无损与动图全部由托管实现解码，
+  不再回退 libwebp；不支持的特性直接抛 `WebpUnsupportedException`（便于被测/被观测）。
+  `WebpDecoderAdapter`/`WebpDecoderAdapterRgba`
   改走 `WebpDecodeDispatch`，上层 API 与 CLI 无需改动。
 - **修掉托管解码的两处性能与内存瓶颈**（此前无损解码比 libwebp 慢 1.25~2.8 倍、噪声图 14.9 倍）：
   - `LsbBitReader` 由「逐 bit 读 + 每次边界检查」改为 64 位缓冲 + 4 字节批量 refill，
@@ -28,12 +29,12 @@
   | 噪声 1024×768 无损 | 9.8 ms | 9.2 ms | 101.8 ms |
   | 143 MP 无损 | 1888 ms | 1905 ms | 2468 ms |
 
-- 动图在 `auto` 下**始终**走 libwebp：托管实现会把每帧解成整幅画布快照（内存与时序都与既有单图
-  解码不同），且 libwebp 的单图 API 本身解不了动图，替换只会改变失败/成功边界。
-- 新增 `SharpImageConverter.Tests/Codec/WebpDecodeBackendTests.cs`（8 个用例）：
+- 动图解码同样由托管实现完成：每帧解成整幅画布快照，与既有单图解码的时序/内存模型不同；
+  单图解码入口仍显式拒绝动图，避免调用方误把某一帧当静态图。
+- 新增 `SharpImageConverter.Tests/Codec/WebpDecodeBackendTests.cs`（7 个用例）：
   `DecodeRgbaInto` 与 `DecodeRgba` 逐字节一致、不越界写尾部、缓冲区不足抛 `ArgumentException`；
-  Auto 无损走托管且与 libwebp 输出一致、Auto 有损回退、Managed 有损抛 `WebpUnsupportedException`、
-  Auto 动图行为与 libwebp 完全一致。
+  `auto` 与 `csharp` 下无损/有损均由托管实现解码（无损输出与 libwebp 逐字节一致），
+  单图入口对动图抛 `WebpUnsupportedException`（两种后端行为一致）。
 
 ### API（含破坏性变更）
 
@@ -71,8 +72,8 @@
 - **声明 trim / AOT 兼容性**：库 csproj 新增 `<IsTrimmable>true` /
   `<IsAotCompatible>true</IsAotCompatible>`，SDK 随之带上 IL2xxx（裁剪）与 IL3xxx（AOT）
   分析器——使用者 `PublishTrimmed` / `PublishAot` 时不会再"静默"拿到运行时错误。
-  开启后全库 **0 条 IL 警告**（派发全是 `typeof(T)` 静态分派，外部依赖只有 libwebp 的
-  P/Invoke），程序集带上 `AssemblyMetadata("IsTrimmable"/"IsAotCompatible","True")`。
+  开启后全库 **0 条 IL 警告**（派发全是 `typeof(T)` 静态分派，生产代码不再 P/Invoke libwebp），
+  程序集带上 `AssemblyMetadata("IsTrimmable"/"IsAotCompatible","True")`。
 
 ### CI
 - **新增 `.github/workflows/ci.yml`**：此前仓库只有 tag 触发的 `release.yml` 与

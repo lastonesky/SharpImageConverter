@@ -71,9 +71,20 @@ namespace SharpImageConverter.Formats.Webp
         internal static byte[] DecodeRgbaFromStream(Stream stream, out int width, out int height,
             out Metadata.ImageMetadata? metadata)
         {
-            // 按 WebpDecodePolicy 在纯托管实现与 libwebp 之间分派，
-            // 托管不支持的特性（有损 VP8 / 动图）在 Auto 下自动回退。
-            return WebpDecodeDispatch.DecodeRgba(stream, out width, out height, out metadata);
+            // 纯 C# 解码；适配器层把位流损坏统一折算为 InvalidDataException，
+            // 与既有（native 时代）的调用方契约保持一致；不支持的动图语义保持 WebpUnsupportedException。
+            try
+            {
+                return WebpDecodeDispatch.DecodeRgba(stream, out width, out height, out metadata);
+            }
+            catch (WebpUnsupportedException)
+            {
+                throw;
+            }
+            catch (WebpException ex)
+            {
+                throw new InvalidDataException("WebP 数据损坏或不完整", ex);
+            }
         }
     }
 

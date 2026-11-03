@@ -7,6 +7,7 @@ using Xunit;
 using SharpImageConverter.Core;
 using SharpImageConverter.Formats.Webp;
 using SharpImageConverter.Metadata;
+using SharpImageConverter.Tests.Helpers;
 
 namespace SharpImageConverter.Tests.Codec;
 
@@ -38,7 +39,7 @@ public class WebpMetadataTests
         AssertContainer(webp, metadata, expectAnimation: false, expectAlpha: true, "csharp lossless");
 
         // 真实 libwebp 解码校验：带扩展 chunk 的文件仍是合法 WebP，像素 bit-exact。
-        byte[] lib = WebpCodec.DecodeRgba(webp, out int lw, out int lh);
+        byte[] lib = LibWebpTestCodec.DecodeRgba(webp, out int lw, out int lh);
         Assert.Equal(w, lw);
         Assert.Equal(h, lh);
         Assert.Equal(rgba, lib);
@@ -52,7 +53,7 @@ public class WebpMetadataTests
         // 再编码 -> chunk 字节完全一致，且仍能解码。
         byte[] reencoded = WebpEncoder.EncodeRgba(decoded.Buffer, decoded.Width, decoded.Height, decoded.Metadata);
         AssertContainer(reencoded, metadata, expectAnimation: false, expectAlpha: true, "csharp lossless re-encode");
-        Assert.Equal(rgba, WebpCodec.DecodeRgba(reencoded, out _, out _));
+        Assert.Equal(rgba, LibWebpTestCodec.DecodeRgba(reencoded, out _, out _));
     }
 
     [Fact]
@@ -68,30 +69,22 @@ public class WebpMetadataTests
         byte[] webp = ms.ToArray();
 
         AssertContainer(webp, metadata, expectAnimation: false, expectAlpha: false, "csharp stream");
-        Assert.Equal(rgba, WebpCodec.DecodeRgba(webp, out _, out _));
+        Assert.Equal(rgba, LibWebpTestCodec.DecodeRgba(webp, out _, out _));
     }
 
     [Fact]
-    public void StaticLossless_LibWebpBackend_RoundTripsMetadata()
+    public void StaticLossless_LibWebpOracle_RoundTripsMetadata()
     {
         int w = 40, h = 30;
         var rgba = Photo(w, h, 5);
         for (int i = 0; i < w * h; i++) rgba[i * 4 + 3] = 255;
 
         var metadata = CreateMetadata();
-        byte[] webp = WithEncodeBackend(WebpEncodeBackend.LibWebp, () =>
-        {
-            var options = new WebpEncoderOptions(75f, WebpConcurrencyStrategy.Serial, 3, lossless: true);
-            var encoder = new WebpEncoderAdapterRgba();
-            encoder.Options = options;
-            var image = new Image<Rgba32>(w, h, rgba, metadata);
-            var ms = new MemoryStream();
-            encoder.EncodeRgba32(ms, image);
-            return ms.ToArray();
-        });
+        var options = new WebpEncoderOptions(75f, WebpConcurrencyStrategy.Serial, 3, lossless: true);
+        byte[] webp = LibWebpTestCodec.EncodeRgba(rgba, w, h, options, metadata);
 
         AssertContainer(webp, metadata, expectAnimation: false, expectAlpha: false, "libwebp lossless");
-        Assert.Equal(rgba, WebpCodec.DecodeRgba(webp, out _, out _));
+        Assert.Equal(rgba, LibWebpTestCodec.DecodeRgba(webp, out _, out _));
     }
 
     // ==================================================================
@@ -106,20 +99,12 @@ public class WebpMetadataTests
         for (int i = 0; i < w * h; i++) rgba[i * 4 + 3] = (byte)(i % 2 == 0 ? 200 : 255);
 
         var metadata = CreateMetadata();
-        byte[] webp = WithEncodeBackend(WebpEncodeBackend.LibWebp, () =>
-        {
-            var options = new WebpEncoderOptions(75f, WebpConcurrencyStrategy.Serial, 3);
-            var encoder = new WebpEncoderAdapterRgba();
-            encoder.Options = options;
-            var image = new Image<Rgba32>(w, h, rgba, metadata);
-            var ms = new MemoryStream();
-            encoder.EncodeRgba32(ms, image);
-            return ms.ToArray();
-        });
+        var options = new WebpEncoderOptions(75f, WebpConcurrencyStrategy.Serial, 3);
+        byte[] webp = LibWebpTestCodec.EncodeRgba(rgba, w, h, options, metadata);
 
         AssertContainer(webp, metadata, expectAnimation: false, expectAlpha: true, "libwebp lossy rgba");
         // 有损无法 bit-exact，只要求真实 libwebp 能解码。
-        byte[] decoded = WebpCodec.DecodeRgba(webp, out int dw, out int dh);
+        byte[] decoded = LibWebpTestCodec.DecodeRgba(webp, out int dw, out int dh);
         Assert.Equal(w, dw);
         Assert.Equal(h, dh);
         Assert.Equal(w * h * 4, decoded.Length);
@@ -132,19 +117,11 @@ public class WebpMetadataTests
         var rgb = PhotoRgb(w, h, 13);
 
         var metadata = CreateMetadata();
-        byte[] webp = WithEncodeBackend(WebpEncodeBackend.LibWebp, () =>
-        {
-            var options = new WebpEncoderOptions(75f, WebpConcurrencyStrategy.Serial, 3);
-            var encoder = new WebpEncoderAdapter();
-            encoder.Options = options;
-            var image = new Image<Rgb24>(w, h, rgb, metadata);
-            var ms = new MemoryStream();
-            encoder.EncodeRgb24(ms, image);
-            return ms.ToArray();
-        });
+        var options = new WebpEncoderOptions(75f, WebpConcurrencyStrategy.Serial, 3);
+        byte[] webp = LibWebpTestCodec.EncodeRgb(rgb, w, h, options, metadata);
 
         AssertContainer(webp, metadata, expectAnimation: false, expectAlpha: false, "libwebp lossy rgb");
-        byte[] decoded = WebpCodec.DecodeRgba(webp, out int dw, out int dh);
+        byte[] decoded = LibWebpTestCodec.DecodeRgba(webp, out int dw, out int dh);
         Assert.Equal(w, dw);
         Assert.Equal(h, dh);
         Assert.Equal(w * h * 4, decoded.Length);
@@ -210,7 +187,7 @@ public class WebpMetadataTests
         var firstAnmf = container.FindAllChunks(WebpChunkId.Anmf)[0];
         var vp8 = container.GetAnmfSubChunks(firstAnmf).First(c => c.Id == WebpChunkId.Vp8);
         byte[] frameWebp = WrapSingleChunk(WebpChunkId.Vp8, vp8.GetData(container.RawData).ToArray());
-        byte[] decoded = WebpCodec.DecodeRgba(frameWebp, out int dw, out int dh);
+        byte[] decoded = LibWebpTestCodec.DecodeRgba(frameWebp, out int dw, out int dh);
         Assert.Equal(w, dw);
         Assert.Equal(h, dh);
         Assert.Equal(w * h * 4, decoded.Length);
@@ -272,15 +249,8 @@ public class WebpMetadataTests
         int w = 20, h = 10;
         var rgb = PhotoRgb(w, h, 31);
 
-        byte[] webp = WithEncodeBackend(WebpEncodeBackend.LibWebp, () =>
-        {
-            var encoder = new WebpEncoderAdapter();
-            encoder.Options = new WebpEncoderOptions(75f, WebpConcurrencyStrategy.Serial, 3);
-            var image = new Image<Rgb24>(w, h, rgb);
-            var ms = new MemoryStream();
-            encoder.EncodeRgb24(ms, image);
-            return ms.ToArray();
-        });
+        var options = new WebpEncoderOptions(75f, WebpConcurrencyStrategy.Serial, 3);
+        byte[] webp = LibWebpTestCodec.EncodeRgb(rgb, w, h, options);
 
         var container = WebpContainer.Load(webp);
         Assert.Equal(WebpContainerKind.Vp8, container.Kind);
@@ -420,19 +390,5 @@ public class WebpMetadataTests
             rgb[i * 3 + 2] = rgba[i * 4 + 2];
         }
         return rgb;
-    }
-
-    private static T WithEncodeBackend<T>(WebpEncodeBackend backend, Func<T> body)
-    {
-        var previous = WebpEncodePolicy.Backend;
-        try
-        {
-            WebpEncodePolicy.Backend = backend;
-            return body();
-        }
-        finally
-        {
-            WebpEncodePolicy.Backend = previous;
-        }
     }
 }
