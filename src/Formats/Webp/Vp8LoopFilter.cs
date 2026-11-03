@@ -1,6 +1,7 @@
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics;
+using SharpImageConverter.Core;
 
 namespace SharpImageConverter.Formats.Webp;
 
@@ -256,6 +257,11 @@ internal static class Vp8LoopFilter
     private static void ChunkStrided(ref byte b, int start, int vstride, ref byte buf,
                                      int thresh2, int ithresh, int hevThresh, int taps)
     {
+        if (SimdCompat.ByteShuffleSupported)
+        {
+            ChunkStridedTransposed(ref b, start, vstride, thresh2, ithresh, hevThresh, taps);
+            return;
+        }
         for (int row = 0; row < 8; row++)
         {
             ref byte src = ref Unsafe.Add(ref b, start + row * vstride);
@@ -295,6 +301,62 @@ internal static class Vp8LoopFilter
         }
         Scatter8(ref Unsafe.Add(ref b, start - 1), vstride, r.P0);
         Scatter8(ref Unsafe.Add(ref b, start), vstride, r.Q0);
+    }
+
+    // Four registers hold eight rows of eight bytes. The same transpose converts
+    // rows to taps before filtering, and taps back to rows for contiguous stores.
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void Transpose8x8(ref Vector128<byte> a, ref Vector128<byte> b,
+        ref Vector128<byte> c, ref Vector128<byte> d)
+    {
+        var ab = SimdCompat.UnpackLow(a, a.GetUpper().ToVector128());
+        var cd = SimdCompat.UnpackLow(b, b.GetUpper().ToVector128());
+        var ef = SimdCompat.UnpackLow(c, c.GetUpper().ToVector128());
+        var gh = SimdCompat.UnpackLow(d, d.GetUpper().ToVector128());
+        var abcd0 = SimdCompat.UnpackLow(ab.AsUInt16(), cd.AsUInt16()).AsUInt32();
+        var abcd1 = SimdCompat.UnpackHigh(ab.AsUInt16(), cd.AsUInt16()).AsUInt32();
+        var efgh0 = SimdCompat.UnpackLow(ef.AsUInt16(), gh.AsUInt16()).AsUInt32();
+        var efgh1 = SimdCompat.UnpackHigh(ef.AsUInt16(), gh.AsUInt16()).AsUInt32();
+        a = SimdCompat.UnpackLow(abcd0, efgh0).AsByte();
+        b = SimdCompat.UnpackHigh(abcd0, efgh0).AsByte();
+        c = SimdCompat.UnpackLow(abcd1, efgh1).AsByte();
+        d = SimdCompat.UnpackHigh(abcd1, efgh1).AsByte();
+    }
+
+    private static void ChunkStridedTransposed(ref byte b, int start, int stride,
+        int thresh2, int ithresh, int hevThresh, int taps)
+    {
+        ref byte src = ref Unsafe.Add(ref b, start - 4);
+        var a = Vector128.Create(Unsafe.ReadUnaligned<ulong>(ref src),
+            Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref src, stride))).AsByte();
+        var c = Vector128.Create(Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref src, 4 * stride)),
+            Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref src, 5 * stride))).AsByte();
+        var d = Vector128.Create(Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref src, 6 * stride)),
+            Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref src, 7 * stride))).AsByte();
+        var middle = Vector128.Create(Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref src, 2 * stride)),
+            Unsafe.ReadUnaligned<ulong>(ref Unsafe.Add(ref src, 3 * stride))).AsByte();
+        Transpose8x8(ref a, ref middle, ref c, ref d);
+        Taps8 t = new()
+        {
+            P3 = Vector128.WidenLower(a).AsInt16(), P2 = Vector128.WidenUpper(a).AsInt16(),
+            P1 = Vector128.WidenLower(middle).AsInt16(), P0 = Vector128.WidenUpper(middle).AsInt16(),
+            Q0 = Vector128.WidenLower(c).AsInt16(), Q1 = Vector128.WidenUpper(c).AsInt16(),
+            Q2 = Vector128.WidenLower(d).AsInt16(), Q3 = Vector128.WidenUpper(d).AsInt16()
+        };
+        ApplyFilter(in t, thresh2, ithresh, hevThresh, taps, out Taps8 r);
+        a = Vector128.Narrow(r.P3.AsUInt16(), r.P2.AsUInt16());
+        middle = Vector128.Narrow(r.P1.AsUInt16(), r.P0.AsUInt16());
+        c = Vector128.Narrow(r.Q0.AsUInt16(), r.Q1.AsUInt16());
+        d = Vector128.Narrow(r.Q2.AsUInt16(), r.Q3.AsUInt16());
+        Transpose8x8(ref a, ref middle, ref c, ref d);
+        Unsafe.WriteUnaligned(ref src, a.AsUInt64().GetElement(0));
+        Unsafe.WriteUnaligned(ref Unsafe.Add(ref src, stride), a.AsUInt64().GetElement(1));
+        Unsafe.WriteUnaligned(ref Unsafe.Add(ref src, 2 * stride), middle.AsUInt64().GetElement(0));
+        Unsafe.WriteUnaligned(ref Unsafe.Add(ref src, 3 * stride), middle.AsUInt64().GetElement(1));
+        Unsafe.WriteUnaligned(ref Unsafe.Add(ref src, 4 * stride), c.AsUInt64().GetElement(0));
+        Unsafe.WriteUnaligned(ref Unsafe.Add(ref src, 5 * stride), c.AsUInt64().GetElement(1));
+        Unsafe.WriteUnaligned(ref Unsafe.Add(ref src, 6 * stride), d.AsUInt64().GetElement(0));
+        Unsafe.WriteUnaligned(ref Unsafe.Add(ref src, 7 * stride), d.AsUInt64().GetElement(1));
     }
 
     // ------------------------------------------------------------------

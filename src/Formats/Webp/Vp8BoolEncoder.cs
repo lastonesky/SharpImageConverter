@@ -1,3 +1,5 @@
+using System.Numerics;
+
 namespace SharpImageConverter.Formats.Webp;
 
 /// <summary>
@@ -7,8 +9,8 @@ namespace SharpImageConverter.Formats.Webp;
 /// <list type="bullet">
 /// <item><c>_range</c> 内部保存“实际 range - 1”（init 254），因此分割点
 /// <c>split = (_range * prob) &gt;&gt; 8</c> 等价于解码端 <c>split = 1 + ((range - 1) * prob &gt;&gt; 8)</c>；</item>
-/// <item>重归一化用 <c>((r &lt; 127) ? (r &lt;&lt; 1) | 1 : r)</c> 的递增形式，等价于 C 实现的
-/// <c>kNorm[] / kNewRange[]</c> 查表；</item>
+/// <item>重归一化用前导零计数一次计算位移，等价于逐次执行 <c>(r &lt;&lt; 1) | 1</c>，
+/// 也等价于 C 实现的 <c>kNorm[] / kNewRange[]</c> 查表；</item>
 /// <item>输出端用 <c>_run</c> 延迟写出连续 0xFF 字节，等后续进位到来时再统一处理，避免回写已输出数据。</item>
 /// </list>
 /// 与 <see cref="Vp8BoolDecoder"/> 严格互逆；实例非线程安全，一次编码由单个线程独占。
@@ -91,15 +93,10 @@ internal sealed class Vp8BoolEncoder
 
         if (_range < RenormThreshold)
         {
-            int shift = 0;
-            int r = _range;
-            while (r < RenormThreshold)
-            {
-                r = (r << 1) | 1;
-                shift++;
-            }
-
-            _range = r;
+            // _range stores actualRange - 1; normalize the actual range
+            // once instead of iterating over every missing high bit.
+            int shift = BitOperations.LeadingZeroCount((uint)(_range + 1)) - 24;
+            _range = ((_range + 1) << shift) - 1;
             _value <<= shift;
             _nbBits += shift;
             if (_nbBits > 0)

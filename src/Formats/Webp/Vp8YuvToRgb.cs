@@ -1,6 +1,7 @@
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics;
+using SharpImageConverter.Core;
 
 namespace SharpImageConverter.Formats.Webp;
 
@@ -177,16 +178,23 @@ internal static class Vp8YuvToRgb
 
     /// <summary>
     /// 把 8 个像素对的两个通道分量（偶位/奇位）交织成 16 个像素值，
-    /// 结果拆成两个 8 通道向量。借 16 字节栈缓冲 + 一次 pshufb 完成跨向量交织。
+    /// 结果拆成两个 8 通道向量；支持时直接在寄存器中交织。
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static void Interleave8(Vector128<ushort> even, Vector128<ushort> odd,
                                     out Vector128<ushort> pix0, out Vector128<ushort> pix1)
     {
-        Span<byte> tmp = stackalloc byte[16];
-        ref byte t = ref MemoryMarshal.GetReference(tmp);
         Vector128<byte> pe = Vector128.Narrow(even, even);
         Vector128<byte> po = Vector128.Narrow(odd, odd);
+        if (SimdCompat.ByteShuffleSupported)
+        {
+            var interleaved = SimdCompat.UnpackLow(pe, po);
+            pix0 = Vector128.WidenLower(interleaved);
+            pix1 = Vector128.WidenUpper(interleaved);
+            return;
+        }
+        Span<byte> tmp = stackalloc byte[16];
+        ref byte t = ref MemoryMarshal.GetReference(tmp);
         Unsafe.WriteUnaligned(ref t, pe.AsUInt64().GetElement(0));
         Unsafe.WriteUnaligned(ref Unsafe.Add(ref t, 8), po.AsUInt64().GetElement(0));
         Vector128<byte> shuffled = Vector128.Shuffle(Vector128.LoadUnsafe(ref t), InterleaveIdx);

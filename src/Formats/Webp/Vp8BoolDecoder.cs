@@ -1,3 +1,5 @@
+using System.Numerics;
+
 namespace SharpImageConverter.Formats.Webp;
 
 /// <summary>
@@ -102,17 +104,20 @@ internal sealed class Vp8BoolDecoder
             _range = split;
         }
 
-        // 归一化：range 保持 ≥128，value 随之左移；每 8 次移位补一个输入字节。
-        while (_range < 128)
+        // Normalize in one shift. A range in [1,127] needs at most seven
+        // bits, so at most one byte refill can be crossed in this operation.
+        if (_range < 128)
         {
-            _value = (_value << 1) & kWindowMask;
-            _range <<= 1;
-            if (++_bitCount == 8)
+            int shift = BitOperations.LeadingZeroCount(_range) - 24;
+            _range <<= shift;
+            _value = (_value << shift) & kWindowMask;
+            int count = _bitCount + shift;
+            if (count >= 8)
             {
-                _bitCount = 0;
+                count -= 8;
                 if (_pos < _end)
                 {
-                    _value |= _data[_pos++];
+                    _value |= (uint)_data[_pos++] << count;
                 }
                 else
                 {
@@ -120,6 +125,7 @@ internal sealed class Vp8BoolDecoder
                     _eof = true;
                 }
             }
+            _bitCount = count;
         }
         return bit;
     }

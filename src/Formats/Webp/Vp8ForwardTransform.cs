@@ -1,3 +1,7 @@
+using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
+using System.Runtime.Intrinsics;
+
 namespace SharpImageConverter.Formats.Webp;
 
 /// <summary>
@@ -25,6 +29,43 @@ internal static class Vp8ForwardTransform
     /// 4×4 正 DCT：输入 16 个残差（光栅顺序），输出 16 个系数（光栅顺序）。
     /// </summary>
     internal static void Dct4x4(ReadOnlySpan<int> residual, Span<int> coeffs)
+    {
+        if (Vp8TransformSimd.IsSupported)
+        {
+            ref int src = ref MemoryMarshal.GetReference(residual);
+            var a = Vector128.LoadUnsafe(ref src);
+            var b = Vector128.LoadUnsafe(ref src, 4);
+            var c = Vector128.LoadUnsafe(ref src, 8);
+            var d = Vector128.LoadUnsafe(ref src, 12);
+            DctPass(ref a, ref b, ref c, ref d);
+            Vp8TransformSimd.Transpose(ref a, ref b, ref c, ref d);
+            DctPass(ref a, ref b, ref c, ref d);
+            Vp8TransformSimd.Transpose(ref a, ref b, ref c, ref d);
+            var one = Vector128.Create(1);
+            ref int dst = ref MemoryMarshal.GetReference(coeffs);
+            Vector128.StoreUnsafe((a + one) >> 1, ref dst);
+            Vector128.StoreUnsafe((b + one) >> 1, ref dst, 4);
+            Vector128.StoreUnsafe((c + one) >> 1, ref dst, 8);
+            Vector128.StoreUnsafe((d + one) >> 1, ref dst, 12);
+            return;
+        }
+        Dct4x4Scalar(residual, coeffs);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void DctPass(ref Vector128<int> a, ref Vector128<int> b,
+        ref Vector128<int> c, ref Vector128<int> d)
+    {
+        var o0 = a + b + c + d;
+        var o1 = Vp8TransformSimd.Mul1(a) + Vp8TransformSimd.Mul2(b)
+            - Vp8TransformSimd.Mul2(c) - Vp8TransformSimd.Mul1(d);
+        var o2 = a - b - c + d;
+        var o3 = Vp8TransformSimd.Mul2(a) - Vp8TransformSimd.Mul1(b)
+            + Vp8TransformSimd.Mul1(c) - Vp8TransformSimd.Mul2(d);
+        a = o0; b = o1; c = o2; d = o3;
+    }
+
+    internal static void Dct4x4Scalar(ReadOnlySpan<int> residual, Span<int> coeffs)
     {
         Span<int> tmp = stackalloc int[16];
 
@@ -74,6 +115,41 @@ internal static class Vp8ForwardTransform
     /// 非零 AC 时会把 16 个块的 DC 在块行之间错位。
     /// </summary>
     internal static void Wht4x4(ReadOnlySpan<int> dc, Span<int> coeffs)
+    {
+        if (Vp8TransformSimd.IsSupported)
+        {
+            ref int src = ref MemoryMarshal.GetReference(dc);
+            var a = Vector128.LoadUnsafe(ref src);
+            var b = Vector128.LoadUnsafe(ref src, 4);
+            var c = Vector128.LoadUnsafe(ref src, 8);
+            var d = Vector128.LoadUnsafe(ref src, 12);
+            WhtPass(ref a, ref b, ref c, ref d);
+            Vp8TransformSimd.Transpose(ref a, ref b, ref c, ref d);
+            WhtPass(ref a, ref b, ref c, ref d);
+            Vp8TransformSimd.Transpose(ref a, ref b, ref c, ref d);
+            var one = Vector128.Create(1);
+            ref int dst = ref MemoryMarshal.GetReference(coeffs);
+            Vector128.StoreUnsafe((a + one) >> 1, ref dst);
+            Vector128.StoreUnsafe((b + one) >> 1, ref dst, 4);
+            Vector128.StoreUnsafe((c + one) >> 1, ref dst, 8);
+            Vector128.StoreUnsafe((d + one) >> 1, ref dst, 12);
+            return;
+        }
+        Wht4x4Scalar(dc, coeffs);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void WhtPass(ref Vector128<int> a, ref Vector128<int> b,
+        ref Vector128<int> c, ref Vector128<int> d)
+    {
+        var ab = a + b;
+        var cd = c + d;
+        var ba = a - b;
+        var dc = d - c;
+        a = ab + cd; b = ab - cd; c = ba + dc; d = ba - dc;
+    }
+
+    internal static void Wht4x4Scalar(ReadOnlySpan<int> dc, Span<int> coeffs)
     {
         Span<int> tmp = stackalloc int[16];
 
