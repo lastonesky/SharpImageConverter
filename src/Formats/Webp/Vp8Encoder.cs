@@ -18,6 +18,14 @@ namespace SharpImageConverter.Formats.Webp;
 ///   （仅宏块边界，16×16 模式不启用宏块内部边界）。</item>
 /// </list>
 ///
+/// 大图降级：VP8 帧头的 first partition 长度字段只有 19 位（≤512KB），而 partition0
+/// 必须承载全部宏块的分段 + 跳过 + 帧内模式信息，超大图像会天然超限（libwebp 在同样
+/// 场景直接报 <c>VP8_ENC_ERROR_PARTITION0_TOO_BIG</c>）。利用两遍架构：第一遍结束后
+/// 测量 partition0 实际长度，超预算则改用降级配置重跑——关闭分段（省每宏块分段位）、
+/// 强制 16×16 预测（省 i4x4 模式树，这是 partition0 的大头）、skip 概率按第一遍统计
+/// 自适应（固定 128 时每宏块固定花 1 bit）。降级配置下若仍超限则抛出明确异常。
+/// 默认配置的位流与降级前逐字节一致。
+///
 /// 位流布局：<c>[frame tag 3][start code 3][w 2][h 2][partition0][token partition]</c>，
 /// 单 token 分区，因此不写分区大小表。输出为 <c>VP8 </c> chunk 的载荷（不含 chunk 头）。
 ///
@@ -34,6 +42,14 @@ internal sealed class Vp8Encoder
 
     /// <summary>VP8 宽度/高度字段为 14 位。</summary>
     internal const int MaxDimension = 16383;
+
+    /// <summary>VP8 帧头 first partition 长度字段为 19 位（RFC 6386 §9.1）。</summary>
+    private const int MaxPartition0Bytes = 1 << 19;
+
+    /// <summary>
+    /// partition0 预算：两遍之间模式决策可能因概率表差异小幅漂移，留 32KB 余量。
+    /// </summary>
+    private const int Partition0BudgetBytes = MaxPartition0Bytes - 32 * 1024;
 
     /// <summary>VP8 系数幅值上限（类别码 Cat6 可表示的最大值）。</summary>
     private const int MaxCoefficient = 2114;
@@ -81,6 +97,22 @@ internal sealed class Vp8Encoder
 
     private Vp8BoolEncoder _part0;
     private Vp8BoolEncoder _tokens;
+
+    /// <summary>是否启用分段（平坦宏块用稍粗量化）。降级模式下关闭以省每宏块分段位。</summary>
+    private bool _useSegmentation;
+
+    /// <summary>是否允许 i4x4 预测。降级模式下强制 16×16 以省每宏块 16 个模式树。</summary>
+    private bool _allowI4;
+
+    /// <summary>
+    /// mb_skip_coeff 位编码概率（帧头 prob_skip_false，8 位显式字面量）。
+    /// 默认配置固定 128（与降级前一致）；降级模式按第一遍统计自适应。
+    /// </summary>
+    private int _skipProb = 128;
+
+    /// <summary>第一遍统计：skip 宏块数 / 宏块总数（真实写位调用各计一次，成本试探不计）。</summary>
+    private long _skipCount;
+    private long _mbCount;
 
     /// <summary>当前生效的 token 概率表（第一遍为默认表，第二遍为统计更新后的表）。</summary>
     private byte[,,,] _probs;
@@ -237,13 +269,57 @@ internal sealed class Vp8Encoder
 
         var encoder = new Vp8Encoder(rgba, width, height, QualityToQIndex(quality));
 
-        // 第一遍：统计 token 概率频次（重建与量化路径不变，只是不写 token 位）。
+        // 默认配置：第一遍统计后检查 partition0 长度，超预算则降级重跑（见类注释）。
+        encoder.Configure(useSegmentation: true, allowI4: true);
         encoder.ResetForPass(encoder._probs, statsOnly: true);
-        encoder.Run();
+        encoder.Run(assemble: false);
+
+        if (encoder._part0.Length > Partition0BudgetBytes)
+        {
+            // 降级配置（关闭分段 + 强制 16×16）每宏块 partition0 开销有内容无关的硬上界
+            // （skip ≤1 + i4x4 判定 ≤1.2 + 亮度模式树 ≤4 + 色度模式树 ≤3 ≈ 9 bit），
+            // 但实际取值随内容波动大，直接用第一遍实测裁决，不做保守预筛——
+            // 只有极端尺寸（约 16000×16000 以上）才会白跑一遍。
+            encoder.Configure(useSegmentation: false, allowI4: false);
+            encoder.ResetForPass(encoder._probs, statsOnly: true);
+            encoder.Run(assemble: false);
+
+            if (encoder._part0.Length > Partition0BudgetBytes)
+                throw Partition0Overflow(width, height, encoder._part0.Length);
+
+            encoder.AdaptSkipProb();
+        }
 
         // 第二遍：用本帧统计得到的概率写位流。
         encoder.ResetForPass(encoder.AdaptProbabilities(), statsOnly: false);
-        return encoder.Run();
+        return encoder.Run(assemble: true);
+    }
+
+    /// <summary>partition0 即使在降级配置下仍超 19 位上限时给出可操作的错误说明。</summary>
+    private static InvalidOperationException Partition0Overflow(int width, int height, long length)
+        => new(
+            $"VP8 partition0 长度 {length} 超出 19 位上限 {MaxPartition0Bytes} 字节：" +
+            $"{width}×{height} 的宏块模式信息无法装入单一 partition（VP8 规范限制，" +
+            "libwebp 同样无法编码）。有损 WebP 请缩小图像尺寸，或改用无损 WebP" +
+            "（VP8L 位流没有 19 位分区限制）。");
+
+    /// <summary>设定本帧的编码配置（默认 / 降级），必须在每遍 ResetForPass 之前调用。</summary>
+    private void Configure(bool useSegmentation, bool allowI4)
+    {
+        _useSegmentation = useSegmentation;
+        _allowI4 = allowI4;
+        _skipProb = 128;
+    }
+
+    /// <summary>
+    /// 按第一遍统计把 skip 概率从固定 128 调整为实际分布：
+    /// <c>p = P(宏块 skip) = skipCount / mbCount</c> 映射到 1..255。
+    /// 超大图像上绝大多数宏块非 skip，收益接近每宏块省 1 bit。
+    /// </summary>
+    private void AdaptSkipProb()
+    {
+        if (_mbCount > 0)
+            _skipProb = Math.Clamp((int)((_skipCount * 255 + _mbCount / 2) / _mbCount), 1, 255);
     }
 
     private static byte[,,,] CopyDefaultProbs()
@@ -301,6 +377,8 @@ internal sealed class Vp8Encoder
         Array.Clear(_i4LeftModes);
         _anyCoefficient = false;
         _y2Nz = 0;
+        _skipCount = 0;
+        _mbCount = 0;
 
         InitReconBoundaries();
     }
@@ -329,7 +407,12 @@ internal sealed class Vp8Encoder
         return Math.Max(2, (q + 1) / 3);
     }
 
-    private byte[] Run()
+    /// <summary>
+    /// 跑完一遍编码。<paramref name="assemble"/> 为 false 时（统计遍）不拼帧——
+    /// partition0 超限时 <see cref="AssembleFrame"/> 会抛异常，而统计遍的产物本就要丢弃，
+    /// 此时只需通过 <see cref="_part0"/>.Length 测量长度供降级决策使用。
+    /// </summary>
+    private byte[] Run(bool assemble)
     {
         WriteGlobalHeader();
 
@@ -350,7 +433,7 @@ internal sealed class Vp8Encoder
 
         byte[] part0 = _part0.Finish();
         byte[] tokens = _tokens.Finish();
-        return AssembleFrame(part0, tokens);
+        return assemble ? AssembleFrame(part0, tokens) : part0;
     }
 
     /// <summary>
@@ -416,21 +499,25 @@ internal sealed class Vp8Encoder
         _part0.PutBitUniform(0); // color_space
         _part0.PutBitUniform(0); // clamping_type
 
-        // 两个 segment：0 保持基础量化，低方差宏块进入 segment 1 并使用稍粗量化。
-        _part0.PutBitUniform(1); // segmentation_enabled
-        _part0.PutBitUniform(1); // update_mb_segmentation_map
-        _part0.PutBitUniform(1); // update_segment_data
-        _part0.PutBitUniform(0); // segment_feature_mode = delta values (keeps the common filter level)
-        for (int s = 0; s < 4; s++)
+        // 分段：默认配置启用（平坦宏块进入 segment 1 并使用稍粗量化）；
+        // 降级配置写 segmentation_enabled=0，解码端不读分段位（ParseSegmentHeader 对应）。
+        _part0.PutBitUniform(_useSegmentation ? 1 : 0); // segmentation_enabled
+        if (_useSegmentation)
         {
-            _part0.PutSignedBits(s == 1 ? Math.Min(FlatSegmentQDelta, _baseQ / 8) : 0, 7);
+            _part0.PutBitUniform(1); // update_mb_segmentation_map
+            _part0.PutBitUniform(1); // update_segment_data
+            _part0.PutBitUniform(0); // segment_feature_mode = delta values (keeps the common filter level)
+            for (int s = 0; s < 4; s++)
+            {
+                _part0.PutSignedBits(s == 1 ? Math.Min(FlatSegmentQDelta, _baseQ / 8) : 0, 7);
+            }
+            // 不设置按段滤波 delta。
+            for (int s = 0; s < 4; s++) _part0.PutBitUniform(0);
+            // map tree：只输出 segment 0/1，segment 2/3 分支概率设为 0。
+            _part0.PutBitUniform(1); _part0.PutLiteral(255, 8);
+            _part0.PutBitUniform(1); _part0.PutLiteral(220, 8);
+            _part0.PutBitUniform(1); _part0.PutLiteral(255, 8);
         }
-        // 不设置按段滤波 delta。
-        for (int s = 0; s < 4; s++) _part0.PutBitUniform(0);
-        // map tree：只输出 segment 0/1，segment 2/3 分支概率设为 0。
-        _part0.PutBitUniform(1); _part0.PutLiteral(255, 8);
-        _part0.PutBitUniform(1); _part0.PutLiteral(220, 8);
-        _part0.PutBitUniform(1); _part0.PutLiteral(255, 8);
 
         // 滤波：normal 型（simple=0），sharpness=0，不写 ref/mode lf delta。
         // 头部字段顺序依据 RFC 6386 §9.4，与解码端 ParseFilterHeader 逐项对应。
@@ -475,7 +562,7 @@ internal sealed class Vp8Encoder
                     }
 
         _part0.PutBitUniform(1); // mb_no_coeff_skip
-        _part0.PutLiteral(128, 8); // prob_skip_false
+        _part0.PutLiteral(_skipProb, 8); // prob_skip_false（默认配置恒为 128，降级配置自适应）
     }
 
     private byte[] AssembleFrame(byte[] part0, byte[] tokens)
@@ -507,7 +594,7 @@ internal sealed class Vp8Encoder
 
     private void EncodeMacroblock(int mbX, int mbY)
     {
-        _currentSegment = IsFlatMacroblock(mbX, mbY) ? 1 : 0;
+        _currentSegment = _useSegmentation && IsFlatMacroblock(mbX, mbY) ? 1 : 0;
         int yOff = (Pad + mbY * 16) * _strideY + Pad + mbX * 16;
         int uvOff = (Pad + mbY * 8) * _strideUv + Pad + mbX * 8;
 
@@ -522,7 +609,7 @@ internal sealed class Vp8Encoder
 
         // ---- 候选 A：i4x4 ----
         // 试排总会完整重建一份，但重建结果要备份：下面的 16×16 路径会把它整个覆盖掉。
-        bool i4Ok = sse16 > 0;
+        bool i4Ok = _allowI4 && sse16 > 0;
         long dist4 = 0, bits4 = 0;
         bool any4 = false;
         if (i4Ok)
@@ -1109,9 +1196,22 @@ internal sealed class Vp8Encoder
     private void WriteMacroblockModes(int mbX, bool useI4, int yMode, int uvMode, bool skip)
     {
         // ParseIntraMode reads a 3-way tree: first choose segment 0/1, then choose the id.
-        _part0.PutBit(0, 255);
-        _part0.PutBit(_currentSegment, 220);
-        _part0.PutBit(skip ? 1 : 0, 128); // prob_skip_false 固定 128
+        // 降级配置下 update_map=0，解码端不读这两个位，这里同样不写。
+        if (_useSegmentation)
+        {
+            _part0.PutBit(0, 255);
+            _part0.PutBit(_currentSegment, 220);
+        }
+
+        // skip 统计只认真实写位：成本试探（CostLuma）会重复调用本函数，第一遍之外的
+        // 计入会翻倍，因此用 _statsOnly && !_costMode 双重门控。
+        if (_statsOnly && !_costMode)
+        {
+            _mbCount++;
+            if (skip)
+                _skipCount++;
+        }
+        _part0.PutBit(skip ? 1 : 0, _skipProb);
 
         // is_i4x4：写 1 表示 16×16，写 0 表示 4×4。
         _part0.PutBit(useI4 ? 0 : 1, 145);
