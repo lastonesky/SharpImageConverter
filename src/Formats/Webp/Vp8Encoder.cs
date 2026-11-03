@@ -137,6 +137,27 @@ internal sealed class Vp8Encoder
     private bool _anyCoefficient;
     private int _y2Nz;
 
+    // ---- 率失真决策 ----
+    /// <summary>只累加位成本、不产出字节的编码器实例；与 <see cref="_part0"/> 共用同一批写位函数。</summary>
+    private readonly Vp8BoolEncoder _costEnc = new(64);
+
+    /// <summary>为 true 时 token 位只计价、不写位流（见 <see cref="PutCoeffBit"/>）。</summary>
+    private bool _costMode;
+
+    /// <summary>
+    /// λ 的比例系数：<c>λQ8 = LambdaScale × y1Ac</c>。λ 随量化步长线性增长——
+    /// 量化越粗，1 bit 码率能换到的失真越多，最优兑换率就越高。
+    /// </summary>
+    private const int LambdaScale = 300;
+
+    /// <summary>本帧的 λ（Q8 定点，λ×256），由 <see cref="LambdaScale"/> 与量化步长算出。</summary>
+    private readonly int _lambdaQ8;
+
+    /// <summary>i4x4 试排后的亮度重建块备份（16×16，按行 16 字节）。</summary>
+    private readonly byte[] _i4ReconBak = new byte[16 * 16];
+    private readonly int[] _i4QuantBak = new int[256];
+    private readonly int[] _i4CodesBak = new int[16];
+
     private Vp8Encoder(ReadOnlySpan<byte> rgba, int width, int height, int baseQ)
     {
         _width = width;
@@ -176,6 +197,7 @@ internal sealed class Vp8Encoder
         // 色度量化的 delta 必须与写入帧头的值一致（解码端按同一公式重建量化步长）。
         _uvDc = Vp8Tables.DcQuantTable[Math.Clamp(q + UvDcDeltaQ, 0, 117)];
         _uvAc = Vp8Tables.AcQuantTable[Math.Clamp(q + UvAcDeltaQ, 0, 127)];
+        _lambdaQ8 = LambdaScale * _y1Ac;
 
         _part0 = new Vp8BoolEncoder(1024);
         _tokens = new Vp8BoolEncoder(1024);
@@ -470,23 +492,43 @@ internal sealed class Vp8Encoder
         int yOff = (Pad + mbY * 16) * _strideY + Pad + mbX * 16;
         int uvOff = (Pad + mbY * 8) * _strideUv + Pad + mbX * 8;
 
-        int yMode = ChooseMode16(mbX, mbY, yOff, out long sse16);
+        // 色度与亮度完全独立（色度预测只读色度平面的上/左邻居），先算定 uvMode 与
+        // chromaAny，两条亮度候选路径共用同一份色度结果。
         int uvMode = ChooseMode8(mbX, mbY, uvOff);
-
         _anyCoefficient = false;
+        PrepareChromaResidual(mbX, mbY, uvOff);
+        bool chromaAny = _anyCoefficient;
 
-        // i4x4 先在重建平面上试走一遍（逐块预测→量化→重建），若最终不选它，
-        // 再恢复 16×16 的预测重做残差——两条路互斥，不能共用重建结果。
-        bool useI4 = TryPrepareI4x4(mbX, mbY, yOff, sse16);
-        if (!useI4)
+        int yMode = ChooseMode16(mbX, mbY, yOff, out long sse16);
+
+        // ---- 候选 A：i4x4 ----
+        // 试排总会完整重建一份，但重建结果要备份：下面的 16×16 路径会把它整个覆盖掉。
+        bool i4Ok = sse16 > 0;
+        long dist4 = 0, bits4 = 0;
+        bool any4 = false;
+        if (i4Ok)
         {
             _anyCoefficient = false;
-            Vp8IntraPred.Pred16(yMode, mbY > 0, mbX > 0, _reconY, yOff, _strideY);
-            PrepareLumaResidual(mbX, mbY, yOff);
+            PrepareI4x4(mbX, mbY, yOff, out dist4);
+            any4 = _anyCoefficient;
+            bits4 = CostLuma(mbX, useI4: true, yMode, uvMode, skip: !(any4 || chromaAny));
+            BackupI4x4(yOff);
         }
-        PrepareChromaResidual(mbX, mbY, uvOff);
 
-        bool skip = !_anyCoefficient;
+        // ---- 候选 B：16×16 ----
+        Vp8IntraPred.Pred16(yMode, mbY > 0, mbX > 0, _reconY, yOff, _strideY);
+        _anyCoefficient = false;
+        PrepareLumaResidual(mbX, mbY, yOff);
+        bool any16 = _anyCoefficient;
+        long dist16 = SseLuma(mbX, mbY);
+        long bits16 = CostLuma(mbX, useI4: false, yMode, uvMode, skip: !(any16 || chromaAny));
+
+        // 率失真决胜：两条路都已算出「重建失真 + 精确码率」，比 SSE 门槛可靠得多。
+        bool useI4 = i4Ok && Score(dist4, bits4) <= Score(dist16, bits16);
+        if (useI4)
+            RestoreI4x4(yOff);
+
+        bool skip = !((useI4 ? any4 : any16) || chromaAny);
 
         WriteMacroblockModes(mbX, useI4, yMode, uvMode, skip);
         if (skip)
@@ -507,6 +549,92 @@ internal sealed class Vp8Encoder
         {
             WriteResidualTokens(mbX);
         }
+    }
+
+    /// <summary>
+    /// 率失真评分：<c>D + λ·R</c>，D 是重建后的亮度 SSE、R 以 bit 计。整体乘 65536 转成
+    /// 整数运算——λ 用 Q8 定点（<see cref="_lambdaQ8"/> = λ×256），则 <c>D·65536 + λQ8·R</c>
+    /// 与 <c>D + λ·(R/256)</c> 同序（R 的单位是 1/256 bit）。
+    /// <para>
+    /// λ 的取值：<c>λQ8 = LambdaScale × y1Ac</c>。选「与量化步长成正比」是因为 1 bit 码率
+    /// 能换回多少失真，直接取决于量化步长。标定结果（6 图 × q50/75/90/95，24 组，对照
+    /// 旧的「SSE 压到 16×16 的 55% 以内」门槛）：
+    /// </para>
+    /// <list type="bullet">
+    /// <item>LambdaScale 150/230/300/350/450/600 → 总体积 −3.04/−3.09/−3.11/−3.13/−3.10/−3.15%，</item>
+    /// <item>平均 ΔPSNR +0.010/−0.003/−0.010/−0.014/−0.022/−0.026 dB。</item>
+    /// </list>
+    /// <para>
+    /// 曲线在 150~600 之间几乎是平的（体积极差 0.11%），说明决策由数据本身决定，不再依赖
+    /// 精调门槛——这与旧门槛的「最优值随内容漂移（照片 40、UI 70~100）」形成对比。取 300。
+    /// </para>
+    /// </summary>
+    private long Score(long distortion, long bits) => distortion * 65536L + (long)_lambdaQ8 * bits;
+
+    /// <summary>
+    /// 在不改动真实编码状态的前提下，精确算出「本宏块按这条路径写出去要多少 bit」：
+    /// 临时把 <see cref="_part0"/><see cref="_tokens"/> 换成只累加成本的实例，
+    /// 复用真实的模式写位与 token 写位函数，因此码率模型与位流生成永远同步。
+    /// 结束后回滚所有逐宏块上下文（nz 与 i4x4 模式上下文）。
+    /// </summary>
+    private long CostLuma(int mbX, bool useI4, int yMode, int uvMode, bool skip)
+    {
+        int tb = mbX * 4;
+        int saveLeftNz = _leftNz, saveLeftDc = _leftNzDc;
+        int saveTopNz = _mbNz[mbX], saveTopDc = _mbNzDc[mbX];
+        Span<byte> saveTop = stackalloc byte[4];
+        Span<byte> saveLeft = stackalloc byte[4];
+        for (int i = 0; i < 4; i++)
+        {
+            saveTop[i] = _i4TopModes[tb + i];
+            saveLeft[i] = _i4LeftModes[i];
+        }
+
+        Vp8BoolEncoder part0 = _part0, tokens = _tokens;
+        bool costMode = _costMode;
+        _costMode = true;
+        _part0 = _costEnc;
+        _tokens = _costEnc;
+        _costEnc.BeginCost();
+
+        WriteMacroblockModes(mbX, useI4, yMode, uvMode, skip);
+        if (!skip)
+        {
+            if (useI4) WriteI4ResidualTokens(mbX);
+            else WriteResidualTokens(mbX);
+        }
+
+        long bits = _costEnc.EndCost();
+        _part0 = part0;
+        _tokens = tokens;
+        _costMode = costMode;
+
+        _leftNz = saveLeftNz;
+        _leftNzDc = saveLeftDc;
+        _mbNz[mbX] = saveTopNz;
+        _mbNzDc[mbX] = saveTopDc;
+        for (int i = 0; i < 4; i++)
+        {
+            _i4TopModes[tb + i] = saveTop[i];
+            _i4LeftModes[i] = saveLeft[i];
+        }
+        return bits;
+    }
+
+    private void BackupI4x4(int yOff)
+    {
+        for (int r = 0; r < 16; r++)
+            Array.Copy(_reconY, yOff + r * _strideY, _i4ReconBak, r * 16, 16);
+        Array.Copy(_lumaQuant, _i4QuantBak, 256);
+        Array.Copy(_lumaCodes, _i4CodesBak, 16);
+    }
+
+    private void RestoreI4x4(int yOff)
+    {
+        for (int r = 0; r < 16; r++)
+            Array.Copy(_i4ReconBak, r * 16, _reconY, yOff + r * _strideY, 16);
+        Array.Copy(_i4QuantBak, _lumaQuant, 256);
+        Array.Copy(_i4CodesBak, _lumaCodes, 16);
     }
 
     /// <summary>
@@ -535,17 +663,18 @@ internal sealed class Vp8Encoder
     }
 
     /// <summary>
-    /// 尝试以 i4x4（B_PRED）编码本宏块：逐块按 SSE 选 10 种 4×4 模式中最优者，
+    /// 试走一遍 i4x4（B_PRED）编码本宏块：逐块按预测域 SSE 选 10 种 4×4 模式中最优者，
     /// 随即量化、反量化、重建，作为下一个子块的预测源（与解码端逐块推进的顺序一致）。
-    /// 返回 false 表示最终不采用 i4x4，此时重建平面已不可用，调用方须重做 16×16。
     /// </summary>
-    private bool TryPrepareI4x4(int mbX, int mbY, int yOff, long sse16)
+    /// <param name="distortion">
+    /// 重建后的亮度失真（16 个子块的 SSE 之和）——这是 RD 比较用的真实失真，
+    /// 不是模式选择时的预测域 SSE。
+    /// </param>
+    private void PrepareI4x4(int mbX, int mbY, int yOff, out long distortion)
     {
-        // sse16 == 0 时 ShouldUseI4x4 恒为假，试排必然白做——精确的提前退出。
-        if (sse16 == 0) return false;
         PrepareTopRight(mbX, mbY, yOff);
 
-        long sse4 = 0;
+        distortion = 0;
         bool any = false;
 
         for (int n = 0; n < 16; n++)
@@ -569,7 +698,6 @@ internal sealed class Vp8Encoder
 
             Vp8IntraPred.Pred4(bestMode, _reconY, off, _strideY);
             _i4Modes[n] = bestMode;
-            sse4 += bestSse;
 
             // 残差 → 正变换 → 量化（i4x4 的 DC 走 y1Dc，不汇入 Y2）→ 反量化 → 重建
             ComputeResidualY(mbX, mbY, n, _residual);
@@ -595,36 +723,13 @@ internal sealed class Vp8Encoder
             bool dcNonZero = _lumaSlots[dst] != 0;
             _lumaCodes[n] = NonZeroCode(nz, dcNonZero);
             ApplyTransform(_lumaSlots, dst, _reconY, off, _strideY, _lumaCodes[n]);
+
+            // 重建后才有的真实失真（模式选择用的是预测域 SSE，两者不是一回事）。
+            distortion += BlockSse4x4(_srcY, _width, _height, _reconY, off, _strideY, baseX, baseY);
         }
 
-        if (!ShouldUseI4x4(sse4, sse16))
-            return false;
-
         _anyCoefficient = any;
-        return true;
     }
-
-    /// <summary>
-    /// 16×16 与 i4x4 的取舍。i4x4 的预测残差通常小得多，但代价是每个子块 1~7 bit 的模式
-    /// 与额外的一次变换；纯 SSE 比较会让编码体积反而变大，因此要求 SSE 改善到 16×16 的
-    /// <see cref="I4SseThresholdPercent"/>% 以内才采用。
-    /// <para>
-    /// 门槛标定（6 张 1024×1024 图 × q50/75/90/95，合计 24 组；明细见
-    /// <c>docs/WebpEncoder.md</c> §3）：门槛 40 时总体积 −6.81%、55 时 −7.48%、
-    /// 70 时 −6.71%、85 时 −4.85%、100（只要 SSE 有改善就用）时 −2.78%，平均 PSNR 分别
-    /// +0.074/+0.087/+0.114/+0.138/+0.159 dB。取 55 为全局最优。
-    /// </para>
-    /// <para>
-    /// 已知局限：最优门槛随内容漂移（自然照片偏 40、UI 截图偏 70~100），单一的像素域门槛
-    /// 无法表达「模式位 vs 残差能量」的兑换率——这属于后续 RD 优化的范畴。
-    /// 代价：1024² q75 编码 78 → 110 ms（+41%），试排对每个宏块都要跑一遍。
-    /// </para>
-    /// </summary>
-    private static bool ShouldUseI4x4(long sse4, long sse16)
-        => sse4 * 100 < sse16 * I4SseThresholdPercent;
-
-    /// <summary>i4x4 采用的 SSE 门槛：需改善到 16×16 的该百分比以内（标定见 <see cref="ShouldUseI4x4"/>）。</summary>
-    private const int I4SseThresholdPercent = 55;
 
     /// <summary>i4x4 亮度子块模式搜索的上界（含）：0=B_DC … 9=B_HU 全开。</summary>
     private const int I4MaxMode = 9;
@@ -1215,6 +1320,16 @@ internal sealed class Vp8Encoder
     /// </summary>
     private void PutCoeffBit(Vp8BoolEncoder bw, int type, int band, int ctx, int node, int bit)
     {
+        if (_costMode)
+        {
+            // 用当前生效的概率表计价。第一遍用的是默认表、第二遍是统计更新后的表，
+            // 因此两遍的评分可能略有差异；这只会让第二遍的重建与第一遍统计的符号分布
+            // 有些偏差（编码效率的损失），不影响位流合法性——解码器用的是帧头里传的表。
+            // 反过来，若固定用默认表，成本会被系统性放大（渐变图实测 4.5×），
+            // 且放大倍数随内容漂移，i4x4 与 16×16 的相对比较会失真。
+            bw.PutBit(bit, _probs[type, band, ctx, node]);
+            return;
+        }
         if (_statsOnly)
         {
             if (bit == 0) _count0[type, band, ctx, node]++;

@@ -36,6 +36,29 @@ internal sealed class Vp8BoolEncoder
     /// <summary>已判定为 0xFF、但因可能进位而延迟写出的字节数。</summary>
     private int _run;
 
+    /// <summary>成本模式：为 true 时 <see cref="PutBit"/> 只累加 <see cref="_cost"/>，不改编码器状态。</summary>
+    private bool _costOnly;
+
+    /// <summary>成本模式下累计的位成本，单位 1/256 bit（见 <see cref="Vp8CostTable"/>）。</summary>
+    private long _cost;
+
+    /// <summary>
+    /// 进入成本模式：之后的写位调用只累加成本、不产出字节。用于率失真决策时精确对比
+    /// 「同一段语法按不同内容写」的码率——两段都能复用同一批写位函数，不必另写码率模型。
+    /// </summary>
+    internal void BeginCost()
+    {
+        _costOnly = true;
+        _cost = 0;
+    }
+
+    /// <summary>退出成本模式并返回累计成本（1/256 bit）。</summary>
+    internal long EndCost()
+    {
+        _costOnly = false;
+        return _cost;
+    }
+
     internal Vp8BoolEncoder(int expectedBytes = 1024)
     {
         _buffer = new byte[Math.Max(expectedBytes, 16)];
@@ -49,6 +72,12 @@ internal sealed class Vp8BoolEncoder
     /// </summary>
     internal void PutBit(int bit, int prob)
     {
+        if (_costOnly)
+        {
+            _cost += Vp8CostTable.Cost[prob, bit];
+            return;
+        }
+
         int split = (_range * prob) >> ProbBits;
         if (bit != 0)
         {
