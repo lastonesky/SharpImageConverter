@@ -90,6 +90,76 @@ public class WebpAlphFilterTests
         }
     }
 
+    /// <summary>
+    /// 编码端 <see cref="AlphEncoder.ApplyFilter"/> 必须与本文件里独立写的前向滤波逐字节一致，
+    /// 且「前向滤波 → VP8L → 逆滤波」对 4 种方式都能还原出原 alpha。
+    /// </summary>
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(3)]
+    public void Alph_ForwardFilter_MatchesReferenceAndRoundTrips(int filter)
+    {
+        const int w = 131, h = 69;
+        var alpha = new byte[w * h];
+        var rnd = new Random(20261103 + filter);
+        for (int y = 0; y < h; y++)
+        for (int x = 0; x < w; x++)
+        {
+            // 混合平坦块、渐变与随机跳变，覆盖行首/列首的退化分支
+            int v = ((x / 7 + y / 5) % 3 == 0) ? (x * 2 + y) & 0xFF : rnd.Next(256);
+            alpha[y * w + x] = (byte)v;
+        }
+
+        var ours = new byte[alpha.Length];
+        AlphEncoder.ApplyFilter(alpha, ours, w, h, filter);
+        var reference = ForwardFilter(alpha, w, h, filter);
+        for (int i = 0; i < alpha.Length; i++)
+        {
+            Assert.True(reference[i] == ours[i],
+                $"filter={filter} 第 {i} 字节（x={i % w}, y={i / w}）：参考={reference[i]} 实现={ours[i]}");
+        }
+
+        var enc = AlphEncoder.Encode(alpha, w, h, filter);
+        Assert.Equal(filter, (enc[0] >> 2) & 0x03);
+        var dec = AlphDecoder.Decode(enc, w, h);
+        for (int i = 0; i < alpha.Length; i++)
+            Assert.True(alpha[i] == dec[i], $"filter={filter} 往返第 {i} 像素：源={alpha[i]} 解出={dec[i]}");
+    }
+
+    /// <summary>自动选择：低色数平面必须落回 none（libwebp 同口径），高色数平滑平面必须选到滤波。</summary>
+    [Fact]
+    public void Alph_AutoSelector_FollowsLibWebpRule()
+    {
+        const int w = 128, h = 96;
+
+        // 2 色（0/255）条纹：≤16 色 ⇒ none
+        var twoColor = new byte[w * h];
+        for (int y = 0; y < h; y++)
+        for (int x = 0; x < w; x++)
+            twoColor[y * w + x] = (byte)((x / 8) % 2 == 0 ? 0 : 255);
+        Assert.Equal(0, (AlphEncoder.Encode(twoColor, w, h)[0] >> 2) & 0x03);
+
+        // 柔和径向渐变（alpha 遮罩的典型形态）：>16 色且未小到触发「不值得试排」的闸门，
+        // 滤波必须胜过 none，且体积确实更小。
+        const int rw = 256, rh = 256;
+        var radial = new byte[rw * rh];
+        for (int y = 0; y < rh; y++)
+        for (int x = 0; x < rw; x++)
+        {
+            double dx = x - rw / 2.0, dy = y - rh / 2.0;
+            int v = (int)(255 - Math.Sqrt(dx * dx + dy * dy) * 1.4);
+            radial[y * rw + x] = (byte)Math.Clamp(v, 0, 255);
+        }
+        var auto = AlphEncoder.Encode(radial, rw, rh);
+        var none = AlphEncoder.Encode(radial, rw, rh, 0);
+        Assert.True(auto.Length < none.Length,
+            $"径向渐变平面的自动选择应小于 none：auto={auto.Length} none={none.Length}");
+        var dec = AlphDecoder.Decode(auto, rw, rh);
+        Assert.Equal(radial, dec);
+    }
+
     /// <summary>按 libwebp filters_enc.c 的前向过滤语义造 ALPH 流（filter 位写进头部）。</summary>
     private static byte[] BuildAlphaFile(byte[] rgba, int w, int h, int filter)
     {
@@ -98,9 +168,9 @@ public class WebpAlphFilterTests
 
         byte[] filtered = ForwardFilter(alpha, w, h, filter);
 
-        // comp=1（VP8L）压缩过滤后的平面，再把 filter 位改到头部
-        byte[] alph = AlphEncoder.Encode(filtered, w, h);
-        alph[0] = (byte)((alph[0] & 0x03) | (filter << 2));
+        // comp=1（VP8L）压缩已经过滤好的平面，filter 位由 EncodePreFiltered 写进头部。
+        // 这里刻意不走 AlphEncoder.Encode(alpha, w, h, filter)——那会把平面再滤一遍。
+        byte[] alph = AlphEncoder.EncodePreFiltered(filtered, w, h, filter);
 
         var opaque = (byte[])rgba.Clone();
         for (int i = 0; i < w * h; i++) opaque[i * 4 + 3] = 255;
