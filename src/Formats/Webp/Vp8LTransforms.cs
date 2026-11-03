@@ -1,3 +1,8 @@
+using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
+using System.Runtime.Intrinsics;
+using System.Runtime.Intrinsics.X86;
+
 namespace SharpImageConverter.Formats.Webp;
 
 /// <summary>
@@ -89,6 +94,189 @@ internal static class Vp8LTransforms
     //                    Predictor Transform
     // =====================================================
 
+    // 4 像素（16 字节）块内的字节级前缀和用：《向上移一个像素》的 pshufb 索引，
+    // 0x80 让该字节取 0，模 256 加法下等价于"无贡献"。
+    private static readonly Vector128<byte> ShiftUp1Pixel = Vector128.Create(
+        0x80, 0x80, 0x80, 0x80,
+        0, 1, 2, 3,
+        4, 5, 6, 7,
+        8, 9, 10, 11);
+
+    private static readonly Vector128<byte> ShiftUp2Pixels = Vector128.Create(
+        0x80, 0x80, 0x80, 0x80,
+        0x80, 0x80, 0x80, 0x80,
+        0, 1, 2, 3,
+        4, 5, 6, 7);
+
+    private static readonly Vector128<byte> BroadcastLastPixel = Vector128.Create(
+        (byte)12, 13, 14, 15, 12, 13, 14, 15, 12, 13, 14, 15, 12, 13, 14, 15);
+
+    private static readonly Vector128<byte> ByteMaskFE = Vector128.Create((byte)0xFE);
+
+    private static readonly Vector128<byte> BlackPixelBytes = Vector128.Create(
+        (byte)0, 0, 0, 0xFF, 0, 0, 0, 0xFF, 0, 0, 0, 0xFF, 0, 0, 0, 0xFF);
+
+    /// <summary>libwebp Average2 的字节级向量版：((a^b)&amp;0xFE)&gt;&gt;1 + (a&amp;b)。</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static Vector128<byte> Average2V(Vector128<byte> a, Vector128<byte> b)
+    {
+        Vector128<byte> x = a ^ b;
+        // 右移按 16 位通道做，(a^b) 的每字节最低位会被带进上一字节的 bit7；
+        // 先清掉各字节 bit0 即可，结果每字节高位置 0，无需再掩。
+        Vector128<byte> even = x & ByteMaskFE;
+        Vector128<byte> half = Vector128.ShiftRightLogical(even.AsUInt16(), 1).AsByte();
+        return half + (a & b);
+    }
+
+    /// <summary>mode 1（left）段：4 像素一块的字节级前缀和，配合上一像素作进位。</summary>
+    private static int PredictorAddLeft(Span<uint> data, int rowOffset, int x, int xEnd)
+    {
+        ref uint dataRef = ref MemoryMarshal.GetReference(data);
+        // Vector128.Create(uint) 把该像素铺满 16 字节（4 个像素槽）：块内前缀和算完后整体加一次进位。
+        Vector128<byte> carry = Vector128.Create(data[rowOffset + x - 1]).AsByte();
+        int px = x;
+        for (; px + 4 <= xEnd; px += 4)
+        {
+            nuint o = (nuint)(rowOffset + px);
+            Vector128<byte> v = Vector128.LoadUnsafe(ref dataRef, o).AsByte();
+            v += Vector128.Shuffle(v, ShiftUp1Pixel);
+            v += Vector128.Shuffle(v, ShiftUp2Pixels);
+            v += carry;
+            Vector128.StoreUnsafe(v.AsUInt32(), ref dataRef, o);
+            carry = Vector128.Shuffle(v, BroadcastLastPixel);
+        }
+        return px;
+    }
+
+    /// <summary>mode 0/2/3/4 段：pred 与 left 无关，整块直接相加。<paramref name="topShift"/> = 0/1/-1。</summary>
+    private static int PredictorAddFromTop(Span<uint> data, int rowOffset, int topRowOffset, int x, int xEnd, int topShift)
+    {
+        ref uint dataRef = ref MemoryMarshal.GetReference(data);
+        int px = x;
+        for (; px + 4 <= xEnd; px += 4)
+        {
+            nuint o = (nuint)(rowOffset + px);
+            Vector128<byte> v = Vector128.LoadUnsafe(ref dataRef, o).AsByte();
+            Vector128<byte> t = Vector128.LoadUnsafe(ref dataRef, (nuint)(topRowOffset + px + topShift)).AsByte();
+            Vector128.StoreUnsafe((v + t).AsUInt32(), ref dataRef, o);
+        }
+        return px;
+    }
+
+    /// <summary>mode 0（black）段：整块加 0xFF000000。</summary>
+    private static int PredictorAddBlack(Span<uint> data, int rowOffset, int x, int xEnd)
+    {
+        ref uint dataRef = ref MemoryMarshal.GetReference(data);
+        int px = x;
+        for (; px + 4 <= xEnd; px += 4)
+        {
+            nuint o = (nuint)(rowOffset + px);
+            Vector128<byte> v = Vector128.LoadUnsafe(ref dataRef, o).AsByte() + BlackPixelBytes;
+            Vector128.StoreUnsafe(v.AsUInt32(), ref dataRef, o);
+        }
+        return px;
+    }
+
+    /// <summary>
+    /// mode 8/9 段：pred = Average2(top[i-1], top[i]) 或 Average2(top[i], top[i+1])，
+    /// 只依赖上一行，可整块向量化。
+    /// </summary>
+    private static int PredictorAddFromTopAverage(Span<uint> data, int rowOffset, int topRowOffset, int x, int xEnd, bool useRight)
+    {
+        ref uint dataRef = ref MemoryMarshal.GetReference(data);
+        int shift = useRight ? 1 : -1;
+        int px = x;
+        for (; px + 4 <= xEnd; px += 4)
+        {
+            nuint o = (nuint)(rowOffset + px);
+            Vector128<byte> v = Vector128.LoadUnsafe(ref dataRef, o).AsByte();
+            Vector128<byte> t0 = Vector128.LoadUnsafe(ref dataRef, (nuint)(topRowOffset + px)).AsByte();
+            Vector128<byte> t1 = Vector128.LoadUnsafe(ref dataRef, (nuint)(topRowOffset + px + shift)).AsByte();
+            Vector128.StoreUnsafe((v + Average2V(t0, t1)).AsUInt32(), ref dataRef, o);
+        }
+        return px;
+    }
+
+    /// <summary>
+    /// 依赖 left 的 predictor（mode 5/6/7/10/11/12/13）无法整块并行：out[x] 是 out[x-1] 的
+    /// 非线性函数。这里把 mode 判断提到循环外，每个模式一条专用循环，并把 left 用寄存器接力，
+    /// 省掉逐像素的 switch 与重复的 data[x-1] 载入。
+    /// </summary>
+    private static int PredictorAddSequential(Span<uint> data, int rowOffset, int topRowOffset, int x, int xEnd, int mode)
+    {
+        ref uint dataRef = ref MemoryMarshal.GetReference(data);
+        uint left = data[rowOffset + x - 1];
+        int px = x;
+
+        switch (mode)
+        {
+            case 5: // Average3(left, top, top[1])
+                for (; px < xEnd; px++)
+                {
+                    uint top = data[topRowOffset + px];
+                    left = ModAddPixels(data[rowOffset + px], Average3(left, top, data[topRowOffset + px + 1]));
+                    data[rowOffset + px] = left;
+                }
+                break;
+            case 6: // Average2(left, top[-1])
+                for (; px < xEnd; px++)
+                {
+                    left = ModAddPixels(data[rowOffset + px], Average2(left, data[topRowOffset + px - 1]));
+                    data[rowOffset + px] = left;
+                }
+                break;
+            case 7: // Average2(left, top)
+                for (; px < xEnd; px++)
+                {
+                    left = ModAddPixels(data[rowOffset + px], Average2(left, data[topRowOffset + px]));
+                    data[rowOffset + px] = left;
+                }
+                break;
+            case 10: // Average4(left, top[-1], top, top[1])
+                for (; px < xEnd; px++)
+                {
+                    uint top = data[topRowOffset + px];
+                    left = ModAddPixels(data[rowOffset + px],
+                        Average4(left, data[topRowOffset + px - 1], top, data[topRowOffset + px + 1]));
+                    data[rowOffset + px] = left;
+                }
+                break;
+            case 11: // Select(top, left, top[-1])
+                for (; px < xEnd; px++)
+                {
+                    left = ModAddPixels(data[rowOffset + px],
+                        Select(data[topRowOffset + px], left, data[topRowOffset + px - 1]));
+                    data[rowOffset + px] = left;
+                }
+                break;
+            case 12: // ClampedAddSubtractFull(left, top, top[-1])
+                for (; px < xEnd; px++)
+                {
+                    left = ModAddPixels(data[rowOffset + px],
+                        ClampedAddSubtractFull(left, data[topRowOffset + px], data[topRowOffset + px - 1]));
+                    data[rowOffset + px] = left;
+                }
+                break;
+            case 13: // ClampedAddSubtractHalf(left, top, top[-1])
+                for (; px < xEnd; px++)
+                {
+                    left = ModAddPixels(data[rowOffset + px],
+                        ClampedAddSubtractHalf(left, data[topRowOffset + px], data[topRowOffset + px - 1]));
+                    data[rowOffset + px] = left;
+                }
+                break;
+            default: // 未列出的值按 libwebp 兜底：mode 14/15 走 left
+                for (; px < xEnd; px++)
+                {
+                    left = ModAddPixels(data[rowOffset + px], left);
+                    data[rowOffset + px] = left;
+                }
+                break;
+        }
+
+        return px;
+    }
+
     /// <summary>
     /// Predictor 逆变换，严格对照 libwebp PredictorInverseTransform_C。
     /// 关键：逐像素按行扫描，每个像素的预测值依赖"已经 Add 过的输出像素"。
@@ -109,6 +297,8 @@ internal static class Vp8LTransforms
         // (x,0) for x>=1: mode 1 (left)
         for (int x = 1; x < width; x++)
             data[x] = ModAddPixels(data[x], data[x - 1]);
+
+        bool simd = Vector128.IsHardwareAccelerated;
 
         // ---- 其余行 ----
         for (int y = 1; y < height; y++)
@@ -137,7 +327,25 @@ internal static class Vp8LTransforms
                 int xEnd = (x & ~mask) + tileWidth;
                 if (xEnd > width) xEnd = width;
 
-                for (int px = x; px < xEnd; px++)
+                int px = x;
+                if (simd && xEnd - x >= 4)
+                {
+                    // 只有与 left 无关的 predictor 才能整块向量化；其余模式留标量路径。
+                    px = mode switch
+                    {
+                        0 => PredictorAddBlack(data, rowOffset, x, xEnd),
+                        1 => PredictorAddLeft(data, rowOffset, x, xEnd),
+                        2 => PredictorAddFromTop(data, rowOffset, topRowOffset, x, xEnd, 0),
+                        3 => PredictorAddFromTop(data, rowOffset, topRowOffset, x, xEnd, 1),
+                        4 => PredictorAddFromTop(data, rowOffset, topRowOffset, x, xEnd, -1),
+                        8 => PredictorAddFromTopAverage(data, rowOffset, topRowOffset, x, xEnd, useRight: false),
+                        9 => PredictorAddFromTopAverage(data, rowOffset, topRowOffset, x, xEnd, useRight: true),
+                        >= 5 => PredictorAddSequential(data, rowOffset, topRowOffset, x, xEnd, mode),
+                        _ => x,
+                    };
+                }
+
+                for (; px < xEnd; px++)
                 {
                     uint leftVal = data[rowOffset + px - 1];
                     uint topCurVal = data[topRowOffset + px];
@@ -201,7 +409,11 @@ internal static class Vp8LTransforms
                 int xEnd = (x & ~mask) + tileWidth;
                 if (xEnd > width) xEnd = width;
 
-                for (int px = x; px < xEnd; px++)
+                int px = x;
+                if (Vector128.IsHardwareAccelerated && xEnd - x >= 4)
+                    px = ColorSegmentVector(data, rowOffset, x, xEnd, g2r, g2b, r2b);
+
+                for (; px < xEnd; px++)
                 {
                     int idx = rowOffset + px;
                     uint argb = data[idx];
@@ -223,6 +435,41 @@ internal static class Vp8LTransforms
         }
     }
 
+    /// <summary>
+    /// Cross-color 段的 4 像素向量版：32 位通道上做 sbyte 乘 + 算术右移 5 + mod 256 加。
+    /// 与标量逐通道同构（g 先按 sbyte 符号扩展到 32 位，R 结果再按 sbyte 参与 r2b）。
+    /// </summary>
+    private static int ColorSegmentVector(Span<uint> data, int rowOffset, int x, int xEnd,
+                                          int g2r, int g2b, int r2b)
+    {
+        ref uint dataRef = ref MemoryMarshal.GetReference(data);
+        Vector128<int> vG2R = Vector128.Create(g2r);
+        Vector128<int> vG2B = Vector128.Create(g2b);
+        Vector128<int> vR2B = Vector128.Create(r2b);
+        Vector128<int> vFF = Vector128.Create(0xFF);
+        Vector128<int> vKeepAR = Vector128.Create(unchecked((int)0xFF00FF00u));
+
+        int px = x;
+        for (; px + 4 <= xEnd; px += 4)
+        {
+            nuint o = (nuint)(rowOffset + px);
+            Vector128<int> argb = Vector128.LoadUnsafe(ref dataRef, o).AsInt32();
+            Vector128<int> g = Vector128.ShiftRightLogical(argb, 8) & vFF;
+            g = Vector128.ShiftRightArithmetic(Vector128.ShiftLeft(g, 24), 24); // sbyte 符号扩展
+            Vector128<int> r = Vector128.ShiftRightLogical(argb, 16) & vFF;
+            Vector128<int> b = argb & vFF;
+
+            r = (r + Vector128.ShiftRightArithmetic(Vector128.Multiply(vG2R, g), 5)) & vFF;
+            b = (b + Vector128.ShiftRightArithmetic(Vector128.Multiply(vG2B, g), 5)) & vFF;
+            b = (b + Vector128.ShiftRightArithmetic(
+                     Vector128.Multiply(vR2B, Vector128.ShiftRightArithmetic(Vector128.ShiftLeft(r, 24), 24)), 5)) & vFF;
+
+            Vector128<int> outv = (argb & vKeepAR) | Vector128.ShiftLeft(r, 16) | b;
+            Vector128.StoreUnsafe(outv.AsUInt32(), ref dataRef, o);
+        }
+        return px;
+    }
+
     // =====================================================
     //                 Subtract Green Transform
     // =====================================================
@@ -234,7 +481,26 @@ internal static class Vp8LTransforms
     public static void ApplySubtractGreenInverse(Span<uint> data, int width, int height)
     {
         int total = width * height;
-        for (int i = 0; i < total; i++)
+        int i = 0;
+
+        // 16 字节 = 4 个 ARGB 像素（内存序 B,G,R,A）。用 pshufb 把每个像素的 G 复刻到
+        // 同像素的 B/R 槽位、其余槽位取 0，再做字节模 256 加法：等价于 R+=G、B+=G。
+        if (Vector128.IsHardwareAccelerated && total >= 4)
+        {
+            ref byte byteRef = ref Unsafe.As<uint, byte>(ref MemoryMarshal.GetReference(data));
+            int byteCount = total * 4;
+            int o = 0;
+            for (; o + 16 <= byteCount; o += 16)
+            {
+                nuint uo = (nuint)o;
+                Vector128<byte> v = Vector128.LoadUnsafe(ref byteRef, uo);
+                Vector128<byte> g = Vector128.Shuffle(v, GreenToRedBlue);
+                Vector128.StoreUnsafe(v + g, ref byteRef, uo);
+            }
+            i = o / 4;
+        }
+
+        for (; i < total; i++)
         {
             uint argb = data[i];
             uint green = (argb >> 8) & 0xFFu;
@@ -244,6 +510,13 @@ internal static class Vp8LTransforms
             data[i] = (argb & 0xFF00FF00u) | redBlue;
         }
     }
+
+    /// <summary>把每个像素的 G 字节复刻到本像素的 B(0)/R(2) 槽位，G/A 槽位取 0（0x80）。</summary>
+    private static readonly Vector128<byte> GreenToRedBlue = Vector128.Create(
+        (byte)1, 0x80, 1, 0x80,
+        (byte)5, 0x80, 5, 0x80,
+        (byte)9, 0x80, 9, 0x80,
+        (byte)13, 0x80, 13, 0x80);
 
     // =====================================================
     //               Color Indexing Transform
@@ -275,6 +548,12 @@ internal static class Vp8LTransforms
         var result = new uint[origWidth * origHeight];
         int srcIdx = 0;
 
+        // bits=0（每像素一个 8 位索引）是绝对主流路径：没有位解包、没有行尾截断，
+        // 且 ExpandPalette 保证 256 项，可整行做无检查的查表。
+        int total = origWidth * origHeight;
+        if (bits == 0 && palette.Length >= 256 && totalUnits >= total && subData.Length >= total)
+            return ExpandIndexed8Bit(subData, result, palette, total);
+
         for (int y = 0; y < origHeight; y++)
         {
             int dstRow = y * origWidth;
@@ -303,6 +582,55 @@ internal static class Vp8LTransforms
         }
         return result;
     }
+
+    /// <summary>
+    /// Color Indexing（bits=0）的展开：索引恒在打包像素的绿字节，逐像素查 256 项调色板。
+    /// AVX2 路径一次 gather 8 个色：pshufb 取每个像素的绿字节 → 把两个 128 位通道的 4+4
+    /// 个索引拼进低 8 字节 → 零扩展成 8 个 int32 → vpgatherdd。
+    /// </summary>
+    private static unsafe uint[] ExpandIndexed8Bit(ReadOnlySpan<uint> subData, uint[] result,
+                                            ReadOnlySpan<uint> palette, int total)
+    {
+        ref uint srcRef = ref MemoryMarshal.GetReference(subData);
+        ref uint dstRef = ref MemoryMarshal.GetArrayDataReference(result);
+
+        int i = 0;
+        if (Avx2.IsSupported && total >= 8)
+        {
+            Span<uint> pal = stackalloc uint[256];
+            palette.Slice(0, 256).CopyTo(pal);
+            ref byte srcBytes = ref Unsafe.As<uint, byte>(ref srcRef);
+            fixed (uint* palPtr = pal)
+            {
+                int limit = total - 8;
+                for (; i <= limit; i += 8)
+                {
+                    // 读侧一次 32 字节 = 8 个像素，天然满足 i+8 <= total 的边界。
+                    Vector256<byte> v = Vector256.LoadUnsafe(ref srcBytes, (nuint)(i * 4));
+                    Vector256<byte> g = Avx2.Shuffle(v, IndexByteMask);
+                    // 每个 128 位通道的低 4 字节各是 4 个索引，先换成 q0,q2 相邻再压成 8 连续字节。
+                    Vector128<byte> low = Avx2.Permute4x64(g.AsInt64(), 0b1000).GetLower().AsByte();
+                    Vector128<byte> idx8 = Vector128.Shuffle(low, CompactIndices);
+                    Vector256<int> idx = Avx2.ConvertToVector256Int32(idx8);
+                    Vector256<int> colors = Avx2.GatherVector256((int*)palPtr, idx, 4);
+                    Vector256.StoreUnsafe(colors.AsUInt32(), ref dstRef, (nuint)i);
+                }
+            }
+        }
+
+        for (; i < total; i++)
+            result[i] = palette[(int)((subData[i] >> 8) & 0xFFu)];
+        return result;
+    }
+
+    /// <summary>每个 128 位通道内取 B,G,R,A 中的绿字节（偏移 1/5/9/13），其余清零。</summary>
+    private static readonly Vector256<byte> IndexByteMask = Vector256.Create(
+        Vector128.Create((byte)1, 5, 9, 13, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80),
+        Vector128.Create((byte)1, 5, 9, 13, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80));
+
+    /// <summary>把 q0|q2 拼接后的 [4 字节索引, 4 字节 0, 4 字节索引, 4 字节 0] 压成 8 连续字节。</summary>
+    private static readonly Vector128<byte> CompactIndices = Vector128.Create(
+        (byte)0, 1, 2, 3, 8, 9, 10, 11, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80);
 
     /// <summary>
     /// 调色板展开，严格对照 libwebp ExpandColorMap：
