@@ -9,6 +9,7 @@
 | [Optimize.md](Optimize.md) | 智能有损压缩（TinyPNG 式）的设计与用法：感知画质度量与阈值标定、各格式策略、量化器取舍、API 与 CLI |
 | [OptimizeAudit.md](OptimizeAudit.md) | `--optimize` 方向性审计：画质判据、WebP 通道口径、GIF 动画、PNG 产出阶段等问题的取证与结论 |
 | [OptimizePlan.md](OptimizePlan.md) | 依据审计结论制定的逐条改进计划（P0~P3），含验收标准与执行记录 |
+| [WebpEncoder.md](WebpEncoder.md) | **WebP 有损（VP8）编码器现状与缺口**：已实现边界、与 libwebp 的同 q 体积对比、i4x4 门槛标定表、按优先级排列的补齐清单（RD / 分段量化 / 无损多 pass / CLI lossless 等） |
 | [JpegAudit.md](JpegAudit.md) | **JPEG 代码审计**：可删除的死代码清单、需要决策的半成品/重复实现、以及编码/解码/optimize 三条链路的剩余性能空间（含 `ParallelPixelThreshold` 定错一个数量级的实测） |
 | [GifFindings.md](GifFindings.md) | GIF 算法与性能记录：Octree/Wu 两条量化路径、LZW 编解码、热点归因与已否决方向 |
 | [ArmFindings.md](ArmFindings.md) | ARM（Apple M4）基线与专属指令实测：x86 SIMD 失效清单、NEON 语义等价、A/B 结果、LD3/RDM/CRC 三条判决 |

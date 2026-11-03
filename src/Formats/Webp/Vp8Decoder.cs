@@ -610,7 +610,7 @@ internal sealed class Vp8Decoder
                 int ymode = _leftModes[y];
                 for (int x = 0; x < 4; x++)
                 {
-                    ymode = DecodeBmode(_partition0, _topModes[topBase + x], ymode);
+                    ymode = Vp8ModeTree.Read(_partition0, _topModes[topBase + x], ymode);
                     _topModes[topBase + x] = (byte)ymode;
                     _imodes[modesBase + y * 4 + x] = (byte)ymode;
                 }
@@ -624,29 +624,6 @@ internal sealed class Vp8Decoder
             : _partition0.GetBit(114) == 0
                 ? 2
                 : (_partition0.GetBit(183) != 0 ? 1 : 3));
-    }
-
-    /// <summary>
-    /// 4×4 亮度模式树（tree_dec.c 的 kBModesProba[top][left] 硬编码分支）。
-    /// 返回值即 B_DC_PRED..B_HU_PRED（0..9）。
-    /// </summary>
-    private static int DecodeBmode(Vp8BoolDecoder br, int top, int left)
-    {
-        byte[,,] p = Vp8Tables.BModesProba;
-        if (br.GetBit(p[top, left, 0]) == 0) return 0; // B_DC_PRED
-        if (br.GetBit(p[top, left, 1]) == 0) return 1; // B_TM_PRED
-        if (br.GetBit(p[top, left, 2]) == 0) return 2; // B_VE_PRED
-        if (br.GetBit(p[top, left, 3]) == 0)
-        {
-            return br.GetBit(p[top, left, 4]) == 0
-                ? 3  // B_HE_PRED
-                : (br.GetBit(p[top, left, 5]) == 0 ? 4 : 5); // B_RD_PRED / B_VR_PRED
-        }
-        return br.GetBit(p[top, left, 6]) == 0
-            ? 6  // B_LD_PRED
-            : br.GetBit(p[top, left, 7]) == 0
-                ? 7  // B_VL_PRED
-                : (br.GetBit(p[top, left, 8]) == 0 ? 8 : 9); // B_HD_PRED / B_HU_PRED
     }
 
     // ==================================================================

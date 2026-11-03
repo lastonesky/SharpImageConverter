@@ -124,6 +124,16 @@ internal sealed class Vp8Encoder
     private readonly short[] _uvSlots = new short[128];
     private readonly int[] _uvCodes = new int[8];
 
+    // ---- i4x4（B_PRED）----
+    /// <summary>本宏块 16 个子块的预测模式（0..9，光栅序）。</summary>
+    private readonly int[] _i4Modes = new int[16];
+    /// <summary>子块在重建平面内的偏移（跨行），与解码端 kScan 同构。</summary>
+    private readonly int[] _i4Scan = new int[16];
+    /// <summary>i4x4 模式树的上方上下文（每宏块列 4 项，每行清 0，与解码端 _topModes 一致）。</summary>
+    private readonly byte[] _i4TopModes;
+    /// <summary>i4x4 模式树的左方上下文（每个宏块行清 0）。</summary>
+    private readonly byte[] _i4LeftModes = new byte[4];
+
     private bool _anyCoefficient;
     private int _y2Nz;
 
@@ -174,6 +184,10 @@ internal sealed class Vp8Encoder
 
         _mbNz = new int[_mbW];
         _mbNzDc = new int[_mbW];
+
+        _i4TopModes = new byte[_mbW * 4];
+        for (int n = 0; n < 16; n++)
+            _i4Scan[n] = (n & 3) * 4 + (n >> 2) * 4 * _strideY;
     }
 
     /// <summary>
@@ -256,6 +270,8 @@ internal sealed class Vp8Encoder
         _leftNzDc = 0;
         Array.Clear(_mbNz);
         Array.Clear(_mbNzDc);
+        Array.Clear(_i4TopModes);
+        Array.Clear(_i4LeftModes);
         _anyCoefficient = false;
         _y2Nz = 0;
 
@@ -295,9 +311,10 @@ internal sealed class Vp8Encoder
             for (int mbX = 0; mbX < _mbW; mbX++)
                 EncodeMacroblock(mbX, mbY);
 
-            // 对应解码端 VP8InitScanline：行末清空左侧 nz 上下文。
+            // 对应解码端 VP8InitScanline：行末清空左侧 nz 上下文与 i4x4 模式上下文。
             _leftNz = 0;
             _leftNzDc = 0;
+            Array.Clear(_i4LeftModes);
 
             // 第一遍只统计概率，滤波不参与任何编码决策，跳过以免重复工作。
             if (!_statsOnly)
@@ -453,22 +470,38 @@ internal sealed class Vp8Encoder
         int yOff = (Pad + mbY * 16) * _strideY + Pad + mbX * 16;
         int uvOff = (Pad + mbY * 8) * _strideUv + Pad + mbX * 8;
 
-        int yMode = ChooseMode16(mbX, mbY, yOff);
+        int yMode = ChooseMode16(mbX, mbY, yOff, out long sse16);
         int uvMode = ChooseMode8(mbX, mbY, uvOff);
 
         _anyCoefficient = false;
-        PrepareLumaResidual(mbX, mbY, yOff);
+
+        // i4x4 先在重建平面上试走一遍（逐块预测→量化→重建），若最终不选它，
+        // 再恢复 16×16 的预测重做残差——两条路互斥，不能共用重建结果。
+        bool useI4 = TryPrepareI4x4(mbX, mbY, yOff, sse16);
+        if (!useI4)
+        {
+            _anyCoefficient = false;
+            Vp8IntraPred.Pred16(yMode, mbY > 0, mbX > 0, _reconY, yOff, _strideY);
+            PrepareLumaResidual(mbX, mbY, yOff);
+        }
         PrepareChromaResidual(mbX, mbY, uvOff);
 
         bool skip = !_anyCoefficient;
 
-        WriteMacroblockModes(yMode, uvMode, skip);
+        WriteMacroblockModes(mbX, useI4, yMode, uvMode, skip);
         if (skip)
         {
             _leftNz = 0;
             _mbNz[mbX] = 0;
-            _leftNzDc = 0;
-            _mbNzDc[mbX] = 0;
+            if (!useI4)
+            {
+                _leftNzDc = 0;
+                _mbNzDc[mbX] = 0;
+            }
+        }
+        else if (useI4)
+        {
+            WriteI4ResidualTokens(mbX);
         }
         else
         {
@@ -476,13 +509,15 @@ internal sealed class Vp8Encoder
         }
     }
 
-    /// <summary>16×16 亮度预测模式选择（0=DC, 1=TM, 2=V, 3=H），结束时预测已写入重建平面。</summary>
-    private int ChooseMode16(int mbX, int mbY, int yOff)
+    /// <summary>
+    /// 16×16 亮度预测模式选择（0=DC, 1=TM, 2=V, 3=H），结束时预测已写入重建平面。
+    /// </summary>
+    private int ChooseMode16(int mbX, int mbY, int yOff, out long bestSse)
     {
         bool hasTop = mbY > 0;
         bool hasLeft = mbX > 0;
         int best = 0;
-        long bestSse = long.MaxValue;
+        bestSse = long.MaxValue;
 
         for (int mode = 0; mode < 4; mode++)
         {
@@ -497,6 +532,146 @@ internal sealed class Vp8Encoder
 
         Vp8IntraPred.Pred16(best, hasTop, hasLeft, _reconY, yOff, _strideY);
         return best;
+    }
+
+    /// <summary>
+    /// 尝试以 i4x4（B_PRED）编码本宏块：逐块按 SSE 选 10 种 4×4 模式中最优者，
+    /// 随即量化、反量化、重建，作为下一个子块的预测源（与解码端逐块推进的顺序一致）。
+    /// 返回 false 表示最终不采用 i4x4，此时重建平面已不可用，调用方须重做 16×16。
+    /// </summary>
+    private bool TryPrepareI4x4(int mbX, int mbY, int yOff, long sse16)
+    {
+        // sse16 == 0 时 ShouldUseI4x4 恒为假，试排必然白做——精确的提前退出。
+        if (sse16 == 0) return false;
+        PrepareTopRight(mbX, mbY, yOff);
+
+        long sse4 = 0;
+        bool any = false;
+
+        for (int n = 0; n < 16; n++)
+        {
+            int off = yOff + _i4Scan[n];
+            int baseX = mbX * 16 + (n & 3) * 4;
+            int baseY = mbY * 16 + (n >> 2) * 4;
+
+            int bestMode = 0;
+            long bestSse = long.MaxValue;
+            for (int mode = 0; mode <= I4MaxMode; mode++)
+            {
+                Vp8IntraPred.Pred4(mode, _reconY, off, _strideY);
+                long sse = BlockSse4x4(_srcY, _width, _height, _reconY, off, _strideY, baseX, baseY);
+                if (sse < bestSse)
+                {
+                    bestSse = sse;
+                    bestMode = mode;
+                }
+            }
+
+            Vp8IntraPred.Pred4(bestMode, _reconY, off, _strideY);
+            _i4Modes[n] = bestMode;
+            sse4 += bestSse;
+
+            // 残差 → 正变换 → 量化（i4x4 的 DC 走 y1Dc，不汇入 Y2）→ 反量化 → 重建
+            ComputeResidualY(mbX, mbY, n, _residual);
+            Vp8ForwardTransform.Dct4x4(_residual, _blockCoef);
+
+            int dst = n * 16;
+            int last = -1;
+            for (int i = 0; i < 16; i++)
+            {
+                int raster = Vp8Tables.Zigzag[i];
+                int dq = i == 0 ? _y1Dc : _y1Ac;
+                int q = Quantize(_blockCoef[raster], dq);
+                _lumaQuant[dst + i] = q;
+                _lumaSlots[dst + raster] = (short)(q * dq);
+                if (q != 0)
+                {
+                    last = i;
+                    any = true;
+                }
+            }
+
+            int nz = last < 0 ? 0 : last + 1;
+            bool dcNonZero = _lumaSlots[dst] != 0;
+            _lumaCodes[n] = NonZeroCode(nz, dcNonZero);
+            ApplyTransform(_lumaSlots, dst, _reconY, off, _strideY, _lumaCodes[n]);
+        }
+
+        if (!ShouldUseI4x4(sse4, sse16))
+            return false;
+
+        _anyCoefficient = any;
+        return true;
+    }
+
+    /// <summary>
+    /// 16×16 与 i4x4 的取舍。i4x4 的预测残差通常小得多，但代价是每个子块 1~7 bit 的模式
+    /// 与额外的一次变换；纯 SSE 比较会让编码体积反而变大，因此要求 SSE 改善到 16×16 的
+    /// <see cref="I4SseThresholdPercent"/>% 以内才采用。
+    /// <para>
+    /// 门槛标定（6 张 1024×1024 图 × q50/75/90/95，合计 24 组；明细见
+    /// <c>docs/WebpEncoder.md</c> §3）：门槛 40 时总体积 −6.81%、55 时 −7.48%、
+    /// 70 时 −6.71%、85 时 −4.85%、100（只要 SSE 有改善就用）时 −2.78%，平均 PSNR 分别
+    /// +0.074/+0.087/+0.114/+0.138/+0.159 dB。取 55 为全局最优。
+    /// </para>
+    /// <para>
+    /// 已知局限：最优门槛随内容漂移（自然照片偏 40、UI 截图偏 70~100），单一的像素域门槛
+    /// 无法表达「模式位 vs 残差能量」的兑换率——这属于后续 RD 优化的范畴。
+    /// 代价：1024² q75 编码 78 → 110 ms（+41%），试排对每个宏块都要跑一遍。
+    /// </para>
+    /// </summary>
+    private static bool ShouldUseI4x4(long sse4, long sse16)
+        => sse4 * 100 < sse16 * I4SseThresholdPercent;
+
+    /// <summary>i4x4 采用的 SSE 门槛：需改善到 16×16 的该百分比以内（标定见 <see cref="ShouldUseI4x4"/>）。</summary>
+    private const int I4SseThresholdPercent = 55;
+
+    /// <summary>i4x4 亮度子块模式搜索的上界（含）：0=B_DC … 9=B_HU 全开。</summary>
+    private const int I4MaxMode = 9;
+
+    /// <summary>
+    /// 对应解码端 frame_dec.c 的 top_right 预处理：i4x4 的 4×4 子块右上边界取自上一宏块行，
+    /// 最右列宏块复制本行第 15 个样本；并把结果复制到本宏块第 3/7/11 行右侧，
+    /// 供下方子块读取。编码端必须与解码端逐字节相同，否则预测会分叉。
+    /// </summary>
+    private void PrepareTopRight(int mbX, int mbY, int yOff)
+    {
+        byte v0, v1, v2, v3;
+        if (mbY > 0)
+        {
+            int src = yOff - _strideY + 16;
+            if (mbX >= _mbW - 1)
+            {
+                byte edge = _reconY[yOff - _strideY + 15];
+                v0 = v1 = v2 = v3 = edge;
+            }
+            else
+            {
+                v0 = _reconY[src];
+                v1 = _reconY[src + 1];
+                v2 = _reconY[src + 2];
+                v3 = _reconY[src + 3];
+            }
+
+            _reconY[src] = v0;
+            _reconY[src + 1] = v1;
+            _reconY[src + 2] = v2;
+            _reconY[src + 3] = v3;
+        }
+        else
+        {
+            // 首个宏块行：上边界统一为 127（InitReconBoundaries 已填）。
+            v0 = v1 = v2 = v3 = 127;
+        }
+
+        for (int k = 1; k <= 3; k++)
+        {
+            int dst = yOff + (4 * k - 1) * _strideY + 16;
+            _reconY[dst] = v0;
+            _reconY[dst + 1] = v1;
+            _reconY[dst + 2] = v2;
+            _reconY[dst + 3] = v3;
+        }
     }
 
     /// <summary>色度 8×8 预测模式选择（U/V 共用同一模式），结束时预测已写入重建平面。</summary>
@@ -725,32 +900,59 @@ internal sealed class Vp8Encoder
         }
     }
 
-    private void WriteMacroblockModes(int yMode, int uvMode, bool skip)
+    private void WriteMacroblockModes(int mbX, bool useI4, int yMode, int uvMode, bool skip)
     {
         _part0.PutBit(skip ? 1 : 0, 128); // prob_skip_false 固定 128
 
-        // is_i4x4：写 1 表示 16×16。
-        _part0.PutBit(1, 145);
+        // is_i4x4：写 1 表示 16×16，写 0 表示 4×4。
+        _part0.PutBit(useI4 ? 0 : 1, 145);
 
-        // 16×16 亮度模式树（与解码端 ParseIntraMode 的读法互为逆序）。
-        switch (yMode)
+        if (useI4)
         {
-            case 1: // TM
-                _part0.PutBit(1, 156);
-                _part0.PutBit(1, 128);
-                break;
-            case 3: // H
-                _part0.PutBit(1, 156);
-                _part0.PutBit(0, 128);
-                break;
-            case 2: // V
-                _part0.PutBit(0, 156);
-                _part0.PutBit(1, 163);
-                break;
-            default: // DC
-                _part0.PutBit(0, 156);
-                _part0.PutBit(0, 163);
-                break;
+            int topBase = mbX * 4;
+            for (int y = 0; y < 4; y++)
+            {
+                int left = _i4LeftModes[y];
+                for (int x = 0; x < 4; x++)
+                {
+                    int mode = _i4Modes[y * 4 + x];
+                    Vp8ModeTree.Write(_part0, mode, _i4TopModes[topBase + x], left);
+                    _i4TopModes[topBase + x] = (byte)mode;
+                    left = mode;
+                }
+                _i4LeftModes[y] = (byte)left;
+            }
+        }
+        else
+        {
+            // 解码端在 16×16 宏块里同样把该宏块的 4 列/4 行模式上下文填成这同一个模式
+            // （ParseIntraMode 的 !isI4X4 分支），i4x4 宏块据此取上下文，必须同步。
+            int topBase16 = mbX * 4;
+            for (int i = 0; i < 4; i++)
+                _i4TopModes[topBase16 + i] = (byte)yMode;
+            for (int i = 0; i < 4; i++)
+                _i4LeftModes[i] = (byte)yMode;
+
+            // 16×16 亮度模式树（与解码端 ParseIntraMode 的读法互为逆序）。
+            switch (yMode)
+            {
+                case 1: // TM
+                    _part0.PutBit(1, 156);
+                    _part0.PutBit(1, 128);
+                    break;
+                case 3: // H
+                    _part0.PutBit(1, 156);
+                    _part0.PutBit(0, 128);
+                    break;
+                case 2: // V
+                    _part0.PutBit(0, 156);
+                    _part0.PutBit(1, 163);
+                    break;
+                default: // DC
+                    _part0.PutBit(0, 156);
+                    _part0.PutBit(0, 163);
+                    break;
+            }
         }
 
         // 色度模式树（U/V 共用）。
@@ -809,6 +1011,50 @@ internal sealed class Vp8Encoder
         int outTopNz = tnz;
         int outLeftNz = lnz >> 4;
 
+        WriteChromaTokens(mbX, ref outTopNz, ref outLeftNz);
+
+        _mbNz[mbX] = outTopNz;
+        _leftNz = outLeftNz;
+    }
+
+    /// <summary>
+    /// i4x4 的亮度系数：没有 Y2，16 个块都以 first=0（DC 在块内）、类型 3 的上下文编码。
+    /// 与解码端 <c>ParseResiduals(isI4X4=true)</c> 的簿记逐句对应。
+    /// </summary>
+    private void WriteI4ResidualTokens(int mbX)
+    {
+        int tnz = _mbNz[mbX] & 0x0f;
+        int lnz = _leftNz & 0x0f;
+        int l = 0;
+
+        for (int y = 0; y < 4; y++)
+        {
+            l = lnz & 1;
+            for (int x = 0; x < 4; x++)
+            {
+                int block = y * 4 + x;
+                int bctx = l + (tnz & 1);
+                WriteCoeffs(_tokens, 3, bctx, 0, _lumaQuant.AsSpan(block * 16, 16));
+                int nz = NonZeroLength(_lumaQuant.AsSpan(block * 16, 16), 0);
+                l = nz > 0 ? 1 : 0;
+                tnz = (tnz >> 1) | (l << 7);
+            }
+            tnz >>= 4;
+            lnz = (lnz >> 1) | (l << 7);
+        }
+        int outTopNz = tnz;
+        int outLeftNz = lnz >> 4;
+
+        WriteChromaTokens(mbX, ref outTopNz, ref outLeftNz);
+
+        _mbNz[mbX] = outTopNz;
+        _leftNz = outLeftNz;
+    }
+
+    /// <summary>色度的 4 个块（U/V 各 2×2）。两种亮度路径共用。</summary>
+    private void WriteChromaTokens(int mbX, ref int outTopNz, ref int outLeftNz)
+    {
+        int tnz, lnz, l;
         int index = 0;
         for (int ch = 0; ch < 4; ch += 2)
         {
@@ -833,9 +1079,6 @@ internal sealed class Vp8Encoder
             outTopNz |= (tnz << 4) << ch;
             outLeftNz |= (lnz & 0xf0) << ch;
         }
-
-        _mbNz[mbX] = outTopNz;
-        _leftNz = outLeftNz;
     }
 
     /// <summary>
