@@ -1,3 +1,7 @@
+using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
+using System.Runtime.Intrinsics;
+
 namespace SharpImageConverter.Formats.Webp;
 
 /// <summary>
@@ -525,9 +529,11 @@ internal sealed class Vp8Encoder
         long sse = 0;
         for (int block = 0; block < 16; block++)
         {
-            ComputeResidualY(mbX, mbY, block, _residual);
-            for (int i = 0; i < 16; i++)
-                sse += (long)_residual[i] * _residual[i];
+            int bx = (block & 3) * 4;
+            int by = (block >> 2) * 4;
+            int reconOff = (Pad + mbY * 16) * _strideY + Pad + mbX * 16 + by * _strideY + bx;
+            sse += BlockSse4x4(_srcY, _width, _height, _reconY, reconOff, _strideY,
+                               mbX * 16 + bx, mbY * 16 + by);
         }
         return sse;
     }
@@ -537,11 +543,66 @@ internal sealed class Vp8Encoder
         long sse = 0;
         for (int ch = 0; ch < 2; ch++)
         {
+            byte[] src = ch == 0 ? _srcU : _srcV;
+            byte[] recon = ch == 0 ? _reconU : _reconV;
             for (int block = 0; block < 4; block++)
             {
-                ComputeResidualUv(mbX, mbY, ch, block, _residual);
-                for (int i = 0; i < 16; i++)
-                    sse += (long)_residual[i] * _residual[i];
+                int bx = (block & 1) * 4;
+                int by = (block >> 1) * 4;
+                int reconOff = (Pad + mbY * 8) * _strideUv + Pad + mbX * 8 + by * _strideUv + bx;
+                sse += BlockSse4x4(src, _cw, _ch, recon, reconOff, _strideUv,
+                                   mbX * 8 + bx, mbY * 8 + by);
+            }
+        }
+        return sse;
+    }
+
+    /// <summary>
+    /// 一个 4×4 块的残差平方和，直接从平面算，不再到 <c>_residual</c> 中转。
+    /// 内侧块（4 行都在图内、行内起止都在图内）走向量路径：两行一次，把 8 个字节
+    /// 宽成 ushort 后相减、相乘，再宽成 int 累加。边缘块回落到逐像素钳制的标量路径，
+    /// 与 <see cref="ComputeResidualY"/> 的钳制规则完全一致。
+    /// </summary>
+    private static long BlockSse4x4(byte[] src, int srcWidth, int srcHeight,
+                                    byte[] recon, int reconOff, int reconStride,
+                                    int baseX, int baseY)
+    {
+        if (baseY + 3 < srcHeight && baseX + 3 < srcWidth)
+        {
+            ref byte srcRef = ref MemoryMarshal.GetArrayDataReference(src);
+            ref byte recRef = ref MemoryMarshal.GetArrayDataReference(recon);
+            Vector128<int> acc = Vector128<int>.Zero;
+            for (int y = 0; y < 4; y += 2)
+            {
+                int s0 = (baseY + y) * srcWidth + baseX;
+                ulong sp = Unsafe.ReadUnaligned<uint>(ref Unsafe.Add(ref srcRef, s0))
+                         | ((ulong)Unsafe.ReadUnaligned<uint>(ref Unsafe.Add(ref srcRef, s0 + srcWidth)) << 32);
+                int r0 = reconOff + y * reconStride;
+                ulong rp = Unsafe.ReadUnaligned<uint>(ref Unsafe.Add(ref recRef, r0))
+                         | ((ulong)Unsafe.ReadUnaligned<uint>(ref Unsafe.Add(ref recRef, r0 + reconStride)) << 32);
+
+                Vector128<short> d =
+                    Vector128.WidenLower(Vector128.CreateScalarUnsafe(sp).AsByte()).AsInt16()
+                    - Vector128.WidenLower(Vector128.CreateScalarUnsafe(rp).AsByte()).AsInt16();
+                Vector128<ushort> sq = Vector128.Multiply(d, d).AsUInt16();
+                acc += Vector128.WidenLower(sq).AsInt32() + Vector128.WidenUpper(sq).AsInt32();
+            }
+            return Vector128.Sum(acc);
+        }
+
+        long sse = 0;
+        for (int y = 0; y < 4; y++)
+        {
+            int gy = baseY + y;
+            if (gy >= srcHeight) gy = srcHeight - 1;
+            int srcRow = gy * srcWidth;
+            int reconRow = reconOff + y * reconStride;
+            for (int x = 0; x < 4; x++)
+            {
+                int gx = baseX + x;
+                if (gx >= srcWidth) gx = srcWidth - 1;
+                int diff = src[srcRow + gx] - recon[reconRow + x];
+                sse += (long)diff * diff;
             }
         }
         return sse;
@@ -981,6 +1042,12 @@ internal sealed class Vp8Encoder
         int baseY = mbY * 16 + by;
         int reconOff = (Pad + mbY * 16) * _strideY + Pad + mbX * 16 + by * _strideY + bx;
 
+        if (baseY + 3 < _height && baseX + 3 < _width)
+        {
+            ResidualBlock4x4(_srcY, _width, _reconY, reconOff, _strideY, baseX, baseY, residual);
+            return;
+        }
+
         for (int y = 0; y < 4; y++)
         {
             int gy = baseY + y;
@@ -998,6 +1065,31 @@ internal sealed class Vp8Encoder
         }
     }
 
+    /// <summary>
+    /// 4×4 残差（内侧块专用，不做越界钳制）：一次取一行的 4 个字节，
+    /// 宽成 short 相减后再宽成 int 存回。调用方必须保证 4 行都在图内、
+    /// 且 baseX..baseX+3 不跨行——越界分支仍走标量钳制路径。
+    /// </summary>
+    private static void ResidualBlock4x4(byte[] src, int srcWidth,
+                                         byte[] recon, int reconOff, int reconStride,
+                                         int baseX, int baseY, int[] residual)
+    {
+        ref byte srcRef = ref MemoryMarshal.GetArrayDataReference(src);
+        ref byte recRef = ref MemoryMarshal.GetArrayDataReference(recon);
+        ref int resRef = ref MemoryMarshal.GetArrayDataReference(residual);
+
+        for (int y = 0; y < 4; y++)
+        {
+            int s = (baseY + y) * srcWidth + baseX;
+            int r = reconOff + y * reconStride;
+            Vector128<short> sv = Vector128.WidenLower(
+                Vector128.CreateScalarUnsafe(Unsafe.ReadUnaligned<uint>(ref Unsafe.Add(ref srcRef, s))).AsByte()).AsInt16();
+            Vector128<short> rv = Vector128.WidenLower(
+                Vector128.CreateScalarUnsafe(Unsafe.ReadUnaligned<uint>(ref Unsafe.Add(ref recRef, r))).AsByte()).AsInt16();
+            Vector128.StoreUnsafe(Vector128.WidenLower(sv - rv), ref resRef, (nuint)(y * 4));
+        }
+    }
+
     private void ComputeResidualUv(int mbX, int mbY, int ch, int block, int[] residual)
     {
         int bx = (block & 1) * 4;
@@ -1007,6 +1099,12 @@ internal sealed class Vp8Encoder
         int reconOff = (Pad + mbY * 8) * _strideUv + Pad + mbX * 8 + by * _strideUv + bx;
         byte[] src = ch == 0 ? _srcU : _srcV;
         byte[] recon = ch == 0 ? _reconU : _reconV;
+
+        if (baseY + 3 < _ch && baseX + 3 < _cw)
+        {
+            ResidualBlock4x4(src, _cw, recon, reconOff, _strideUv, baseX, baseY, residual);
+            return;
+        }
 
         for (int y = 0; y < 4; y++)
         {
