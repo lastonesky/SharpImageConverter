@@ -26,6 +26,9 @@ namespace SharpImageConverter.Core
         /// </summary>
         public float? WebpQuality { get; set; }
 
+        /// <summary>是否输出无损 WebP（VP8L）；为 null 时沿用编码器设置。</summary>
+        public bool? WebpLossless { get; set; }
+
         /// <summary>
         /// 复制一份选项，避免调用方在保存过程中继续改同一个实例。
         /// </summary>

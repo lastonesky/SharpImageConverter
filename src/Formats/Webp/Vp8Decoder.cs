@@ -219,6 +219,7 @@ internal sealed class Vp8Decoder
 
         if (_width == 0 || _height == 0)
             throw new WebpBitstreamException("VP8 图像宽高为 0");
+        WebpDecoder.ValidatePixelCount(_width, _height);
 
         if (partitionLength > _data.Length - _offset)
             throw new WebpBitstreamException("VP8 partition0 长度超出 chunk 数据范围");

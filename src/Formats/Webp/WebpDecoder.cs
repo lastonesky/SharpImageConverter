@@ -37,6 +37,8 @@ public sealed record WebpAnimation(int CanvasWidth, int CanvasHeight, int LoopCo
 /// </summary>
 public static class WebpDecoder
 {
+    // Bound RGBA allocations before multiplication/allocation. 64 MP caps one image at 256 MiB.
+    private const long MaxDecodedPixels = 64_000_000;
     /// <summary>
     /// 解码 WebP 文件到 RGBA 像素缓冲区（动图返回最后一帧的整幅画布）。
     /// </summary>
@@ -160,12 +162,16 @@ public static class WebpDecoder
         if (primary.Id == WebpChunkId.Vp8)
         {
             var rgba8 = DecodeVp8Chunk(primary.GetData(container.RawData), out width, out height);
+            ValidateStaticCanvas(container, width, height);
+            ValidatePixelCount(width, height);
             ApplyAlphChunk(container, rgba8, width, height);
             return rgba8;
         }
 
         EnsureVp8L(primary);
         Vp8LDecoder.ReadSize(primary.GetData(container.RawData), out width, out height);
+        ValidateStaticCanvas(container, width, height);
+        ValidatePixelCount(width, height);
 
         var rgba = new byte[checked(width * height * 4)];
         DecodeStaticInto(container, primary, rgba, width, height);
@@ -194,6 +200,8 @@ public static class WebpDecoder
         if (primary.Id == WebpChunkId.Vp8)
         {
             var rgba8 = DecodeVp8Chunk(primary.GetData(container.RawData), out width, out height);
+            ValidateStaticCanvas(container, width, height);
+            ValidatePixelCount(width, height);
             ApplyAlphChunk(container, rgba8, width, height);
             int need = checked(width * height * 4);
             if (dst.Length < need)
@@ -204,6 +212,8 @@ public static class WebpDecoder
 
         EnsureVp8L(primary);
         Vp8LDecoder.ReadSize(primary.GetData(container.RawData), out width, out height);
+        ValidateStaticCanvas(container, width, height);
+        ValidatePixelCount(width, height);
 
         int required = checked(width * height * 4);
         if (dst.Length < required)
@@ -239,6 +249,21 @@ public static class WebpDecoder
     {
         if (primary.Id != WebpChunkId.Vp8L)
             throw new WebpContainerException($"主图像 chunk 类型未处理: {primary.Id}");
+    }
+
+    private static void ValidateStaticCanvas(WebpContainer container, int width, int height)
+    {
+        if (container.CanvasWidth > 0 && container.CanvasHeight > 0
+            && (container.CanvasWidth != width || container.CanvasHeight != height))
+            throw new WebpContainerException(
+                $"VP8X 画布尺寸 {container.CanvasWidth}x{container.CanvasHeight} 与静态图像尺寸 {width}x{height} 不符");
+    }
+
+    internal static void ValidatePixelCount(int width, int height)
+    {
+        if (width <= 0 || height <= 0 || (long)width * height > MaxDecodedPixels)
+            throw new WebpUnsupportedException(
+                $"图像尺寸 {width}x{height} 超出解码像素上限 {MaxDecodedPixels:N0}");
     }
 
     private static WebpChunk RequirePrimaryChunk(WebpContainer container)
@@ -290,6 +315,7 @@ public static class WebpDecoder
             throw new WebpContainerException($"动图画布尺寸无效：{canvasWidth}x{canvasHeight}");
         if (canvasWidth > 16383 || canvasHeight > 16383)
             throw new WebpUnsupportedException("动图画布尺寸超出实现上限 16383");
+        ValidatePixelCount(canvasWidth, canvasHeight);
 
         var canvas = new byte[canvasWidth * canvasHeight * 4];
         // 上一帧绘制前（已应用上一帧 disposal）的画布；混合运算的 dst 就是它。
@@ -309,6 +335,7 @@ public static class WebpDecoder
             var header = WebpContainer.ParseAnmfHeader(container.RawData, anmf);
             if (header.Width <= 0 || header.Height <= 0)
                 throw new WebpContainerException($"ANMF 帧尺寸无效：{header.Width}x{header.Height}");
+            ValidatePixelCount(header.Width, header.Height);
             // WebP 规范（RFC 9649 §2.7.1.1）要求帧矩形完全位于画布内；
             // libwebp 的 demux（IsValidExtendedFormat）同样按此拒绝整份文件。
             if (header.X < 0 || header.Y < 0 || header.X + header.Width > canvasWidth || header.Y + header.Height > canvasHeight)

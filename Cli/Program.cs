@@ -296,7 +296,7 @@ sealed partial class Program
         Console.WriteLine("支持输入: .jpg/.jpeg/.png/.bmp/.webp/.gif");
         Console.WriteLine("支持输出: .jpg/.jpeg/.png/.bmp/.webp/.gif");
         Console.WriteLine("操作: resize:WxH | resizebilinear:WxH | resizefit:WxH | grayscale");
-        Console.WriteLine("参数: --quality N | --subsample 420/422/444 | --jpeg-progressive | --keep-metadata | --idct int/float | --stream | --stream-strict | --strict-format | --memory-limit N | --no-memory-guard | --jpeg-debug | --gif-frames | --anim-frames | --gray | --dithering on/off");
+        Console.WriteLine("参数: --quality N（JPEG/WebP 有损）| --webp-lossless | --subsample 420/422/444 | --jpeg-progressive | --keep-metadata | --idct int/float | --stream | --stream-strict | --strict-format | --memory-limit N | --no-memory-guard | --jpeg-debug | --gif-frames | --anim-frames | --gray | --dithering on/off");
         Console.WriteLine("动图: GIF 与 WebP 动图互转保留全部帧与时长；输出为静态格式时只取首帧（并提示）；--gif-frames/--anim-frames 把动图拆成单帧序列");
         Console.WriteLine("WebP 档位: --webp-method 0~6 已无效果（纯 C# 编码器没有 effort 档位，仍接受该参数只为兼容既有脚本）");
         Console.WriteLine("JPEG 编码: 默认 baseline；--jpeg-progressive 输出 progressive（SOF2）；--jpeg-trellis 启用 RD 优化量化（同画质省 5%~15% 体积，编码耗时约 3~10 倍，默认关闭）");

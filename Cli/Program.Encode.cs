@@ -127,7 +127,8 @@ sealed partial class Program
         {
             var encoder = new WebpEncoderAdapter
             {
-                Quality = options.JpegQuality ?? 75,
+                Quality = options.WebpQuality ?? 75,
+                Lossless = options.WebpLossless,
                 ConcurrencyStrategy = options.ParallelWebpEncode ? WebpConcurrencyStrategy.Parallel : WebpConcurrencyStrategy.Auto,
             };
             // 只在用户显式指定时覆盖，默认档由 WebpEncoderOptions 决定（当前为 method 3）
@@ -173,7 +174,8 @@ sealed partial class Program
         {
             var encoder = new WebpEncoderAdapterRgba
             {
-                Quality = options.JpegQuality ?? 75,
+                Quality = options.WebpQuality ?? 75,
+                Lossless = options.WebpLossless,
                 ConcurrencyStrategy = options.ParallelWebpEncode ? WebpConcurrencyStrategy.Parallel : WebpConcurrencyStrategy.Auto,
             };
             if (options.WebpMethod.HasValue) encoder.Method = options.WebpMethod.Value;

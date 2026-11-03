@@ -27,6 +27,12 @@ internal sealed class CliOptions(string inputPath)
     /// <summary>JPEG 质量（1-100）。</summary>
     public int? JpegQuality { get; set; }
 
+    /// <summary>WebP 有损质量（1-100）。</summary>
+    public int? WebpQuality { get; set; }
+
+    /// <summary>强制输出无损 WebP。</summary>
+    public bool WebpLossless { get; set; }
+
     /// <summary>是否使用 4:2:0 子采样。</summary>
     public bool? Subsample420 { get; set; }
 

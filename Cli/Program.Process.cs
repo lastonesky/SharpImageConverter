@@ -506,7 +506,7 @@ sealed partial class Program
 
         var durations = anim.Frames.Select(f => f.DurationMs).ToList();
         int loop = anim.LoopCount;
-        float quality = options.JpegQuality.HasValue ? options.JpegQuality.Value : 75f;
+        float quality = options.WebpQuality ?? 75f;
 
         // 带操作时逐帧处理（alpha 一并保留，尺寸随之改变）
         List<Image<Rgba32>> frames;
@@ -526,7 +526,8 @@ sealed partial class Program
 
         if (outExt == ".webp")
         {
-            WebpAnimationEncoder.EncodeRgba32(outputPath, frames, durations, loop, quality);
+            WebpAnimationEncoder.EncodeRgba32(outputPath, frames, durations, loop,
+                new WebpEncoderOptions(quality, WebpConcurrencyStrategy.Auto, lossless: options.WebpLossless));
             reporter.Info($"✅ WebP 动图: {frames.Count} 帧 {frames[0].Width}x{frames[0].Height}，循环 {loop} 次");
             return;
         }
@@ -578,9 +579,10 @@ sealed partial class Program
         }
 
         int loop = anim.LoopCount;
-        float qWebp = options.JpegQuality.HasValue ? options.JpegQuality.Value : 75f;
+        float qWebp = options.WebpQuality ?? 75f;
         // 必须走 RGBA 路径：GIF 的透明索引只存在于 alpha 通道，走 Rgb24 会把透明背景变成不透明。
-        WebpAnimationEncoder.EncodeRgba32(outputPath, anim.RgbaFrames!, anim.FrameDurationsMs, loop, qWebp);
+        WebpAnimationEncoder.EncodeRgba32(outputPath, anim.RgbaFrames!, anim.FrameDurationsMs, loop,
+            new WebpEncoderOptions(qWebp, WebpConcurrencyStrategy.Auto, lossless: options.WebpLossless));
     }
     static void ProcessGifToWebpWithOps(CliOptions options)
     {
@@ -595,8 +597,9 @@ sealed partial class Program
             processed.Add(ApplyOpsToRgba(anim.RgbaFrames[i], options.Operations));
         }
 
-        float qWebpOps = options.JpegQuality.HasValue ? options.JpegQuality.Value : 75f;
-        WebpAnimationEncoder.EncodeRgba32(outputPath, processed, anim.FrameDurationsMs, anim.LoopCount, qWebpOps);
+        float qWebpOps = options.WebpQuality ?? 75f;
+        WebpAnimationEncoder.EncodeRgba32(outputPath, processed, anim.FrameDurationsMs, anim.LoopCount,
+            new WebpEncoderOptions(qWebpOps, WebpConcurrencyStrategy.Auto, lossless: options.WebpLossless));
     }
 
     /// <summary>

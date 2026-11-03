@@ -165,6 +165,12 @@ namespace SharpImageConverter.Formats.Webp
             set => Options = Options with { Method = value };
         }
 
+        public bool Lossless
+        {
+            get => Options.Lossless;
+            set => Options = Options with { Lossless = value };
+        }
+
         /// <summary>
         /// 将 RGB24 图像编码为 WebP 文件
         /// </summary>
@@ -205,7 +211,11 @@ namespace SharpImageConverter.Formats.Webp
 
         /// <summary>把 <see cref="SaveOptions.WebpQuality"/> 套到本实例的其余参数上。</summary>
         private WebpEncoderOptions Effective(SaveOptions options)
-            => options.WebpQuality is { } q ? Options with { Quality = q } : Options;
+            => Options with
+            {
+                Quality = options.WebpQuality ?? Options.Quality,
+                Lossless = options.WebpLossless ?? Options.Lossless,
+            };
     }
 
     /// <summary>
@@ -231,6 +241,12 @@ namespace SharpImageConverter.Formats.Webp
         {
             get => Options.Method;
             set => Options = Options with { Method = value };
+        }
+
+        public bool Lossless
+        {
+            get => Options.Lossless;
+            set => Options = Options with { Lossless = value };
         }
 
         /// <summary>
@@ -269,11 +285,22 @@ namespace SharpImageConverter.Formats.Webp
 
         /// <summary>把 <see cref="SaveOptions.WebpQuality"/> 套到本实例的其余参数上。</summary>
         private WebpEncoderOptions Effective(SaveOptions options)
-            => options.WebpQuality is { } q ? Options with { Quality = q } : Options;
+            => Options with
+            {
+                Quality = options.WebpQuality ?? Options.Quality,
+                Lossless = options.WebpLossless ?? Options.Lossless,
+            };
     }
 
     public static class WebpAnimationEncoder
     {
+        public static void EncodeRgba32(string path, IReadOnlyList<Image<Rgba32>> frames,
+            IReadOnlyList<int> frameDurationsMs, int loopCount, WebpEncoderOptions options)
+        {
+            using var fs = new FileStream(path, FileMode.Create, FileAccess.Write);
+            EncodeRgba32(fs, frames, frameDurationsMs, loopCount, options);
+        }
+
         public static void EncodeRgb24(string path, IReadOnlyList<Image<Rgb24>> frames, IReadOnlyList<int> frameDurationsMs, int loopCount, float quality = 75f)
         {
             using var fs = new FileStream(path, FileMode.Create, FileAccess.Write);
@@ -342,6 +369,15 @@ namespace SharpImageConverter.Formats.Webp
         public static void EncodeRgba32(Stream stream, IReadOnlyList<Image<Rgba32>> frames, IReadOnlyList<int> frameDurationsMs, int loopCount, float quality = 75f)
         {
             EncodeRgba32(stream, frames, frameDurationsMs, loopCount, new WebpEncoderOptions(quality, WebpConcurrencyStrategy.Auto));
+        }
+
+        public static void EncodeRgba32(string path, byte[][] rgbaFrames, int width, int height,
+            IReadOnlyList<int> frameDurationsMs, int loopCount, WebpEncoderOptions options)
+        {
+            using var fs = new FileStream(path, FileMode.Create, FileAccess.Write);
+            WebpCodec.EncodeAnimatedRgbaToStream(fs, rgbaFrames, width, height,
+                frameDurationsMs is int[] durations ? durations : new List<int>(frameDurationsMs).ToArray(),
+                loopCount, options);
         }
 
         /// <summary>

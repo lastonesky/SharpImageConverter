@@ -277,6 +277,12 @@ sealed partial class Program
             if (TryParseQuality(args, ref i, out int? quality))
             {
                 options.JpegQuality = quality;
+                options.WebpQuality = quality;
+                continue;
+            }
+            if (string.Equals(a, "--webp-lossless", StringComparison.OrdinalIgnoreCase))
+            {
+                options.WebpLossless = true;
                 continue;
             }
             if (TryParseNamedInt(args, ref i, "--webp-method", out int? webpMethod))

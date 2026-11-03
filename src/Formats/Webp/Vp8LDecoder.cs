@@ -97,6 +97,7 @@ public static class Vp8LDecoder
         height = (int)reader.ReadBits(14) + 1;
         if (width < 1 || height < 1 || width > MaxDimension || height > MaxDimension)
             throw new WebpBitstreamException($"VP8L 尺寸 {width}x{height} 超出规格");
+        WebpDecoder.ValidatePixelCount(width, height);
 
         _ = reader.ReadBits(1); // alpha_used
         int version = (int)reader.ReadBits(3);
