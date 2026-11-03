@@ -15,8 +15,9 @@ namespace SharpImageConverter.Formats.Webp;
 /// 各自与 color cache / LZ77 组合的若干候选里选输出最小的一个，全部候选都可被
 /// libwebp 解码且与原始 RGBA 逐像素 bit-exact。
 ///
-/// 有损走 <see cref="Vp8Encoder"/>（VP8 关键帧）；ALPH 编码尚未实现，
-/// 输入带非不透明 alpha 时抛 <see cref="WebpUnsupportedException"/>。
+/// 有损走 <see cref="Vp8Encoder"/>（VP8 关键帧）；输入带非不透明 alpha 时，
+/// 额外用 <see cref="AlphEncoder"/> 把 alpha 平面以 VP8L 无损压缩写入 ALPH chunk，
+/// 容器改为 VP8X（置 alpha 标志）+ ALPH + VP8 的规范顺序。
 /// </summary>
 public static class WebpEncoder
 {
@@ -122,7 +123,7 @@ public static class WebpEncoder
     /// <summary>
     /// 把 RGBA 像素编码为完整 WebP 字节（有损 VP8 关键帧）。
     /// </summary>
-    /// <param name="rgba">像素数据，每像素 R,G,B,A 连续 4 字节；alpha 必须全为 255。</param>
+    /// <param name="rgba">像素数据，每像素 R,G,B,A 连续 4 字节；alpha 可包含任意值。</param>
     /// <param name="width">图像宽度（1..16383）。</param>
     /// <param name="height">图像高度（1..16383）。</param>
     /// <param name="quality">质量（0..100，越大越清晰、体积越大）。</param>
@@ -145,9 +146,40 @@ public static class WebpEncoder
         ImageMetadata? metadata)
     {
         ValidateLossyDimensions(width, height, rgba.Length);
-        EnsureOpaqueAlpha(rgba, width, height);
         var vp8 = Vp8Encoder.Encode(rgba, width, height, quality);
-        return WrapInRiff(vp8, WebpChunkId.Vp8, width, height, metadata);
+
+        int pixelCount = width * height;
+        byte[]? alph = null;
+        for (int i = 0; i < pixelCount; i++)
+        {
+            if (rgba[i * 4 + 3] == 255) continue;
+            var alpha = new byte[pixelCount];
+            for (int p = 0; p < pixelCount; p++)
+                alpha[p] = rgba[p * 4 + 3];
+            alph = AlphEncoder.Encode(alpha, width, height);
+            break;
+        }
+
+        byte[] result = alph is null
+            ? WrapInRiff(vp8, WebpChunkId.Vp8)
+            : WrapLossyWithAlpha(vp8, alph, width, height);
+        return WebpMetadataWriter.Apply(result, width, height, metadata);
+    }
+
+    /// <summary>
+    /// 组装 VP8X + ALPH + VP8 的有损带 alpha 容器。
+    /// 规范顺序：VP8X（alpha 标志置位）→ ALPH（紧邻图像数据之前）→ VP8。
+    /// </summary>
+    private static byte[] WrapLossyWithAlpha(ReadOnlySpan<byte> vp8, ReadOnlySpan<byte> alph, int width, int height)
+    {
+        var chunks = new[]
+        {
+            new WebpOutputChunk(WebpChunkId.Vp8X,
+                WebpChunkWriter.BuildVp8X((byte)Vp8XFlags.Alpha, width, height)),
+            new WebpOutputChunk(WebpChunkId.Alph, alph.ToArray()),
+            new WebpOutputChunk(WebpChunkId.Vp8, vp8.ToArray()),
+        };
+        return WebpChunkWriter.Assemble(chunks);
     }
 
     /// <summary>
@@ -174,19 +206,6 @@ public static class WebpEncoder
                 $"VP8 高度必须在 1..{Vp8Encoder.MaxDimension} 之间");
         if (rgbaLength != checked(width * height * 4))
             throw new ArgumentException("RGBA 像素长度与尺寸不匹配", nameof(rgbaLength));
-    }
-
-    /// <summary>
-    /// 有损 VP8 路径不做 ALPH 编码，alpha 必须全为不透明，否则明确抛不支持。
-    /// </summary>
-    private static void EnsureOpaqueAlpha(ReadOnlySpan<byte> rgba, int width, int height)
-    {
-        int pixels = width * height;
-        for (int i = 0; i < pixels; i++)
-        {
-            if (rgba[i * 4 + 3] != 255)
-                throw new WebpUnsupportedException("有损 VP8 编码暂不支持带 alpha 的图像（ALPH 编码未实现）");
-        }
     }
 
     private static void ValidateDimensions(int width, int height, int rgbaLength)

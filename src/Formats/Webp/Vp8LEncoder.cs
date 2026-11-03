@@ -9,7 +9,7 @@ internal readonly struct Vp8LEncoderOptions
     public Vp8LEncoderOptions(bool useTransforms, bool useColorCache, bool useLz77,
         bool useColorIndexing = false, bool uniformPredictor = false, bool selectBest = false,
         bool useMetaHuffman = true, bool autoPredictor = false, bool autoCrossColor = true,
-        int forcedPredictorMode = -1)
+        int forcedPredictorMode = -1, int forcedCacheBits = -1)
     {
         UseTransforms = useTransforms;
         UseColorCache = useColorCache;
@@ -21,6 +21,7 @@ internal readonly struct Vp8LEncoderOptions
         AutoPredictor = autoPredictor;
         AutoCrossColor = autoCrossColor;
         ForcedPredictorMode = forcedPredictorMode;
+        ForcedCacheBits = forcedCacheBits;
     }
 
     public bool UseTransforms { get; }
@@ -65,6 +66,9 @@ internal readonly struct Vp8LEncoderOptions
     /// <summary>分析用：强制使用指定 predictor 模式（-1 表示正常搜索）。</summary>
     public int ForcedPredictorMode { get; }
 
+    /// <summary>分析用：强制使用指定 color cache 位数（-1 表示按尺寸自动选）。</summary>
+    public int ForcedCacheBits { get; }
+
     /// <summary>仅 literal：无变换、无 color cache、无 LZ77，用于阶段 A 体积基线。</summary>
     public static readonly Vp8LEncoderOptions LiteralOnly = new(false, false, false, useMetaHuffman: false);
 
@@ -97,6 +101,9 @@ internal static class Vp8LEncoder
     private const int MaxCopyLength = 4096;
     private const int MaxDistance = 1048456;
 
+    /// <summary>VP8L color cache 的乘性哈希常数（编码端与解码端定义一致）。</summary>
+    private const uint HashMultiplier = 0x1e35a7bdu;
+
     /// <summary>meta-Huffman 的 entropy image 最多保留的 tile 数（同时也是内存上界）。</summary>
     private const int MaxHuffmanTiles = 1024;
 
@@ -105,9 +112,11 @@ internal static class Vp8LEncoder
 
     /// <summary>
     /// token 缓存（统计遍 → 写出遍复用）的像素数上限。超过该尺寸不再缓存，
-    /// 写出遍重新遍历一遍，以换取可控的峰值内存；512×512 等常见尺寸均在缓存范围内。
+    /// 写出遍重新遍历一遍，以换取可控的峰值内存。
+    /// 每像素最坏一个 token（紧凑 <see cref="Token"/> 16B）+ 位置 4B，2048×2048
+    /// 时约 84MB，是"能省一次 LZ77 搜索"与峰值内存之间的折中。
     /// </summary>
-    private const int MaxCachedTokenPixels = 1 << 19;
+    private const int MaxCachedTokenPixels = 1 << 22;
 
     /// <summary>调色板剪枝的颜色数上限（配合"≤0.5 字节/像素"一起判断）。</summary>
     private const int MaxDecisivePaletteColors = 16;
@@ -134,7 +143,7 @@ internal static class Vp8LEncoder
         if (palette == null && options.UseTransforms && width >= 8 && height >= 8)
         {
             var pair = PrepareSpatialPair(pixels, width, height, options.AutoCrossColor, options.AutoPredictor,
-                options.UseLz77, options.UseColorCache, options.ForcedPredictorMode);
+                options.UseLz77, options.UseColorCache, options.ForcedPredictorMode, options.ForcedCacheBits);
             spatial = options.AutoCrossColor ? pair.WithColor : pair.WithoutColor;
         }
 
@@ -173,6 +182,9 @@ internal static class Vp8LEncoder
         public int CacheSymbolCount;
         public int CopyCount;
         public int CopiedPixels;
+
+        /// <summary>copy 距离分布：≤8 / ≤32 / ≤128 / ≤512 / ≤2048 / ≤8192 / &gt;8192。</summary>
+        public readonly int[] DistanceBuckets = new int[7];
 
         /// <summary>匹配长度分布：&lt;8 / &lt;16 / &lt;32 / &lt;64 / &lt;256 / ≥256。</summary>
         public readonly int[] MatchLengthBuckets = new int[6];
@@ -237,11 +249,12 @@ internal static class Vp8LEncoder
     /// predictor 搜索。返回结果与逐候选全量搜索只在近并列的情况下可能不同。
     /// </summary>
     private static PreparedSpatialPair PrepareSpatialPair(uint[] source, int width, int height,
-        bool autoCrossColor, bool autoPredictor, bool useLz77, bool useColorCache, int forcedMode = -1)
+        bool autoCrossColor, bool autoPredictor, bool useLz77, bool useColorCache, int forcedMode = -1,
+        int forcedCacheBits = -1)
     {
-        int cacheBits = useColorCache ? ChooseCacheBits(width * height) : 0;
         var sg = (uint[])source.Clone();
         ApplySubtractGreenForward(sg);
+        int cacheBits = useColorCache ? ChooseCacheBitsBySize(sg.Length, forcedCacheBits) : 0;
 
         int bits = width >= 16 && height >= 16 ? 4 : 3;
         int subWidth = SubSampleSize(width, bits);
@@ -500,17 +513,24 @@ internal static class Vp8LEncoder
 
         if (!paletteDecisive)
         {
+            // cross-color 被拒绝时 WithColor 与 WithoutColor 是同一个对象，
+            // 此时 (cache, spatial) 与 (no-cache, spatialNoColor) 等候选会完全重合，
+            // 必须去重，否则大图上会白跑一整遍 token 编码（耗时占比很高）。
+            bool colorActive = spatial != null && spatial != spatialNoColor;
             Consider(EncodePrepared(pixels, width, height, alphaUsed,
                 new Vp8LEncoderOptions(true, true, true, autoPredictor: true), spatial, null));
-            // 无 cross-color 的候选：cross-color 的残差熵通常更低，但 mod-256 回绕会在
-            // 残差里留下一道随行推进的断点（渐变图每行恰好一个像素），整行重复因此被
-            // 打断，LZ77 收益大幅缩水。这类收益只有在真实编码后才看得出来，所以交给
-            // 候选选择而不是熵估计来裁决。
             Consider(EncodePrepared(pixels, width, height, alphaUsed,
                 new Vp8LEncoderOptions(true, false, true, autoPredictor: true, autoCrossColor: false),
                 spatialNoColor, null));
-            Consider(EncodePrepared(pixels, width, height, alphaUsed,
-                new Vp8LEncoderOptions(true, false, true, autoPredictor: true), spatial, null));
+            if (colorActive)
+            {
+                // 无 cross-color 的候选：cross-color 的残差熵通常更低，但 mod-256 回绕会在
+                // 残差里留下一道随行推进的断点（渐变图每行恰好一个像素），整行重复因此被
+                // 打断，LZ77 收益大幅缩水。这类收益只有在真实编码后才看得出来，所以交给
+                // 候选选择而不是熵估计来裁决。
+                Consider(EncodePrepared(pixels, width, height, alphaUsed,
+                    new Vp8LEncoderOptions(true, false, true, autoPredictor: true), spatial, null));
+            }
             Consider(EncodePrepared(pixels, width, height, alphaUsed,
                 new Vp8LEncoderOptions(true, false, false, autoPredictor: true), spatial, null));
         }
@@ -533,7 +553,8 @@ internal static class Vp8LEncoder
         Vp8LEncoderOptions options, bool level0, Vp8LEncodeDiagnostics? diagnostics = null)
     {
 
-        int cacheBits = options.UseColorCache ? ChooseCacheBits(width * height) : 0;
+        int cacheBits = options.UseColorCache
+            ? ChooseCacheBits(pixels, width, height, options.ForcedCacheBits) : 0;
         if (cacheBits > 0)
         {
             writer.WriteBit(1);
@@ -651,10 +672,57 @@ internal static class Vp8LEncoder
         writer.WriteCode(code.Codes[symbol], code.Lengths[symbol]);
     }
 
-    private static int ChooseCacheBits(int pixelCount)
+    /// <summary>color cache 位数候选：位数越小码表越小，位数越大命中越多，逐图实测取最小。</summary>
+    /// <remarks>
+    /// 10 位在渐变类样本上只比 8 位省 0.1% 以内，却要多付一次整图走查，因此不参与搜索。
+    /// </remarks>
+    private static readonly int[] CacheBitsCandidates = { 4, 6, 8 };
+
+    /// <summary>cache 位数选择时的抽样像素上限（中等图像只估算中部横带）。</summary>
+    private const int CacheBitsSamplePixels = 1 << 15;
+
+    /// <summary>
+    /// 逐图选择 color cache 位数。
+    /// cache 尺寸并非越大越好：表变大后 green 字母表与缓存符号码长同步上升，命中率增长
+    /// 抵不过码表开销增长。这里用真实 token 码长（含码表开销）比较候选位数。
+    ///
+    /// 适用范围有明确边界：位流体积同时受 meta-Huffman 分组影响，而估计阶段只能按单组
+    /// 计算，图像越大、分组越多，排序越不可靠（实测 peppers/scene 整图估计会把 6 位
+    /// 排到 4 位之上，实际 c4 明显更小）。因此超过 1MP 的图像不启用逐图选择，沿用
+    /// 按尺寸的保守取值；中等图像取中部 ≤32K 像素横带估算，兼顾代表性与耗时。
+    /// 候选按位数升序遍历，严格小于才替换，近并列时保留更小的表。
+    /// </summary>
+    private static int ChooseCacheBits(uint[] pixels, int width, int height, int forcedBits)
     {
-        if (pixelCount >= 4096) return 8;
-        if (pixelCount >= 256) return 6;
+        if (forcedBits >= 0) return forcedBits;
+        int total = pixels.Length;
+        if (total < 256) return 4;
+        if (total > 1 << 20) return ChooseCacheBitsBySize(total, forcedBits);
+
+        int bestBits = CacheBitsCandidates[0];
+        double bestCost = double.MaxValue;
+        foreach (int bits in CacheBitsCandidates)
+        {
+            double cost = EstimateTokenBitsBand(pixels, width, height, bits, CacheBitsSamplePixels);
+            if (cost < bestCost)
+            {
+                bestCost = cost;
+                bestBits = bits;
+            }
+        }
+        return bestBits;
+    }
+
+    /// <summary>
+    /// 仅按像素数取 color cache 位数（供 predictor 方案搜索时的代价估算使用）。
+    /// 真正的 cache 位数在拿到最终残差后用 <see cref="ChooseCacheBits"/> 逐图决定，
+    /// 这里不参与输出选择。
+    /// </summary>
+    private static int ChooseCacheBitsBySize(int total, int forcedBits)
+    {
+        if (forcedBits >= 0) return forcedBits;
+        if (total >= 4096) return 8;
+        if (total >= 256) return 6;
         return 4;
     }
 
@@ -691,6 +759,9 @@ internal static class Vp8LEncoder
         public Token[]? CachedTokens;
         public int[]? CachedPositions;
         public int CachedCount;
+
+        /// <summary>所有 copy token 的长度/距离附加位数之和（与码符号位数相加即为 token 位数）。</summary>
+        public long ExtraBits;
     }
 
     /// <summary>
@@ -700,7 +771,8 @@ internal static class Vp8LEncoder
     /// 因此解码端不会触发紧凑映射，位流中的表顺序与 entropy image 的组 id 一一对应。
     /// </summary>
     private static TokenStatistics CollectStatistics(uint[] pixels, int width, int height, int cacheBits,
-        int greenAlphabet, Vp8LEncoderOptions options, bool allowMetaHuffman, Vp8LEncodeDiagnostics? diagnostics = null)
+        int greenAlphabet, Vp8LEncoderOptions options, bool allowMetaHuffman,
+        Vp8LEncodeDiagnostics? diagnostics = null, int maxChainOverride = -1, bool cacheTokens = true)
     {
         var stats = new TokenStatistics();
         stats.Cost = CostModel.Build(pixels, cacheBits, greenAlphabet, options.UseLz77);
@@ -711,13 +783,14 @@ internal static class Vp8LEncoder
         int numTiles = tilesX * tilesY;
         bool meta = allowMetaHuffman && numTiles >= 4 && width * height >= 256;
 
-        var walker = new TokenWalker(pixels, width, height, options.UseLz77, cacheBits, stats.Cost);
+        var walker = new TokenWalker(pixels, width, height, options.UseLz77, cacheBits, stats.Cost,
+            maxChainOverride);
         Token token;
         int position;
 
         // 统计遍顺带缓存 token 序列，写出遍直接复用（LZ77 搜索只做一次）。
         // 缓存按像素数上限（每像素最坏一个 token、约 16 字节 + 位置），避免大图内存失控。
-        bool cache = width * height <= MaxCachedTokenPixels;
+        bool cache = cacheTokens && width * height <= MaxCachedTokenPixels;
         if (cache)
         {
             stats.CachedTokens = new Token[width * height];
@@ -726,6 +799,7 @@ internal static class Vp8LEncoder
 
         void RecordToken(Token t, int pos)
         {
+            if (t.Kind == TokenKind.Copy) stats.ExtraBits += t.LengthExtraBits + t.DistanceExtraBits;
             if (diagnostics != null) CountToken(t);
             if (!cache) return;
             stats.CachedTokens![stats.CachedCount] = t;
@@ -750,6 +824,11 @@ internal static class Vp8LEncoder
                     int bucket = length < 8 ? 0 : length < 16 ? 1 : length < 32 ? 2 :
                         length < 64 ? 3 : length < 256 ? 4 : 5;
                     diagnostics!.MatchLengthBuckets[bucket]++;
+                    int distance = Vp8LDistance.PlaneCodeToDistance(
+                        width, DecodeCopyValue(t.DistanceSymbol, t.DistanceExtraValue));
+                    int dbucket = distance <= 8 ? 0 : distance <= 32 ? 1 : distance <= 128 ? 2 :
+                        distance <= 512 ? 3 : distance <= 2048 ? 4 : distance <= 8192 ? 5 : 6;
+                    diagnostics!.DistanceBuckets[dbucket]++;
                     break;
             }
         }
@@ -1270,27 +1349,29 @@ internal static class Vp8LEncoder
             int lengthExtraValue, int lengthExtraBits, int distanceSymbol, int distanceExtraValue, int distanceExtraBits)
         {
             Kind = kind;
-            GreenSymbol = greenSymbol;
+            GreenSymbol = (ushort)greenSymbol;
             Red = red;
             Blue = blue;
             Alpha = alpha;
-            LengthExtraValue = lengthExtraValue;
-            LengthExtraBits = lengthExtraBits;
-            DistanceSymbol = distanceSymbol;
+            LengthExtraValue = (ushort)lengthExtraValue;
+            LengthExtraBits = (byte)lengthExtraBits;
+            DistanceSymbol = (byte)distanceSymbol;
             DistanceExtraValue = distanceExtraValue;
-            DistanceExtraBits = distanceExtraBits;
+            DistanceExtraBits = (byte)distanceExtraBits;
         }
 
-        public TokenKind Kind { get; }
-        public int GreenSymbol { get; }
-        public byte Red { get; }
-        public byte Blue { get; }
-        public byte Alpha { get; }
-        public int LengthExtraValue { get; }
-        public int LengthExtraBits { get; }
-        public int DistanceSymbol { get; }
-        public int DistanceExtraValue { get; }
-        public int DistanceExtraBits { get; }
+        // 紧凑字段布局（16B）：大图 token 缓存是编码耗时的主要来源之一，
+        // 每像素一个 token 时缓存体积与写出遍的内存带宽都直接受字段宽度影响。
+        public readonly TokenKind Kind;
+        public readonly ushort GreenSymbol;
+        public readonly byte Red;
+        public readonly byte Blue;
+        public readonly byte Alpha;
+        public readonly byte LengthExtraBits;
+        public readonly byte DistanceSymbol;
+        public readonly byte DistanceExtraBits;
+        public readonly ushort LengthExtraValue;
+        public readonly int DistanceExtraValue;
     }
 
     /// <summary>
@@ -1302,7 +1383,6 @@ internal static class Vp8LEncoder
     /// </summary>
     private sealed class TokenWalker
     {
-        private const uint HashMultiplier = 0x1e35a7bdu;
         private const uint HashMultiplier2 = 0x9e3779b1u;
         private const int HashBits = 17;
 
@@ -1350,15 +1430,24 @@ internal static class Vp8LEncoder
             _chain = useLz77 ? new int[chainSize] : System.Array.Empty<int>();
             _chainMask = chainSize - 1;
 
-            // 链深度按像素数自适应：小图候选便宜，保留 32 个以稳住压缩率；
-            // 大图深搜命中率下降，逐级缩减到 16 个。体积变化由 WebpLEncoderTests 的体积回归锁定。
+            // 链深度按像素数自适应。哈希只取两个像素，周期图案（渐变、alpha 渐变）上
+            // 同 hash 的候选极多，只看最近 24 个时候选距离上限只有几十像素，
+            // 会系统性漏掉 distance ≈ 2×行宽的长匹配；中小图候选比较便宜，
+            // 加深到 96 可让平均匹配长度明显上升。大图逐一位置搜索代价随深度线性增长，
+            // 保持 16 以守住耗时。体积变化由 WebpLEncoderTests 的体积回归锁定。
             _maxChainCandidates = useLz77
-                ? (maxChainOverride > 0 ? maxChainOverride
-                    : _total < 1 << 16 ? 32 : _total < 1 << 20 ? 24 : 16)
+                ? (maxChainOverride > 0 ? maxChainOverride : ChooseChainDepth(_total))
                 : 0;
             _distanceToPlaneCode = useLz77 ? BuildDistanceToPlaneCode(width) : System.Array.Empty<int>();
             _cache = cacheBits > 0 ? new uint[1 << cacheBits] : System.Array.Empty<uint>();
         }
+
+        /// <summary>
+        /// hash 链深度：中小图用深链换压缩率，大图保持浅链守耗时。
+        /// 阈值按像素数划分，与候选配置无关，保证统计遍/写出遍一致。
+        /// </summary>
+        private static int ChooseChainDepth(int total)
+            => total < 1 << 14 ? 32 : total < 1 << 16 ? 64 : total < 1 << 20 ? 96 : 16;
 
         public bool Next(out Token token, out int startPosition)
         {
@@ -1369,11 +1458,13 @@ internal static class Vp8LEncoder
                 return false;
             }
 
-            if (_useLz77 && TryFindCopy(out int length, out int distance))
+            int pos = _pos;
+            if (_useLz77 && TryFindCopy(pos, _maxChainCandidates, out int length, out int distance))
             {
+                _lastDistance = distance;
                 token = BuildCopyToken(length, distance, _distanceToPlaneCode);
-                InsertRange(_pos, length);
-                _pos += length;
+                InsertRange(pos, length);
+                _pos = pos + length;
                 return true;
             }
 
@@ -1392,28 +1483,27 @@ internal static class Vp8LEncoder
             InsertPosition(_pos);
             _pos++;
 
-            if (useCache)
-            {
-                int key = CacheKey(pixel);
-                token = new Token(TokenKind.ColorCache, NumLiteralCodes + NumLengthCodes + key,
-                    0, 0, 0, 0, 0, 0, 0, 0);
-                return true;
-            }
-
-            token = new Token(TokenKind.Literal, (int)((pixel >> 8) & 0xFF),
-                (byte)((pixel >> 16) & 0xFF), (byte)(pixel & 0xFF), (byte)((pixel >> 24) & 0xFF),
-                0, 0, 0, 0, 0);
+            token = useCache ? BuildCacheToken(pixel) : BuildLiteralToken(pixel);
             return true;
         }
 
+        private Token BuildCacheToken(uint pixel)
+            => new Token(TokenKind.ColorCache, NumLiteralCodes + NumLengthCodes + CacheKey(pixel),
+                0, 0, 0, 0, 0, 0, 0, 0);
+
+        private static Token BuildLiteralToken(uint pixel)
+            => new Token(TokenKind.Literal, (int)((pixel >> 8) & 0xFF),
+                (byte)((pixel >> 16) & 0xFF), (byte)(pixel & 0xFF), (byte)((pixel >> 24) & 0xFF),
+                0, 0, 0, 0, 0);
+
+
         private int CacheKey(uint pixel) => (int)((pixel * HashMultiplier) >> (32 - _cacheBits));
 
-        private bool TryFindCopy(out int bestLength, out int bestDistance)
+        private bool TryFindCopy(int pos, int chainLimit, out int bestLength, out int bestDistance)
         {
             bestLength = 0;
             bestDistance = 0;
 
-            int pos = _pos;
             int maxLength = Math.Min(MaxCopyLength, _total - pos);
             if (maxLength < MinMatchLength || pos + 1 >= _total) return false;
 
@@ -1445,7 +1535,7 @@ internal static class Vp8LEncoder
             int candidate = _hashHead[hash];
             int examined = 0;
 
-            while (candidate >= 0 && examined < _maxChainCandidates)
+            while (candidate >= 0 && examined < chainLimit)
             {
                 if (bestLength >= maxLength) break;
 
@@ -1485,7 +1575,6 @@ internal static class Vp8LEncoder
             }
 
             if (bestLength < MinMatchLength || bestGain <= 0) return false;
-            _lastDistance = bestDistance;
             return true;
         }
 
@@ -2006,12 +2095,6 @@ internal static class Vp8LEncoder
             }
         }
 
-        // ---- LZ77 感知的复评 ----
-        // 残差熵最低的模式不一定是真实体积最小的模式：渐变 / 规则图案的图像上，
-        // mode 1(left)、2(top) 之类保留"整行重复"的模式虽然熵略高，却能让 LZ77
-        // 以 distance=width 一次覆盖数千像素；平均类模式（5..13）把行间一致性打散，
-        // 熵最低但只能产生大量短匹配。这里只对"行重复性明显"的图做复评，避免给
-        // 普通照片白白增加耗时。
         bool repetitionStrong = false;
         double uniformTokenBits = double.MaxValue;
         var scratch = useLz77 ? new uint[pixels.Length] : System.Array.Empty<uint>();
@@ -2035,36 +2118,36 @@ internal static class Vp8LEncoder
                 if (CountRowRepeats(scratch, width) * 8 >= scratch.Length) repetitionStrong = true;
             }
 
-            if (repetitionStrong)
+        // ---- LZ77 感知的复评（对所有图生效）----
+        // 熵最优不等于字节最优：mode 0（不预测）在左右/中心对称的渐变上能让 LZ77
+        // 直接复制成段像素，mode 1（left）在自然照片上通常最利于整行重复；这两者
+        // 都可能因残差熵偏高而落选。复评按真实 token 走查取最小，不依赖行重复代理。
+            int topK = pixels.Length >= 1 << 18 ? 2 : 3;
+            var candidates = new List<int>(8) { uniformMode };
+            for (int i = 0; i < ranked.Count && i < topK; i++)
             {
-                int topK = pixels.Length >= 1 << 18 ? 2 : 3;
-                var candidates = new List<int>(7);
-                for (int i = 0; i < ranked.Count && i < topK; i++)
-                {
-                    if (!candidates.Contains(ranked[i].Mode)) candidates.Add(ranked[i].Mode);
-                }
-                // left / top / top-right / top-left 这四种"结构型"模式保留行/列邻域结构，
-                // 是整行重复的最大受益者；1MP 以内逐个实测，更大的图只测最常见的 1、2 以控耗时。
-                int structuralLimit = pixels.Length <= 1 << 20 ? 4 : 2;
-                for (int mode = 1; mode <= structuralLimit; mode++)
-                {
-                    if (!candidates.Contains(mode)) candidates.Add(mode);
-                }
-
-                int tokenMode = uniformMode;
-                foreach (int mode in candidates)
-                {
-                    System.Array.Copy(pixels, scratch, pixels.Length);
-                    ApplyPredictorPlan(scratch, width, height, bits, new PredictorPlan(mode, null, 0), modePixels);
-                    double tokenBits = EstimateTokenBits(scratch, width, height, cacheBits);
-                    if (tokenBits < uniformTokenBits)
-                    {
-                        uniformTokenBits = tokenBits;
-                        tokenMode = mode;
-                    }
-                }
-                uniformMode = tokenMode;
+                if (!candidates.Contains(ranked[i].Mode)) candidates.Add(ranked[i].Mode);
             }
+            if (!candidates.Contains(0)) candidates.Add(0);
+            int structuralLimit = pixels.Length <= 1 << 20 ? 4 : 2;
+            for (int mode = 1; mode <= structuralLimit; mode++)
+            {
+                if (!candidates.Contains(mode)) candidates.Add(mode);
+            }
+
+            int tokenMode = uniformMode;
+            foreach (int mode in candidates)
+            {
+                System.Array.Copy(pixels, scratch, pixels.Length);
+                ApplyPredictorPlan(scratch, width, height, bits, new PredictorPlan(mode, null, 0), modePixels);
+                double tokenBits = EstimateTokenBitsSampled(scratch, width, height, cacheBits);
+                if (tokenBits < uniformTokenBits)
+                {
+                    uniformTokenBits = tokenBits;
+                    tokenMode = mode;
+                }
+            }
+            uniformMode = tokenMode;
         }
 
         // 所选模式的熵代价（供 cross-color / 逐 tile 比较使用，统一在熵空间）。
@@ -2115,35 +2198,71 @@ internal static class Vp8LEncoder
     }
 
     /// <summary>
-    /// 用真实 token 走查估算位数（同一套 LZ77 / cache 决策，但不构造 Huffman 码表），
-    /// 用于在不同 predictor 模式之间比较"真实可压缩性"。
+    /// 估计一套预测方案的 token 位数：用同一套 LZ77 / cache 决策产生 token，
+    /// 再按实际 token 频次构造 Huffman 码表并累加码长与码表开销。
+    /// 近似代价模型（熵估计）在 alpha 渐变等样本上会给出相反的排序，因此必须用真实码长。
     /// </summary>
     private static double EstimateTokenBits(uint[] pixels, int width, int height, int cacheBits)
     {
         int greenAlphabet = NumLiteralCodes + NumLengthCodes + (cacheBits > 0 ? 1 << cacheBits : 0);
-        var cost = CostModel.Build(pixels, cacheBits, greenAlphabet, buildCoveredPrefix: true);
-        var walker = new TokenWalker(pixels, width, height, useLz77: true, cacheBits, cost, maxChainOverride: 8);
+        var options = new Vp8LEncoderOptions(true, cacheBits > 0, true, useMetaHuffman: false);
+        // 估算路径不缓存 token：频次与附加位总已在统计遍累加，直接按码长求和即可，
+        // 避免为每个候选模式分配一份整图 token 数组（大图上会造成明显的 GC 抖动）。
+        var stats = CollectStatistics(pixels, width, height, cacheBits, greenAlphabet, options,
+            allowMetaHuffman: false, cacheTokens: false);
+
+        // 码表开销同样计入：不同模式的符号使用分布不同，表大小也随之变化。
+        double bits = SumCodeBits(stats.GreenFreq[0], stats.GreenCodes[0]) +
+                      SumCodeBits(stats.RedFreq[0], stats.RedCodes[0]) +
+                      SumCodeBits(stats.BlueFreq[0], stats.BlueCodes[0]) +
+                      SumCodeBits(stats.AlphaFreq[0], stats.AlphaCodes[0]) +
+                      SumCodeBits(stats.DistanceFreq[0], stats.DistanceCodes[0]) +
+                      stats.ExtraBits +
+                      TableBits(stats.GreenFreq[0]) + TableBits(stats.RedFreq[0]) +
+                      TableBits(stats.BlueFreq[0]) + TableBits(stats.AlphaFreq[0]) +
+                      TableBits(stats.DistanceFreq[0]);
+        return bits;
+    }
+
+    private static double SumCodeBits(int[] freq, Vp8LHuffmanCode code)
+    {
         double bits = 0;
-        Token token;
-        int position;
-        while (walker.Next(out token, out position))
+        for (int i = 0; i < freq.Length; i++)
         {
-            _ = position;
-            switch (token.Kind)
-            {
-                case TokenKind.Literal:
-                    bits += cost.LiteralCost(((uint)token.Alpha << 24) | ((uint)token.Red << 16) |
-                                             ((uint)token.GreenSymbol << 8) | token.Blue);
-                    break;
-                case TokenKind.ColorCache:
-                    bits += cost.CacheSymbolCost;
-                    break;
-                case TokenKind.Copy:
-                    bits += CostModel.MinCopyCost + token.LengthExtraBits + token.DistanceExtraBits;
-                    break;
-            }
+            if (freq[i] != 0) bits += (double)freq[i] * code.Lengths[i];
         }
         return bits;
+    }
+
+    /// <summary>
+    /// predictor 模式复评用的 token 位数估计：大图取中部一条不超过 64K 像素的横带，
+    /// 避免为每个候选模式付一次整图 LZ77 走查；小图直接整幅估算。
+    /// 横带保留了真实的行宽与邻域关系，足以区分"整行可复制"与"行结构被打散"。
+    /// </summary>
+    private static double EstimateTokenBitsSampled(uint[] pixels, int width, int height, int cacheBits)
+    {
+        if (pixels.Length <= 1 << 20) return EstimateTokenBits(pixels, width, height, cacheBits);
+        int rows = Math.Clamp(65536 / Math.Max(1, width), 8, height);
+        int start = (height - rows) / 2;
+        var band = new uint[width * rows];
+        System.Array.Copy(pixels, start * width, band, 0, band.Length);
+        return EstimateTokenBits(band, width, rows, cacheBits);
+    }
+
+    /// <summary>
+    /// color cache 位数选择用的 token 位数估计：图像超过横带预算时只估算中部横带
+    /// （预算越小耗时越低、代表性越弱）。横带保留真实行宽与邻域，能反映 cache 命中率。
+    /// </summary>
+    private static double EstimateTokenBitsBand(uint[] pixels, int width, int height, int cacheBits,
+        int bandPixels)
+    {
+        if (pixels.Length <= bandPixels || height < 2)
+            return EstimateTokenBits(pixels, width, height, cacheBits);
+        int rows = Math.Max(1, Math.Min(height, bandPixels / Math.Max(1, width)));
+        int start = (height - rows) / 2;
+        var band = new uint[width * rows];
+        System.Array.Copy(pixels, start * width, band, 0, band.Length);
+        return EstimateTokenBits(band, width, rows, cacheBits);
     }
 
     /// <summary>隔行隔列抽样统计残差直方图（仅用于给 predictor 模式排序）。</summary>

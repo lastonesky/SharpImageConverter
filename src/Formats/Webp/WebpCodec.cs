@@ -8,8 +8,9 @@ namespace SharpImageConverter.Formats.Webp
     /// <summary>
     /// WebP 编解码的公共入口：默认走纯 C# 实现，只有显式选择
     /// <see cref="WebpEncodeBackend.LibWebp"/> / <see cref="WebpDecodeBackend.LibWebp"/>
-    /// 或功能需要原生能力（动图编码、流式增量解码）时才落到
-    /// <see cref="LibWebpCodec"/>。
+    /// 或调用仍以 native 为实现的适配器（如本类的 <c>EncodeAnimatedRgba</c>）时才落到
+    /// <see cref="LibWebpCodec"/>。纯 C# 侧的动图编码见 <see cref="WebpAnimationWriter"/>，
+    /// 逐行解码见 <see cref="WebpRowSource"/>。
     /// </summary>
     internal static class WebpCodec
     {

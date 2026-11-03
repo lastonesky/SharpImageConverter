@@ -604,15 +604,33 @@ public class WebpEncodeBackendTests
     }
 
     [Fact]
-    public void CSharp_Lossy_Alpha_ThrowsUnsupported()
+    public void CSharp_Lossy_Alpha_ProducesAlphChunk_AndRoundTrips()
     {
         var rgba = PhotoSample(16, 16);
-        rgba[3] = 0; // 第一个像素非不透明
+        for (int i = 0; i < 16 * 16; i++)
+            rgba[i * 4 + 3] = (byte)(i % 5 == 0 ? 0 : (i * 13 + 40) & 0xFF); // 非不透明输入
 
-        Assert.Throws<WebpUnsupportedException>(() =>
-            WithEncodeBackend(WebpEncodeBackend.CSharp,
-                () => WebpCodec.EncodeRgba(rgba, 16, 16,
-                    new WebpEncoderOptions(75f, WebpConcurrencyStrategy.Serial, 6, lossless: false))));
+        byte[] webp = WithEncodeBackend(WebpEncodeBackend.CSharp,
+            () => WebpCodec.EncodeRgba(rgba, 16, 16,
+                new WebpEncoderOptions(75f, WebpConcurrencyStrategy.Serial, 6, lossless: false)));
+
+        var container = WebpContainer.Load(webp);
+        Assert.Equal(WebpContainerKind.Vp8X, container.Kind);
+        Assert.True(container.HasAlpha);
+        Assert.True(container.HasAlphaChunk);
+
+        // 真实 libwebp 解码：alpha 平面由 ALPH（VP8L 无损）承载，必须与源完全一致。
+        byte[] lib = WebpCodec.DecodeRgba(webp, out int lw, out int lh);
+        Assert.Equal(16, lw);
+        Assert.Equal(16, lh);
+        for (int i = 0; i < 16 * 16; i++)
+            Assert.Equal(rgba[i * 4 + 3], lib[i * 4 + 3]);
+
+        // 同一码流在纯 C# 解码器下与 libwebp 仅允许 RGB ±1（alpha 严格相等）。
+        byte[] csharp = WebpDecoder.DecodeRgba(webp, out int mw, out int mh);
+        Assert.Equal(16, mw);
+        Assert.Equal(16, mh);
+        AssertNearPixel(lib, csharp, "csharp lossy alpha libwebp->csharp");
     }
 
     private static T WithEncodeBackend<T>(WebpEncodeBackend backend, Func<T> body)

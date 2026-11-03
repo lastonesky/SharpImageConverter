@@ -12,7 +12,7 @@ namespace SharpImageConverter.Formats.Webp
         /// <summary>强制 libwebp 原生实现（既有无损/有损行为，便于对拍与回退）。</summary>
         LibWebp = 1,
 
-        /// <summary>强制纯 C# 托管实现：无损走 VP8L，有损走 VP8（暂不支持 alpha）。</summary>
+        /// <summary>强制纯 C# 实现：无损走 VP8L，有损走 VP8（带 alpha 时写 ALPH）。</summary>
         CSharp = 2,
     }
 
@@ -21,9 +21,8 @@ namespace SharpImageConverter.Formats.Webp
     ///
     /// 环境变量 <c>SIC_WEBP_ENCODE_BACKEND</c>：<c>auto</c>（默认）/ <c>libwebp</c>（别名 <c>native</c>）/ <c>csharp</c>。
     ///
-    /// 托管编码器同时提供 VP8L 无损与 VP8 有损：<see cref="WebpEncodeBackend.CSharp"/> 下两者都走纯 C#，
-    /// 有损的 alpha（ALPH 编码）尚未实现，遇到带 alpha 的请求抛 <see cref="WebpUnsupportedException"/>，
-    /// 避免静默改用 libwebp 导致行为不可预期。
+    /// 纯 C# 编码器同时提供 VP8L 无损与 VP8 有损：<see cref="WebpEncodeBackend.CSharp"/> 下两者都走纯 C#，
+    /// 有损遇到非不透明 alpha 时用 VP8L 压缩 alpha 平面并写 ALPH chunk。
     /// </summary>
     public static class WebpEncodePolicy
     {
