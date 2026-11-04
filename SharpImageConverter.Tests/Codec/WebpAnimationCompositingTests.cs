@@ -111,6 +111,110 @@ public class WebpAnimationCompositingTests
         Assert.False(LibWebpAnimDecoder.TryDecode(webp, out _, out _, out _));
     }
 
+    [Fact]
+    public void Animation_ReadInfo_ReportsCanvasFrameCountAndLoop()
+    {
+        const int cw = 24, ch = 16;
+        var frames = new[]
+        {
+            new FrameSpec(PatternRgba(cw, ch, seed: 18, opaque: true), 0, 0, cw, ch, 120, Blend: false, DisposeBg: false),
+            new FrameSpec(PatternRgba(12, 8, seed: 19, opaque: false), 4, 4, 12, 8, 80, Blend: true, DisposeBg: true),
+        };
+        byte[] webp = BuildAnimation(cw, ch, frames);
+
+        var info = WebpDecoder.ReadAnimationInfo(webp);
+
+        Assert.Equal(cw, info.CanvasWidth);
+        Assert.Equal(ch, info.CanvasHeight);
+        Assert.Equal(frames.Length, info.FrameCount);
+        Assert.Equal(0, info.LoopCount); // ANIM 中 loop count = 0 表示无限
+    }
+
+    [Fact]
+    public void Animation_ReadInfo_OnStaticImage_Throws()
+    {
+        byte[] staticWebp = LibWebpTestCodec.EncodeRgba(
+            PatternRgba(10, 10, seed: 20, opaque: true), 10, 10,
+            new WebpEncoderOptions(75f, lossless: true));
+
+        Assert.Throws<WebpContainerException>(() => WebpDecoder.ReadAnimationInfo(staticWebp));
+        Assert.Throws<WebpContainerException>(() => WebpDecoder.EnumerateFrames(staticWebp));
+    }
+
+    [Fact]
+    public void Animation_EnumerateFrames_MatchesDecodeAnimation()
+    {
+        const int cw = 28, ch = 18;
+        var frames = new[]
+        {
+            new FrameSpec(PatternRgba(cw, ch, seed: 21, opaque: true), 0, 0, cw, ch, 100, Blend: false, DisposeBg: false),
+            new FrameSpec(PatternRgba(16, 10, seed: 22, opaque: false), 6, 4, 16, 10, 100, Blend: true, DisposeBg: true),
+            new FrameSpec(PatternRgba(20, 12, seed: 23, opaque: false), 2, 2, 20, 12, 100, Blend: true, DisposeBg: false),
+        };
+        byte[] webp = BuildAnimation(cw, ch, frames);
+
+        var expected = WebpDecoder.DecodeAnimation(webp);
+        var lazy = WebpDecoder.EnumerateFrames(webp);
+        var actual = lazy.ToArray();
+
+        Assert.Equal(expected.Frames.Length, actual.Length);
+        for (int i = 0; i < actual.Length; i++)
+        {
+            Assert.Equal(expected.Frames[i].X, actual[i].X);
+            Assert.Equal(expected.Frames[i].Y, actual[i].Y);
+            Assert.Equal(expected.Frames[i].Width, actual[i].Width);
+            Assert.Equal(expected.Frames[i].Height, actual[i].Height);
+            Assert.Equal(expected.Frames[i].DurationMs, actual[i].DurationMs);
+            PixelAssert.Equal(expected.Frames[i].Rgba, actual[i].Rgba, cw, ch);
+        }
+
+        // 同一序列可重复枚举，且每次状态独立
+        Assert.Equal(actual.Length, lazy.ToArray().Length);
+
+        // Stream 重载在读入后即可释放流
+        using var ms = new MemoryStream(webp);
+        var fromStream = WebpDecoder.EnumerateFrames(ms).ToArray();
+        PixelAssert.Equal(actual[^1].Rgba, fromStream[^1].Rgba, cw, ch);
+    }
+
+    /// <summary>
+    /// 惰性语义：后续帧损坏时，前面的帧仍可独立解码并返回；
+    /// 只有枚举推进到损坏帧才抛出异常。
+    /// </summary>
+    [Fact]
+    public void Animation_EnumerateFrames_DecodesLazily_BeforeCorruptLaterFrame()
+    {
+        const int cw = 16, ch = 16;
+        var frames = new[]
+        {
+            new FrameSpec(PatternRgba(cw, ch, seed: 24, opaque: true), 0, 0, cw, ch, 100, Blend: false, DisposeBg: false),
+            new FrameSpec(PatternRgba(8, 8, seed: 25, opaque: true), 4, 4, 8, 8, 100, Blend: false, DisposeBg: false),
+        };
+        byte[] webp = BuildAnimation(cw, ch, frames);
+
+        // 破坏第二帧 VP8L 的签名字节：容器结构仍合法，帧头仍可解析
+        var container = WebpContainer.Load(webp);
+        var anmfs = container.FindAllChunks(WebpChunkId.Anmf);
+        Assert.Equal(frames.Length, anmfs.Count);
+        var vp8l = container.GetAnmfSubChunks(anmfs[1]).Single(c => c.Id == WebpChunkId.Vp8L);
+        webp[vp8l.DataOffset] = 0x00;
+
+        // 只读头部的信息读取不受损坏帧影响
+        Assert.Equal(frames.Length, WebpDecoder.ReadAnimationInfo(webp).FrameCount);
+
+        var enumerator = WebpDecoder.EnumerateFrames(webp).GetEnumerator();
+        try
+        {
+            Assert.True(enumerator.MoveNext(), "第一帧应当可以在不触碰损坏帧的情况下完成解码");
+            PixelAssert.Equal(frames[0].Rgba, enumerator.Current.Rgba, cw, ch);
+            Assert.ThrowsAny<WebpException>(() => enumerator.MoveNext());
+        }
+        finally
+        {
+            (enumerator as IDisposable)?.Dispose();
+        }
+    }
+
     private static void AssertBitExact(FrameSpec[] frames, int canvasWidth, int canvasHeight)
     {
         byte[] webp = BuildAnimation(canvasWidth, canvasHeight, frames);

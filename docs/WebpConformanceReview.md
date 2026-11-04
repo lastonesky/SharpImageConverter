@@ -107,9 +107,9 @@ CTE 子图打包（blue=green_to_red、green=green_to_blue、red=red_to_blue）�
    （`Vp8LHuffman.cs:40-46`）；两符号均越界时才因全零码长报错。
 5. **【宽松·与 libwebp 一致】单激活符号树不校验码长必须为 1**，按 0-bit 单符号
    表解码（`HuffmanTable.cs:73-88,181-184`）。
-6. **【备注】predictor 模式 14/15 兜底为 left**（`Vp8LTransforms.cs:90`），注释称
-   「按 libwebp」，但 libwebp 哨兵实为 Predictor0（黑）；仅影响损坏位流的容错
-   表现，编码端只写 0..13，不构成规范偏差。
+6. **【已修复】predictor 模式 14/15 兜底对齐 libwebp 的 Predictor0（黑）**
+   （`Vp8LTransforms.cs:90-92`）；此前误用 left。仅影响损坏位流的容错表现，
+   编码端只写 0..13，不构成规范偏差。
 7. **【备注·规范措辞歧义】** `max_symbol` 的计数单位实现为「元符号」（16/17/18
    各计 1 次），与 libwebp `ReadHuffmanCodeLengths` 一致；规范原文「code lengths」
    措辞与参考实现存在歧义，如需与其他解码器互操作时留意。
@@ -126,13 +126,13 @@ CTE 子图打包（blue=green_to_red、green=green_to_blue、red=red_to_blue）�
 | §4 缺口 1 系数 trellis | 仍成立（无 trellis 相关代码） |
 | §4 缺口 2 滤波强度不参与 RD | 仍成立（`EstimateFilterLevel(q)` 查表定死，`Vp8Encoder.cs:403`） |
 | §4 缺口 3 无损多 pass | **部分过时**。meta-Huffman 的 tile 直方图 k-means 聚类已实现（`Vp8LEncoder.cs:769,1026`，按估计码长+码表开销选组数）；「用最终码长重算 Huffman」与「长窗 LZ77」（距离已支持至 2²⁰ 全图、长度 4096 为规范上限）表述需按当前实现改写 |
-| §4 缺口 4 动图逐帧 `canvas.ToArray()` | 仍成立（`WebpDecoder.cs:402`） |
+| §4 缺口 4 动图逐帧 `canvas.ToArray()` | **已修复**：新增 `WebpDecoder.EnumerateFrames` 惰性逐帧解码（O(画布) 内存），末帧解码路径改走惰性枚举 |
 | §2/§3 实测数据表 | 历史数据，本次未复测，不在核对范围 |
 
 ## 3. 建议后续动作
 
 1. （已随本报告完成）解码端 16384 上限修复 + 回归测试。
 2. 修订 `WebpEncoder.md` §1 熵编码表述、补录大图降级、按现状改写缺口 3。
-3. （可选）把 §1.9 第 6 条的兜底注释/行为与 libwebp 对齐（Predictor0 而非 left）。
+3. （已完成）把 §1.9 第 6 条的兜底行为与 libwebp 对齐（Predictor0 而非 left）。
 4. （可选）§1.9 第 4/5 条宽松口径如需严格化，加显式报错路径；当前与 libwebp
    行为一致，不动也不影响互操作。

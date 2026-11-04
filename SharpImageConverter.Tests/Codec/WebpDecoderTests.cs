@@ -853,6 +853,57 @@ public class WebpDecoderTests
         Assert.Throws<WebpContainerException>(() => WebpContainer.Load(new byte[] { 0x52, 0x49, 0x46, 0x46 }));
     }
 
+    /// <summary>
+    /// 简单格式（无 VP8X）也应当能从 VP8 关键帧头读取图像尺寸。
+    /// </summary>
+    [Fact]
+    public void Container_SimpleVp8_ExposesImageDimensions()
+    {
+        const int w = 37, h = 23;
+        byte[] webp = LibWebpTestCodec.EncodeRgba(
+            GradientRgba(w, h, opaque: true), w, h,
+            new WebpEncoderOptions(75f, lossless: false));
+
+        var container = WebpContainer.Load(webp);
+
+        Assert.Equal(WebpContainerKind.Vp8, container.Kind);
+        Assert.Equal(w, container.CanvasWidth);
+        Assert.Equal(h, container.CanvasHeight);
+        Assert.False(container.HasAlpha);
+    }
+
+    [Fact]
+    public void Container_RiffDeclaredSizeLargerThanData_Throws()
+    {
+        byte[] webp = EncodeLossless(RandomRgba(8, 8, seed: 77), 8, 8);
+        uint riffSize = BitConverter.ToUInt32(webp, 4);
+        BitConverter.GetBytes(riffSize + 16u).CopyTo(webp, 4);
+
+        var ex = Assert.Throws<WebpContainerException>(() => WebpContainer.Load(webp));
+        Assert.Contains("RIFF", ex.Message);
+    }
+
+    [Fact]
+    public void Decode_RiffSizeSentinel_StillDecodes()
+    {
+        const int w = 8, h = 8;
+        byte[] rgba = GradientRgba(w, h, opaque: true);
+        byte[] webp = EncodeLossless(rgba, w, h);
+        BitConverter.GetBytes(0xFFFFFFFFu).CopyTo(webp, 4);
+
+        byte[] decoded = WebpDecoder.DecodeRgba(webp, out int dw, out int dh);
+        Assert.Equal(w, dw);
+        Assert.Equal(h, dh);
+        PixelAssert.Equal(rgba, decoded, w, h);
+    }
+
+    [Fact]
+    public void Vp8LReservedPredictorModes_FallBackToBlackLikeLibWebp()
+    {
+        Assert.Equal(0xFF000000u, Vp8LTransforms.Predictor(14, 0x11223344u, 0x55667788u, 0xAABBCCDDu, 0xEEFF0011u));
+        Assert.Equal(0xFF000000u, Vp8LTransforms.Predictor(15, 0x11223344u, 0x55667788u, 0xAABBCCDDu, 0xEEFF0011u));
+    }
+
     // ==================================================================
     //  5. 截断 / 损坏文件健壮性
     // ==================================================================

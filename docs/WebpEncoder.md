@@ -130,7 +130,13 @@ libwebp 的分段是把「低细节但非零残差」的宏块用大得多（del
 2. **系数 trellis**：当前仍为标量量化；可在量化时按 RD 代价选择系数值。
 3. **滤波强度参与率失真**：当前按 q 查表定死（`EstimateFilterLevel`）。
 4. **无损编码多 pass**：直方图二次优化（用第一遍的实际码长重算 Huffman）、长窗 LZ77。
-5. **动图解码改按帧流式**：当前每帧 `canvas.ToArray()`，内存 O(帧数 × 画布)。
+
+已补齐（2026-11-04）：
+- 动图**逐帧惰性解码**：`WebpDecoder.EnumerateFrames` 每次只合成并返回当前帧快照，
+  枚举器自身仅保留当前画布与上一帧 disposal 状态（O(画布)），不再为整段动图驻留
+  O(帧数 × 画布)；`DecodeAnimation` 仍返回完整帧数组以保持既有 API。
+  仅取末帧的 `DecodeRgba` / `DecodeRgbaInto` 也改走惰性路径。
+  `WebpDecoder.ReadAnimationInfo` 只解析容器/ANMF 头即可得到画布尺寸、帧数与循环次数。
 
 ## 5. 踩过的坑
 

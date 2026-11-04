@@ -87,7 +87,9 @@ internal static class Vp8LTransforms
         11 => Select(topCur, left, topLeft),           // select
         12 => ClampedAddSubtractFull(left, topCur, topLeft),
         13 => ClampedAddSubtractHalf(left, topCur, topLeft),
-        _ => left,
+        // 14/15 在规范中保留；libwebp 的哨兵实现同样落到 Predictor0（黑），
+        // 这里对齐该行为，保证损坏码流下的输出与参考实现一致。
+        _ => 0xFF000000,
     };
 
     // =====================================================

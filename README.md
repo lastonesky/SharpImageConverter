@@ -53,14 +53,15 @@
   - LZW 压缩；不写入透明度与动画元数据（延时、循环）
 
 ### WebP 支持
-- 读取/写入 WebP（编码通过 `runtimes/` 下的原生 `libwebp`）
-- **解码可选纯 C# 实现**：VP8L 无损（含 ALPH 独立 alpha、VP8X 动图帧）由托管代码解码，
-  与 libwebp 逐像素一致；有损 VP8 与动图仍走 libwebp。环境变量 `SIC_WEBP_BACKEND`
-  取 `auto`（默认）/ `libwebp` / `managed`，`managed` 模式对不支持的特性直接报错而不回退；
-  `SIC_WEBP_TRACE=1` 可打印回退原因。也可在代码里设置 `WebpDecodePolicy.Backend`
+- 读取/写入 WebP 完全由托管 C# 实现：VP8L 无损编解码、有损 VP8 编码、VP8/VP8L 解码、
+  ALPH 独立 alpha，以及 VP8X / ANIM / ANMF 动图容器
+- 支持简单格式（VP8/VP8L）与 VP8X 扩展格式；动图既可整段解码，也可用
+  `WebpDecoder.EnumerateFrames` 逐帧惰性解码（峰值内存 O(画布) 而不是 O(帧数 × 画布)），
+  `WebpDecoder.ReadAnimationInfo` 可在不解码像素的情况下读取画布尺寸 / 帧数 / 循环次数
+- 支持 ICCP / EXIF / XMP 元数据块的读取与透传写入
 - 统一解码为 RGB24，再根据输出扩展名选择编码器写回
-- WebP 编码质量与并发策略可配置
-- WebP 实现依赖 Google 的 libwebp 及相关组件（BSD-3-Clause License），其版权与许可信息详见 `THIRD-PARTY-NOTICES.md`
+- WebP 编码质量、有损/无损模式与并发策略可配置
+- 原生 libwebp 仅用于测试中的逐像素对拍，库本身不依赖原生组件
 
 ### 中间格式
 - 引入 `ImageFrame` 作为格式转换的中间数据结构，支持 `Rgb24`（默认）、`Bgr24`、`Bgra32`、`Rgba32` 四种像素格式
@@ -91,7 +92,7 @@ SharpImageConverter/
 │  ├── Compression/              # 智能有损压缩（Optimize）：画质度量、各格式优化器、量化器
 │  ├── Metadata/                 # 元数据结构（Orientation/EXIF/ICC/DPI）
 │  ├── ImageFrame.cs             # 另一套图像载体（支持 BGR/BGRA 与不可 Seek 流）
-│  ├── runtimes/                 # WebP 原生库（win-x64/linux-x64/osx-arm64）
+│  ├── runtimes/                 # 原生 libwebp（仅供测试对拍/基准，运行库不依赖）
 │  └── SharpImageConverter.csproj
 ├── Cli/                         # 独立命令行项目（Program*.cs 按职责拆分：Parse/Process/Encode/Optimize/Bench）
 │  ├── Program.cs
@@ -120,8 +121,7 @@ SharpImageConverter/
 - **.NET SDK 10.0**（本库当前只产出 `net10.0` 单一目标框架；多目标到 `net8.0` 需要先确认
   SIMD/运行时 API 的可用性，尚未提供。请以 `src/SharpImageConverter.csproj` 的
   `TargetFramework` 为准）
-- Windows x64 / Linux x64 / macOS arm64（WebP 依赖 `runtimes/` 下对应 RID 的原生 libwebp；
-  **linux-arm64 与 osx-x64 目前没有原生库**，这两个平台只能使用 JPEG/PNG/BMP/GIF）
+- Windows x64 / Linux x64 / macOS arm64（WebP 为纯托管实现，不受原生库 RID 限制）
 
 ## 安装（NuGet）
 

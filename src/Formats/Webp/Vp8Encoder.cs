@@ -92,8 +92,14 @@ internal sealed class Vp8Encoder
     private readonly int[] _uvAc = new int[4];
     private int _currentSegment;
 
-    private const int FlatSegmentQDelta = 6;
-    private const int FlatSegmentThreshold = 256 * 256;
+    /// <summary>每个宏块的分段号（按活动度预分析，行优先）。关闭分段时内容无关紧要。</summary>
+    private byte[] _segmentMap = Array.Empty<byte>();
+
+    /// <summary>各段相对 base_q 的量化 delta（segment_feature_mode=0 的语义）。</summary>
+    private readonly int[] _segDelta = new int[4];
+
+    /// <summary>segment map 三叉树（实际是两次二选一）的三个概率（写 0 的概率，0..255）。</summary>
+    private readonly int[] _segMapProbs = { 255, 255, 255 };
 
     private Vp8BoolEncoder _part0;
     private Vp8BoolEncoder _tokens;
@@ -186,6 +192,16 @@ internal sealed class Vp8Encoder
     /// </summary>
     private const int LambdaScale = 300;
 
+    /// <summary>
+    /// 系数 trellis 的 λ 比例系数：<c>λQ8 = TrellisLambda × dq</c>（dq 为所在块的 AC/DC 步长）。
+    /// 标定结果见 <c>docs/WebpEncoder.md</c>：6 图 × q50/75/90/95 的 24 组对照。
+    /// </summary>
+    internal static int TrellisLambda = 300;
+
+    /// <summary>trellis 的预分配工作区（每编码器独占，无逐块堆分配）。</summary>
+    private readonly Vp8TrellisScratch _trellis = new();
+
+
 
 
     /// <summary>i4x4 试排后的亮度重建块备份（16×16，按行 16 字节）。</summary>
@@ -225,9 +241,19 @@ internal sealed class Vp8Encoder
         int q = Math.Clamp(baseQ, 0, 127);
         _baseQ = q;
         _filterLevel = EstimateFilterLevel(q);
+
+        // 分段量化：按 16×16 源亮度的活动度把宏块分成 4 档，越平坦的档量化越粗。
+        // 每档 delta 的上限随 q 缩放（高 q 时保持原量化精度，避免高码率下掉质量）。
+        int deltaCap = Math.Max(0, q / 8);
+        _segDelta[0] = Math.Min(6, deltaCap);
+        _segDelta[1] = Math.Min(4, deltaCap);
+        _segDelta[2] = Math.Min(2, deltaCap);
+        _segDelta[3] = 0;
+        BuildSegmentMap();
+
         for (int segment = 0; segment < 4; segment++)
         {
-            int segmentQ = Math.Min(127, q + (segment == 1 ? Math.Min(FlatSegmentQDelta, q / 8) : 0));
+            int segmentQ = Math.Clamp(q + _segDelta[segment], 0, 127);
             _y1Dc[segment] = Vp8Tables.DcQuantTable[segmentQ];
             _y1Ac[segment] = Vp8Tables.AcQuantTable[segmentQ];
             _y2Dc[segment] = _y1Dc[segment] * 2;
@@ -508,15 +534,18 @@ internal sealed class Vp8Encoder
             _part0.PutBitUniform(1); // update_segment_data
             _part0.PutBitUniform(0); // segment_feature_mode = delta values (keeps the common filter level)
             for (int s = 0; s < 4; s++)
-            {
-                _part0.PutSignedBits(s == 1 ? Math.Min(FlatSegmentQDelta, _baseQ / 8) : 0, 7);
-            }
-            // 不设置按段滤波 delta。
+                _part0.PutSignedBits(_segDelta[s], 7);
+
+            // 不设置按段滤波 delta（任务 2C 在此扩展）。
             for (int s = 0; s < 4; s++) _part0.PutBitUniform(0);
-            // map tree：只输出 segment 0/1，segment 2/3 分支概率设为 0。
-            _part0.PutBitUniform(1); _part0.PutLiteral(255, 8);
-            _part0.PutBitUniform(1); _part0.PutLiteral(220, 8);
-            _part0.PutBitUniform(1); _part0.PutLiteral(255, 8);
+
+            // map tree：先选高/低活动度半区，再在半区内选具体段（与解码端
+            // ParseIntraMode 的两次 GetBit 完全对应）。
+            for (int s = 0; s < 3; s++)
+            {
+                _part0.PutBitUniform(1);
+                _part0.PutLiteral(_segMapProbs[s], 8);
+            }
         }
 
         // 滤波：normal 型（simple=0），sharpness=0，不写 ref/mode lf delta。
@@ -594,7 +623,7 @@ internal sealed class Vp8Encoder
 
     private void EncodeMacroblock(int mbX, int mbY)
     {
-        _currentSegment = _useSegmentation && IsFlatMacroblock(mbX, mbY) ? 1 : 0;
+        _currentSegment = _useSegmentation ? _segmentMap[mbY * _mbW + mbX] : 0;
         int yOff = (Pad + mbY * 16) * _strideY + Pad + mbX * 16;
         int uvOff = (Pad + mbY * 8) * _strideUv + Pad + mbX * 8;
 
@@ -678,26 +707,57 @@ internal sealed class Vp8Encoder
     private long Score(long distortion, long bits)
         => distortion * 65536L + (long)(LambdaScale * _y1Ac[_currentSegment]) * bits;
 
-    private bool IsFlatMacroblock(int mbX, int mbY)
+    /// <summary>
+    /// 按 16×16 源亮度活动度把宏块分到 4 段，并据实际分布估计 segment map 的树概率。
+    /// 活动度取「宏块内像素方差」的等价量 <c>n·Σx² − (Σx)²</c>（除以采样数即 n·var），
+    /// 边缘宏块按实际有效像素采样，避免把图像外区域计入。
+    /// 阈值 4096 / 16384 / 65536 对应标准差 4 / 8 / 16，覆盖从纯色块到细腻纹理；
+    /// 越平坦的段使用越粗的量化（见构造函数中的 <see cref="_segDelta"/>）。
+    /// </summary>
+    private void BuildSegmentMap()
     {
-        const int sampleCount = 16 * 16;
-        long sum = 0, sumSquares = 0;
-        int baseX = mbX * 16, baseY = mbY * 16;
-        for (int y = 0; y < 16; y++)
+        _segmentMap = new byte[_mbW * _mbH];
+        Span<int> counts = stackalloc int[4];
+        for (int mbY = 0; mbY < _mbH; mbY++)
         {
-            int sy = Math.Min(baseY + y, _height - 1);
-            int row = sy * _width;
-            for (int x = 0; x < 16; x++)
+            for (int mbX = 0; mbX < _mbW; mbX++)
             {
-                int sx = Math.Min(baseX + x, _width - 1);
-                int value = _srcY[row + sx];
-                sum += value;
-                sumSquares += value * value;
+                int x0 = mbX * 16, y0 = mbY * 16;
+                int x1 = Math.Min(x0 + 16, _width), y1 = Math.Min(y0 + 16, _height);
+                long sum = 0, sumSquares = 0;
+                int sampleCount = 0;
+                for (int y = y0; y < y1; y++)
+                {
+                    int row = y * _width;
+                    for (int x = x0; x < x1; x++)
+                    {
+                        int value = _srcY[row + x];
+                        sum += value;
+                        sumSquares += value * value;
+                    }
+                    sampleCount += x1 - x0;
+                }
+                long metric = sampleCount * sumSquares - sum * sum;
+                int segment = metric <= 4096 ? 0 : metric <= 16384 ? 1 : metric <= 65536 ? 2 : 3;
+                _segmentMap[mbY * _mbW + mbX] = (byte)segment;
+                counts[segment]++;
             }
         }
-        // n*Σx² - (Σx)² = n times the sum of squared deviations from the mean.
-        long varianceNumerator = sampleCount * sumSquares - sum * sum;
-        return varianceNumerator <= FlatSegmentThreshold;
+
+        int total = _mbW * _mbH;
+        int low = counts[0] + counts[1];
+        int high = counts[2] + counts[3];
+        _segMapProbs[0] = ProbabilityOfZero(low, total);
+        _segMapProbs[1] = ProbabilityOfZero(counts[0], low);
+        _segMapProbs[2] = ProbabilityOfZero(counts[2], high);
+    }
+
+    /// <summary>把「写 0 的次数 / 总数」映射为 VP8 概率（P(0)，1..255，0 保留给 255 附近的安全值）。</summary>
+    private static int ProbabilityOfZero(int zeroCount, int total)
+    {
+        if (total == 0)
+            return 255;
+        return Math.Clamp((zeroCount * 255 + total / 2) / total, 1, 255);
     }
 
     /// <summary>
@@ -848,7 +908,7 @@ internal sealed class Vp8Encoder
             long bestScore = long.MaxValue;
             foreach (int mode in candidates)
             {
-                PrepareI4Block(mbX, mbY, n, off, mode);
+                PrepareI4Block(mbX, mbY, n, off, mode, context, trellis: false);
                 long d = BlockSse4x4(_srcY, _width, _height, _reconY, off, _strideY, baseX, baseY);
                 long bits = CostI4Block(mode, topMode, leftMode, context, n);
                 long score = Score(d, bits);
@@ -859,7 +919,7 @@ internal sealed class Vp8Encoder
                 }
             }
 
-            bool nonZero = PrepareI4Block(mbX, mbY, n, off, bestMode);
+            bool nonZero = PrepareI4Block(mbX, mbY, n, off, bestMode, context, trellis: true);
             _i4Modes[n] = bestMode;
             topNz[bx] = leftNz[by] = nonZero ? 1 : 0;
             any |= nonZero;
@@ -886,9 +946,8 @@ internal sealed class Vp8Encoder
         }
     }
 
-    private bool PrepareI4Block(int mbX, int mbY, int n, int off, int bestMode)
+    private bool PrepareI4Block(int mbX, int mbY, int n, int off, int bestMode, int context, bool trellis)
     {
-        bool any = false;
         Vp8IntraPred.Pred4(bestMode, _reconY, off, _strideY);
 
         // 残差 → 正变换 → 量化（i4x4 的 DC 走 y1Dc，不汇入 Y2）→ 反量化 → 重建
@@ -896,21 +955,34 @@ internal sealed class Vp8Encoder
         Vp8ForwardTransform.Dct4x4(_residual, _blockCoef);
 
         int dst = n * 16;
-        int last = -1;
-        for (int i = 0; i < 16; i++)
+        int seg = _currentSegment;
+        int last;
+        if (trellis)
         {
-            int raster = Vp8Tables.Zigzag[i];
-            int dq = i == 0 ? _y1Dc[_currentSegment] : _y1Ac[_currentSegment];
-            int q = Quantize(_blockCoef[raster], dq);
-            _lumaQuant[dst + i] = q;
-            _lumaSlots[dst + raster] = (short)(q * dq);
-            if (q != 0)
+            // 候选模式比较时用标量量化（4 个候选 × 16 次 DP 代价过高），最终胜者才做 RD 量化。
+            last = Vp8Trellis.Quantize(
+                _blockCoef, _lumaQuant.AsSpan(dst, 16), _lumaSlots.AsSpan(dst, 16),
+                first: 0, type: 3, ctx: context,
+                dcStep: _y1Dc[seg], acStep: _y1Ac[seg],
+                probs: _probs, lambdaQ8: TrellisLambda * _y1Ac[seg],
+                distortionWeight: 1, scratch: _trellis);
+        }
+        else
+        {
+            last = -1;
+            for (int i = 0; i < 16; i++)
             {
-                last = i;
-                any = true;
+                int raster = Vp8Tables.Zigzag[i];
+                int dq = i == 0 ? _y1Dc[seg] : _y1Ac[seg];
+                int q = Quantize(_blockCoef[raster], dq);
+                _lumaQuant[dst + i] = q;
+                _lumaSlots[dst + raster] = (short)(q * dq);
+                if (q != 0)
+                    last = i;
             }
         }
 
+        bool any = last >= 0;
         int nz = last < 0 ? 0 : last + 1;
         bool dcNonZero = _lumaSlots[dst] != 0;
         _lumaCodes[n] = NonZeroCode(nz, dcNonZero);
@@ -1094,23 +1166,19 @@ internal sealed class Vp8Encoder
             _lumaQuant[dst] = 0;
         }
 
-        // 2) 正 WHT + 量化（DC 与 AC 分别用 y2Dc / y2Ac）。
+        // 2) 正 WHT + trellis 量化（DC 与 AC 分别用 y2Dc / y2Ac）。
         Vp8ForwardTransform.Wht4x4(_lumaDc, _y2Coef);
-        int lastY2 = -1;
-        for (int n = 0; n < 16; n++)
-        {
-            int raster = Vp8Tables.Zigzag[n];
-            int dq = n == 0 ? _y2Dc[_currentSegment] : _y2Ac[_currentSegment];
-            int q = Quantize(_y2Coef[raster], dq);
-            _y2Quant[n] = q;
-            _y2Dequant[raster] = (short)(q * dq);
-            if (q != 0)
-            {
-                lastY2 = n;
-                _anyCoefficient = true;
-            }
-        }
+        int seg = _currentSegment;
+        int y2Ctx = _mbNzDc[mbX] + _leftNzDc;
+        int lastY2 = Vp8Trellis.Quantize(
+            _y2Coef, _y2Quant, _y2Dequant,
+            first: 0, type: 1, ctx: y2Ctx,
+            dcStep: _y2Dc[seg], acStep: _y2Ac[seg],
+            probs: _probs, lambdaQ8: TrellisLambda * _y2Ac[seg],
+            distortionWeight: 4, scratch: _trellis);
         _y2Nz = lastY2 < 0 ? 0 : lastY2 + 1;
+        if (lastY2 >= 0)
+            _anyCoefficient = true;
 
         // 3) 把 Y2 的 DC 分发到 16 个亮度块（与解码端完全相同的两条路径）。
         if (_y2Nz > 1)
@@ -1124,27 +1192,38 @@ internal sealed class Vp8Encoder
                 _lumaSlots[block * 16] = dc0;
         }
 
-        // 4) 量化各块 AC，记录扫描序量化值与反量化结果。
-        for (int block = 0; block < 16; block++)
+        // 4) trellis 量化各块 AC，记录扫描序量化值与反量化结果。
+        //    上下文簿记与 WriteResidualTokens 的 Y1 AC 分支逐句一致：trellis 的码率估计
+        //    必须使用与真实写位相同的 bctx，否则 DP 会朝错误方向倾斜。
+        int tnz = _mbNz[mbX] & 0x0f;
+        int lnz = _leftNz & 0x0f;
+        int l = 0;
+        for (int y = 0; y < 4; y++)
         {
-            int dst = block * 16;
-            int last = -1;
-            for (int n = 1; n < 16; n++)
+            l = lnz & 1;
+            for (int x = 0; x < 4; x++)
             {
-                int raster = Vp8Tables.Zigzag[n];
-                int q = Quantize(_lumaCoef[dst + raster], _y1Ac[_currentSegment]);
-                _lumaQuant[dst + n] = q;
-                _lumaSlots[dst + raster] = (short)(q * _y1Ac[_currentSegment]);
-                if (q != 0)
-                {
-                    last = n;
+                int block = y * 4 + x;
+                int dst = block * 16;
+                int bctx = l + (tnz & 1);
+                int last = Vp8Trellis.Quantize(
+                    _lumaCoef.AsSpan(dst, 16), _lumaQuant.AsSpan(dst, 16), _lumaSlots.AsSpan(dst, 16),
+                    first: 1, type: 0, ctx: bctx,
+                    dcStep: _y1Dc[seg], acStep: _y1Ac[seg],
+                    probs: _probs, lambdaQ8: TrellisLambda * _y1Ac[seg],
+                    distortionWeight: 1, scratch: _trellis);
+                if (last >= 0)
                     _anyCoefficient = true;
-                }
-            }
 
-            int nz = last < 0 ? 1 : last + 1;
-            bool dcNonZero = _lumaSlots[dst] != 0;
-            _lumaCodes[block] = NonZeroCode(nz, dcNonZero);
+                int nz = last < 0 ? 1 : last + 1;
+                l = nz > 1 ? 1 : 0;
+                tnz = (tnz >> 1) | (l << 7);
+
+                bool dcNonZero = _lumaSlots[dst] != 0;
+                _lumaCodes[block] = NonZeroCode(nz, dcNonZero);
+            }
+            tnz >>= 4;
+            lnz = (lnz >> 1) | (l << 7);
         }
 
         // 5) 逐块重建，变换变体与解码端 DoTransform 完全一致。
@@ -1158,49 +1237,68 @@ internal sealed class Vp8Encoder
     /// <summary>色度残差：16 个系数全部进入 token（DC 不受 Y2 影响）。</summary>
     private void PrepareChromaResidual(int mbX, int mbY, int uvOff)
     {
-        for (int ch = 0; ch < 2; ch++)
+        int seg = _currentSegment;
+        int index = 0;
+        // 上下文簿记与 WriteChromaTokens 完全一致（U 的 4 块在前，V 的 4 块在后）。
+        for (int ch = 0; ch < 4; ch += 2)
         {
-            for (int block = 0; block < 4; block++)
+            int tnz = _mbNz[mbX] >> (4 + ch);
+            int lnz = _leftNz >> (4 + ch);
+            int l = 0;
+            for (int y = 0; y < 2; y++)
             {
-                ComputeResidualUv(mbX, mbY, ch, block, _residual);
-                Vp8ForwardTransform.Dct4x4(_residual, _blockCoef);
-
-                int index = ch * 4 + block;
-                int dst = index * 16;
-                int last = -1;
-                for (int n = 0; n < 16; n++)
+                l = lnz & 1;
+                for (int x = 0; x < 2; x++)
                 {
-                    int raster = Vp8Tables.Zigzag[n];
-                    int dq = n == 0 ? _uvDc[_currentSegment] : _uvAc[_currentSegment];
-                    int q = Quantize(_blockCoef[raster], dq);
-                    _uvQuant[dst + n] = q;
-                    _uvSlots[dst + raster] = (short)(q * dq);
-                    if (q != 0)
-                    {
-                        last = n;
+                    int block = y * 2 + x;
+                    ComputeResidualUv(mbX, mbY, ch >> 1, block, _residual);
+                    Vp8ForwardTransform.Dct4x4(_residual, _blockCoef);
+
+                    int bctx = l + (tnz & 1);
+                    int last = Vp8Trellis.Quantize(
+                        _blockCoef, _uvQuant.AsSpan(index * 16, 16), _uvSlots.AsSpan(index * 16, 16),
+                        first: 0, type: 2, ctx: bctx,
+                        dcStep: _uvDc[seg], acStep: _uvAc[seg],
+                        probs: _probs, lambdaQ8: TrellisLambda * _uvAc[seg],
+                        distortionWeight: 1, scratch: _trellis);
+                    if (last >= 0)
                         _anyCoefficient = true;
-                    }
+
+                    int nz = last < 0 ? 0 : last + 1;
+                    l = nz > 0 ? 1 : 0;
+                    tnz = (tnz >> 1) | (l << 3);
+
+                    int code = NonZeroCode(nz, _uvSlots[index * 16] != 0);
+                    _uvCodes[index] = code;
+
+                    int off = uvOff + (block & 1) * 4 + (block >> 1) * 4 * _strideUv;
+                    ApplyTransform(_uvSlots, index * 16, ch == 0 ? _reconU : _reconV,
+                                   off, _strideUv, code);
+                    index++;
                 }
-
-                int nz = last < 0 ? 0 : last + 1;
-                bool dcNonZero = _uvSlots[dst] != 0;
-                int code = NonZeroCode(nz, dcNonZero);
-                _uvCodes[index] = code;
-
-                int off = uvOff + (block & 1) * 4 + (block >> 1) * 4 * _strideUv;
-                ApplyTransform(_uvSlots, dst, ch == 0 ? _reconU : _reconV, off, _strideUv, code);
+                tnz >>= 2;
+                lnz = (lnz >> 1) | (l << 5);
             }
         }
     }
 
     private void WriteMacroblockModes(int mbX, bool useI4, int yMode, int uvMode, bool skip)
     {
-        // ParseIntraMode reads a 3-way tree: first choose segment 0/1, then choose the id.
+        // ParseIntraMode 读两次二选一：第一次高/低活动度半区，第二次半区内编号。
         // 降级配置下 update_map=0，解码端不读这两个位，这里同样不写。
         if (_useSegmentation)
         {
-            _part0.PutBit(0, 255);
-            _part0.PutBit(_currentSegment, 220);
+            int segment = _currentSegment;
+            if (segment < 2)
+            {
+                _part0.PutBit(0, _segMapProbs[0]);
+                _part0.PutBit(segment, _segMapProbs[1]);
+            }
+            else
+            {
+                _part0.PutBit(1, _segMapProbs[0]);
+                _part0.PutBit(segment - 2, _segMapProbs[2]);
+            }
         }
 
         // skip 统计只认真实写位：成本试探（CostLuma）会重复调用本函数，第一遍之外的

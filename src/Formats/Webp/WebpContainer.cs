@@ -88,10 +88,16 @@ public sealed class WebpContainer
     /// <summary>文件类型判别。</summary>
     public WebpContainerKind Kind { get; private set; }
 
-    /// <summary>画布宽度（仅 VP8X / ANIM 有效，否则为 0）。</summary>
+    /// <summary>
+    /// 画布宽度：VP8X 取画布尺寸，简单格式（VP8L / VP8）取图像自身尺寸；
+    /// 帧头缺失或无法识别时为 0。
+    /// </summary>
     public int CanvasWidth { get; private set; }
 
-    /// <summary>画布高度（仅 VP8X / ANIM 有效，否则为 0）。</summary>
+    /// <summary>
+    /// 画布高度：VP8X 取画布尺寸，简单格式（VP8L / VP8）取图像自身尺寸；
+    /// 帧头缺失或无法识别时为 0。
+    /// </summary>
     public int CanvasHeight { get; private set; }
 
     /// <summary>是否为动画 WebP。</summary>
@@ -228,12 +234,16 @@ public sealed class WebpContainer
         if (webpId != WebpMagic.Webp)
             throw new WebpContainerException($"RIFF 不是 WEBP，类型字节: 0x{webpId:X8}");
 
-        // RIFF size 字段 = 整个文件大小 - 8；允许与实际不一致（有些编码器不严格遵守）
-        // checked cast 会在 riffSize=0xFFFFFFFF 时溢出，用 try/catch 包成可控异常
+        // RIFF size 字段 = 整个文件大小 - 8。部分编码器不严格遵守：允许文件尾部有多余字节，
+        // 但声明长度大于实际数据意味着文件在 chunk 边界处被截断，必须提前拒绝，
+        // 否则后续 chunk 遍历会把「合法但缺失尾部」的文件误当完整文件。
+        // 0xFFFFFFFF 是常见的「长度未知」哨兵，不做该检查。
         int expectedSize;
         try { expectedSize = checked((int)riffSize) + 8; }
         catch (OverflowException) { expectedSize = int.MaxValue; }
-        // 允许文件末尾少量缺失（截断检测由 chunk 遍历时进行）
+        if (riffSize != uint.MaxValue && expectedSize > _data.Length)
+            throw new WebpContainerException(
+                $"RIFF 声明长度 {expectedSize} 字节大于实际数据 {_data.Length} 字节（文件被截断）");
 
         // 遍历所有 chunk
         int pos = WebpMagic.HeaderSize;
@@ -313,11 +323,19 @@ public sealed class WebpContainer
             }
         }
 
-        // 如果没有 VP8X，但有 VP8L，可以直接从 VP8L 头获取尺寸
-        if (Kind == WebpContainerKind.Vp8L && CanvasWidth == 0)
+        // 简单格式没有 VP8X 画布字段，尺寸需要从图像帧头读取
+        if (CanvasWidth == 0)
         {
-            var vp8l = FindChunk(WebpChunkId.Vp8L);
-            if (vp8l.HasValue) ParseVp8LHeader(vp8l.Value);
+            if (Kind == WebpContainerKind.Vp8L)
+            {
+                var vp8l = FindChunk(WebpChunkId.Vp8L);
+                if (vp8l.HasValue) ParseVp8LHeader(vp8l.Value);
+            }
+            else if (Kind == WebpContainerKind.Vp8)
+            {
+                var vp8 = FindChunk(WebpChunkId.Vp8);
+                if (vp8.HasValue) ParseVp8Header(vp8.Value);
+            }
         }
     }
 
@@ -375,6 +393,28 @@ public sealed class WebpContainer
         int version = (int)reader.ReadBits(3);
         if (version != 0)
             throw new WebpUnsupportedException($"VP8L version={version} 不支持（本实现只支持 version=0）");
+    }
+
+    /// <summary>
+    /// 从 VP8 关键帧头读取图像尺寸（RFC 6386 §9.1：3 字节 frame tag + 3 字节起始码 + 14 位宽高）。
+    /// 非关键帧的尺寸字段位置无定义，保持 0 交由解码器按规范拒绝。
+    /// </summary>
+    private void ParseVp8Header(WebpChunk chunk)
+    {
+        var span = chunk.GetData(_data);
+        if (span.Length < 10) throw new WebpContainerException("VP8 chunk 数据过短（需要至少 10 字节帧头）");
+
+        bool keyFrame = (span[0] & 0x01) == 0;
+        if (!keyFrame) return;
+        if (span[3] != 0x9D || span[4] != 0x01 || span[5] != 0x2A) return;
+
+        int width = (span[6] | (span[7] << 8)) & 0x3FFF;
+        int height = (span[8] | (span[9] << 8)) & 0x3FFF;
+        if (width <= 0 || height <= 0 || width > 16383 || height > 16383)
+            throw new WebpContainerException($"VP8 帧尺寸无效：{width}x{height}");
+
+        CanvasWidth = width;
+        CanvasHeight = height;
     }
 
     /// <summary>

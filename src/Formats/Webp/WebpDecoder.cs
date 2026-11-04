@@ -11,6 +11,12 @@ public sealed record WebpFrame(byte[] Rgba, int X, int Y, int Width, int Height,
 public sealed record WebpAnimation(int CanvasWidth, int CanvasHeight, int LoopCount, WebpFrame[] Frames);
 
 /// <summary>
+/// 动图容器信息：画布尺寸、帧数与循环次数（0 = 无限）。
+/// 仅解析 VP8X/ANIM/ANMF 头，不解码任何帧像素，因此可用于在解码前预分配或做准入判断。
+/// </summary>
+public sealed record WebpAnimationInfo(int CanvasWidth, int CanvasHeight, int FrameCount, int LoopCount);
+
+/// <summary>
 /// 纯 C# WebP 解码器入口。
 ///
 /// 支持范围：
@@ -142,17 +148,97 @@ public static class WebpDecoder
         return DecodeAnimationFromContainer(container);
     }
 
+    /// <summary>
+    /// 读取动图容器信息（不解码像素）。
+    /// </summary>
+    /// <exception cref="WebpContainerException">文件不是动图、缺少 ANMF 或帧头损坏。</exception>
+    public static WebpAnimationInfo ReadAnimationInfo(string path)
+    {
+        using var fs = new FileStream(path, FileMode.Open, FileAccess.Read);
+        return ReadAnimationInfo(fs);
+    }
+
+    /// <summary>
+    /// 读取动图容器信息（不解码像素）。
+    /// </summary>
+    public static WebpAnimationInfo ReadAnimationInfo(Stream stream)
+    {
+        ArgumentNullException.ThrowIfNull(stream);
+        return ReadAnimationInfoFromContainer(WebpContainer.Load(stream));
+    }
+
+    /// <summary>
+    /// 读取动图容器信息（不解码像素）。
+    /// </summary>
+    public static WebpAnimationInfo ReadAnimationInfo(ReadOnlySpan<byte> data)
+        => ReadAnimationInfoFromContainer(WebpContainer.Load(data));
+
+    /// <summary>
+    /// 读取动图容器信息（不解码像素）。
+    /// </summary>
+    public static WebpAnimationInfo ReadAnimationInfo(byte[] data)
+    {
+        ArgumentNullException.ThrowIfNull(data);
+        return ReadAnimationInfoFromContainer(WebpContainer.Load(data));
+    }
+
+    /// <summary>
+    /// 逐帧惰性解码动图，返回完整的画布快照序列。
+    /// </summary>
+    /// <remarks>
+    /// 与 <see cref="DecodeAnimation(string)"/> 不同，本方法不会一次性保留全部帧：
+    /// 枚举器每次只合成一帧并返回该帧快照，之后仅保留两份画布状态（当前帧合成结果与
+    /// 上一帧 disposal 后的状态），峰值内存为 O(画布) 而不是 O(帧数 × 画布)，
+    /// 适合长动图或网络服务逐帧转码。<br/>
+    /// 返回的 <see cref="WebpFrame.Rgba"/> 由调用方持有；调用方宣布帧处理完毕后即可释放，
+    /// 枚举器不会复用该数组。序列可以多次枚举（每次重新解码），不同枚举之间的状态互不共享。
+    /// </remarks>
+    /// <exception cref="WebpContainerException">文件不是动图、缺少 ANMF 或帧头损坏。</exception>
+    /// <exception cref="WebpUnsupportedException">帧数据使用当前实现不支持的特性。</exception>
+    public static IEnumerable<WebpFrame> EnumerateFrames(string path)
+    {
+        using var fs = new FileStream(path, FileMode.Open, FileAccess.Read);
+        return EnumerateFrames(fs);
+    }
+
+    /// <summary>
+    /// 逐帧惰性解码动图（流会在返回前读完，之后可立即释放）。
+    /// </summary>
+    public static IEnumerable<WebpFrame> EnumerateFrames(Stream stream)
+    {
+        ArgumentNullException.ThrowIfNull(stream);
+        return CreateLazyFrames(WebpContainer.Load(stream));
+    }
+
+    /// <summary>
+    /// 逐帧惰性解码动图（不复制输入数组，容器在枚举期间引用该数组，调用方不得修改）。
+    /// </summary>
+    public static IEnumerable<WebpFrame> EnumerateFrames(byte[] data)
+    {
+        ArgumentNullException.ThrowIfNull(data);
+        return CreateLazyFrames(WebpContainer.Load(data));
+    }
+
+    private static IEnumerable<WebpFrame> CreateLazyFrames(WebpContainer container)
+    {
+        // 在返回序列前完成整份文件的容器/帧头校验：调用方拿到序列时文件已确认可用。
+        var info = ReadAnimationInfoFromContainer(container);
+        return EnumerateFramesCore(container, info);
+    }
+
     private static byte[] DecodeRgbaFromContainer(WebpContainer container, out int width, out int height)
     {
-        // 动图：复用动图解码流程，返回最后一帧的整幅画布快照
+        // 动图：逐帧解码并只保留最后一帧画布，避免为整段动图驻留全部快照
         if (container.IsAnimation)
         {
-            var animation = DecodeAnimationFromContainer(container);
-            if (animation.Frames.Length == 0)
+            var info = ReadAnimationInfoFromContainer(container);
+            WebpFrame? last = null;
+            foreach (var frame in EnumerateFramesCore(container, info))
+                last = frame;
+            if (last is null)
                 throw new WebpContainerException("动图缺少可解码的帧");
-            var last = animation.Frames[animation.Frames.Length - 1];
-            width = animation.CanvasWidth;
-            height = animation.CanvasHeight;
+            width = info.CanvasWidth;
+            height = info.CanvasHeight;
             return last.Rgba;
         }
 
@@ -182,16 +268,19 @@ public static class WebpDecoder
     {
         if (container.IsAnimation)
         {
-            var animation = DecodeAnimationFromContainer(container);
-            if (animation.Frames.Length == 0)
+            // 与 DecodeRgba 共用惰性路径：只保留最后一帧快照，避免全部帧驻留
+            var info = ReadAnimationInfoFromContainer(container);
+            WebpFrame? last = null;
+            foreach (var frame in EnumerateFramesCore(container, info))
+                last = frame;
+            if (last is null)
                 throw new WebpContainerException("动图缺少可解码的帧");
-            var last = animation.Frames[animation.Frames.Length - 1];
-            width = animation.CanvasWidth;
-            height = animation.CanvasHeight;
+            width = info.CanvasWidth;
+            height = info.CanvasHeight;
             int need = checked(width * height * 4);
             if (dst.Length < need)
                 throw new ArgumentException($"输出缓冲区不足：需要 {need} 字节，实际 {dst.Length}", nameof(dst));
-            last.Rgba.AsSpan().CopyTo(dst);
+            last.Rgba.AsSpan(0, need).CopyTo(dst);
             return;
         }
 
@@ -304,7 +393,8 @@ public static class WebpDecoder
             rgba[i * 4 + 3] = alpha[i];
     }
 
-    private static WebpAnimation DecodeAnimationFromContainer(WebpContainer container)
+    /// <summary>校验动图容器头并统计帧数（只读 VP8X/ANIM/ANMF 头，不解码帧像素）。</summary>
+    private static WebpAnimationInfo ReadAnimationInfoFromContainer(WebpContainer container)
     {
         if (!container.IsAnimation)
             throw new WebpContainerException("该文件不是动图（缺少 VP8X Animation 标志）");
@@ -317,13 +407,37 @@ public static class WebpDecoder
             throw new WebpUnsupportedException("动图画布尺寸超出实现上限 16383");
         ValidatePixelCount(canvasWidth, canvasHeight);
 
+        int frameCount = container.FindAllChunks(WebpChunkId.Anmf).Count;
+        if (frameCount == 0)
+            throw new WebpContainerException("动图缺少 ANMF 帧");
+
+        return new WebpAnimationInfo(canvasWidth, canvasHeight, frameCount, container.LoopCount);
+    }
+
+    private static WebpAnimation DecodeAnimationFromContainer(WebpContainer container)
+    {
+        var info = ReadAnimationInfoFromContainer(container);
+        var frames = new List<WebpFrame>(info.FrameCount);
+        foreach (var frame in EnumerateFramesCore(container, info))
+            frames.Add(frame);
+
+        return new WebpAnimation(info.CanvasWidth, info.CanvasHeight, info.LoopCount, frames.ToArray());
+    }
+
+    /// <summary>
+    /// 动图逐帧合成核心（惰性）：每次 MoveNext 只解码当前 ANMF 子帧并合成到画布，
+    /// 返回快照后立即推进到下一帧状态。枚举器自身只持有两份画布（当前帧与上一帧 disposal 后）。
+    /// </summary>
+    private static IEnumerable<WebpFrame> EnumerateFramesCore(WebpContainer container, WebpAnimationInfo info)
+    {
+        int canvasWidth = info.CanvasWidth;
+        int canvasHeight = info.CanvasHeight;
+
         var canvas = new byte[canvasWidth * canvasHeight * 4];
         // 上一帧绘制前（已应用上一帧 disposal）的画布；混合运算的 dst 就是它。
         var prevDisposed = new byte[canvas.Length];
 
-        var frames = new List<WebpFrame>();
         var anmfs = container.FindAllChunks(WebpChunkId.Anmf);
-        if (anmfs.Count == 0) throw new WebpContainerException("动图缺少 ANMF 帧");
 
         bool prevDispose = false;
         bool prevWasKeyFrame = false;
@@ -399,7 +513,8 @@ public static class WebpDecoder
                 BlendRect(canvas, prevDisposed, canvasWidth, header.X, header.Y, fw, fh,
                     prevDispose, prevX, prevY, prevW, prevH);
 
-            frames.Add(new WebpFrame(canvas.ToArray(), header.X, header.Y, header.Width, header.Height, header.DurationMs));
+            // 快照所有权交给调用方；枚举器继续复用 canvas 合成下一帧。
+            yield return new WebpFrame(canvas.ToArray(), header.X, header.Y, header.Width, header.Height, header.DurationMs);
 
             // 为下一帧准备输入画布：保留本帧结果，再按 dispose 语义清除本帧矩形。
             Array.Copy(canvas, prevDisposed, canvas.Length);
@@ -413,8 +528,6 @@ public static class WebpDecoder
             prevW = header.Width;
             prevH = header.Height;
         }
-
-        return new WebpAnimation(canvasWidth, canvasHeight, container.LoopCount, frames.ToArray());
     }
 
     /// <summary>VP8L 图像头中的 alpha_is_used 位（5 字节头，bit 36 → byte[4] 的 bit 4）。</summary>

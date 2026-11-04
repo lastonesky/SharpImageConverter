@@ -50,15 +50,16 @@ This library was originally created to address several practical issues we encou
   - LZW compression; no transparency/animation metadata (delay, loop)
 
 ### WebP
-- Read/Write WebP (encoding via native libwebp under `runtimes/`)
-- **Optional pure C# decoder**: VP8L lossless (including ALPH and VP8X animation frames) is decoded
-  in managed code and is bit-exact against libwebp; lossy VP8 and animations still use libwebp.
-  Env var `SIC_WEBP_BACKEND` accepts `auto` (default) / `libwebp` / `managed`; `managed` throws
-  instead of falling back for unsupported features, and `SIC_WEBP_TRACE=1` logs fallback reasons.
-  It can also be set in code via `WebpDecodePolicy.Backend`
+- Read/Write WebP entirely in managed C#: VP8L lossless encode/decode, lossy VP8 encoding,
+  VP8/VP8L decoding, ALPH side-channel alpha, and VP8X / ANIM / ANMF animation containers
+- Supports simple format (VP8/VP8L) and VP8X extended format; animations can be decoded as a whole,
+  or frame-by-frame with `WebpDecoder.EnumerateFrames` (peak memory O(canvas) instead of
+  O(frames × canvas)). `WebpDecoder.ReadAnimationInfo` returns canvas size / frame count / loop count
+  without decoding any pixels
+- ICCP / EXIF / XMP metadata chunks are read and passed through on write
 - Unified decode to RGB24; select encoder based on output file extension
-- WebP encode quality and concurrency strategy are configurable
-- WebP implementation relies on Google's libwebp and related components (BSD-3-Clause License); see `THIRD-PARTY-NOTICES.md` for copyright and license details
+- WebP encode quality, lossy/lossless mode and concurrency strategy are configurable
+- Native libwebp is only used by tests for pixel-exact cross-checking; the library itself has no native dependency
 
 ### Intermediate Format
 - `ImageFrame` as the intermediate structure for format conversion, supporting `Rgb24` (default), `Bgr24`, `Bgra32` and `Rgba32` pixel formats
@@ -89,7 +90,7 @@ SharpImageConverter/
 │  ├── Compression/              # Smart lossy optimization: quality metrics, per-format optimizers
 │  ├── Metadata/                 # Metadata structures (Orientation/EXIF/ICC/DPI)
 │  ├── ImageFrame.cs             # Second pixel container (BGR/BGRA + non-seekable streams)
-│  ├── runtimes/                 # WebP native libraries (win-x64/linux-x64/osx-arm64)
+│  ├── runtimes/                 # Native libwebp (tests/benchmarks only; runtime has no native dependency)
 │  └── SharpImageConverter.csproj
 ├── Cli/                         # Standalone CLI project (Program*.cs split by role: Parse/Process/Encode/Optimize/Bench)
 │  ├── Program.cs
@@ -115,9 +116,7 @@ SharpImageConverter/
 Requirements:
 - **.NET SDK 10.0** (the library currently ships a single `net10.0` target; multi-targeting
   to `net8.0` is not available yet — trust `TargetFramework` in `src/SharpImageConverter.csproj`)
-- Windows x64 / Linux x64 / macOS arm64 (WebP needs the native libwebp for your RID under
-  `runtimes/`; **linux-arm64 and osx-x64 have no native libraries yet**, so only
-  JPEG/PNG/BMP/GIF work there)
+- Windows x64 / Linux x64 / macOS arm64 (WebP is managed code and has no native library RID restriction)
 
 ## Install (NuGet)
 
