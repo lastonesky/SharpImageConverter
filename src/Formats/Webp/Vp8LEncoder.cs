@@ -130,7 +130,7 @@ internal static class Vp8LEncoder
         if (rgba.Length != checked(width * height * 4))
             throw new ArgumentException("RGBA 像素长度与尺寸不匹配", nameof(rgba));
 
-        if (options.SelectBest) return EncodeBest(rgba, width, height);
+        if (options.SelectBest) return EncodeBest(rgba, width, height, diagnostics);
 
         int total = width * height;
         var pixels = ToArgb(rgba, total);
@@ -177,6 +177,18 @@ internal static class Vp8LEncoder
         public long MetaImageBits;
         public long TableBits;
         public long TokenBits;
+
+        /// <summary>按实际统计直方图计算的四通道一阶熵 + 附加位，即当前 token 集的理论下界。</summary>
+        public long IdealTokenBits;
+
+        /// <summary>各通道（G/R/B/A/dist）实际 Huffman 码长位数，用于诊断码表构造质量。</summary>
+        public double[] ChannelHuffBits = new double[5];
+
+        /// <summary>各通道的理论熵位数。</summary>
+        public double[] ChannelIdealBits = new double[5];
+
+        /// <summary>构建出的码表中出现的最大码长（等于上限 15 说明限长逻辑实际生效）。</summary>
+        public int MaxCodeLengthSeen;
 
         public int LiteralCount;
         public int CacheSymbolCount;
@@ -465,7 +477,8 @@ internal static class Vp8LEncoder
     /// 变换阶段与 token 编码阶段分离：同一份变换结果被多个 token 候选复用，
     /// 避免为每个候选重复做 predictor 搜索（这是编码耗时的主要来源）。
     /// </summary>
-    private static byte[] EncodeBest(ReadOnlySpan<byte> rgba, int width, int height)
+    private static byte[] EncodeBest(ReadOnlySpan<byte> rgba, int width, int height,
+        Vp8LEncodeDiagnostics? diagnostics = null)
     {
         int total = width * height;
         var pixels = ToArgb(rgba, total);
@@ -475,16 +488,18 @@ internal static class Vp8LEncoder
         // （较贵的）空间变换搜索。
         PreparedPalette? palette = TryPreparePalette(pixels, width, height);
         byte[]? paletteBest = null;
+        Vp8LEncoderOptions paletteBestOptions = default;
         if (palette != null)
         {
-            paletteBest = EncodePrepared(pixels, width, height, alphaUsed,
-                new Vp8LEncoderOptions(false, true, true, useColorIndexing: true), null, palette);
-            var noCache = EncodePrepared(pixels, width, height, alphaUsed,
-                new Vp8LEncoderOptions(false, false, true, useColorIndexing: true), null, palette);
-            if (noCache.Length < paletteBest.Length) paletteBest = noCache;
-            var noLz77 = EncodePrepared(pixels, width, height, alphaUsed,
-                new Vp8LEncoderOptions(false, true, false, useColorIndexing: true), null, palette);
-            if (noLz77.Length < paletteBest.Length) paletteBest = noLz77;
+            var withCache = new Vp8LEncoderOptions(false, true, true, useColorIndexing: true);
+            paletteBest = EncodePrepared(pixels, width, height, alphaUsed, withCache, null, palette);
+            paletteBestOptions = withCache;
+            var noCacheOptions = new Vp8LEncoderOptions(false, false, true, useColorIndexing: true);
+            var noCache = EncodePrepared(pixels, width, height, alphaUsed, noCacheOptions, null, palette);
+            if (noCache.Length < paletteBest.Length) { paletteBest = noCache; paletteBestOptions = noCacheOptions; }
+            var noLz77Options = new Vp8LEncoderOptions(false, true, false, useColorIndexing: true);
+            var noLz77 = EncodePrepared(pixels, width, height, alphaUsed, noLz77Options, null, palette);
+            if (noLz77.Length < paletteBest.Length) { paletteBest = noLz77; paletteBestOptions = noLz77Options; }
         }
 
         // 剪枝：颜色数很少且调色板已经把整幅图压到 ≤ 0.5 字节/像素时，
@@ -506,9 +521,18 @@ internal static class Vp8LEncoder
         }
 
         byte[]? best = null;
-        void Consider(byte[] candidate)
+        Vp8LEncoderOptions bestOptions = default;
+        PreparedSpatial? bestSpatial = null;
+        PreparedPalette? bestPalette = null;
+        void Consider(byte[] candidate, in Vp8LEncoderOptions options, PreparedSpatial? usedSpatial, PreparedPalette? usedPalette)
         {
-            if (best == null || candidate.Length < best.Length) best = candidate;
+            if (best == null || candidate.Length < best.Length)
+            {
+                best = candidate;
+                bestOptions = options;
+                bestSpatial = usedSpatial;
+                bestPalette = usedPalette;
+            }
         }
 
         if (!paletteDecisive)
@@ -517,26 +541,29 @@ internal static class Vp8LEncoder
             // 此时 (cache, spatial) 与 (no-cache, spatialNoColor) 等候选会完全重合，
             // 必须去重，否则大图上会白跑一整遍 token 编码（耗时占比很高）。
             bool colorActive = spatial != null && spatial != spatialNoColor;
-            Consider(EncodePrepared(pixels, width, height, alphaUsed,
-                new Vp8LEncoderOptions(true, true, true, autoPredictor: true), spatial, null));
-            Consider(EncodePrepared(pixels, width, height, alphaUsed,
-                new Vp8LEncoderOptions(true, false, true, autoPredictor: true, autoCrossColor: false),
-                spatialNoColor, null));
+            var a1 = new Vp8LEncoderOptions(true, true, true, autoPredictor: true);
+            Consider(EncodePrepared(pixels, width, height, alphaUsed, a1, spatial, null), a1, spatial, null);
+            var a2 = new Vp8LEncoderOptions(true, false, true, autoPredictor: true, autoCrossColor: false);
+            Consider(EncodePrepared(pixels, width, height, alphaUsed, a2, spatialNoColor, null), a2, spatialNoColor, null);
             if (colorActive)
             {
                 // 无 cross-color 的候选：cross-color 的残差熵通常更低，但 mod-256 回绕会在
                 // 残差里留下一道随行推进的断点（渐变图每行恰好一个像素），整行重复因此被
                 // 打断，LZ77 收益大幅缩水。这类收益只有在真实编码后才看得出来，所以交给
                 // 候选选择而不是熵估计来裁决。
-                Consider(EncodePrepared(pixels, width, height, alphaUsed,
-                    new Vp8LEncoderOptions(true, false, true, autoPredictor: true), spatial, null));
+                var a3 = new Vp8LEncoderOptions(true, false, true, autoPredictor: true);
+                Consider(EncodePrepared(pixels, width, height, alphaUsed, a3, spatial, null), a3, spatial, null);
             }
-            Consider(EncodePrepared(pixels, width, height, alphaUsed,
-                new Vp8LEncoderOptions(true, false, false, autoPredictor: true), spatial, null));
+            var a4 = new Vp8LEncoderOptions(true, false, false, autoPredictor: true);
+            Consider(EncodePrepared(pixels, width, height, alphaUsed, a4, spatial, null), a4, spatial, null);
         }
-        Consider(EncodePrepared(pixels, width, height, alphaUsed,
-            Vp8LEncoderOptions.LiteralOnly, null, null));
-        if (paletteBest != null) Consider(paletteBest);
+        Consider(EncodePrepared(pixels, width, height, alphaUsed, Vp8LEncoderOptions.LiteralOnly, null, null),
+            Vp8LEncoderOptions.LiteralOnly, null, null);
+        if (paletteBest != null) Consider(paletteBest, paletteBestOptions, null, palette);
+
+        // 诊断快照按胜出候选重编一遍：只在显式请求时发生，生产路径不付这份代价。
+        if (diagnostics != null && best != null)
+            EncodePrepared(pixels, width, height, alphaUsed, bestOptions, bestSpatial, bestPalette, diagnostics);
 
         return best!;
     }
@@ -576,6 +603,47 @@ internal static class Vp8LEncoder
         // 统计 token（顺带决定 meta-Huffman 分组），并构造码表。
         var stats = CollectStatistics(pixels, width, height, cacheBits, greenAlphabet, options,
             allowMetaHuffman: level0 && options.UseMetaHuffman, diagnostics);
+
+        if (diagnostics != null)
+        {
+            double ideal = stats.ExtraBits;
+            for (int g = 0; g < stats.NumGroups; g++)
+            {
+                ideal += EntropyBits(stats.GreenFreq[g]);
+                ideal += EntropyBits(stats.RedFreq[g]);
+                ideal += EntropyBits(stats.BlueFreq[g]);
+                ideal += EntropyBits(stats.AlphaFreq[g]);
+                ideal += EntropyBits(stats.DistanceFreq[g]);
+            }
+            diagnostics.IdealTokenBits = (long)Math.Round(ideal);
+
+            for (int g = 0; g < stats.NumGroups; g++)
+            {
+                MeasureChannel(stats.GreenFreq[g], stats.GreenCodes[g], 0);
+                MeasureChannel(stats.RedFreq[g], stats.RedCodes[g], 1);
+                MeasureChannel(stats.BlueFreq[g], stats.BlueCodes[g], 2);
+                MeasureChannel(stats.AlphaFreq[g], stats.AlphaCodes[g], 3);
+                MeasureChannel(stats.DistanceFreq[g], stats.DistanceCodes[g], 4);
+            }
+        }
+
+        void MeasureChannel(int[] freq, Vp8LHuffmanCode code, int index)
+        {
+            long total = 0;
+            for (int i = 0; i < freq.Length; i++) total += freq[i];
+            if (total == 0) return;
+            double huff = 0, entropy = 0;
+            for (int i = 0; i < freq.Length; i++)
+            {
+                int f = freq[i];
+                if (f == 0) continue;
+                huff += (double)f * code.Lengths[i];
+                entropy += f * Math.Log2(total / (double)f);
+                if (code.Lengths[i] > diagnostics!.MaxCodeLengthSeen) diagnostics.MaxCodeLengthSeen = code.Lengths[i];
+            }
+            diagnostics!.ChannelHuffBits[index] += huff;
+            diagnostics.ChannelIdealBits[index] += entropy;
+        }
 
         long beforeMetaImage = writer.TotalBits;
         // meta-Huffman 标志只在 level 0 出现（RFC 9649 §2.5），子图像必须不写这个位。

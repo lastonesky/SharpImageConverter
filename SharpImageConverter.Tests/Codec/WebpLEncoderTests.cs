@@ -1,6 +1,8 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using Xunit;
+using SharpImageConverter.Core;
 using SharpImageConverter;
 using SharpImageConverter.Formats.Webp;
 using SharpImageConverter.Tests.Helpers;
@@ -276,6 +278,46 @@ public class WebpLEncoderTests
     // ==================================================================
     //  压缩率基线：阶段 A vs 阶段 B（各特性必须真的带来收益或至少不劣化）
     // ==================================================================
+
+    /// <summary>
+    /// 压缩率对拍：无损体积不得明显劣于 libwebp。
+    ///
+    /// 背景：限长 Huffman 曾在 Kraft 校验失败后退化成扁平码（所有符号 9~10 位）。
+    /// 那种位流**完全合法**——能解码、往返 bit-exact、Kraft 和也成立——只有体积异常
+    /// （照片样本上曾达 libwebp 的 1.72 倍）。合法性与往返测试都抓不到，只有和 libwebp
+    /// 比体积才能兜住，所以这条断言是那类回归的唯一护栏。
+    /// </summary>
+    [Fact]
+    public void Full_SizeWithin35PercentOfLibWebp_OnStructuredImages()
+    {
+        // 样本必须够大、符号够多，限长 Huffman 才会真正被触发：96×72 这类小图上
+        // 活跃符号少、树深不足 15，绕过限长逻辑，用它们做护栏会漏掉回归。
+        // scene.png 是真实照片（长尾残差），修复前它的比值是 1.57x，正是本断言的靶子。
+        var samples = new List<Sample>
+        {
+            new Sample("photo-96x72", Photo(96, 72, seed: 11), 96, 72),
+            new Sample("photo-320x240", Photo(320, 240, seed: 17), 320, 240),
+            new Sample("gradient-256x192", Gradient(256, 192), 256, 192),
+            new Sample("alpha-192x128", AlphaGradient(192, 128), 192, 128),
+        };
+        string scenePath = Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", "examples", "scene.png");
+        if (File.Exists(scenePath))
+        {
+            var scene = SharpImageConverter.Core.Image.LoadRgba32(scenePath);
+            samples.Add(new Sample("scene.png", scene.Buffer, scene.Width, scene.Height));
+        }
+        foreach (var sample in samples)
+        {
+            int ours = WebpEncoder.EncodeRgba(sample.Rgba, sample.W, sample.H).Length;
+            int lib = LibWebpTestCodec.EncodeLosslessRgbaForDispatch(sample.Rgba, sample.W, sample.H).Length;
+
+            // 小图（<10 万像素）里位流头 + 码表的固定开销占比高，比值天然偏高，
+            // 因此额外放宽一个固定字节数；大图上这条余量可以忽略。
+            long budget = (long)(lib * 1.35) + 256;
+            Assert.True(ours <= budget,
+                $"{sample.Name}: 我方 {ours} 字节 / libwebp {lib} 字节 = {(double)ours / lib:F2}x（上限 1.35x + 256B）");
+        }
+    }
 
     [Fact]
     public void StageB_ShouldNotBeLargerThanLiteralOnly_ForStructuredImages()
