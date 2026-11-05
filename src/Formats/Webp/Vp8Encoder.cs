@@ -32,6 +32,8 @@ namespace SharpImageConverter.Formats.Webp;
 /// 两遍编码：第一遍只统计 1056 个 token 概率节点的 0/1 次数（不写 token 位），
 /// 第二遍用统计得到的概率写位流并在帧头写出更新项。两遍的量化与重建路径完全确定，
 /// 符号序列因此一致；重建平面在第二遍开始前由宏块网格整体覆盖，无需清空。
+/// 第一遍做过的模式决策（16×16 亮度模式、i4x4 的 16 个子块模式、色度模式）会被记录下来，
+/// 第二遍直接重放，省掉重复的 RD 搜索。
 ///
 /// 实例持有整帧缓冲区，非线程安全；每次编码创建独立实例。
 /// </summary>
@@ -47,9 +49,11 @@ internal sealed class Vp8Encoder
     private const int MaxPartition0Bytes = 1 << 19;
 
     /// <summary>
-    /// partition0 预算：两遍之间模式决策可能因概率表差异小幅漂移，留 32KB 余量。
+    /// partition0 预算（19 位上限减去给第二遍预留的余量）。第二遍重放同一批模式决策，
+    /// 逐宏块数据与第一遍一致；差别只在 skip 位（第一遍固定 128，第二遍按实测比例自适应，
+    /// 平均代价只会更低）以及 token 概率更新表（约 1KB）。因此 4KB 余量足够覆盖。
     /// </summary>
-    private const int Partition0BudgetBytes = MaxPartition0Bytes - 32 * 1024;
+    private const int Partition0BudgetBytes = MaxPartition0Bytes - 4 * 1024;
 
     /// <summary>VP8 系数幅值上限（类别码 Cat6 可表示的最大值）。</summary>
     private const int MaxCoefficient = 2114;
@@ -95,6 +99,28 @@ internal sealed class Vp8Encoder
     /// <summary>每个宏块的分段号（按活动度预分析，行优先）。关闭分段时内容无关紧要。</summary>
     private byte[] _segmentMap = Array.Empty<byte>();
 
+    // ---- 两遍决策复用 ----
+    // 第二遍与第一遍的量化/重建路径完全确定，只有 token 概率不同；因此把第一遍已经做出的
+    // 模式决策（16×16 亮度模式、i4x4 的 16 个子块模式、色度模式）记录下来，第二遍直接重放，
+    // 省掉 i4x4 的 10 模式 × 16 子块 + 3 候选 RD 比较与 16×16/色度的 4 模式搜索。
+    /// <summary>第一遍的宏块决策：bit0 = i4x4，bit1..2 = 16×16 亮度模式，bit3..4 = 色度模式。</summary>
+    private byte[] _mbDecision = Array.Empty<byte>();
+
+    /// <summary>i4x4 宏块的 16 个子块模式（每宏块 16 字节，行优先）。</summary>
+    private byte[] _i4Decision = Array.Empty<byte>();
+
+    /// <summary>本遍是否记录决策（第一遍）。</summary>
+    private bool _recordDecisions;
+
+    /// <summary>本遍是否重放记录下来的决策（第二遍）。</summary>
+    private bool _replayDecisions;
+
+    /// <summary>
+    /// 第一遍是否完整记录了全部宏块的决策。探测遍可能因 partition0 超限被提前中断，
+    /// 此时剩余行没有决策，第二遍不能重放。
+    /// </summary>
+    private bool _decisionsValid;
+
     /// <summary>各段相对 base_q 的量化 delta（segment_feature_mode=0 的语义）。</summary>
     private readonly int[] _segDelta = new int[4];
 
@@ -137,6 +163,33 @@ internal sealed class Vp8Encoder
 
     /// <summary>当前生效的 token 概率表（第一遍为默认表，第二遍为统计更新后的表）。</summary>
     private byte[,,,] _probs;
+
+    /// <summary>
+    /// <see cref="_probs"/> 的展平位成本表：[(type, band, ctx, node, bit)] → 成本（1/256 bit）。
+    /// trellis 内层每次候选都要查若干次，用一维表代替四维索引。
+    /// </summary>
+    private readonly int[] _nodeCost = new int[4 * 8 * 3 * 11 * 2];
+
+    /// <summary>按当前概率表重建 <see cref="_nodeCost"/>（每个编码遍一次）。</summary>
+    private void BuildNodeCosts()
+    {
+        for (int type = 0; type < 4; type++)
+        {
+            for (int band = 0; band < 8; band++)
+            {
+                for (int ctx = 0; ctx < 3; ctx++)
+                {
+                    for (int node = 0; node < 11; node++)
+                    {
+                        int prob = _probs[type, band, ctx, node];
+                        int at = ((type * 8 + band) * 3 + ctx) * 11 + node;
+                        _nodeCost[at * 2] = Vp8CostTable.Cost[prob, 0];
+                        _nodeCost[at * 2 + 1] = Vp8CostTable.Cost[prob, 1];
+                    }
+                }
+            }
+        }
+    }
 
     /// <summary>第一遍只统计符号频次：为 true 时 token 位不写入、只累加计数。</summary>
     private bool _statsOnly;
@@ -318,9 +371,12 @@ internal sealed class Vp8Encoder
         // 默认配置：第一遍统计后检查 partition0 长度，超预算则降级重跑（见类注释）。
         encoder.Configure(useSegmentation: true, allowI4: true);
         encoder.ResetForPass(encoder._probs, statsOnly: true);
+        // 超大图的默认配置会撑爆 partition0 时，探测遍一旦确定超 19 位上限就提前收手，避免白跑整遍。
+        encoder._abortOnPartition0Overflow = true;
         encoder.Run(assemble: false);
+        encoder._abortOnPartition0Overflow = false;
 
-        if (encoder._part0.Length > Partition0BudgetBytes)
+        if (encoder._probeAborted || encoder._part0.Length > Partition0BudgetBytes)
         {
             // 降级配置（关闭分段 + 强制 16×16）每宏块 partition0 开销有内容无关的硬上界
             // （skip ≤1 + i4x4 判定 ≤1.2 + 亮度模式树 ≤4 + 色度模式树 ≤3 ≈ 9 bit），
@@ -340,7 +396,7 @@ internal sealed class Vp8Encoder
         // 环内滤波强度：用第一遍已建好的重建帧做候选强度实测选择。
         encoder.SelectFilterLevel();
 
-        // 第二遍：用本帧统计得到的概率写位流。
+        // 第二遍：用本帧统计得到的概率写位流，并重放第一遍的模式决策。
         encoder.ResetForPass(encoder.AdaptProbabilities(), statsOnly: false);
         return encoder.Run(assemble: true);
     }
@@ -359,6 +415,8 @@ internal sealed class Vp8Encoder
         _useSegmentation = useSegmentation;
         _allowI4 = allowI4;
         _skipProb = 128;
+        // 换配置意味着重建路径变了，先前记录的决策不再对应当前配置。
+        _decisionsValid = false;
     }
 
     /// <summary>
@@ -418,9 +476,22 @@ internal sealed class Vp8Encoder
     private void ResetForPass(byte[,,,] probs, bool statsOnly)
     {
         _probs = probs;
+        BuildNodeCosts();
         _statsOnly = statsOnly;
+        _recordDecisions = statsOnly;
+        _replayDecisions = !statsOnly && _decisionsValid;
+        _probeAborted = false;
         _part0 = new Vp8BoolEncoder(1024);
         _tokens = new Vp8BoolEncoder(1024);
+
+        if (_recordDecisions)
+        {
+            int mbCount = _mbW * _mbH;
+            if (_mbDecision.Length != mbCount)
+                _mbDecision = new byte[mbCount];
+            if (_allowI4 && _i4Decision.Length != mbCount * 16)
+                _i4Decision = new byte[mbCount * 16];
+        }
 
         _leftNz = 0;
         _leftNzDc = 0;
@@ -428,6 +499,11 @@ internal sealed class Vp8Encoder
         Array.Clear(_mbNzDc);
         Array.Clear(_i4TopModes);
         Array.Clear(_i4LeftModes);
+
+        // 每遍的统计独立累计：探测遍可能因 partition0 超限被提前中断（或换成降级配置），
+        // 把两遍的计数混在一起会让概率偏离实际生效的那一遍。
+        Array.Clear(_count0);
+        Array.Clear(_count1);
         _anyCoefficient = false;
         _y2Nz = 0;
         _skipCount = 0;
@@ -461,6 +537,18 @@ internal sealed class Vp8Encoder
     }
 
     /// <summary>
+    /// 探测遍：partition0 一旦确定会超 19 位上限就放弃本遍。
+    /// 布尔编码器只会追加字节，长度单调增长，因此在宏块行末超过上限即说明最终必然超限，
+    /// 剩下的行不必再算（超大图可省掉大半遍编码）。
+    /// 不做按行外推：各行模式信息密度差异很大（实测照片顶部比其余部分密一倍），外推会把
+    /// 本可通过的图像误判成必须降级，反而白跑一整遍降级编码。
+    /// </summary>
+    private bool _abortOnPartition0Overflow;
+
+    /// <summary>本遍是否因 partition0 确定超过 19 位上限被提前中断（此时长度只是下界）。</summary>
+    private bool _probeAborted;
+
+    /// <summary>
     /// 跑完一遍编码。<paramref name="assemble"/> 为 false 时（统计遍）不拼帧——
     /// partition0 超限时 <see cref="AssembleFrame"/> 会抛异常，而统计遍的产物本就要丢弃，
     /// 此时只需通过 <see cref="_part0"/>.Length 测量长度供降级决策使用。
@@ -482,7 +570,19 @@ internal sealed class Vp8Encoder
             // 第一遍只统计概率，滤波不参与任何编码决策，跳过以免重复工作。
             if (!_statsOnly)
                 FilterRow(mbY, _filterLevel);
+
+            if (_abortOnPartition0Overflow && _part0.Length > MaxPartition0Bytes)
+            {
+                // 已写长度超过 19 位上限：这一遍的最终长度只会更长，降级已成定局，
+                // 剩下的行不必再算。
+                _probeAborted = true;
+                break;
+            }
         }
+
+        // 中断的探测遍只覆盖了前若干行，记录下来的决策不完整，不能用于第二遍重放。
+        if (_recordDecisions && !_probeAborted)
+            _decisionsValid = true;
 
         byte[] part0 = _part0.Finish();
         byte[] tokens = _tokens.Finish();
@@ -493,7 +593,8 @@ internal sealed class Vp8Encoder
     /// 环内滤波强度参与 RD 决策：第一遍重建完成后，用候选强度逐个对重建帧滤波，按
     /// 滤波后相对源图像的加权 SSE（4·Y + U + V）选最优。滤波强度只占 6 位固定帧头，
     /// 不产生逐宏块码率，因此直接以失真最小为准则。
-    /// 这一步始终使用第一遍的重建平面（第二遍会重新覆盖它）。
+    /// 这一步始终使用第一遍的重建平面（第二遍会重新覆盖它），且只按行采样评估——
+    /// 采样行的滤波结果与全帧逐行滤波在对应行上相同，候选之间的可比性不受影响。
     /// </summary>
     private void SelectFilterLevel()
     {
@@ -514,7 +615,7 @@ internal sealed class Vp8Encoder
         int bestLevel = _filterLevel;
         for (int i = 0; i < count; i++)
         {
-            FilterAll(candidates[i]);
+            FilterRowsForScore(candidates[i]);
             long sse = ComputeFilteredSse();
             if (sse < bestSse)
             {
@@ -535,7 +636,7 @@ internal sealed class Vp8Encoder
             for (int i = 0; i < SegmentLfDeltaCandidates.Length; i++)
             {
                 Array.Copy(SegmentLfDeltaCandidates[i], _segLfDelta, 4);
-                FilterAll(bestLevel);
+                FilterRowsForScore(bestLevel);
                 long sse = ComputeFilteredSse();
                 if (sse < bestDeltaSse)
                 {
@@ -546,38 +647,73 @@ internal sealed class Vp8Encoder
         }
 
         Array.Copy(bestDeltas, _segLfDelta, 4);
-        FilterAll(bestLevel);
     }
 
-    private void FilterAll(int level)
+    /// <summary>
+    /// 滤波强度评估的行采样步长（宏块行）：采样行足以稳定区分候选强度，而候选项与分段
+    /// delta 要评估十余遍，是超大图的主要开销之一。行数多时进一步放稀，行数太少时取全帧。
+    /// </summary>
+    private const int FilterScoreRowStep = 4;
+
+    /// <summary>超大图（≥256 宏块行）用 1/8 采样：143MP 图实测占整条命令约 16s。</summary>
+    private const int FilterScoreRowStepLarge = 8;
+
+    private int FilterScoreStep =>
+        _mbH >= FilterScoreRowStepLarge * 32
+            ? FilterScoreRowStepLarge
+            : _mbH <= FilterScoreRowStep * 2 ? 1 : FilterScoreRowStep;
+
+    /// <summary>
+    /// 按 <see cref="FilterScoreStep"/> 采样宏块行做滤波，供候选强度评分使用。
+    /// 采样行的上边界需要上一行的未滤波重建作为输入，所以先把它拷入输出平面——
+    /// 这样各候选拿到的边界输入一致，比较结果不受评估顺序影响。
+    /// </summary>
+    private void FilterRowsForScore(int level)
     {
-        for (int mbY = 0; mbY < _mbH; mbY++)
+        int step = FilterScoreStep;
+        for (int mbY = 0; mbY < _mbH; mbY += step)
+        {
+            if (step > 1 && mbY > 0)
+                CopyRowToOut(mbY - 1);
             FilterRow(mbY, level);
+        }
     }
 
-    /// <summary>滤波输出相对源图像的加权 SSE：亮度权重 4，两个色度各 1（对应 4:2:0 的采样比）。</summary>
+    /// <summary>
+    /// 滤波输出相对源图像的加权 SSE：亮度权重 4，两个色度各 1（对应 4:2:0 的采样比）。
+    /// 只统计参与评分的采样行（与 <see cref="FilterRowsForScore"/> 同步）。
+    /// </summary>
     private long ComputeFilteredSse()
     {
+        int step = FilterScoreStep;
         long sse = 0;
-        for (int y = 0; y < _height; y++)
+        for (int mbY = 0; mbY < _mbH; mbY += step)
         {
-            int srcRow = y * _width;
-            int outRow = y * _strideOutY;
-            for (int x = 0; x < _width; x++)
+            int y0 = mbY * 16;
+            int y1 = Math.Min(y0 + 16, _height);
+            for (int y = y0; y < y1; y++)
             {
-                int d = _srcY[srcRow + x] - _outY[outRow + x];
-                sse += 4L * d * d;
+                int srcRow = y * _width;
+                int outRow = y * _strideOutY;
+                for (int x = 0; x < _width; x++)
+                {
+                    int d = _srcY[srcRow + x] - _outY[outRow + x];
+                    sse += 4L * d * d;
+                }
             }
-        }
-        for (int y = 0; y < _ch; y++)
-        {
-            for (int x = 0; x < _cw; x++)
+
+            int c0 = mbY * 8;
+            int c1 = Math.Min(c0 + 8, _ch);
+            for (int y = c0; y < c1; y++)
             {
-                int i = y * _cw + x;
-                int o = y * _strideOutUv + x;
-                int du = _srcU[i] - _outU[o];
-                int dv = _srcV[i] - _outV[o];
-                sse += (long)du * du + (long)dv * dv;
+                for (int x = 0; x < _cw; x++)
+                {
+                    int i = y * _cw + x;
+                    int o = y * _strideOutUv + x;
+                    int du = _srcU[i] - _outU[o];
+                    int dv = _srcV[i] - _outV[o];
+                    sse += (long)du * du + (long)dv * dv;
+                }
             }
         }
         return sse;
@@ -591,21 +727,10 @@ internal sealed class Vp8Encoder
     /// </summary>
     private void FilterRow(int mbY, int baseLevel)
     {
+        CopyRowToOut(mbY);
+
         int yBase = mbY * 16 * _strideOutY;
         int uvBase = mbY * 8 * _strideOutUv;
-
-        int srcY = (Pad + mbY * 16) * _strideY + Pad;
-        int rowBytes = _mbW * 16;
-        for (int j = 0; j < 16; j++)
-            Array.Copy(_reconY, srcY + j * _strideY, _outY, yBase + j * _strideOutY, rowBytes);
-
-        int srcUv = (Pad + mbY * 8) * _strideUv + Pad;
-        int uvRowBytes = _mbW * 8;
-        for (int j = 0; j < 8; j++)
-        {
-            Array.Copy(_reconU, srcUv + j * _strideUv, _outU, uvBase + j * _strideOutUv, uvRowBytes);
-            Array.Copy(_reconV, srcUv + j * _strideUv, _outV, uvBase + j * _strideOutUv, uvRowBytes);
-        }
 
         // PrecomputeFilterStrengths（sharpness=0、无 ref/mode 增量）：
         // 每个宏块的实际 level = base + 所在段的 lf delta（clamp 0..63），
@@ -639,6 +764,25 @@ internal sealed class Vp8Encoder
                 Vp8LoopFilter.VFilter8(_outU, offUv, _strideOutUv, limit + 4, ilevel, hevThresh);
                 Vp8LoopFilter.VFilter8(_outV, offUv, _strideOutUv, limit + 4, ilevel, hevThresh);
             }
+        }
+    }
+
+    /// <summary>把某个宏块行的未滤波重建（亮度 + 两路色度）拷进滤波输出平面。</summary>
+    private void CopyRowToOut(int mbY)
+    {
+        int yBase = mbY * 16 * _strideOutY;
+        int srcY = (Pad + mbY * 16) * _strideY + Pad;
+        int rowBytes = _mbW * 16;
+        for (int j = 0; j < 16; j++)
+            Array.Copy(_reconY, srcY + j * _strideY, _outY, yBase + j * _strideOutY, rowBytes);
+
+        int uvBase = mbY * 8 * _strideOutUv;
+        int srcUv = (Pad + mbY * 8) * _strideUv + Pad;
+        int uvRowBytes = _mbW * 8;
+        for (int j = 0; j < 8; j++)
+        {
+            Array.Copy(_reconU, srcUv + j * _strideUv, _outU, uvBase + j * _strideOutUv, uvRowBytes);
+            Array.Copy(_reconV, srcUv + j * _strideUv, _outV, uvBase + j * _strideOutUv, uvRowBytes);
         }
     }
 
@@ -755,6 +899,13 @@ internal sealed class Vp8Encoder
         int yOff = (Pad + mbY * 16) * _strideY + Pad + mbX * 16;
         int uvOff = (Pad + mbY * 8) * _strideUv + Pad + mbX * 8;
 
+        // 第二遍直接重放第一遍的模式决策：只有 token 概率不同，量化与重建路径完全确定。
+        if (_replayDecisions)
+        {
+            EncodeMacroblockReplay(mbX, mbY, yOff, uvOff);
+            return;
+        }
+
         // 色度与亮度完全独立（色度预测只读色度平面的上/左邻居），先算定 uvMode 与
         // chromaAny，两条亮度候选路径共用同一份色度结果。
         int uvMode = ChooseMode8(mbX, mbY, uvOff);
@@ -793,6 +944,9 @@ internal sealed class Vp8Encoder
 
         bool skip = !((useI4 ? any4 : any16) || chromaAny);
 
+        if (_recordDecisions)
+            RecordDecision(mbX, mbY, useI4, yMode, uvMode);
+
         WriteMacroblockModes(mbX, useI4, yMode, uvMode, skip);
         if (skip)
         {
@@ -812,6 +966,104 @@ internal sealed class Vp8Encoder
         {
             WriteResidualTokens(mbX);
         }
+    }
+
+    /// <summary>记录第一遍的模式决策，供第二遍重放（<see cref="_i4Modes"/> 仍是 i4x4 的胜者）。</summary>
+    private void RecordDecision(int mbX, int mbY, bool useI4, int yMode, int uvMode)
+    {
+        int index = mbY * _mbW + mbX;
+        _mbDecision[index] = (byte)((useI4 ? 1 : 0) | (yMode << 1) | (uvMode << 3));
+        if (useI4)
+        {
+            int dst = index * 16;
+            for (int n = 0; n < 16; n++)
+                _i4Decision[dst + n] = (byte)_i4Modes[n];
+        }
+    }
+
+    /// <summary>
+    /// 第二遍的宏块编码：模式沿用第一遍记录的结果，只重做预测、正变换、量化与重建，
+    /// 然后写模式树与 token。量化用第二遍的自适应概率表，因此系数与第一遍可能略有差异；
+    /// skip 位按本次实际的非零系数判定，与 token 内容始终自洽。
+    /// </summary>
+    private void EncodeMacroblockReplay(int mbX, int mbY, int yOff, int uvOff)
+    {
+        int index = mbY * _mbW + mbX;
+        byte decision = _mbDecision[index];
+        bool useI4 = (decision & 1) != 0;
+        int yMode = (decision >> 1) & 3;
+        int uvMode = (decision >> 3) & 3;
+
+        Vp8IntraPred.Pred8(uvMode, mbY > 0, mbX > 0, _reconU, uvOff, _strideUv);
+        Vp8IntraPred.Pred8(uvMode, mbY > 0, mbX > 0, _reconV, uvOff, _strideUv);
+        _anyCoefficient = false;
+        PrepareChromaResidual(mbX, mbY, uvOff);
+        bool chromaAny = _anyCoefficient;
+
+        if (useI4)
+        {
+            _anyCoefficient = ReplayI4x4(mbX, mbY, yOff, index * 16);
+        }
+        else
+        {
+            Vp8IntraPred.Pred16(yMode, mbY > 0, mbX > 0, _reconY, yOff, _strideY);
+            _anyCoefficient = false;
+            PrepareLumaResidual(mbX, mbY, yOff);
+        }
+
+        bool skip = !(_anyCoefficient || chromaAny);
+
+        WriteMacroblockModes(mbX, useI4, yMode, uvMode, skip);
+        if (skip)
+        {
+            _leftNz = 0;
+            _mbNz[mbX] = 0;
+            if (!useI4)
+            {
+                _leftNzDc = 0;
+                _mbNzDc[mbX] = 0;
+            }
+        }
+        else if (useI4)
+        {
+            WriteI4ResidualTokens(mbX);
+        }
+        else
+        {
+            WriteResidualTokens(mbX);
+        }
+    }
+
+    /// <summary>
+    /// 重放第一遍的 i4x4：子块顺序、上下文簿记与 <see cref="PrepareI4x4"/> 完全一致，
+    /// 只是跳过 10 模式 × 16 子块的预测搜索与 3 候选 RD 比较，直接按记录的模式量化重建。
+    /// </summary>
+    /// <returns>本宏块是否有非零系数。</returns>
+    private bool ReplayI4x4(int mbX, int mbY, int yOff, int modeBase)
+    {
+        PrepareTopRight(mbX, mbY, yOff);
+
+        Span<int> topNz = stackalloc int[4];
+        Span<int> leftNz = stackalloc int[4];
+        for (int i = 0; i < 4; i++)
+        {
+            topNz[i] = (_mbNz[mbX] >> i) & 1;
+            leftNz[i] = (_leftNz >> i) & 1;
+        }
+
+        bool any = false;
+        for (int n = 0; n < 16; n++)
+        {
+            int off = yOff + _i4Scan[n];
+            int bx = n & 3, by = n >> 2;
+            int context = topNz[bx] + leftNz[by];
+            int mode = _i4Decision[modeBase + n];
+            bool nonZero = PrepareI4Block(mbX, mbY, n, off, mode, context, trellis: true);
+            _i4Modes[n] = mode;
+            topNz[bx] = leftNz[by] = nonZero ? 1 : 0;
+            any |= nonZero;
+        }
+        return any;
     }
 
     /// <summary>
@@ -1099,7 +1351,7 @@ internal sealed class Vp8Encoder
                 _blockCoef, _lumaQuant.AsSpan(dst, 16), _lumaSlots.AsSpan(dst, 16),
                 first: 0, type: 3, ctx: context,
                 dcStep: _y1Dc[seg], acStep: _y1Ac[seg],
-                probs: _probs, lambdaQ8: TrellisLambda * _y1Ac[seg],
+                nodeCosts: _nodeCost, lambdaQ8: TrellisLambda * _y1Ac[seg],
                 distortionWeight: 1, scratch: _trellis);
         }
         else
@@ -1309,7 +1561,7 @@ internal sealed class Vp8Encoder
             _y2Coef, _y2Quant, _y2Dequant,
             first: 0, type: 1, ctx: y2Ctx,
             dcStep: _y2Dc[seg], acStep: _y2Ac[seg],
-            probs: _probs, lambdaQ8: TrellisLambda * _y2Ac[seg],
+            nodeCosts: _nodeCost, lambdaQ8: TrellisLambda * _y2Ac[seg],
             distortionWeight: 4, scratch: _trellis);
         _y2Nz = lastY2 < 0 ? 0 : lastY2 + 1;
         if (lastY2 >= 0)
@@ -1345,7 +1597,7 @@ internal sealed class Vp8Encoder
                     _lumaCoef.AsSpan(dst, 16), _lumaQuant.AsSpan(dst, 16), _lumaSlots.AsSpan(dst, 16),
                     first: 1, type: 0, ctx: bctx,
                     dcStep: _y1Dc[seg], acStep: _y1Ac[seg],
-                    probs: _probs, lambdaQ8: TrellisLambda * _y1Ac[seg],
+                    nodeCosts: _nodeCost, lambdaQ8: TrellisLambda * _y1Ac[seg],
                     distortionWeight: 1, scratch: _trellis);
                 if (last >= 0)
                     _anyCoefficient = true;
@@ -1394,7 +1646,7 @@ internal sealed class Vp8Encoder
                         _blockCoef, _uvQuant.AsSpan(index * 16, 16), _uvSlots.AsSpan(index * 16, 16),
                         first: 0, type: 2, ctx: bctx,
                         dcStep: _uvDc[seg], acStep: _uvAc[seg],
-                        probs: _probs, lambdaQ8: TrellisLambda * _uvAc[seg],
+                        nodeCosts: _nodeCost, lambdaQ8: TrellisLambda * _uvAc[seg],
                         distortionWeight: 1, scratch: _trellis);
                     if (last >= 0)
                         _anyCoefficient = true;

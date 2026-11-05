@@ -47,7 +47,7 @@ internal static class Vp8Trellis
     /// <param name="ctx">块起始非零上下文（0..2）。</param>
     /// <param name="dcStep">DC 量化步长。</param>
     /// <param name="acStep">AC 量化步长。</param>
-    /// <param name="probs">当前生效的 token 概率表。</param>
+    /// <param name="nodeCosts">按 [type][band][ctx][node][bit] 展平的位成本表。</param>
     /// <param name="lambdaQ8">λ（Q8），单位与 <paramref name="distortionWeight"/> 无关的位成本换算系数。</param>
     /// <param name="distortionWeight">失真权重（Y2 为 4，其余为 1）。</param>
     /// <param name="scratch">复用缓冲。</param>
@@ -61,7 +61,7 @@ internal static class Vp8Trellis
         int ctx,
         int dcStep,
         int acStep,
-        byte[,,,] probs,
+        ReadOnlySpan<int> nodeCosts,
         int lambdaQ8,
         int distortionWeight,
         Vp8TrellisScratch scratch)
@@ -77,17 +77,41 @@ internal static class Vp8Trellis
 
         long[] current = scratch.Current;
         long[] next = scratch.Next;
-        System.Array.Fill(current, long.MaxValue);
-        System.Array.Fill(next, long.MaxValue);
+        Span<int> gapCost = scratch.GapCost;
 
         // 初始状态：m = −1（索引 0），ctx = 块初始上下文。
-        current[0 * 3 + ctx] = 0;
+        int readPrefix = Math.Min(StateCount, 3 * (first + 1));
+        Array.Fill(current, long.MaxValue, 0, readPrefix);
+        current[ctx] = 0;
 
         for (int n = first; n < 16; n++)
         {
             int band = Vp8Tables.Bands[n];
 
-            for (int state = 0; state < StateCount; state++)
+            // 写前清空本位置会用到的状态区间：位置 n 只能由 m ≤ n−1 的状态转移而来，
+            // 写入目标最高是 (n+1)·3+2，所以前缀 3·(n+2) 足够覆盖读写范围。
+            Array.Fill(next, long.MaxValue, 0, Math.Min(StateCount, 3 * (n + 2)));
+
+            // 空档代价只取决于「空档起点 c」与入口上下文，与具体状态无关，故按位置预结算一次：
+            // 位置 n 处 gapCost[c][gctx] = 从 c 起的 node0/node1 头部 + c+1..n−1 的零游程。
+            // 这样内层候选只需一次查表，避免对每个候选重复扫描空档（原实现是 O(n) 次成本查询）。
+            int tail = 0;
+            for (int c = n - 1; c >= first; c--)
+            {
+                if (c + 1 < n)
+                    tail += BitCost(nodeCosts, type, Vp8Tables.Bands[c + 1], 0, 1, 0);
+                int cband = Vp8Tables.Bands[c];
+                int dst = c * 3;
+                for (int gctx = 0; gctx < 3; gctx++)
+                {
+                    gapCost[dst + gctx] = tail
+                        + BitCost(nodeCosts, type, cband, gctx, 0, 1)
+                        + BitCost(nodeCosts, type, cband, gctx, 1, 0);
+                }
+            }
+
+            int readLimit = Math.Min(StateCount, 3 * (n + 1));
+            for (int state = 0; state < readLimit; state++)
             {
                 long cost = current[state];
                 if (cost == long.MaxValue) continue;
@@ -125,19 +149,16 @@ internal static class Vp8Trellis
                     int gapCtx = m < 0 ? ctx : ctxAfter;
                     if (gapStart < n)
                     {
-                        rate += BitCost(probs, type, Vp8Tables.Bands[gapStart], gapCtx, 0, 1);
-                        rate += BitCost(probs, type, Vp8Tables.Bands[gapStart], gapCtx, 1, 0);
-                        for (int j = gapStart + 1; j < n; j++)
-                            rate += BitCost(probs, type, Vp8Tables.Bands[j], 0, 1, 0);
+                        rate += gapCost[gapStart * 3 + gapCtx];
                         baseContext = 0;
                     }
                     else
                     {
-                        rate += BitCost(probs, type, band, gapCtx, 0, 1);
+                        rate += BitCost(nodeCosts, type, band, gapCtx, 0, 1);
                         baseContext = gapCtx;
                     }
 
-                    rate += NonZeroCost(probs, type, band, baseContext, level);
+                    rate += NonZeroCost(nodeCosts, type, band, baseContext, level);
                     int nextCtx = level == 1 || level == -1 ? 1 : 2;
                     int newStateIndex = (n + 1) * 3 + nextCtx;
 
@@ -152,9 +173,7 @@ internal static class Vp8Trellis
                 }
             }
 
-            // 交换缓冲；next 清空前先保存到数组尾部（避免 Array.Fill 每次分配）。
             long[] swap = current; current = next; next = swap;
-            System.Array.Fill(next, long.MaxValue);
         }
 
         // 结算终止位，选择全局最优。
@@ -168,9 +187,9 @@ internal static class Vp8Trellis
             int ctxAfter = state % 3;
             long finalCost = cost;
             if (m < 0)
-                finalCost += (long)lambdaQ8 * BitCost(probs, type, Vp8Tables.Bands[first], ctx, 0, 0);
+                finalCost += (long)lambdaQ8 * BitCost(nodeCosts, type, Vp8Tables.Bands[first], ctx, 0, 0);
             else if (m < 15)
-                finalCost += (long)lambdaQ8 * BitCost(probs, type, Vp8Tables.Bands[m + 1], ctxAfter, 0, 0);
+                finalCost += (long)lambdaQ8 * BitCost(nodeCosts, type, Vp8Tables.Bands[m + 1], ctxAfter, 0, 0);
             if (finalCost < best)
             {
                 best = finalCost;
@@ -246,57 +265,61 @@ internal static class Vp8Trellis
         return coefficient < 0 ? -quantized : quantized;
     }
 
-    private static int BitCost(byte[,,,] probs, int type, int band, int ctx, int node, int bit)
-        => Vp8CostTable.Cost[probs[type, band, ctx, node], bit];
+    /// <summary>
+    /// 按 [type][band][ctx][node][bit] 展平的位成本表（每个编码遍重建一次）：
+    /// 一维连续访问，避免热循环里反复做四维数组索引。
+    /// </summary>
+    private static int BitCost(ReadOnlySpan<int> nodeCosts, int type, int band, int ctx, int node, int bit)
+        => nodeCosts[((((type * 8 + band) * 3 + ctx) * 11 + node) * 2) + bit];
 
-    private static int NonZeroCost(byte[,,,] probs, int type, int band, int ctx, int level)
+    private static int NonZeroCost(ReadOnlySpan<int> nodeCosts, int type, int band, int ctx, int level)
     {
-        int cost = BitCost(probs, type, band, ctx, 1, 1);
+        int cost = BitCost(nodeCosts, type, band, ctx, 1, 1);
         int magnitude = Math.Abs(level);
         if (magnitude == 1)
         {
-            cost += BitCost(probs, type, band, ctx, 2, 0);
+            cost += BitCost(nodeCosts, type, band, ctx, 2, 0);
         }
         else
         {
-            cost += BitCost(probs, type, band, ctx, 2, 1);
-            cost += LargeValueCost(probs, type, band, ctx, magnitude);
+            cost += BitCost(nodeCosts, type, band, ctx, 2, 1);
+            cost += LargeValueCost(nodeCosts, type, band, ctx, magnitude);
         }
         cost += Vp8CostTable.Cost[128, level < 0 ? 1 : 0];
         return cost;
     }
 
     /// <summary>对应 <c>Vp8Encoder.PutLargeValue</c>（幅值 ≥ 2）的位成本。</summary>
-    private static int LargeValueCost(byte[,,,] probs, int type, int band, int ctx, int magnitude)
+    private static int LargeValueCost(ReadOnlySpan<int> nodeCosts, int type, int band, int ctx, int magnitude)
     {
         int cost = 0;
         if (magnitude <= 4)
         {
-            cost += BitCost(probs, type, band, ctx, 3, 0);
+            cost += BitCost(nodeCosts, type, band, ctx, 3, 0);
             if (magnitude == 2)
             {
-                cost += BitCost(probs, type, band, ctx, 4, 0);
+                cost += BitCost(nodeCosts, type, band, ctx, 4, 0);
             }
             else
             {
-                cost += BitCost(probs, type, band, ctx, 4, 1);
-                cost += BitCost(probs, type, band, ctx, 5, magnitude == 4 ? 1 : 0);
+                cost += BitCost(nodeCosts, type, band, ctx, 4, 1);
+                cost += BitCost(nodeCosts, type, band, ctx, 5, magnitude == 4 ? 1 : 0);
             }
             return cost;
         }
 
-        cost += BitCost(probs, type, band, ctx, 3, 1);
+        cost += BitCost(nodeCosts, type, band, ctx, 3, 1);
         if (magnitude <= 10)
         {
-            cost += BitCost(probs, type, band, ctx, 6, 0);
+            cost += BitCost(nodeCosts, type, band, ctx, 6, 0);
             if (magnitude <= 6)
             {
-                cost += BitCost(probs, type, band, ctx, 7, 0);
+                cost += BitCost(nodeCosts, type, band, ctx, 7, 0);
                 cost += Vp8CostTable.Cost[159, magnitude == 6 ? 1 : 0];
             }
             else
             {
-                cost += BitCost(probs, type, band, ctx, 7, 1);
+                cost += BitCost(nodeCosts, type, band, ctx, 7, 1);
                 if (magnitude <= 8)
                 {
                     cost += Vp8CostTable.Cost[165, 0];
@@ -311,11 +334,11 @@ internal static class Vp8Trellis
             return cost;
         }
 
-        cost += BitCost(probs, type, band, ctx, 6, 1);
+        cost += BitCost(nodeCosts, type, band, ctx, 6, 1);
         int category = magnitude <= 18 ? 0 : magnitude <= 34 ? 1 : magnitude <= 66 ? 2 : 3;
         int bit1 = category >= 2 ? 1 : 0;
-        cost += BitCost(probs, type, band, ctx, 8, bit1);
-        cost += BitCost(probs, type, band, ctx, 9 + bit1, category & 1);
+        cost += BitCost(nodeCosts, type, band, ctx, 8, bit1);
+        cost += BitCost(nodeCosts, type, band, ctx, 9 + bit1, category & 1);
 
         ReadOnlySpan<byte> table = category switch
         {
@@ -342,6 +365,9 @@ internal sealed class Vp8TrellisScratch
     internal readonly int[] PreviousLevels = new int[16 * Vp8Trellis.StateCount];
 
     internal readonly int[] Candidates = new int[5];
+
+    /// <summary>[位置 × 3]：位置 n 的空档代价（按空档起点与入口上下文预结算）。</summary>
+    internal readonly int[] GapCost = new int[16 * 3];
 
     internal int BestState;
 
