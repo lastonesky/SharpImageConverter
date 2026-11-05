@@ -10,13 +10,21 @@ namespace SharpImageConverter.Formats.Webp;
 ///
 /// 语义与 <see cref="IRowImageSource"/> 保持一致：调用方按行取像素，无需持有整幅 RGBA。
 /// 数据读取按块进行并容忍短读；网络中断 / 流提前结束会明确抛出 <see cref="InvalidDataException"/>。
-/// 每个实例只持有自己的解码结果与行游标，多个实例可并发使用。
+/// 每个实例只持有自己的解码状态与行游标，多个实例可并发使用。
+///
+/// 流式策略：
+/// - VP8L（无损）走行增量解码器 <see cref="Vp8LRowDecoder"/>：只顺序读取到 VP8L chunk，
+///   之后按输出行推进位流，常驻像素只有约 4.2 MB 的 LZ77 环形历史缓冲。
+/// - VP8（有损，含 ALPH）暂时保留整帧解码回退（行级化需要窗口化 VP8 解码器，见 spec 4B），
+///   容器解析本身仍是顺序读取。
 /// </summary>
 internal sealed class WebpRowSource : IRowImageSource
 {
     private readonly Stream _stream;
     private readonly bool _ownsStream;
-    private readonly byte[] _rgba;
+    private readonly byte[]? _rgba;          // 有损回退路径的整帧 RGBA
+    private readonly Vp8LRowDecoder? _rowDecoder;
+    private readonly uint[]? _argbRow;       // 行路径的当前行 ARGB 工作区
     private readonly object _lock = new();
     private int _nextRow;
     private bool _disposed;
@@ -39,31 +47,39 @@ internal sealed class WebpRowSource : IRowImageSource
         _stream = stream;
         _ownsStream = ownsStream;
 
-        byte[] data = ReadAll(stream);
-        bool hasAlpha;
         int width, height;
+        bool hasAlpha;
+        byte[]? rgba = null;
+        Vp8LRowDecoder? rowDecoder;
         try
         {
-            var container = WebpContainer.Load(data);
-            if (container.IsAnimation)
-                throw new WebpUnsupportedException("流式逐行解码不支持动图 WebP（无需整帧缓冲的静态图像）");
-            hasAlpha = container.HasAlpha;
-            _rgba = WebpDecoder.DecodeRgba(data, out width, out height);
+            try
+            {
+                ParseStaticImage(stream, out width, out height, out hasAlpha, out rowDecoder, out rgba);
+            }
+            catch (WebpUnsupportedException)
+            {
+                throw;
+            }
+            catch (Exception ex) when (ex is WebpContainerException or WebpBitstreamException
+                or ArgumentException or IndexOutOfRangeException or OverflowException)
+            {
+                throw new InvalidDataException("无效或不完整的 WebP 数据流", ex);
+            }
         }
-        catch (WebpUnsupportedException)
+        catch
         {
+            if (ownsStream) stream.Dispose();
             throw;
-        }
-        catch (Exception ex) when (ex is WebpContainerException or WebpBitstreamException
-            or ArgumentException or IndexOutOfRangeException or OverflowException)
-        {
-            throw new InvalidDataException("无效或不完整的 WebP 数据流", ex);
         }
 
         Width = width;
         Height = height;
         HasAlpha = hasAlpha;
         Channels = hasAlpha ? 4 : 3;
+        _rowDecoder = rowDecoder;
+        _rgba = rgba;
+        _argbRow = rowDecoder != null ? new uint[width] : null;
     }
 
     public int Width { get; }
@@ -95,63 +111,284 @@ internal sealed class WebpRowSource : IRowImageSource
             if (row.Length < needed)
                 throw new ArgumentException("Row buffer too small", nameof(row));
 
-            int sourceOffset = _nextRow * Width * 4;
-            if (Channels == 4)
+            if (_rowDecoder != null)
             {
-                _rgba.AsSpan(sourceOffset, Width * 4).CopyTo(row);
+                var argb = _argbRow!;
+                if (!_rowDecoder.TryReadArgbRow(argb)) return false;
+
+                if (Channels == 4)
+                {
+                    for (int x = 0; x < Width; x++)
+                    {
+                        uint p = argb[x];
+                        int d = x * 4;
+                        row[d] = (byte)(p >> 16);       // R
+                        row[d + 1] = (byte)(p >> 8);    // G
+                        row[d + 2] = (byte)p;           // B
+                        row[d + 3] = (byte)(p >> 24);   // A
+                    }
+                }
+                else
+                {
+                    for (int x = 0; x < Width; x++)
+                    {
+                        uint p = argb[x];
+                        int d = x * 3;
+                        row[d] = (byte)(p >> 16);
+                        row[d + 1] = (byte)(p >> 8);
+                        row[d + 2] = (byte)p;
+                    }
+                }
             }
             else
             {
-                var source = _rgba.AsSpan(sourceOffset, Width * 4);
-                for (int x = 0; x < Width; x++)
+                int sourceOffset = _nextRow * Width * 4;
+                if (Channels == 4)
                 {
-                    int s = x * 4;
-                    int d = x * 3;
-                    row[d] = source[s];
-                    row[d + 1] = source[s + 1];
-                    row[d + 2] = source[s + 2];
+                    _rgba!.AsSpan(sourceOffset, Width * 4).CopyTo(row);
+                }
+                else
+                {
+                    var source = _rgba!.AsSpan(sourceOffset, Width * 4);
+                    for (int x = 0; x < Width; x++)
+                    {
+                        int s = x * 4;
+                        int d = x * 3;
+                        row[d] = source[s];
+                        row[d + 1] = source[s + 1];
+                        row[d + 2] = source[s + 2];
+                    }
                 }
             }
+
             _nextRow++;
             return true;
         }
     }
 
     /// <summary>
-    /// 分块读完整条流。可定位流按剩余长度预分配；不可定位流（网络/管道）逐块累积。
-    /// 任一次短读都不视为失败，只有读到 0 且仍有数据缺口（可定位流）才判定为截断。
+    /// 顺序解析 RIFF/WebP 容器并决定解码路径。VP8L 直接构造行增量解码器；
+    /// VP8（有损）把已读字节与剩余流拼成完整文件后回退到整帧解码（保持既有行为）。
     /// </summary>
-    private static byte[] ReadAll(Stream stream)
+    private static void ParseStaticImage(Stream stream, out int width, out int height, out bool hasAlpha,
+                                         out Vp8LRowDecoder? rowDecoder, out byte[]? rgba)
     {
+        width = 0;
+        height = 0;
+        hasAlpha = false;
+        rowDecoder = null;
+        rgba = null;
+
+        Span<byte> head = stackalloc byte[WebpMagic.HeaderSize];
+        ReadExactly(stream, head, "WebP 流在 RIFF 头之前结束");
+        if (BinaryPrimitives.ReadUInt32LittleEndian(head) != WebpMagic.Riff ||
+            BinaryPrimitives.ReadUInt32LittleEndian(head[8..]) != WebpMagic.Webp)
+        {
+            throw new WebpContainerException("不是有效的 WebP 文件（RIFF/WEBP 标识不符）");
+        }
+
+        // RIFF size 覆盖 "WEBP" 标识之后的全部字节。此时已消费 12 字节，剩余应为 size-4。
+        uint riffSize = BinaryPrimitives.ReadUInt32LittleEndian(head[4..8]);
+        if (riffSize < 4)
+            throw new WebpContainerException("RIFF 声明长度非法（小于 WEBP 标识长度）");
+        long declaredRemaining = (long)riffSize - 4;
         if (stream.CanSeek)
         {
-            long remaining = stream.Length - stream.Position;
-            if (remaining < 0) remaining = 0;
-            if (remaining > int.MaxValue) throw new InvalidDataException("WebP 数据超过 2GB，无法一次性解码");
-
-            var buffer = new byte[(int)remaining];
-            int filled = 0;
-            while (filled < buffer.Length)
-            {
-                int read = stream.Read(buffer, filled, buffer.Length - filled);
-                if (read <= 0)
-                    throw new InvalidDataException("WebP 流在读取完成前结束（数据被截断）");
-                filled += read;
-            }
-            return buffer;
+            long actualRemaining = stream.Length - stream.Position;
+            if (actualRemaining < declaredRemaining)
+                throw new WebpContainerException(
+                    $"WebP 数据被截断：RIFF 声明还需 {declaredRemaining} 字节，实际仅剩 {actualRemaining} 字节");
         }
 
-        using var ms = new MemoryStream();
-        var chunk = new byte[64 * 1024];
+        bool hasVp8X = false;
+        bool vp8xAlpha = false;
+        int canvasWidth = 0;
+        int canvasHeight = 0;
+
+        // 有损回退需要从头重建文件；只在找到主图像 chunk 之前缓存已消费的字节。
+        using var capture = new MemoryStream();
+        capture.Write(head);
+
         while (true)
         {
-            int read = stream.Read(chunk, 0, chunk.Length);
-            if (read <= 0) break;
-            ms.Write(chunk, 0, read);
-            if (ms.Length > int.MaxValue) throw new InvalidDataException("WebP 数据超过 2GB，无法一次性解码");
+            Span<byte> chunkHeader = stackalloc byte[8];
+            int got = ReadUpTo(stream, chunkHeader);
+            if (got == 0) break; // 正常到达流末尾
+            if (got < 8) throw new WebpContainerException("chunk 头被截断");
+
+            WebpChunkId id = (WebpChunkId)BinaryPrimitives.ReadUInt32LittleEndian(chunkHeader);
+            uint size = BinaryPrimitives.ReadUInt32LittleEndian(chunkHeader[4..]);
+            // 回退路径需要逐字节还原文件，chunk 头必须先入缓存（数据在各自分支里追加）。
+            capture.Write(chunkHeader);
+
+            if (size > int.MaxValue)
+                throw new WebpContainerException($"chunk {id} 长度 {size} 超过 2GB");
+            if ((long)size + 8 > declaredRemaining)
+                throw new WebpContainerException(
+                    $"chunk {id} 声明长度 {size} 超出 RIFF 剩余长度 {declaredRemaining}");
+
+            switch (id)
+            {
+                case WebpChunkId.Vp8X:
+                {
+                    byte[] vp8x = ReadChunkData(stream, size, capture);
+                    if (vp8x.Length < 10)
+                        throw new WebpContainerException("VP8X chunk 过短（至少 10 字节）");
+
+                    hasVp8X = true;
+                    byte flags = vp8x[0];
+                    if ((flags & (byte)Vp8XFlags.Animation) != 0)
+                    {
+                        throw new WebpUnsupportedException(
+                            "流式逐行解码不支持动图 WebP（无需整帧缓冲的静态图像）");
+                    }
+                    vp8xAlpha = (flags & (byte)Vp8XFlags.Alpha) != 0;
+                    canvasWidth = (vp8x[4] | (vp8x[5] << 8) | (vp8x[6] << 16)) + 1;
+                    canvasHeight = (vp8x[7] | (vp8x[8] << 8) | (vp8x[9] << 16)) + 1;
+                    break;
+                }
+                case WebpChunkId.Anim:
+                case WebpChunkId.Anmf:
+                    throw new WebpUnsupportedException(
+                        "流式逐行解码不支持动图 WebP（无需整帧缓冲的静态图像）");
+
+                case WebpChunkId.Alph:
+                    // 独立 alpha 通道只能与有损 VP8 配合；内容随回退路径一起缓存。
+                    ReadChunkData(stream, size, capture);
+                    break;
+
+                case WebpChunkId.Vp8L:
+                {
+                    byte[] payload = ReadChunkData(stream, size, capture: null);
+                    if (payload.Length < 5)
+                        throw new WebpContainerException("VP8L chunk 过短（至少 5 字节帧头）");
+
+                    rowDecoder = new Vp8LRowDecoder(payload);
+                    width = rowDecoder.Width;
+                    height = rowDecoder.Height;
+
+                    // 简单格式的 alpha 来自 VP8L 帧头 bit 28；VP8X 存在时与容器语义一致，以 flags 为准。
+                    bool vp8lAlpha = (payload[4] & 0x10) != 0;
+                    hasAlpha = hasVp8X ? vp8xAlpha : vp8lAlpha;
+
+                    if (hasVp8X && (canvasWidth != width || canvasHeight != height))
+                    {
+                        throw new WebpBitstreamException(
+                            $"VP8X 画布 {canvasWidth}x{canvasHeight} 与 VP8L 图像 {width}x{height} 不一致");
+                    }
+                    return;
+                }
+
+                case WebpChunkId.Vp8:
+                {
+                    // 有损 VP8：把已缓存的头部/ALPH 与当前 chunk 及剩余流拼接，走整帧解码。
+                    CopyChunkToCapture(stream, size, capture);
+                    SkipPadding(stream, size, capture);
+                    CopyRemaining(stream, capture);
+
+                    byte[] full = capture.ToArray();
+                    rgba = WebpDecoder.DecodeRgba(full, out width, out height);
+                    hasAlpha = hasVp8X && vp8xAlpha;
+
+                    if (hasVp8X && (canvasWidth != width || canvasHeight != height))
+                    {
+                        throw new WebpBitstreamException(
+                            $"VP8X 画布 {canvasWidth}x{canvasHeight} 与 VP8 图像 {width}x{height} 不一致");
+                    }
+                    return;
+                }
+
+                default:
+                    // ICCP / EXIF / XMP 等元数据：跳过，但保留字节以备有损回退。
+                    ReadChunkData(stream, size, capture);
+                    break;
+            }
+
+            declaredRemaining -= (long)size + 8 + (size & 1);
         }
-        if (ms.Length == 0) throw new InvalidDataException("WebP 流为空");
-        return ms.ToArray();
+
+        throw new WebpContainerException("WebP 文件中未找到图像数据（VP8 / VP8L）");
+    }
+
+    /// <summary>读满 target 字节；短读允许，读到 0 视为截断。</summary>
+    private static void ReadExactly(Stream stream, Span<byte> dst, string error)
+    {
+        int filled = 0;
+        while (filled < dst.Length)
+        {
+            int read = stream.Read(dst[filled..]);
+            if (read <= 0) throw new WebpContainerException(error);
+            filled += read;
+        }
+    }
+
+    /// <summary>尽量读满 dst，返回实际读到的字节数（0 表示流已结束）。</summary>
+    private static int ReadUpTo(Stream stream, Span<byte> dst)
+    {
+        int filled = 0;
+        while (filled < dst.Length)
+        {
+            int read = stream.Read(dst[filled..]);
+            if (read <= 0) break;
+            filled += read;
+        }
+        return filled;
+    }
+
+    /// <summary>读取一个 chunk 的全部数据（含 padding 处理），可选写入 capture。</summary>
+    private static byte[] ReadChunkData(Stream stream, uint size, MemoryStream? capture)
+    {
+        var data = new byte[(int)size];
+        int filled = 0;
+        while (filled < data.Length)
+        {
+            int read = stream.Read(data, filled, data.Length - filled);
+            if (read <= 0) throw new WebpContainerException("chunk 数据被截断");
+            filled += read;
+        }
+        if (capture != null) capture.Write(data, 0, data.Length);
+
+        SkipPadding(stream, size, capture);
+        return data;
+    }
+
+    /// <summary>RIFF 偶数对齐：奇数长度的 chunk 后跟 1 字节 padding（截断时容忍缺失）。</summary>
+    private static void SkipPadding(Stream stream, uint size, MemoryStream? capture)
+    {
+        if ((size & 1) == 0) return;
+        Span<byte> pad = stackalloc byte[1];
+        if (ReadUpTo(stream, pad) == 1 && capture != null)
+            capture.Write(pad);
+    }
+
+    /// <summary>把 chunk 数据以流式方式追加到 capture（避免一次性再分配大缓冲）。</summary>
+    private static void CopyChunkToCapture(Stream stream, uint size, MemoryStream capture)
+    {
+        var buffer = new byte[64 * 1024];
+        while (size > 0)
+        {
+            int take = (int)Math.Min(size, (uint)buffer.Length);
+            int filled = 0;
+            while (filled < take)
+            {
+                int read = stream.Read(buffer, filled, take - filled);
+                if (read <= 0) throw new WebpContainerException("chunk 数据被截断");
+                filled += read;
+            }
+            capture.Write(buffer, 0, take);
+            size -= (uint)take;
+        }
+    }
+
+    private static void CopyRemaining(Stream stream, MemoryStream capture)
+    {
+        var buffer = new byte[64 * 1024];
+        while (true)
+        {
+            int read = stream.Read(buffer, 0, buffer.Length);
+            if (read <= 0) break;
+            capture.Write(buffer, 0, read);
+        }
     }
 
     public void Dispose()

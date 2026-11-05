@@ -122,31 +122,31 @@ public static class Vp8LDecoder
     }
 
     /// <summary>
-    /// 描述一个 transform 的完整信息（对照 libwebp VP8LTransform）。
-    /// XSize / YSize = 原始图像尺寸（变换应用前），SubXSize / SubYSize = sub-sample 后（仅 color indexing 会变）。
+    /// 行增量解码专用入口：解析 VP8L 帧头与头部状态，并返回像素流起点的位读快照。
+    /// 调用方保存快照后即可在任何时刻重建 <see cref="LsbBitReader"/> 继续读像素 token，
+    /// 无需先解完整帧。
     /// </summary>
-    private readonly record struct TransformInfo(
-        Vp8LTransforms.TransformType Type,
-        int Bits,
-        int XSize,
-        int YSize,
-        int SubXSize,
-        int SubYSize,
-        uint[]? Data
-    );
+    internal static Vp8LImageState ReadLevel0State(ReadOnlySpan<byte> data, out int width, out int height,
+                                                   out LsbBitReaderSnapshot pixelSnapshot)
+    {
+        var reader = new LsbBitReader(data);
+        ReadHeader(ref reader, out width, out height);
+        var state = ReadImageStreamState(width, height, isLevel0: true, ref reader);
+        pixelSnapshot = reader.Snapshot();
+        return state;
+    }
 
     /// <summary>
-    /// 递归解码：VP8L 的核心流程。对照 libwebp DecodeImageStream()。
+    /// 读取 VP8L 图像流的头部（transform / color cache / Huffman），并返回共享状态。
+    /// 对照 libwebp DecodeImageStream() 中“解析头部”的部分；像素解码与逆变换由调用方完成，
+    /// 这样整图解码与行增量解码可以复用同一份位流解读逻辑。
     /// </summary>
-    /// <param name="level0Dst">
-    /// 仅 level 0 使用：调用方提供的整幅工作区（ARGB）。长度不足时退化为内部新建。
-    /// </param>
-    private static Span<uint> DecodeImageStreamCore(int xsize, int ysize, bool isLevel0,
-                                                    ref LsbBitReader reader, Span<uint> level0Dst)
+    private static Vp8LImageState ReadImageStreamState(int xsize, int ysize, bool isLevel0,
+                                                       ref LsbBitReader reader)
     {
         int transformXSize = xsize;
         int transformYSize = ysize;
-        var transforms = new List<TransformInfo>();
+        var transforms = new List<Vp8LTransformInfo>();
 
         // ---- 1. 读取 transforms（仅 level 0） ----
         if (isLevel0)
@@ -167,7 +167,7 @@ public static class Vp8LDecoder
                         int subX = SubSampleSize(transformXSize, bits);
                         int subY = SubSampleSize(transformYSize, bits);
                         var dataPixels = DecodeImageStreamCore(subX, subY, isLevel0: false, ref reader, default).ToArray();
-                        transforms.Add(new TransformInfo(
+                        transforms.Add(new Vp8LTransformInfo(
                             (Vp8LTransforms.TransformType)type, bits,
                             transformXSize, transformYSize,
                             transformXSize, transformYSize, // predictor/color 不改图像尺寸
@@ -175,7 +175,7 @@ public static class Vp8LDecoder
                         break;
                     }
                     case 2: // SUBTRACT_GREEN_TRANSFORM
-                        transforms.Add(new TransformInfo(
+                        transforms.Add(new Vp8LTransformInfo(
                             Vp8LTransforms.TransformType.SubtractGreen, 0,
                             transformXSize, transformYSize,
                             transformXSize, transformYSize, null));
@@ -202,7 +202,7 @@ public static class Vp8LDecoder
                             palettePixels.AsSpan(0, numColors), numColors, bitsPerPixel);
                         transformXSize = subX;
                         transformYSize = subY;
-                        transforms.Add(new TransformInfo(
+                        transforms.Add(new Vp8LTransformInfo(
                             Vp8LTransforms.TransformType.ColorIndexing, bitsPerPixel,
                             origX, origY,
                             subX, subY,
@@ -305,21 +305,56 @@ public static class Vp8LDecoder
             }
         }
 
-        // ---- 4. 像素解码 ----
-        int totalPixels = transformXSize * transformYSize;
+        return new Vp8LImageState
+        {
+            Width = xsize,
+            Height = ysize,
+            DecodeWidth = transformXSize,
+            DecodeHeight = transformYSize,
+            Transforms = transforms,
+            ColorCache = colorCache,
+            Tables = tables,
+            HuffmanImage = huffmanImage,
+            HuffStride = huffStride,
+            HuffPrecision = huffmanPrecision,
+            NumGroups = numHuffmanGroups,
+        };
+    }
+
+    /// <summary>
+    /// 递归解码：VP8L 的核心流程。对照 libwebp DecodeImageStream()。
+    /// </summary>
+    /// <param name="level0Dst">
+    /// 仅 level 0 使用：调用方提供的整幅工作区（ARGB）。长度不足时退化为内部新建。
+    /// </param>
+    private static Span<uint> DecodeImageStreamCore(int xsize, int ysize, bool isLevel0,
+                                                    ref LsbBitReader reader, Span<uint> level0Dst)
+    {
+        var state = ReadImageStreamState(xsize, ysize, isLevel0, ref reader);
+
+        // ---- 像素解码 ----
+        int totalPixels = state.DecodeWidth * state.DecodeHeight;
         Span<uint> argb = (isLevel0 && level0Dst.Length >= totalPixels)
             ? level0Dst[..totalPixels]
             : new uint[totalPixels];
 
-        DecodePixels(ref reader, tables, argb, colorCache, transformXSize,
-                     huffmanImage, huffStride, huffmanPrecision, numHuffmanGroups);
+        DecodePixels(ref reader, state.Tables, argb, state.ColorCache, state.DecodeWidth,
+                     state.HuffmanImage, state.HuffStride, state.HuffPrecision, state.NumGroups);
 
-        // ---- 5. 逆变换（对照 libwebp ApplyInverseTransforms：逆序应用） ----
+        return ApplyInverseTransforms(state, argb, isLevel0, level0Dst);
+    }
+
+    /// <summary>
+    /// 应用逆变换（对照 libwebp ApplyInverseTransforms：按 transform 读取顺序的逆序应用）。
+    /// Color Indexing 是最后应用的，所以它的逆变换最先做，会把 argb 从 sub 尺寸上采样回原始尺寸。
+    /// </summary>
+    private static Span<uint> ApplyInverseTransforms(Vp8LImageState state, Span<uint> argb,
+                                                     bool isLevel0, Span<uint> level0Dst)
+    {
         // 注意：TransformInfo.XSize/YSize 始终是变换应用前的尺寸。
-        // Color Indexing 是最后应用的，所以它的逆变换最先做，会把 argb 从 sub 尺寸上采样回原始尺寸。
-        for (int t = transforms.Count - 1; t >= 0; t--)
+        for (int t = state.Transforms.Count - 1; t >= 0; t--)
         {
-            var transform = transforms[t];
+            var transform = state.Transforms[t];
             switch (transform.Type)
             {
                 case Vp8LTransforms.TransformType.Predictor:

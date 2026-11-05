@@ -254,6 +254,57 @@ dotnet-trace collect --profile dotnet-sampled-thread-time --output .perf/webp-en
 本轮最终原始记录为 `.perf/webp-final-paired.csv`，测试记录为
 `.perf/webp-tests.xml` 和 `.perf/webp-scalar-tests.xml`。
 
+## 6.7 WebP 第二轮：压缩率与流式解码（2026-11-05）
+
+测量台为 `.perf/QualityProbe`：6 类 1024×1024 语料（photo / ui / grad / a_text /
+rgba_panel / rgba_softgrad）× q50/75/90/95 共 24 组；libwebp 原生 DLL 同 q 编码，
+PSNR 用 libwebp 解码后的 RGB 计算；基线程序集经 `AssemblyLoadContext` 在同一进程
+A/B 交替加载。原始明细在 `.perf/quality.csv`。
+
+### 有损压缩率（trellis + 4 段分段 + 滤波 RD）
+
+24 组合计：我方 1,066,296 B，libwebp 1,249,300 B（**0.853×**）；同一测量台的
+上一版基线 1,176,518 B（**−9.37%**），平均 PSNR 43.603 vs 43.533 dB（+0.070 dB），
+无单组体积增长。`rgba_panel` 相对 libwebp 由 1.50/1.90/2.00/2.66 降到
+0.87/0.89/1.03/0.73。逐内容比值与参数说明见 `WebpEncoder.md` §2、§3.5–§3.7。
+
+### VP8L 无损多 pass
+
+首遍统计完成后用**实际码长**（`ChannelBits` 对每个通道的真实写入位数 +
+`MetaImageBits` 的组图开销）重算 Huffman，再以 2 轮精化（`MaxRefinePasses=2`）
+在候选 token 集合中按真实位数择优；仅对 `width×height ≥ 4096` 的图启用，
+小图保持零额外开销。libwebp 无损码流交叉验证：双方解码均与源 RGBA bit-exact
+（maxdiff = 0）。
+
+实测体积（我方编码后字节数）：`a_text` 2412 → 2408（−0.17%）、`rgba_softgrad`
+3562 → 3540（−0.62%）；photo/ui/grad/rgba_panel 不变。**未达 −2% 目标**：
+剩余差距主要在 predictor 选择、分组聚类与码表写出，静态像素熵模型对贪心 LZ77
+已接近最优，单靠码长重算无法再挤出 2% 量级。
+
+### 行级流式解码（VP8L）
+
+`WebpRowSource` 现在对 VP8L 真正行增量：流式解析 RIFF，只保留
+`maxDistance + maxLength + width + 1` 的环形历史（4096×4096 约 4.22 MB）
+与 predictor 的双行缓冲，不预解码整帧。VP8 有损仍为整帧解码后逐行输出。
+
+4096×4096 无损图（帧像素 67,108,864 B）实测分配：
+
+| 路径 | 分配字节 | 相对整帧 |
+|---|---:|---:|
+| `WebpDecoder.DecodeRgba`（整帧） | 67,373,976 | 100% |
+| `WebpRowSource`（行增量） | 4,603,312 | **6.8%** |
+
+即峰值驻留下降约 93.2%。逐像素与整帧解码一致（含调色板图、含 alpha 图与
+libwebp 产出的无损码流）；短读、截断、并发、动图拒绝均有测试覆盖。
+
+**VP8 有损为什么本轮没有行级化**：VP8 的帧内预测与环内滤波都需要「上一宏块行」
+的重建结果，YUV→RGB 还要跨两行做 4:2:0 上采样；现有 `Vp8Decoder` 直接分配整幅
+Y/U/V 与输出平面并顺序重建，改成流式需要把重建/输出平面改为 2 宏块行的环形窗口。
+分阶段方案：① `Init / DecodeNextMacroblockRow / EmitReadyRows`，保留整帧路径作为
+对照；② 逐行 YUV→RGB 入口并让 `WebpRowSource` 切换；③ 全矩阵逐像素对拍
+（奇数宽高、alpha、q30/75/95）+ 长图驻留断言。属架构级重写，本轮按 spec 允许的
+回退路径不实施，`WebpRowSource` 对 VP8 仍整帧解码后逐行输出。
+
 ## 7. 缩放 / 灰度 / 像素搬运（143 MP 与 2048² 裁切图）
 
 | 操作 | 改动前 | 改动后 | 加速 |

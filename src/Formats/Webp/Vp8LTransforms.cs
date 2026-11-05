@@ -289,81 +289,105 @@ internal static class Vp8LTransforms
     public static void ApplyPredictorInverse(Span<uint> data, int width, int height,
                                               ReadOnlySpan<uint> predictorData, int bits)
     {
-        int tileWidth = 1 << bits;
-        int mask = tileWidth - 1;
-        int tilesPerRow = (width + tileWidth - 1) >> bits; // VP8LSubSampleSize
-
-        // ---- 第一行 ----
-        // (0,0): mode 0 (black) — predictor = ARGB_BLACK (0xFF000000)
-        data[0] = ModAddPixels(data[0], 0xFF000000u);
-        // (x,0) for x>=1: mode 1 (left)
-        for (int x = 1; x < width; x++)
-            data[x] = ModAddPixels(data[x], data[x - 1]);
-
-        bool simd = Vector128.IsHardwareAccelerated;
-
-        // ---- 其余行 ----
-        for (int y = 1; y < height; y++)
+        int tilesPerRow = Vp8LSubSampleSize(width, bits);
+        for (int y = 0; y < height; y++)
         {
-            int rowOffset = y * width;
-            int topRowOffset = rowOffset - width;
-            int dataRowIdx = y >> bits;
-            int dataBase = dataRowIdx * tilesPerRow;
-
-            // (0,y): mode 2 (top)
-            data[rowOffset] = ModAddPixels(data[rowOffset], data[topRowOffset]);
-
-            // (x,y) for x>=1: 按 tile 分段
-            // 对照 libwebp: pred_mode_src++ 每次 tile 段迭代后递增
-            int predSrcIdx = dataBase;
-            int x = 1;
-            while (x < width)
-            {
-                // predictor mode 从 uint32 的 bits 8..11 取（libwebp: ((*pred_mode_src++) >> 8) & 0xf）
-                if (predSrcIdx >= predictorData.Length)
-                    throw new WebpBitstreamException(
-                        $"Predictor 模式数据不足：需要 tile {predSrcIdx}，实际长度 {predictorData.Length}");
-                int mode = (int)((predictorData[predSrcIdx] >> 8) & 0xF);
-                predSrcIdx++;
-
-                int xEnd = (x & ~mask) + tileWidth;
-                if (xEnd > width) xEnd = width;
-
-                int px = x;
-                if (simd && xEnd - x >= 4)
-                {
-                    // 只有与 left 无关的 predictor 才能整块向量化；其余模式留标量路径。
-                    px = mode switch
-                    {
-                        0 => PredictorAddBlack(data, rowOffset, x, xEnd),
-                        1 => PredictorAddLeft(data, rowOffset, x, xEnd),
-                        2 => PredictorAddFromTop(data, rowOffset, topRowOffset, x, xEnd, 0),
-                        3 => PredictorAddFromTop(data, rowOffset, topRowOffset, x, xEnd, 1),
-                        4 => PredictorAddFromTop(data, rowOffset, topRowOffset, x, xEnd, -1),
-                        8 => PredictorAddFromTopAverage(data, rowOffset, topRowOffset, x, xEnd, useRight: false),
-                        9 => PredictorAddFromTopAverage(data, rowOffset, topRowOffset, x, xEnd, useRight: true),
-                        >= 5 => PredictorAddSequential(data, rowOffset, topRowOffset, x, xEnd, mode),
-                        _ => x,
-                    };
-                }
-
-                for (; px < xEnd; px++)
-                {
-                    uint leftVal = data[rowOffset + px - 1];
-                    uint topCurVal = data[topRowOffset + px];
-                    uint topLeftVal = data[topRowOffset + px - 1];
-                    // libwebp 的 top 指针为 out - width，top[i + 1] 在每行最后一列恰好等于
-                    // 当前行的第一个像素 data[rowOffset]（该像素已按 top 模式还原）。
-                    uint topRightVal = data[topRowOffset + px + 1];
-
-                    uint pred = Predictor(mode, leftVal, topCurVal, topLeftVal, topRightVal);
-                    data[rowOffset + px] = ModAddPixels(data[rowOffset + px], pred);
-                }
-
-                x = xEnd;
-            }
+            int topRowOffset = y == 0 ? 0 : (y - 1) * width;
+            ApplyPredictorInverseRow(data, y * width, topRowOffset, width, predictorData,
+                tilesPerRow, y, bits);
         }
     }
+
+    /// <summary>
+    /// Predictor 逆变换的单行实现。整图解码器按行调用它；流式解码器把「上一行输出」
+    /// 与「当前行」放在同一个连续缓冲区的两个相邻行槽位里，用 <paramref name="topRowOffset"/>
+    /// 指向上一行，从而复用同一套向量化内核。
+    /// </summary>
+    /// <param name="rowOffset">当前行在 <paramref name="data"/> 中的起始下标；其前一个像素
+    /// （rowOffset-1）在该行第一列时不会被读取。</param>
+    /// <param name="topRowOffset">上一行起始下标；<paramref name="y"/> 为 0 时不使用。</param>
+    /// <param name="y">行号（决定 predictor tile 行与首行规则）。</param>
+    internal static void ApplyPredictorInverseRow(Span<uint> data, int rowOffset, int topRowOffset,
+                                                  int width, ReadOnlySpan<uint> predictorData,
+                                                  int tilesPerRow, int y, int bits)
+    {
+        if (width <= 0) return;
+        int tileWidth = 1 << bits;
+        int mask = tileWidth - 1;
+        bool simd = Vector128.IsHardwareAccelerated;
+
+        if (y == 0)
+        {
+            // (0,0): mode 0 (black) — predictor = ARGB_BLACK (0xFF000000)
+            data[rowOffset] = ModAddPixels(data[rowOffset], 0xFF000000u);
+            // (x,0) for x>=1: mode 1 (left)，可整行做前缀和
+            int px = 1;
+            if (simd && width - 1 >= 4)
+                px = PredictorAddLeft(data, rowOffset, 1, width);
+            for (; px < width; px++)
+                data[rowOffset + px] = ModAddPixels(data[rowOffset + px], data[rowOffset + px - 1]);
+            return;
+        }
+
+        int dataRowIdx = y >> bits;
+        int dataBase = dataRowIdx * tilesPerRow;
+
+        // (0,y): mode 2 (top)
+        data[rowOffset] = ModAddPixels(data[rowOffset], data[topRowOffset]);
+
+        // (x,y) for x>=1: 按 tile 分段
+        // 对照 libwebp: pred_mode_src++ 每次 tile 段迭代后递增
+        int predSrcIdx = dataBase;
+        int x = 1;
+        while (x < width)
+        {
+            // predictor mode 从 uint32 的 bits 8..11 取（libwebp: ((*pred_mode_src++) >> 8) & 0xf）
+            if (predSrcIdx >= predictorData.Length)
+                throw new WebpBitstreamException(
+                    $"Predictor 模式数据不足：需要 tile {predSrcIdx}，实际长度 {predictorData.Length}");
+            int mode = (int)((predictorData[predSrcIdx] >> 8) & 0xF);
+            predSrcIdx++;
+
+            int xEnd = (x & ~mask) + tileWidth;
+            if (xEnd > width) xEnd = width;
+
+            int px = x;
+            if (simd && xEnd - x >= 4)
+            {
+                // 只有与 left 无关的 predictor 才能整块向量化；其余模式留标量路径。
+                px = mode switch
+                {
+                    0 => PredictorAddBlack(data, rowOffset, x, xEnd),
+                    1 => PredictorAddLeft(data, rowOffset, x, xEnd),
+                    2 => PredictorAddFromTop(data, rowOffset, topRowOffset, x, xEnd, 0),
+                    3 => PredictorAddFromTop(data, rowOffset, topRowOffset, x, xEnd, 1),
+                    4 => PredictorAddFromTop(data, rowOffset, topRowOffset, x, xEnd, -1),
+                    8 => PredictorAddFromTopAverage(data, rowOffset, topRowOffset, x, xEnd, useRight: false),
+                    9 => PredictorAddFromTopAverage(data, rowOffset, topRowOffset, x, xEnd, useRight: true),
+                    >= 5 => PredictorAddSequential(data, rowOffset, topRowOffset, x, xEnd, mode),
+                    _ => x,
+                };
+            }
+
+            for (; px < xEnd; px++)
+            {
+                uint leftVal = data[rowOffset + px - 1];
+                uint topCurVal = data[topRowOffset + px];
+                uint topLeftVal = data[topRowOffset + px - 1];
+                // libwebp 的 top 指针为 out - width，top[i + 1] 在每行最后一列恰好等于
+                // 当前行的第一个像素 data[rowOffset]（该像素已按 top 模式还原）。
+                uint topRightVal = data[topRowOffset + px + 1];
+
+                uint pred = Predictor(mode, leftVal, topCurVal, topLeftVal, topRightVal);
+                data[rowOffset + px] = ModAddPixels(data[rowOffset + px], pred);
+            }
+
+            x = xEnd;
+        }
+    }
+
+    /// <summary>VP8LSubSampleSize：向上取整的 2^bits 分块数。</summary>
+    private static int Vp8LSubSampleSize(int size, int bits) => (size + (1 << bits) - 1) >> bits;
 
     // =====================================================
     //                    Color Transform
@@ -381,59 +405,67 @@ internal static class Vp8LTransforms
     public static void ApplyColorTransformInverse(Span<uint> data, int width, int height,
                                                    ReadOnlySpan<uint> colorData, int bits)
     {
+        int tilesPerRow = (width + (1 << bits) - 1) >> bits;
+        for (int y = 0; y < height; y++)
+            ApplyColorTransformInverseRow(data, y * width, width, colorData, tilesPerRow, y, bits);
+    }
+
+    /// <summary>
+    /// Cross-color 逆变换的单行实现。整图路径按行调用它；流式解码器直接对当前行调用。
+    /// </summary>
+    /// <param name="tilesPerRow">横向 tile 数（= VP8LSubSampleSize(width, bits)）。</param>
+    internal static void ApplyColorTransformInverseRow(Span<uint> data, int rowOffset, int width,
+                                                       ReadOnlySpan<uint> colorData, int tilesPerRow,
+                                                       int y, int bits)
+    {
+        if (width <= 0) return;
+
         int tileWidth = 1 << bits;
         int mask = tileWidth - 1;
-        int tilesPerRow = (width + tileWidth - 1) >> bits;
+        int predRowIdx = (y >> bits) * tilesPerRow;
 
-        for (int y = 0; y < height; y++)
+        // 每个 tileWidth 像素段用同一组 multiplier（对照 libwebp ColorSpaceInverseTransform_C）
+        int x = 0;
+        while (x < width)
         {
-            int rowOffset = y * width;
-            int dataRowIdx = y >> bits;
-            int predRowIdx = dataRowIdx * tilesPerRow;
+            int tileIdx = x / tileWidth;
+            int ccIdx = predRowIdx + tileIdx;
 
-            // 每个 tileWidth 像素段用同一组 multiplier（对照 libwebp ColorSpaceInverseTransform_C）
-            int x = 0;
-            while (x < width)
+            int g2r = 0, g2b = 0, r2b = 0;
+            if (ccIdx < colorData.Length)
             {
-                int tileIdx = x / tileWidth;
-                int ccIdx = predRowIdx + tileIdx;
-
-                int g2r = 0, g2b = 0, r2b = 0;
-                if (ccIdx < colorData.Length)
-                {
-                    uint cc = colorData[ccIdx];
-                    // libwebp ColorCodeToMultipliers
-                    g2r = (sbyte)(cc & 0xFF);            // bits 0..7
-                    g2b = (sbyte)((cc >> 8) & 0xFF);      // bits 8..15
-                    r2b = (sbyte)((cc >> 16) & 0xFF);     // bits 16..23
-                }
-
-                int xEnd = (x & ~mask) + tileWidth;
-                if (xEnd > width) xEnd = width;
-
-                int px = x;
-                if (Vector128.IsHardwareAccelerated && xEnd - x >= 4)
-                    px = ColorSegmentVector(data, rowOffset, x, xEnd, g2r, g2b, r2b);
-
-                for (; px < xEnd; px++)
-                {
-                    int idx = rowOffset + px;
-                    uint argb = data[idx];
-                    // libwebp 把 CrossColor 的像素分量和乘数都当 sbyte（有符号）处理
-                    sbyte g = (sbyte)((argb >> 8) & 0xFF);
-                    int r = (int)((argb >> 16) & 0xFF);
-                    int b = (int)(argb & 0xFF);
-
-                    // mod 256 加法（byte 自然溢出）
-                    r = (r + ((g2r * g) >> 5)) & 0xFF;
-                    b = (b + ((g2b * g) >> 5)) & 0xFF;
-                    b = (b + ((r2b * (sbyte)r) >> 5)) & 0xFF;
-
-                    data[idx] = (argb & 0xFF00FF00u) | ((uint)r << 16) | (uint)b;
-                }
-
-                x = xEnd;
+                uint cc = colorData[ccIdx];
+                // libwebp ColorCodeToMultipliers
+                g2r = (sbyte)(cc & 0xFF);            // bits 0..7
+                g2b = (sbyte)((cc >> 8) & 0xFF);      // bits 8..15
+                r2b = (sbyte)((cc >> 16) & 0xFF);     // bits 16..23
             }
+
+            int xEnd = (x & ~mask) + tileWidth;
+            if (xEnd > width) xEnd = width;
+
+            int px = x;
+            if (Vector128.IsHardwareAccelerated && xEnd - x >= 4)
+                px = ColorSegmentVector(data, rowOffset, x, xEnd, g2r, g2b, r2b);
+
+            for (; px < xEnd; px++)
+            {
+                int idx = rowOffset + px;
+                uint argb = data[idx];
+                // libwebp 把 CrossColor 的像素分量和乘数都当 sbyte（有符号）处理
+                sbyte g = (sbyte)((argb >> 8) & 0xFF);
+                int r = (int)((argb >> 16) & 0xFF);
+                int b = (int)(argb & 0xFF);
+
+                // mod 256 加法（byte 自然溢出）
+                r = (r + ((g2r * g) >> 5)) & 0xFF;
+                b = (b + ((g2b * g) >> 5)) & 0xFF;
+                b = (b + ((r2b * (sbyte)r) >> 5)) & 0xFF;
+
+                data[idx] = (argb & 0xFF00FF00u) | ((uint)r << 16) | (uint)b;
+            }
+
+            x = xEnd;
         }
     }
 
@@ -482,34 +514,43 @@ internal static class Vp8LTransforms
     /// </summary>
     public static void ApplySubtractGreenInverse(Span<uint> data, int width, int height)
     {
-        int total = width * height;
+        for (int y = 0; y < height; y++)
+            ApplySubtractGreenInverseRow(data, y * width, width);
+    }
+
+    /// <summary>Subtract Green 逆变换的单行实现（像素局部，无行间依赖）。</summary>
+    internal static void ApplySubtractGreenInverseRow(Span<uint> data, int rowOffset, int width)
+    {
         int i = 0;
 
         // 16 字节 = 4 个 ARGB 像素（内存序 B,G,R,A）。用 pshufb 把每个像素的 G 复刻到
         // 同像素的 B/R 槽位、其余槽位取 0，再做字节模 256 加法：等价于 R+=G、B+=G。
-        if (Vector128.IsHardwareAccelerated && total >= 4)
+        if (Vector128.IsHardwareAccelerated && width >= 4)
         {
             ref byte byteRef = ref Unsafe.As<uint, byte>(ref MemoryMarshal.GetReference(data));
-            int byteCount = total * 4;
-            int o = 0;
-            for (; o + 16 <= byteCount; o += 16)
+            int byteStart = rowOffset * 4;
+            int byteCount = width * 4;
+            int o = byteStart;
+            int end = byteStart + byteCount;
+            for (; o + 16 <= end; o += 16)
             {
                 nuint uo = (nuint)o;
                 Vector128<byte> v = Vector128.LoadUnsafe(ref byteRef, uo);
                 Vector128<byte> g = Vector128.Shuffle(v, GreenToRedBlue);
                 Vector128.StoreUnsafe(v + g, ref byteRef, uo);
             }
-            i = o / 4;
+            i = (o - byteStart) / 4;
         }
 
-        for (; i < total; i++)
+        int rowEnd = rowOffset + width;
+        for (int idx = rowOffset + i; idx < rowEnd; idx++)
         {
-            uint argb = data[i];
+            uint argb = data[idx];
             uint green = (argb >> 8) & 0xFFu;
             uint redBlue = argb & 0x00FF00FFu;
             redBlue += (green << 16) | green;
             redBlue &= 0x00FF00FFu;
-            data[i] = (argb & 0xFF00FF00u) | redBlue;
+            data[idx] = (argb & 0xFF00FF00u) | redBlue;
         }
     }
 
@@ -542,72 +583,91 @@ internal static class Vp8LTransforms
                                                    int origWidth, int origHeight,
                                                    ReadOnlySpan<uint> palette, int bits)
     {
-        int bitsPerPixel = 8 >> bits;   // 8 / 4 / 2 / 1
-        int pixelsPerUnit = 1 << bits;  // 1 / 2 / 4 / 8
-        uint indexMask = (1u << bitsPerPixel) - 1u;
-        int totalUnits = subWidth * subHeight;
-
         var result = new uint[origWidth * origHeight];
-        int srcIdx = 0;
-
-        // bits=0（每像素一个 8 位索引）是绝对主流路径：没有位解包、没有行尾截断，
-        // 且 ExpandPalette 保证 256 项，可整行做无检查的查表。
-        int total = origWidth * origHeight;
-        if (bits == 0 && palette.Length >= 256 && totalUnits >= total && subData.Length >= total)
-            return ExpandIndexed8Bit(subData, result, palette, total);
-
         for (int y = 0; y < origHeight; y++)
         {
-            int dstRow = y * origWidth;
-            for (int x = 0; x < origWidth; x += pixelsPerUnit)
-            {
-                if (srcIdx >= totalUnits || srcIdx >= subData.Length)
-                    throw new WebpBitstreamException("Color Indexing 打包像素数量不足");
-
-                uint packed = subData[srcIdx++];
-                uint packedByte = (packed >> 8) & 0xFFu;
-
-                for (int k = 0; k < pixelsPerUnit; k++)
-                {
-                    int dstX = x + k;
-                    if (dstX >= origWidth) break;
-
-                    uint idx = bitsPerPixel == 8
-                        ? packedByte
-                        : (packedByte >> (k * bitsPerPixel)) & indexMask;
-
-                    if (idx >= (uint)palette.Length)
-                        throw new WebpBitstreamException($"调色板索引 {idx} 超出范围");
-                    result[dstRow + dstX] = palette[(int)idx];
-                }
-            }
+            int subStart = y * subWidth;
+            ReadOnlySpan<uint> subRow = subStart <= subData.Length
+                ? subData[subStart..]
+                : ReadOnlySpan<uint>.Empty;
+            int dstStart = y * origWidth;
+            ApplyColorIndexingInverseRow(subRow, result.AsSpan(dstStart, origWidth),
+                                         origWidth, palette, bits);
         }
         return result;
     }
 
     /// <summary>
-    /// Color Indexing（bits=0）的展开：索引恒在打包像素的绿字节，逐像素查 256 项调色板。
+    /// Color Indexing 逆变换的单行实现：从打包行还原出 <paramref name="origWidth"/> 个像素。
+    /// 行间无依赖，整图路径与流式解码器共用。
+    /// </summary>
+    /// <param name="subRow">当前行的打包像素（长度需覆盖本行所需的 unit 数）。</param>
+    /// <param name="dstRow">输出行（长度至少 origWidth）。</param>
+    internal static void ApplyColorIndexingInverseRow(ReadOnlySpan<uint> subRow, Span<uint> dstRow,
+                                                     int origWidth, ReadOnlySpan<uint> palette, int bits)
+    {
+        if (origWidth <= 0) return;
+
+        // bits=0（每像素一个 8 位索引）是绝对主流路径：没有位解包、没有行尾截断，
+        // 且 ExpandPalette 保证 256 项，可整行做无检查的查表。
+        if (bits == 0 && palette.Length >= 256)
+        {
+            if (subRow.Length < origWidth)
+                throw new WebpBitstreamException("Color Indexing 打包像素数量不足");
+            ExpandIndexed8BitRow(subRow, dstRow, palette, origWidth);
+            return;
+        }
+
+        int bitsPerPixel = 8 >> bits;   // 8 / 4 / 2 / 1
+        int pixelsPerUnit = 1 << bits;  // 1 / 2 / 4 / 8
+        uint indexMask = (1u << bitsPerPixel) - 1u;
+
+        int unit = 0;
+        for (int x = 0; x < origWidth; x += pixelsPerUnit)
+        {
+            if ((uint)unit >= (uint)subRow.Length)
+                throw new WebpBitstreamException("Color Indexing 打包像素数量不足");
+
+            uint packedByte = (subRow[unit++] >> 8) & 0xFFu;
+            for (int k = 0; k < pixelsPerUnit; k++)
+            {
+                int dstX = x + k;
+                if (dstX >= origWidth) break;
+
+                uint idx = bitsPerPixel == 8
+                    ? packedByte
+                    : (packedByte >> (k * bitsPerPixel)) & indexMask;
+
+                if (idx >= (uint)palette.Length)
+                    throw new WebpBitstreamException($"调色板索引 {idx} 超出范围");
+                dstRow[dstX] = palette[(int)idx];
+            }
+        }
+    }
+
+    /// <summary>
+    /// Color Indexing（bits=0）的逐行展开：索引恒在打包像素的绿字节，逐像素查 256 项调色板。
     /// AVX2 路径一次 gather 8 个色：pshufb 取每个像素的绿字节 → 把两个 128 位通道的 4+4
     /// 个索引拼进低 8 字节 → 零扩展成 8 个 int32 → vpgatherdd。
     /// </summary>
-    private static unsafe uint[] ExpandIndexed8Bit(ReadOnlySpan<uint> subData, uint[] result,
-                                            ReadOnlySpan<uint> palette, int total)
+    private static unsafe void ExpandIndexed8BitRow(ReadOnlySpan<uint> src, Span<uint> dst,
+                                                    ReadOnlySpan<uint> palette, int count)
     {
-        ref uint srcRef = ref MemoryMarshal.GetReference(subData);
-        ref uint dstRef = ref MemoryMarshal.GetArrayDataReference(result);
+        ref uint srcRef = ref MemoryMarshal.GetReference(src);
+        ref uint dstRef = ref MemoryMarshal.GetReference(dst);
 
         int i = 0;
-        if (Avx2.IsSupported && total >= 8)
+        if (Avx2.IsSupported && count >= 8)
         {
             Span<uint> pal = stackalloc uint[256];
-            palette.Slice(0, 256).CopyTo(pal);
+            palette[..256].CopyTo(pal);
             ref byte srcBytes = ref Unsafe.As<uint, byte>(ref srcRef);
             fixed (uint* palPtr = pal)
             {
-                int limit = total - 8;
+                int limit = count - 8;
                 for (; i <= limit; i += 8)
                 {
-                    // 读侧一次 32 字节 = 8 个像素，天然满足 i+8 <= total 的边界。
+                    // 读侧一次 32 字节 = 8 个像素，天然满足 i+8 <= count 的边界。
                     Vector256<byte> v = Vector256.LoadUnsafe(ref srcBytes, (nuint)(i * 4));
                     Vector256<byte> g = Avx2.Shuffle(v, IndexByteMask);
                     // 每个 128 位通道的低 4 字节各是 4 个索引，先换成 q0,q2 相邻再压成 8 连续字节。
@@ -620,9 +680,8 @@ internal static class Vp8LTransforms
             }
         }
 
-        for (; i < total; i++)
-            result[i] = palette[(int)((subData[i] >> 8) & 0xFFu)];
-        return result;
+        for (; i < count; i++)
+            dst[i] = palette[(int)((src[i] >> 8) & 0xFFu)];
     }
 
     /// <summary>每个 128 位通道内取 B,G,R,A 中的绿字节（偏移 1/5/9/13），其余清零。</summary>

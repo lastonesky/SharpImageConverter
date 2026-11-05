@@ -118,6 +118,18 @@ internal static class Vp8LEncoder
     /// </summary>
     private const int MaxCachedTokenPixels = 1 << 22;
 
+    /// <summary>
+    /// 启用「真实码长多遍统计」的最小像素数。更小的图上 LZ77 命中很少，后续各遍几乎不改
+    /// 变结果，跳过可省掉额外遍历。
+    /// </summary>
+    private const int MinRefinePixels = 4096;
+
+    /// <summary>
+    /// 真实码长精化的最大轮数。每轮都要整图重走一遍 LZ77；实测第 3 轮起收益已低于
+    /// 0.02%，再多轮只会线性增加耗时。
+    /// </summary>
+    private const int MaxRefinePasses = 2;
+
     /// <summary>调色板剪枝的颜色数上限（配合"≤0.5 字节/像素"一起判断）。</summary>
     private const int MaxDecisivePaletteColors = 16;
 
@@ -833,17 +845,104 @@ internal static class Vp8LEncoder
     }
 
     /// <summary>
-    /// 遍历 token 一遍收集频次：默认单组；启用 meta-Huffman 时按 2^precision 的 tile
-    /// 收集直方图，再聚类成若干组（组数按估计码长 + 码表开销选最优）。
-    /// 组 id 一定连续覆盖 0..numGroups-1，且 numGroups ≤ <see cref="MaxHuffmanGroups"/>，
-    /// 因此解码端不会触发紧凑映射，位流中的表顺序与 entropy image 的组 id 一一对应。
+    /// 多遍统计：
+    /// <list type="number">
+    /// <item>首遍用静态代价模型（像素直方图熵取整）做 LZ77/cache 选择，并缓存 token；</item>
+    /// <item>后续各遍用上一遍的<b>真实 Huffman 码长</b>重建代价模型，重新做 LZ77/cache 选择；</item>
+    /// <item>每遍都用 <see cref="PassBits"/> 算出该 token 集合在最终码表下的真实总位数，
+    ///       只有严格更小才采纳，因此结果永远不会劣于首遍（首遍即多遍之前的原行为）。</item>
+    /// </list>
+    /// 采纳精化结果时首遍的 token 缓存作废（写出遍用自己的代价模型重走一遍），
+    /// 因此任何时刻只持有一份 token 缓存，峰值内存与单遍相同。
     /// </summary>
     private static TokenStatistics CollectStatistics(uint[] pixels, int width, int height, int cacheBits,
         int greenAlphabet, Vp8LEncoderOptions options, bool allowMetaHuffman,
         Vp8LEncodeDiagnostics? diagnostics = null, int maxChainOverride = -1, bool cacheTokens = true)
     {
+        var first = CollectStatisticsPass(pixels, width, height, cacheBits, greenAlphabet, options,
+            allowMetaHuffman, diagnostics, maxChainOverride, cacheTokens, null);
+
+        // 小图/无 LZ77 时精化不会改变选择（只有 literal 与 cache），直接返回首遍。
+        if (!options.UseLz77 || width * height < MinRefinePixels)
+            return first;
+
+        double bestBits = PassBits(first, greenAlphabet);
+        TokenStatistics best = first;
+        CostModel? bestModel = null;
+        var model = CostModel.FromStatistics(first, pixels, cacheBits, greenAlphabet,
+            buildCoveredPrefix: true);
+        double previousBits = bestBits;
+
+        for (int pass = 0; pass < MaxRefinePasses; pass++)
+        {
+            var candidate = CollectStatisticsPass(pixels, width, height, cacheBits, greenAlphabet, options,
+                allowMetaHuffman, diagnostics: null, maxChainOverride, cacheTokens: false, costOverride: model);
+            double bits = PassBits(candidate, greenAlphabet);
+
+            // 代价继续下降才进入下一轮；停止下降时说明已经收敛（再走一遍只会得到同样结果）。
+            bool improving = bits < previousBits;
+            previousBits = bits;
+            if (bits < bestBits)
+            {
+                bestBits = bits;
+                best = candidate;
+                bestModel = model;
+            }
+            if (!improving) break;
+
+            model = CostModel.FromStatistics(candidate, pixels, cacheBits, greenAlphabet,
+                buildCoveredPrefix: true);
+        }
+
+        if (bestModel == null)
+            return best;
+
+        // 精化胜出：首遍缓存作废（写出遍按 best.Cost 重新走一遍，结果与统计遍确定一致），
+        // 避免同时持有两份 token 缓存。
+        first.CachedTokens = null;
+        first.CachedPositions = null;
+        if (diagnostics == null)
+            return best;
+
+        // 诊断快照必须反映实际输出，按胜出模型重编一遍（仅在显式请求诊断时发生）。
+        return CollectStatisticsPass(pixels, width, height, cacheBits, greenAlphabet, options,
+            allowMetaHuffman, diagnostics, maxChainOverride, cacheTokens: false, costOverride: bestModel);
+    }
+
+    /// <summary>
+    /// 一趟统计结果在最终码表下的真实总位数：各通道 Σ freq·码长 + 码表位数 +
+    /// copy 附加位 + entropy image 实际编码位数。单符号通道写出时被完全跳过，这里同样记 0。
+    /// 这是多遍选择与 meta-Huffman 组数选择的统一度量。
+    /// </summary>
+    private static double PassBits(TokenStatistics stats, int greenAlphabet)
+    {
+        double bits = stats.ExtraBits;
+        for (int g = 0; g < stats.NumGroups; g++)
+        {
+            bits += ChannelBits(stats.GreenFreq[g], greenAlphabet);
+            bits += ChannelBits(stats.RedFreq[g], NumLiteralCodes);
+            bits += ChannelBits(stats.BlueFreq[g], NumLiteralCodes);
+            bits += ChannelBits(stats.AlphaFreq[g], NumLiteralCodes);
+            bits += ChannelBits(stats.DistanceFreq[g], NumDistanceCodes);
+        }
+        if (stats.NumGroups > 1)
+            bits += MetaImageBits(stats.TilesX, stats.TilesY, stats.GroupMap, stats.NumGroups);
+        return bits;
+    }
+
+    /// <summary>
+     /// 遍历 token 一遍收集频次：默认单组；启用 meta-Huffman 时按 2^precision 的 tile
+     /// 收集直方图，再聚类成若干组（组数按估计码长 + 码表开销选最优）。
+     /// 组 id 一定连续覆盖 0..numGroups-1，且 numGroups ≤ <see cref="MaxHuffmanGroups"/>，
+     /// 因此解码端不会触发紧凑映射，位流中的表顺序与 entropy image 的组 id 一一对应。
+     /// </summary>
+    private static TokenStatistics CollectStatisticsPass(uint[] pixels, int width, int height, int cacheBits,
+        int greenAlphabet, Vp8LEncoderOptions options, bool allowMetaHuffman,
+        Vp8LEncodeDiagnostics? diagnostics, int maxChainOverride, bool cacheTokens,
+        CostModel? costOverride)
+    {
         var stats = new TokenStatistics();
-        stats.Cost = CostModel.Build(pixels, cacheBits, greenAlphabet, options.UseLz77);
+        stats.Cost = costOverride ?? CostModel.Build(pixels, cacheBits, greenAlphabet, options.UseLz77);
 
         int precisionBits = ChooseHuffmanPrecision(width, height);
         int tilesX = SubSampleSize(width, precisionBits);
@@ -959,7 +1058,8 @@ internal static class Vp8LEncoder
         int[] bestAssign = new int[numTiles];
         Histograms best = MergeTiles(tileGreen, tileRed, tileBlue, tileAlpha, tileDistance,
             bestAssign, 1, greenAlphabet);
-        double bestCost = EstimateCost(best, 1) + MetaImageBits(numTiles, 1);
+        double bestCost = ExactCost(best, 1, greenAlphabet) +
+            MetaImageBits(tilesX, tilesY, bestAssign, 1);
 
         foreach (int wanted in new[] { 2, 4, 8, MaxHuffmanGroups })
         {
@@ -971,7 +1071,8 @@ internal static class Vp8LEncoder
 
             var candidate = MergeTiles(tileGreen, tileRed, tileBlue, tileAlpha, tileDistance,
                 assign, groups, greenAlphabet);
-            double cost = EstimateCost(candidate, groups) + MetaImageBits(numTiles, groups);
+            double cost = ExactCost(candidate, groups, greenAlphabet) +
+                MetaImageBits(tilesX, tilesY, assign, groups);
             if (cost < bestCost)
             {
                 bestCost = cost;
@@ -1174,18 +1275,44 @@ internal static class Vp8LEncoder
         groupCount = next;
     }
 
-    /// <summary>估计位流体积（bit）：各通道直方图熵 + 每张表的码长表开销。</summary>
-    private static double EstimateCost(Histograms h, int numGroups)
+    // ---- meta-Huffman 组数选择 ----
+    /// <summary>
+    /// 精确代价：直接按频次构造码表，用「Σ freq·码长 + 实际码表位数」比较候选分组。
+    /// 旧的 <c>EntropyBits + TableBits</c> 只是近似（熵没有码长上限、码表开销用线性估计），
+    /// 在组数较多、各组符号集差异大时会系统性高估/低估，选错组数。
+    /// </summary>
+    private static double ExactCost(Histograms h, int numGroups, int greenAlphabet)
     {
         double cost = 0;
         for (int g = 0; g < numGroups; g++)
         {
-            cost += EntropyBits(h.Green[g]) + EntropyBits(h.Red[g]) + EntropyBits(h.Blue[g]) +
-                    EntropyBits(h.Alpha[g]) + EntropyBits(h.Distance[g]);
-            cost += TableBits(h.Green[g]) + TableBits(h.Red[g]) + TableBits(h.Blue[g]) +
-                    TableBits(h.Alpha[g]) + TableBits(h.Distance[g]);
+            cost += ChannelBits(h.Green[g], greenAlphabet);
+            cost += ChannelBits(h.Red[g], NumLiteralCodes);
+            cost += ChannelBits(h.Blue[g], NumLiteralCodes);
+            cost += ChannelBits(h.Alpha[g], NumLiteralCodes);
+            cost += ChannelBits(h.Distance[g], NumDistanceCodes);
         }
         return cost;
+    }
+
+    /// <summary>单个通道的精确代价：token 位数（Σ freq·码长）+ 码表自身写出的位数。</summary>
+    private static double ChannelBits(int[] frequency, int alphabet)
+    {
+        var code = Vp8LHuffmanCode.Build(frequency, alphabet);
+        long tokenBits = 0;
+        // 单符号通道按规范写 simple code 且码长 1，但写出端（WriteSymbol）会完全跳过，
+        // 实际 token 位数是 0。若仍按 1 bit/符号累加，恒定 alpha 的图上会把每个 token
+        // 多算 1 bit（照片类约 70 万 bit），组数/代价比较会因此失真。
+        if (code.SingleSymbol < 0)
+        {
+            for (int i = 0; i < alphabet; i++)
+            {
+                if (frequency[i] > 0) tokenBits += (long)frequency[i] * code.Lengths[i];
+            }
+        }
+        var writer = new LsbBitWriter();
+        code.WriteTo(writer);
+        return tokenBits + writer.TotalBits;
     }
 
     private static double EntropyBits(int[] histogram) => EntropyBits(histogram, 0, histogram.Length);
@@ -1236,11 +1363,21 @@ internal static class Vp8LEncoder
         return active <= 1 ? 6 : 10 + 2.0 * active;
     }
 
-    /// <summary>entropy image 自身的位流开销估计（每个 tile 一个组 id）。</summary>
-    private static double MetaImageBits(int numTiles, int numGroups)
+    /// <summary>
+    /// entropy image 自身的真实位流开销：把候选分组按最终写法完整编码一遍子图像，
+    /// 取实际写出位数。
+    /// 旧实现用 <c>24 + numTiles·log2(numGroups)</c> 线性估计，忽略了子图像自身的
+    /// 帧头、变换列表结束位与 5 张 Huffman 表，系统性低估开销，导致组数选择偏向
+    /// 过多分组 —— 小图/强渐变图上元 Huffman 反而比单组更大。
+    /// </summary>
+    private static double MetaImageBits(int tilesX, int tilesY, int[] assign, int numGroups)
     {
         if (numGroups <= 1) return 0;
-        return 24 + numTiles * Math.Log2(numGroups);
+        var pixels = new uint[tilesX * tilesY];
+        for (int t = 0; t < pixels.Length; t++) pixels[t] = (uint)(assign[t] << 8);
+        var writer = new LsbBitWriter();
+        EncodeSubImage(writer, pixels, tilesX, tilesY);
+        return writer.TotalBits;
     }
 
     private static void BuildCodes(TokenStatistics stats, int greenAlphabet)
@@ -1288,6 +1425,10 @@ internal static class Vp8LEncoder
         private readonly int[] _blue;
         private readonly int[] _alpha;
 
+        /// <summary>长度前缀符号的实际码长（首遍统计后才有；静态模型为 null）。</summary>
+        private readonly int[]? _length;
+        private readonly int[]? _distance;
+
         /// <summary>被覆盖像素代价的前缀和（长度 total+1），仅在启用 LZ77 时构造。</summary>
         private readonly int[]? _coveredPrefix;
 
@@ -1304,12 +1445,14 @@ internal static class Vp8LEncoder
         public const int MinCopyCost = LengthSymbolCost + DistanceSymbolCost;
 
         private CostModel(int[] green, int[] red, int[] blue, int[] alpha, int cacheSymbolCost,
-            uint[]? prefixSource)
+            uint[]? prefixSource, int[]? distance = null, int[]? length = null)
         {
             _green = green;
             _red = red;
             _blue = blue;
             _alpha = alpha;
+            _length = length;
+            _distance = distance;
             CacheSymbolCost = cacheSymbolCost;
 
             if (prefixSource == null)
@@ -1334,25 +1477,130 @@ internal static class Vp8LEncoder
         public static CostModel Build(uint[] pixels, int cacheBits, int greenAlphabet,
             bool buildCoveredPrefix)
         {
-            var green = new int[NumLiteralCodes];
-            var red = new int[NumLiteralCodes];
-            var blue = new int[NumLiteralCodes];
-            var alpha = new int[NumLiteralCodes];
-            for (int i = 0; i < pixels.Length; i++)
-            {
-                uint p = pixels[i];
-                green[(p >> 8) & 0xFF]++;
-                red[(p >> 16) & 0xFF]++;
-                blue[p & 0xFF]++;
-                alpha[p >> 24]++;
-            }
+            LiteralCosts(pixels, out int[] green, out int[] red, out int[] blue, out int[] alpha);
 
             int cacheSymbolCost = cacheBits > 0
                 ? (int)Math.Ceiling(Math.Log2(greenAlphabet))
                 : int.MaxValue / 2;
-            return new CostModel(BitsCost(green), BitsCost(red), BitsCost(blue), BitsCost(alpha),
+            return new CostModel(green, red, blue, alpha,
                 cacheSymbolCost, buildCoveredPrefix ? pixels : null);
         }
+
+        /// <summary>按像素直方图统计四个 literal 通道的代价（熵取整）。</summary>
+        private static void LiteralCosts(uint[] pixels, out int[] green, out int[] red,
+            out int[] blue, out int[] alpha)
+        {
+            var greenFreq = new int[NumLiteralCodes];
+            var redFreq = new int[NumLiteralCodes];
+            var blueFreq = new int[NumLiteralCodes];
+            var alphaFreq = new int[NumLiteralCodes];
+            for (int i = 0; i < pixels.Length; i++)
+            {
+                uint p = pixels[i];
+                greenFreq[(p >> 8) & 0xFF]++;
+                redFreq[(p >> 16) & 0xFF]++;
+                blueFreq[p & 0xFF]++;
+                alphaFreq[p >> 24]++;
+            }
+            green = BitsCost(greenFreq);
+            red = BitsCost(redFreq);
+            blue = BitsCost(blueFreq);
+            alpha = BitsCost(alphaFreq);
+        }
+
+        /// <summary>
+        /// 混合代价模型：literal 侧仍用<b>像素直方图</b>的熵估计，长度/距离/color-cache
+        /// 符号则改用首遍 token 统计得到的<b>真实 Huffman 码长</b>。
+        ///
+        /// 为什么 literal 不能直接用 token 码长：LZ77 在评估一个候选 copy 时，需要的是
+        /// 「这些像素若不 copy、各自要花多少位」的反事实代价。被 copy 覆盖的像素本来
+        /// 就很少以 literal 形式出现，它们在 token 直方图里的码长反而偏长；直接用它会让
+        /// 覆盖收益被系统性高估，LZ77 逐渐偏向又长又远的 copy（实测 photo 上额外位
+        /// 从 33 万 bit 涨到 57 万 bit，净体积反而变大）。
+        /// 而静态模型把长度/距离符号一律按 6 bit 估，对常见短距离明显过贵、对罕见
+        /// 长距离明显便宜，正是 LZ77 选择偏保守的根源。两者各取所长即可。
+        /// </summary>
+        public static CostModel FromStatistics(TokenStatistics stats, uint[] pixels, int cacheBits,
+            int greenAlphabet, bool buildCoveredPrefix)
+        {
+            LiteralCosts(pixels, out int[] greenCost, out int[] redCost, out int[] blueCost,
+                out int[] alphaCost);
+
+            int[] greenFreq = MergeFrequency(stats.GreenFreq, greenAlphabet);
+            var greenCode = Vp8LHuffmanCode.Build(greenFreq, greenAlphabet);
+
+            var lengthCost = new int[NumLengthCodes];
+            for (int i = 0; i < NumLengthCodes; i++)
+            {
+                int symbol = NumLiteralCodes + i;
+                lengthCost[i] = symbol < greenCode.Lengths.Length && greenFreq[symbol] == 0
+                    ? 12
+                    : Math.Max(1, greenCode.Lengths[symbol]);
+            }
+
+            int[] distanceCost = CodeLengthCosts(MergeFrequency(stats.DistanceFreq, NumDistanceCodes),
+                NumDistanceCodes);
+
+            int cacheSymbolCost = int.MaxValue / 2;
+            if (cacheBits > 0)
+            {
+                int cacheStart = NumLiteralCodes + NumLengthCodes;
+                int cacheEnd = Math.Min(greenAlphabet, cacheStart + (1 << cacheBits));
+                long weighted = 0;
+                long count = 0;
+                for (int i = cacheStart; i < cacheEnd; i++)
+                {
+                    if (greenFreq[i] > 0)
+                    {
+                        weighted += (long)greenFreq[i] * Math.Max(1, greenCode.Lengths[i]);
+                        count += greenFreq[i];
+                    }
+                }
+                cacheSymbolCost = count > 0
+                    ? (int)((weighted + count - 1) / count)
+                    : (int)Math.Ceiling(Math.Log2(greenAlphabet));
+            }
+
+            return new CostModel(greenCost, redCost, blueCost, alphaCost, cacheSymbolCost,
+                buildCoveredPrefix ? pixels : null, distanceCost, lengthCost);
+        }
+
+        private static int[] MergeFrequency(int[][] perGroup, int alphabet)
+        {
+            var merged = new int[alphabet];
+            for (int g = 0; g < perGroup.Length; g++)
+            {
+                var group = perGroup[g];
+                int n = Math.Min(alphabet, group.Length);
+                for (int i = 0; i < n; i++) merged[i] += group[i];
+            }
+            return merged;
+        }
+
+        private static int[] CodeLengthCosts(int[] frequency, int alphabet)
+        {
+            var code = Vp8LHuffmanCode.Build(frequency, alphabet);
+            var costs = new int[alphabet];
+            for (int i = 0; i < alphabet; i++)
+            {
+                costs[i] = frequency[i] == 0 ? 12 : Math.Max(1, code.Lengths[i]);
+            }
+            return costs;
+        }
+
+        /// <summary>长度前缀符号的代价：精化模型用实际码长，静态模型退回 6 bit 估计。</summary>
+        public int LengthCost(int prefix)
+        {
+            if (_length != null && (uint)prefix < (uint)_length.Length)
+                return Math.Max(1, _length[prefix]);
+            return LengthSymbolCost;
+        }
+
+        /// <summary>距离前缀符号的实际码长。</summary>
+        public int DistanceCost(int symbol)
+            => _distance != null && symbol >= 0 && symbol < _distance.Length
+                ? Math.Max(1, _distance[symbol])
+                : DistanceSymbolCost;
 
         private static int[] BitsCost(int[] histogram)
         {
@@ -1673,8 +1921,8 @@ internal static class Vp8LEncoder
         {
             var lengthCode = EncodeCopyValue(length);
             var distanceCode = EncodeDistance(distance, _distanceToPlaneCode);
-            return CostModel.LengthSymbolCost + lengthCode.ExtraBits +
-                   CostModel.DistanceSymbolCost + distanceCode.ExtraBits;
+            return _cost.LengthCost(lengthCode.Prefix) + lengthCode.ExtraBits +
+                   _cost.DistanceCost(distanceCode.Prefix) + distanceCode.ExtraBits;
         }
 
         private void InsertPosition(int pos)

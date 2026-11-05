@@ -4,6 +4,26 @@ using System.Buffers.Binary;
 namespace SharpImageConverter.Formats.Webp;
 
 /// <summary>
+/// <see cref="LsbBitReader"/> 的可保存状态。位读取器是 ref struct，无法被类持有；
+/// 逐行解码器保存该快照，在每次读行时重建读取器并延续位置。
+/// </summary>
+internal readonly struct LsbBitReaderSnapshot
+{
+    public readonly ulong Buffer;
+    public readonly int BitsInBuffer;
+    public readonly int BytePos;
+    public readonly long TotalBitsRead;
+
+    public LsbBitReaderSnapshot(ulong buffer, int bitsInBuffer, int bytePos, long totalBitsRead)
+    {
+        Buffer = buffer;
+        BitsInBuffer = bitsInBuffer;
+        BytePos = bytePos;
+        TotalBitsRead = totalBitsRead;
+    }
+}
+
+/// <summary>
 /// LSB-first 位流读取器，VP8L 无损格式使用。
 ///
 /// 实现要点：内部维护一个 64 位缓冲，按 4 字节批量 refill；常见路径
@@ -26,6 +46,23 @@ internal ref struct LsbBitReader
         _bytePos = 0;
         _totalBitsRead = 0;
     }
+
+    /// <summary>从快照恢复读取位置（用于逐行解码在两次调用之间保持位流状态）。</summary>
+    public LsbBitReader(ReadOnlySpan<byte> data, LsbBitReaderSnapshot snapshot)
+    {
+        _data = data;
+        _buffer = snapshot.Buffer;
+        _bitsInBuffer = snapshot.BitsInBuffer;
+        _bytePos = snapshot.BytePos;
+        _totalBitsRead = snapshot.TotalBitsRead;
+    }
+
+    /// <summary>保存当前读取位置。快照只含标量状态，数据本身由调用方持有。</summary>
+    public LsbBitReaderSnapshot Snapshot() =>
+        new(_buffer, _bitsInBuffer, _bytePos, _totalBitsRead);
+
+    /// <summary>已消费位数（用于计算下一行开始前还需要多少个符号）。</summary>
+    public long BitsConsumed => _totalBitsRead;
 
     /// <summary>当前已读位数（方便调试与测试）。</summary>
     public int TotalBitsRead => (int)_totalBitsRead;
