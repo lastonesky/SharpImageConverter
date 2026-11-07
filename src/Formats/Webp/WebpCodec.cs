@@ -35,8 +35,8 @@ namespace SharpImageConverter.Formats.Webp
         {
             ArgumentNullException.ThrowIfNull(rgba);
             return options.Lossless
-                ? WebpEncoder.EncodeRgba(rgba, width, height, metadata)
-                : WebpEncoder.EncodeLossyRgba(rgba, width, height, options.Quality, metadata);
+                ? WebpEncoder.EncodeRgba(rgba, width, height, options.Method, metadata)
+                : WebpEncoder.EncodeLossyRgba(rgba, width, height, options.Quality, options.Method, metadata);
         }
 
         public static byte[] EncodeRgb(byte[] rgb, int width, int height, WebpEncoderOptions options,
@@ -45,8 +45,8 @@ namespace SharpImageConverter.Formats.Webp
             ArgumentNullException.ThrowIfNull(rgb);
             byte[] rgba = ExpandRgb(rgb, width, height);
             return options.Lossless
-                ? WebpEncoder.EncodeRgba(rgba, width, height, metadata)
-                : WebpEncoder.EncodeLossyRgba(rgba, width, height, options.Quality, metadata);
+                ? WebpEncoder.EncodeRgba(rgba, width, height, options.Method, metadata)
+                : WebpEncoder.EncodeLossyRgba(rgba, width, height, options.Quality, options.Method, metadata);
         }
 
         public static void EncodeRgbaToStream(Stream stream, ReadOnlySpan<byte> rgba, int width, int height, float quality)
@@ -66,10 +66,11 @@ namespace SharpImageConverter.Formats.Webp
             if (rgba.Length != checked(width * height * 4)) throw new ArgumentException("RGBA 像素长度不匹配", nameof(rgba));
             if (options.Lossless)
             {
-                WebpEncoder.EncodeRgbaToStream(stream, rgba, width, height, metadata);
+                WebpEncoder.EncodeRgbaToStream(stream, rgba, width, height, options.Method, metadata);
                 return;
             }
-            WebpEncoder.EncodeLossyRgbaToStream(stream, rgba, width, height, options.Quality, metadata);
+            WebpEncoder.EncodeLossyRgbaToStream(stream, rgba, width, height, options.Quality,
+                options.Method, metadata);
         }
 
         public static void EncodeRgbToStream(Stream stream, ReadOnlySpan<byte> rgb, int width, int height,
@@ -79,10 +80,11 @@ namespace SharpImageConverter.Formats.Webp
             byte[] rgba = ExpandRgb(rgb, width, height);
             if (options.Lossless)
             {
-                WebpEncoder.EncodeRgbaToStream(stream, rgba, width, height, metadata);
+                WebpEncoder.EncodeRgbaToStream(stream, rgba, width, height, options.Method, metadata);
                 return;
             }
-            WebpEncoder.EncodeLossyRgbaToStream(stream, rgba, width, height, options.Quality, metadata);
+            WebpEncoder.EncodeLossyRgbaToStream(stream, rgba, width, height, options.Quality,
+                options.Method, metadata);
         }
 
         public static byte[] EncodeAnimatedRgba(byte[][] rgbaFrames, int width, int height, int[] frameDurationsMs,

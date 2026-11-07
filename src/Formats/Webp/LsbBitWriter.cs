@@ -1,10 +1,14 @@
 using System;
+using System.Buffers.Binary;
 
 namespace SharpImageConverter.Formats.Webp;
 
 /// <summary>
 /// LSB-first 位流写入器，与 <see cref="LsbBitReader"/> 对称，供 VP8L 编码器使用。
-/// <c>WriteBits</c> 按低位先写；Huffman 码字按规范以 MSB-first 写出，故用 <c>WriteCode</c>。
+/// 对齐 libwebp src/utils/bit_writer_utils.h:147 VP8LPutBits()：
+/// 64 bit 累加器，累计满 32 bit 时一次写出 4 字节，而不是每满 8 bit 刷一次。
+/// Huffman 码字由 <see cref="Vp8LHuffmanCode"/> 在建表时预先反转为 LSB-first
+/// （对齐 huffman_encode_utils.c:385-411 ConvertBitDepthsToSymbols）。
 /// </summary>
 internal sealed class LsbBitWriter
 {
@@ -29,30 +33,26 @@ internal sealed class LsbBitWriter
         _bitsInBuffer += count;
         _totalBits += count;
 
-        while (_bitsInBuffer >= 8) FlushByte();
+        while (_bitsInBuffer >= 32) FlushWord();
     }
 
     /// <summary>写入 1 个 bit。</summary>
     public void WriteBit(int bit) => WriteBits((uint)(bit & 1), 1);
 
-    /// <summary>
-    /// 写入 Huffman 码字：规范中码字以 MSB-first 排列，而位流按字节 LSB-first 存放，
-    /// 因此这里先反转码字再按位写入。
-    /// </summary>
+    /// <summary>写入 Huffman 码字：调用方已在建表时把规范码反转为 LSB-first。</summary>
     public void WriteCode(int code, int length)
     {
-        if (length <= 0) return;
-        WriteBits((uint)ReverseBits(code, length), length);
+        if (length > 0) WriteBits((uint)code, length);
     }
 
     /// <summary>补齐到字节边界（不足一字节的尾部补 0）。</summary>
     public void AlignToByte()
     {
-        if (_bitsInBuffer > 0)
+        while (_bitsInBuffer > 0)
         {
             EmitByte((byte)(_buffer & 0xFF));
             _buffer >>= 8;
-            _bitsInBuffer = 0;
+            _bitsInBuffer = Math.Max(0, _bitsInBuffer - 8);
         }
     }
 
@@ -65,33 +65,33 @@ internal sealed class LsbBitWriter
         return result;
     }
 
-    private void FlushByte()
+    private void FlushWord()
     {
-        EmitByte((byte)(_buffer & 0xFF));
-        _buffer >>= 8;
-        _bitsInBuffer -= 8;
+        EmitUInt32((uint)_buffer);
+        _buffer >>= 32;
+        _bitsInBuffer -= 32;
+    }
+
+    private void EmitUInt32(uint value)
+    {
+        EnsureCapacity(4);
+        BinaryPrimitives.WriteUInt32LittleEndian(_bytes.AsSpan(_byteCount, 4), value);
+        _byteCount += 4;
     }
 
     private void EmitByte(byte value)
     {
-        if (_byteCount == _bytes.Length)
-        {
-            int newSize = checked(_bytes.Length * 2);
-            var grown = new byte[newSize];
-            Array.Copy(_bytes, grown, _byteCount);
-            _bytes = grown;
-        }
+        EnsureCapacity(1);
         _bytes[_byteCount++] = value;
     }
 
-    private static int ReverseBits(int value, int count)
+    private void EnsureCapacity(int extra)
     {
-        int result = 0;
-        for (int i = 0; i < count; i++)
-        {
-            result = (result << 1) | (value & 1);
-            value >>= 1;
-        }
-        return result;
+        if (_byteCount + extra <= _bytes.Length) return;
+        int newSize = _bytes.Length;
+        while (newSize < _byteCount + extra) newSize = checked(newSize * 2);
+        var grown = new byte[newSize];
+        Array.Copy(_bytes, grown, _byteCount);
+        _bytes = grown;
     }
 }

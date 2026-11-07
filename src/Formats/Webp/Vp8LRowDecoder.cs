@@ -26,6 +26,7 @@ internal sealed class Vp8LRowDecoder
     private static readonly uint[] EmptyRow = new uint[1];
 
     private readonly byte[] _payload;
+    private readonly int _dataOffset;
     private readonly Vp8LImageState _state;
     private readonly Vp8LTransformInfo[] _reversedTransforms;
     private readonly Vp8LTransformInfo? _predictorTransform;
@@ -58,13 +59,43 @@ internal sealed class Vp8LRowDecoder
     internal int RingSize => _ringSize;
 
     public Vp8LRowDecoder(byte[] payload)
+        : this(payload,
+               ParseFramed(payload, out int width, out int height, out var snapshot),
+               snapshot, width, height, dataOffset: 0)
+    {
+    }
+
+    /// <summary>
+    /// ALPH 的 VP8L 裸流（无 5 字节帧头，尺寸由调用方给出）构造入口。
+    /// <paramref name="data"/> 的 <paramref name="dataOffset"/> 之后是裸位流；
+    /// 直接引用调用方的缓冲，避免为压缩数据额外复制。
+    /// </summary>
+    internal static Vp8LRowDecoder CreateBare(byte[] data, int dataOffset, int width, int height)
+    {
+        ArgumentNullException.ThrowIfNull(data);
+        if (dataOffset < 0 || dataOffset > data.Length)
+            throw new ArgumentOutOfRangeException(nameof(dataOffset));
+
+        var state = Vp8LDecoder.ReadBareStreamState(data.AsSpan(dataOffset), width, height, out var snapshot);
+        return new Vp8LRowDecoder(data, state, snapshot, width, height, dataOffset);
+    }
+
+    private static Vp8LImageState ParseFramed(byte[] payload, out int width, out int height,
+                                              out LsbBitReaderSnapshot snapshot)
     {
         ArgumentNullException.ThrowIfNull(payload);
-        _payload = payload;
+        return Vp8LDecoder.ReadLevel0State(payload, out width, out height, out snapshot);
+    }
 
-        _state = Vp8LDecoder.ReadLevel0State(payload, out int width, out int height, out _snapshot);
-        _outputWidth = width;
-        _outputHeight = height;
+    private Vp8LRowDecoder(byte[] payload, Vp8LImageState state, LsbBitReaderSnapshot snapshot,
+                           int outputWidth, int outputHeight, int dataOffset)
+    {
+        _payload = payload;
+        _dataOffset = dataOffset;
+        _state = state;
+        _snapshot = snapshot;
+        _outputWidth = outputWidth;
+        _outputHeight = outputHeight;
         _width = _state.DecodeWidth;
         _height = _state.DecodeHeight;
         _totalPixels = checked(_width * _height);
@@ -118,7 +149,7 @@ internal sealed class Vp8LRowDecoder
         int y = _nextRow;
 
         // ---- 1. 推进位流直到本行最后一个像素被解出（copy 可能跨行，允许越界到后续行） ----
-        var reader = new LsbBitReader(_payload, _snapshot);
+        var reader = new LsbBitReader(_payload.AsSpan(_dataOffset), _snapshot);
         DecodeUntil(ref reader, (y + 1) * _width);
         _snapshot = reader.Snapshot();
 

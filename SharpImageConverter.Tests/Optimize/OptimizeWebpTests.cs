@@ -145,13 +145,14 @@ namespace SharpImageConverter.Tests
         [InlineData(90f, 6)]
         public void WebpEncoderOptions_MethodIsReservedAndKeptAsIs(float quality, int requested)
         {
-            // 纯 C# 编码器没有 effort 档位：method 只是兼容参数，既不做 4→3 降级也不再影响产物。
+            // method 现在是真的 effort 档位（0..4 快档 / 5..6 完整档），但取值必须原样保留，
+            // 既不做 4→3 降级也不做越界钳制。
             var options = new WebpEncoderOptions(quality, WebpConcurrencyStrategy.Auto, requested);
             Assert.Equal(requested, options.Method);
         }
 
         [Fact]
-        public void WebpEncoderOptions_MethodHasNoEffectOnOutput()
+        public void WebpEncoderOptions_MethodSelectsEffortDeterministically()
         {
             const int w = 48, h = 32;
             var rgba = new byte[w * h * 4];
@@ -172,8 +173,27 @@ namespace SharpImageConverter.Tests
                 outputs.Add(ms.ToArray());
             }
 
+            // 同一 effort 档位内必须确定性逐字节一致（0..4 都是快档，6 是完整档）。
+            int[] fastMethods = { 0, 2, 3, 4 };
+            for (int i = 1; i < 4; i++)
+                Assert.True(outputs[0].AsSpan().SequenceEqual(outputs[i]),
+                    $"快档 method {fastMethods[i]} 的产物应与 method 0 一致");
+
+            // 跨档允许不同（用 effort 换速度/体积），但每档都必须是合法可解码的 WebP。
             foreach (var bytes in outputs)
-                Assert.True(outputs[0].AsSpan().SequenceEqual(bytes), "不同 method 的产物必须逐字节一致");
+            {
+                var decoded = WebpDecoder.DecodeRgba(bytes, out int dw, out int dh);
+                Assert.Equal(w, dw);
+                Assert.Equal(h, dh);
+                Assert.Equal(rgba.Length, decoded.Length);
+            }
+
+            // 完整档重复编码同样不能受缓冲池 / 跨调用状态影响。
+            using var again = new MemoryStream();
+            new WebpEncoderAdapterRgba { Options = new WebpEncoderOptions(70, WebpConcurrencyStrategy.Auto, 6) }
+                .EncodeRgba32(again, new Image<Rgba32>(w, h, rgba));
+            Assert.True(outputs[4].AsSpan().SequenceEqual(again.ToArray()),
+                "完整档重复编码必须逐字节一致");
         }
 
         [Fact]

@@ -11,6 +11,47 @@ namespace SharpImageConverter.Tests.Codec;
 public class WebpVp8EncoderTests
 {
     // ==================================================================
+    //  回归：partition0 降级路径的量化档位
+    // ==================================================================
+
+    [Fact]
+    public void Configure_DisabledSegmentation_UsesBaseQuantizers()
+    {
+        // 超大图（约 >6500² 宏块模式信息超 19 位 partition0）走降级配置：
+        // Configure(false, false) 关闭分段后，所有宏块 _currentSegment=0，
+        // 量化表必须回到基础 q。若仍叠加 _segDelta[0]（+2），整图比预期粗两档，
+        // 色度 DC 预测在平坦区的偏差（约 ±10~12）落入量化死区被丢弃，残差无法
+        // 修正，沿色度 DC 预测方向逐宏块传播，在白色背景上形成大面积半透明
+        // 粉紫偏色（143MP 实测：右下角 V 均值 128→140）。
+        var rgba = new byte[16 * 16 * 4];
+        for (int i = 0; i < rgba.Length; i += 4)
+            rgba[i + 3] = 255;
+
+        var encoder = new Vp8Encoder(rgba, 16, 16, baseQ: 88);
+        var configure = typeof(Vp8Encoder).GetMethod("Configure",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+        configure.Invoke(encoder, new object[] { false, false });
+
+        var flags = System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance;
+        int baseQ = (int)typeof(Vp8Encoder).GetField("_baseQ", flags)!.GetValue(encoder)!;
+        var y1Dc = (int[])typeof(Vp8Encoder).GetField("_y1Dc", flags)!.GetValue(encoder)!;
+        var y1Ac = (int[])typeof(Vp8Encoder).GetField("_y1Ac", flags)!.GetValue(encoder)!;
+        var uvDc = (int[])typeof(Vp8Encoder).GetField("_uvDc", flags)!.GetValue(encoder)!;
+        var uvAc = (int[])typeof(Vp8Encoder).GetField("_uvAc", flags)!.GetValue(encoder)!;
+
+        int uvDcQ = Math.Clamp(baseQ + Vp8Encoder_UvDcDeltaQ, 0, 117);
+        int uvAcQ = Math.Clamp(baseQ + Vp8Encoder_UvAcDeltaQ, 0, 127);
+        Assert.Equal(Vp8Tables.DcQuantTable[baseQ], y1Dc[0]);
+        Assert.Equal(Vp8Tables.AcQuantTable[baseQ], y1Ac[0]);
+        Assert.Equal(Vp8Tables.DcQuantTable[uvDcQ], uvDc[0]);
+        Assert.Equal(Vp8Tables.AcQuantTable[uvAcQ], uvAc[0]);
+    }
+
+    /// <summary>与 Vp8Encoder.UvDcDeltaQ / UvAcDeltaQ 常量保持一致（断言用）。</summary>
+    private const int Vp8Encoder_UvDcDeltaQ = -2;
+    private const int Vp8Encoder_UvAcDeltaQ = -4;
+
+    // ==================================================================
     //  T0：bool 编码器 ↔ 解码器互逆
     // ==================================================================
 
@@ -327,7 +368,9 @@ public class WebpVp8EncoderTests
         int w = frame.Width;
         int h = frame.Height;
 
-        byte[] ours = WebpEncoder.EncodeLossyRgba(rgba, w, h, quality);
+        // 体积/画质对拍针对完整档（method ≥ 5）；快档的位流合法性由
+        // Vp8Encode_DecodesIdenticallyInLibWebpAndCSharp 与下面的快档专项测试覆盖。
+        byte[] ours = WebpEncoder.EncodeLossyRgba(rgba, w, h, quality, 6);
         byte[] reference = LibWebpTestCodec.EncodeRgba(rgba, w, h, quality);
 
         double ourPsnr = RgbPsnr(rgba, LibWebpTestCodec.DecodeRgba(ours, out _, out _), w, h);
@@ -369,7 +412,7 @@ public class WebpVp8EncoderTests
         const float quality = 75f;
         byte[] rgba = MakeSmoothGradient(w, h);
 
-        byte[] ours = WebpEncoder.EncodeLossyRgba(rgba, w, h, quality);
+        byte[] ours = WebpEncoder.EncodeLossyRgba(rgba, w, h, quality, 6);
         byte[] reference = LibWebpTestCodec.EncodeRgba(rgba, w, h, quality);
 
         double ourPsnr = RgbPsnr(rgba, LibWebpTestCodec.DecodeRgba(ours, out _, out _), w, h);
@@ -380,6 +423,44 @@ public class WebpVp8EncoderTests
         Assert.True(ours.Length <= reference.Length * 1.5,
             $"平滑渐变 q{quality}: 体积 {ours.Length} 字节是 libwebp {reference.Length} 字节的 " +
             $"{(double)ours.Length / reference.Length:F2}×（要求 ≤1.5×）");
+
+        byte[] csharpDecoded = WebpDecoder.DecodeRgba(ours, out int cw, out int ch);
+        byte[] libDecoded = LibWebpTestCodec.DecodeRgba(ours, out int lw, out int lh);
+        Assert.Equal(w, cw);
+        Assert.Equal(h, ch);
+        Assert.Equal(w, lw);
+        Assert.Equal(h, lh);
+        for (int i = 0; i < libDecoded.Length; i++)
+        {
+            if (i % 4 == 3)
+            {
+                Assert.Equal(libDecoded[i], csharpDecoded[i]);
+                continue;
+            }
+            Assert.InRange(csharpDecoded[i], libDecoded[i] - 1, libDecoded[i] + 1);
+        }
+    }
+
+    /// <summary>
+    /// 快档（method ≤ 4）只保证位流合法与画质，不承诺压缩率：
+    /// 单遍 + 标量量化 + 查表滤波必须仍能被 libwebp 与托管解码器解出，
+    /// 且 PSNR 与 libwebp 同档质量的差距不超过 2dB。
+    /// </summary>
+    [Theory]
+    [InlineData(75f)]
+    [InlineData(90f)]
+    public void Lossy_FastEffort_IsDecodableAndKeepsQuality(float quality)
+    {
+        const int w = 640, h = 480;
+        byte[] rgba = MakeSmoothGradient(w, h);
+
+        byte[] ours = WebpEncoder.EncodeLossyRgba(rgba, w, h, quality, 4);
+        byte[] reference = LibWebpTestCodec.EncodeRgba(rgba, w, h, quality);
+
+        double ourPsnr = RgbPsnr(rgba, LibWebpTestCodec.DecodeRgba(ours, out _, out _), w, h);
+        double libPsnr = RgbPsnr(rgba, LibWebpTestCodec.DecodeRgba(reference, out _, out _), w, h);
+        Assert.True(libPsnr - ourPsnr <= 2.0,
+            $"快档 q{quality}: PSNR {ourPsnr:F2}dB 比 libwebp {libPsnr:F2}dB 低 {libPsnr - ourPsnr:F2}dB");
 
         byte[] csharpDecoded = WebpDecoder.DecodeRgba(ours, out int cw, out int ch);
         byte[] libDecoded = LibWebpTestCodec.DecodeRgba(ours, out int lw, out int lh);

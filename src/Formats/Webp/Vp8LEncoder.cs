@@ -9,7 +9,7 @@ internal readonly struct Vp8LEncoderOptions
     public Vp8LEncoderOptions(bool useTransforms, bool useColorCache, bool useLz77,
         bool useColorIndexing = false, bool uniformPredictor = false, bool selectBest = false,
         bool useMetaHuffman = true, bool autoPredictor = false, bool autoCrossColor = true,
-        int forcedPredictorMode = -1, int forcedCacheBits = -1)
+        int forcedPredictorMode = -1, int forcedCacheBits = -1, bool fast = false)
     {
         UseTransforms = useTransforms;
         UseColorCache = useColorCache;
@@ -22,6 +22,7 @@ internal readonly struct Vp8LEncoderOptions
         AutoCrossColor = autoCrossColor;
         ForcedPredictorMode = forcedPredictorMode;
         ForcedCacheBits = forcedCacheBits;
+        Fast = fast;
     }
 
     public bool UseTransforms { get; }
@@ -69,6 +70,9 @@ internal readonly struct Vp8LEncoderOptions
     /// <summary>分析用：强制使用指定 color cache 位数（-1 表示按尺寸自动选）。</summary>
     public int ForcedCacheBits { get; }
 
+    /// <summary>快档：跳过真实码长精化轮与 meta-Huffman 分组（由入口统一关闭）。</summary>
+    public bool Fast { get; }
+
     /// <summary>仅 literal：无变换、无 color cache、无 LZ77，用于阶段 A 体积基线。</summary>
     public static readonly Vp8LEncoderOptions LiteralOnly = new(false, false, false, useMetaHuffman: false);
 
@@ -76,10 +80,19 @@ internal readonly struct Vp8LEncoderOptions
     public static readonly Vp8LEncoderOptions Full =
         new(true, true, true, useMetaHuffman: true, autoPredictor: true);
 
-    /// <summary>生产入口使用：在候选配置中选最小输出。</summary>
+    /// <summary>生产入口使用：在候选配置中选最小输出（高档完整路径）。</summary>
     public static readonly Vp8LEncoderOptions Auto =
         new(true, true, true, useColorIndexing: true, selectBest: true,
             useMetaHuffman: true, autoPredictor: true);
+
+    /// <summary>
+    /// 快档（对应 libwebp <c>method ≤ 4</c>）：只跑一条候选（调色板或空间变换），
+    /// 不做真实码长精化轮、不用 meta-Huffman 分组。输出仍是合法可逆的 VP8L 位流，
+    /// 仅体积略大；这正是用 effort 换速度的部分。
+    /// </summary>
+    public static readonly Vp8LEncoderOptions AutoFast =
+        new(true, true, true, useColorIndexing: true, useMetaHuffman: false,
+            autoPredictor: true, fast: true);
 }
 
 /// <summary>
@@ -125,6 +138,19 @@ internal static class Vp8LEncoder
     private const int MinRefinePixels = 4096;
 
     /// <summary>
+    /// predictor 模式复评从整图切到横带估算的像素阈值。横带对周期性内容
+    /// （重复周期长于横带行数的图案）会漏掉长距离重复并排错序，因此只对
+    /// 超过 1MP 的大图启用（大图上整图走查才是不可接受的成本）。
+    /// </summary>
+    private const int PlanBandPixels = 1 << 20;
+
+    /// <summary>
+    /// 横带估算后允许再做整图首遍复评的像素上限（只取前 2 名）。
+    /// 更大的图整图走查本身太贵，保持纯横带（与启用两阶段之前的行为一致）。
+    /// </summary>
+    private const int PlanFullReevalPixels = 1 << 22;
+
+    /// <summary>
     /// 真实码长精化的最大轮数。每轮都要整图重走一遍 LZ77；实测第 3 轮起收益已低于
     /// 0.02%，再多轮只会线性增加耗时。
     /// </summary>
@@ -132,6 +158,72 @@ internal static class Vp8LEncoder
 
     /// <summary>调色板剪枝的颜色数上限（配合"≤0.5 字节/像素"一起判断）。</summary>
     private const int MaxDecisivePaletteColors = 16;
+
+    /// <summary>
+    /// 编码期大数组复用池（线程静态、LIFO 栈式租借）。
+    /// VP8L 一次编码要跑十几遍 token 走查，每遍新建 token 缓存 / LZ77 链 /
+    /// 代价模型前缀和会带来数百 MB 的分配与 GC 压力（1024² 实测 300~500 MB）。
+    /// 租借按栈式嵌套（子图像编码嵌在外层 token 流里），由 EncodeTokenStream 与
+    /// EstimateTokenBits 在结束时按快照回退；池保留线程内出现过的最大尺寸，
+    /// 跨编码复用（同线程后续编码不再重复分配）。
+    /// </summary>
+    private static class BufferPool
+    {
+        private sealed class Bag<T>
+        {
+            public readonly List<T[]> Items = new();
+            public int Cursor;
+        }
+
+        [ThreadStatic] private static Bag<Token>? _tokens;
+        [ThreadStatic] private static Bag<int>? _ints;
+        [ThreadStatic] private static Bag<uint>? _uints;
+
+        internal static Snapshot Mark()
+            => new(_tokens?.Cursor ?? 0, _ints?.Cursor ?? 0, _uints?.Cursor ?? 0);
+
+        internal static void Rewind(Snapshot snapshot)
+        {
+            if (_tokens != null) _tokens.Cursor = snapshot.Tokens;
+            if (_ints != null) _ints.Cursor = snapshot.Ints;
+            if (_uints != null) _uints.Cursor = snapshot.Uints;
+        }
+
+        private static T[] Rent<T>(ref Bag<T>? bag, int length)
+        {
+            bag ??= new Bag<T>();
+            var items = bag.Items;
+            int cursor = bag.Cursor;
+            T[] array;
+            if (cursor < items.Count)
+            {
+                array = items[cursor];
+                if (array.Length < length)
+                {
+                    array = new T[length];
+                    items[cursor] = array;
+                }
+            }
+            else
+            {
+                array = new T[length];
+                items.Add(array);
+            }
+            bag.Cursor = cursor + 1;
+            return array;
+        }
+
+        internal static Token[] RentTokens(int length) => Rent(ref _tokens, length);
+        internal static int[] RentInts(int length) => Rent(ref _ints, length);
+        internal static uint[] RentUints(int length) => Rent(ref _uints, length);
+
+        internal readonly struct Snapshot(int tokenCount, int intCount, int uintCount)
+        {
+            public int Tokens { get; } = tokenCount;
+            public int Ints { get; } = intCount;
+            public int Uints { get; } = uintCount;
+        }
+    }
 
     /// <summary>把 RGBA 编码成完整的 VP8L chunk 数据（不含 RIFF 容器）。</summary>
     public static byte[] EncodeVp8L(ReadOnlySpan<byte> rgba, int width, int height, Vp8LEncoderOptions options,
@@ -154,12 +246,135 @@ internal static class Vp8LEncoder
         PreparedSpatial? spatial = null;
         if (palette == null && options.UseTransforms && width >= 8 && height >= 8)
         {
-            var pair = PrepareSpatialPair(pixels, width, height, options.AutoCrossColor, options.AutoPredictor,
-                options.UseLz77, options.UseColorCache, options.ForcedPredictorMode, options.ForcedCacheBits);
-            spatial = options.AutoCrossColor ? pair.WithColor : pair.WithoutColor;
+            // 对齐 libwebp src/enc/vp8l_enc.c:108-256 AnalyzeEntropy() 与 :1589-1601：
+            // 熵分析选出 kDirect 时 use_predict / use_subtract_green / use_cross_color
+            // 全部关闭，整条空间变换链是净亏（纯噪声、高熵图上尤其明显）。
+            // C# 的空间变换链固定为 subtract-green + predictor(+可选 cross-color)，
+            // 因此这里等价地不写任何 transform，直接以结束位收尾。
+            int transformBits = width >= 16 && height >= 16 ? 4 : 3;
+            // SIC_WEBP_NO_DIRECT_BAIL 仅用于同进程 A/B 实测，生产路径保持开启。
+            bool directBest = options.Fast &&
+                Environment.GetEnvironmentVariable("SIC_WEBP_NO_DIRECT_BAIL") != "1" &&
+                IsDirectEntropyBest(pixels, width, height, transformBits);
+            if (!directBest)
+            {
+                var pair = PrepareSpatialPair(pixels, width, height, options.AutoCrossColor, options.AutoPredictor,
+                    options.UseLz77, options.UseColorCache, options.ForcedPredictorMode, options.ForcedCacheBits,
+                    options.Fast);
+                spatial = options.AutoCrossColor ? pair.WithColor : pair.WithoutColor;
+            }
         }
 
         return EncodePrepared(pixels, width, height, alphaUsed, options, spatial, palette, diagnostics);
+    }
+
+    /// <summary>
+    /// 对齐 libwebp src/enc/vp8l_enc.c:108-256 AnalyzeEntropy()：
+    /// 一遍扫描统计 direct / predictor 差分 / subtract-green 残差的通道熵，
+    /// 按变换头惩罚（predictor 每 tile log2(14) 位、predictor+subtract-green 每 tile
+    /// log2(24) 位）比较四种编码形态。返回 true 表示 kDirect 最优，此时任何空间变换
+    /// 都只会增加熵，libwebp 在 :1589-1601 会把三个 use_* 开关全部关掉。
+    ///
+    /// 与 C 版唯一差异：按行抽样（最多约 64K 像素）而不是全量扫描。熵估计对抽样稳健，
+    /// 且不会给可压缩图平白增加一次整图 O(N) 开销；行内仍保留 libwebp 的
+    /// 「跳过与前一像素相同的像素」规则，上一行比较按相邻抽样行处理。
+    /// </summary>
+    private static bool IsDirectEntropyBest(uint[] pixels, int width, int height, int transformBits)
+    {
+        const int MaxSamples = 1 << 16;
+        const int PreScreenSamples = 4096;
+        int stride = NumLiteralCodes;
+
+        // 预筛：kDirect 只可能在高熵（接近不可压缩）图上胜出。先用 4096 个样本
+        // 估计 direct 熵，明显可压缩时直接返回 false，避免为结构化图平白增加
+        // 一次 64K 像素扫描与缓存污染（同进程 A/B 实测该扫描会让渐变图慢约 10%）。
+        // 按「每活跃通道」归一化：不透明图的 A 通道熵恒为 0，用 4 通道总熵会把
+        // 纯噪声图（RGB 各 8 bit、A 为 0，共 24 bit/像素）误判成可压缩。
+        var screen = new int[4 * stride];
+        int screenStep = Math.Max(1, pixels.Length / PreScreenSamples);
+        int screenCount = 0;
+        for (int i = 0; i < pixels.Length; i += screenStep)
+        {
+            AddChannels(pixels[i], screen, 0);
+            screenCount++;
+        }
+        double screenBits = 0;
+        int activeChannels = 0;
+        for (int c = 0; c < 4; c++)
+        {
+            double bits = EntropyBits(screen, c * stride, stride);
+            screenBits += bits;
+            if (bits > screenCount) activeChannels++; // >1 bit/像素视为活跃通道
+        }
+        if (activeChannels == 0 || screenBits < screenCount * activeChannels * 7.0) return false;
+
+        // 12 张 256 桶直方图：
+        //   0..3  direct 的 A/R/G/B
+        //   4..7  pix_diff（与前一像素的 mod-256 差）的 A/R/G/B
+        //   8..9  subtract-green 后的 R/B（基于原像素）
+        //  10..11 subtract-green 后的 R/B（基于 pix_diff）
+        var histo = new int[12 * stride];
+
+        int rowStep = Math.Max(1, width * height / MaxSamples);
+        int prevRowStart = -1;
+        for (int y = 0; y < height; y += rowStep)
+        {
+            int row = y * width;
+            uint pixPrev = pixels[row];
+            for (int x = 0; x < width; x++)
+            {
+                uint pix = pixels[row + x];
+                uint diff = ModSubPixels(pix, pixPrev);
+                pixPrev = pix;
+                if (diff == 0) continue;
+                if (prevRowStart >= 0 && pix == pixels[prevRowStart + x]) continue;
+
+                AddChannels(pix, histo, 0);
+                AddChannels(diff, histo, 4 * stride);
+                AddSubGreen(pix, histo, 8 * stride);
+                AddSubGreen(diff, histo, 10 * stride);
+            }
+            prevRowStart = row;
+        }
+
+        // libwebp :174-179：predictor 直方图补一个零计数，抵消 diff==0 跳过造成的零缺失。
+        for (int c = 0; c < 4; c++) histo[(4 + c) * stride]++;
+        for (int c = 0; c < 2; c++) histo[(10 + c) * stride]++;
+
+        Span<double> comp = stackalloc double[12];
+        for (int i = 0; i < 12; i++)
+            comp[i] = EntropyBits(histo, i * stride, stride);
+
+        double direct = comp[0] + comp[1] + comp[2] + comp[3];
+        // 本编码器的空间变换链固定为 subtract-green + predictor(+可选 cross-color)，
+        // 即 libwebp 的 kSpatialSubGreen；kSpatial / kSubGreen 两种独立形态并未实现。
+        // 因此决策口径对齐 libwebp :170 的 last_mode_to_analyze 收窄：只与
+        // 实际会写出的形态比较，避免噪声图被「熵几乎相同但不带 predictor」的
+        // kSubGreen 抢走，从而永远不触发 kDirect。
+        double spatialSubGreen = comp[4] + comp[10] + comp[6] + comp[11];
+
+        double tiles = (double)SubSampleSize(width, transformBits) * SubSampleSize(height, transformBits);
+        spatialSubGreen += tiles * Log2(24);  // 14 种 predictor + color-transform 元素的变换头
+
+        // 与 libwebp :214-219 一致：从 kDirect 起，只有严格更优才替换（相等时保留 kDirect）。
+        return direct <= spatialSubGreen;
+    }
+
+    private static void AddChannels(uint pixel, int[] histo, int offset)
+    {
+        histo[offset + (int)(pixel >> 24)]++;
+        histo[offset + NumLiteralCodes + (int)((pixel >> 16) & 0xFF)]++;
+        histo[offset + 2 * NumLiteralCodes + (int)((pixel >> 8) & 0xFF)]++;
+        histo[offset + 3 * NumLiteralCodes + (int)(pixel & 0xFF)]++;
+    }
+
+    private static void AddSubGreen(uint pixel, int[] histo, int offset)
+    {
+        int g = (int)((pixel >> 8) & 0xFF);
+        int r = (int)((pixel >> 16) & 0xFF);
+        int b = (int)(pixel & 0xFF);
+        histo[offset + ((r - g) & 0xFF)]++;
+        histo[offset + NumLiteralCodes + ((b - g) & 0xFF)]++;
     }
 
     /// <summary>
@@ -274,7 +489,7 @@ internal static class Vp8LEncoder
     /// </summary>
     private static PreparedSpatialPair PrepareSpatialPair(uint[] source, int width, int height,
         bool autoCrossColor, bool autoPredictor, bool useLz77, bool useColorCache, int forcedMode = -1,
-        int forcedCacheBits = -1)
+        int forcedCacheBits = -1, bool fast = false)
     {
         var sg = (uint[])source.Clone();
         ApplySubtractGreenForward(sg);
@@ -284,7 +499,7 @@ internal static class Vp8LEncoder
         int subWidth = SubSampleSize(width, bits);
         int subHeight = SubSampleSize(height, bits);
 
-        var basePlan = ChoosePredictorPlan(sg, width, height, bits, !autoPredictor, forcedMode, useLz77, cacheBits);
+        var basePlan = ChoosePredictorPlan(sg, width, height, bits, !autoPredictor, forcedMode, useLz77, cacheBits, fast);
 
         var plain = (uint[])sg.Clone();
         var plainModes = new uint[subWidth * subHeight];
@@ -331,7 +546,7 @@ internal static class Vp8LEncoder
         int colorForced = forcedMode >= 0 ? forcedMode
             : basePlan.TileModes == null ? basePlan.UniformMode : -1;
         var colorPlan = ChoosePredictorPlan(chosenCandidate.Pixels, width, height, bits,
-            !autoPredictor, colorForced, useLz77, cacheBits);
+            !autoPredictor, colorForced, useLz77, cacheBits, fast);
         if (colorPlan.Cost >= basePlan.Cost)
             return new PreparedSpatialPair { WithColor = withoutColor, WithoutColor = withoutColor };
 
@@ -591,6 +806,22 @@ internal static class Vp8LEncoder
     private static void EncodeTokenStream(LsbBitWriter writer, uint[] pixels, int width, int height,
         Vp8LEncoderOptions options, bool level0, Vp8LEncodeDiagnostics? diagnostics = null)
     {
+        // 整条 token 流（含嵌套的子图像编码）结束后按 LIFO 回退缓冲池：
+        // 子图像的租借发生在本层持有 token 缓存期间，若不按栈序释放会别名覆盖外层缓存。
+        var snapshot = BufferPool.Mark();
+        try
+        {
+            EncodeTokenStreamCore(writer, pixels, width, height, options, level0, diagnostics);
+        }
+        finally
+        {
+            BufferPool.Rewind(snapshot);
+        }
+    }
+
+    private static void EncodeTokenStreamCore(LsbBitWriter writer, uint[] pixels, int width, int height,
+        Vp8LEncoderOptions options, bool level0, Vp8LEncodeDiagnostics? diagnostics = null)
+    {
 
         int cacheBits = options.UseColorCache
             ? ChooseCacheBits(pixels, width, height, options.ForcedCacheBits) : 0;
@@ -842,6 +1073,9 @@ internal static class Vp8LEncoder
 
         /// <summary>所有 copy token 的长度/距离附加位数之和（与码符号位数相加即为 token 位数）。</summary>
         public long ExtraBits;
+
+        /// <summary>copy token 个数，用于快档判断 LZ77 是否值得再精化一轮。</summary>
+        public int CopyCount;
     }
 
     /// <summary>
@@ -857,13 +1091,20 @@ internal static class Vp8LEncoder
     /// </summary>
     private static TokenStatistics CollectStatistics(uint[] pixels, int width, int height, int cacheBits,
         int greenAlphabet, Vp8LEncoderOptions options, bool allowMetaHuffman,
-        Vp8LEncodeDiagnostics? diagnostics = null, int maxChainOverride = -1, bool cacheTokens = true)
+        Vp8LEncodeDiagnostics? diagnostics = null, int maxChainOverride = -1, bool cacheTokens = true,
+        bool refine = true)
     {
         var first = CollectStatisticsPass(pixels, width, height, cacheBits, greenAlphabet, options,
             allowMetaHuffman, diagnostics, maxChainOverride, cacheTokens, null);
 
-        // 小图/无 LZ77 时精化不会改变选择（只有 literal 与 cache），直接返回首遍。
-        if (!options.UseLz77 || width * height < MinRefinePixels)
+        // 估算路径（refine: false）与小图/无 LZ77 时只跑首遍：精化轮每轮都是整图 LZ77 重走，
+        // 只用于最终候选之间的体积择优，不影响估算排序的公平性（所有候选同口径）。
+        if (!refine || !options.UseLz77 || width * height < MinRefinePixels)
+            return first;
+
+        // 快档：首遍 LZ77 几乎没命中（纯噪声 / 高熵内容）时，精化轮不可能改善码长，
+        // 跳过这一趟整图重走。copy 占比 > 0.1% 的可压缩内容仍保留一轮精化。
+        if (options.Fast && first.CopyCount * 1000L < (long)width * height)
             return first;
 
         double bestBits = PassBits(first, greenAlphabet);
@@ -873,7 +1114,10 @@ internal static class Vp8LEncoder
             buildCoveredPrefix: true);
         double previousBits = bestBits;
 
-        for (int pass = 0; pass < MaxRefinePasses; pass++)
+        // 快档只保留一轮精化：首遍的静态代价模型在渐变/结构化图上会漏掉长距离 copy，
+        // 完全不精化会让体积退化数倍；第 2 轮起收益 <0.02%，不值得再走一遍整图 LZ77。
+        int maxPasses = options.Fast ? 1 : MaxRefinePasses;
+        for (int pass = 0; pass < maxPasses; pass++)
         {
             var candidate = CollectStatisticsPass(pixels, width, height, cacheBits, greenAlphabet, options,
                 allowMetaHuffman, diagnostics: null, maxChainOverride, cacheTokens: false, costOverride: model);
@@ -950,23 +1194,31 @@ internal static class Vp8LEncoder
         int numTiles = tilesX * tilesY;
         bool meta = allowMetaHuffman && numTiles >= 4 && width * height >= 256;
 
-        var walker = new TokenWalker(pixels, width, height, options.UseLz77, cacheBits, stats.Cost,
-            maxChainOverride);
-        Token token;
-        int position;
-
         // 统计遍顺带缓存 token 序列，写出遍直接复用（LZ77 搜索只做一次）。
         // 缓存按像素数上限（每像素最坏一个 token、约 16 字节 + 位置），避免大图内存失控。
+        // 顺序约定：先租缓存、后建 walker——回退必须 LIFO，walker 的链/哈希表要在栈顶。
         bool cache = cacheTokens && width * height <= MaxCachedTokenPixels;
         if (cache)
         {
-            stats.CachedTokens = new Token[width * height];
-            stats.CachedPositions = new int[width * height];
+            stats.CachedTokens = BufferPool.RentTokens(width * height);
+            stats.CachedPositions = BufferPool.RentInts(width * height);
         }
+
+        var walker = new TokenWalker(pixels, width, height, options.UseLz77, cacheBits, stats.Cost,
+            maxChainOverride);
+        // walker 的链/哈希表在走查结束即可复用（token 缓存与代价模型仍被外层持有，
+        // 必须从栈顶回退）；异常路径由 EncodeTokenStream / EstimateTokenBits 的外层回退兑底。
+        var walkerSnapshot = BufferPool.Mark();
+        Token token;
+        int position;
 
         void RecordToken(Token t, int pos)
         {
-            if (t.Kind == TokenKind.Copy) stats.ExtraBits += t.LengthExtraBits + t.DistanceExtraBits;
+            if (t.Kind == TokenKind.Copy)
+            {
+                stats.ExtraBits += t.LengthExtraBits + t.DistanceExtraBits;
+                stats.CopyCount++;
+            }
             if (diagnostics != null) CountToken(t);
             if (!cache) return;
             stats.CachedTokens![stats.CachedCount] = t;
@@ -1019,6 +1271,7 @@ internal static class Vp8LEncoder
             stats.AlphaFreq = new[] { alpha };
             stats.DistanceFreq = new[] { distance };
             BuildCodes(stats, greenAlphabet);
+            BufferPool.Rewind(walkerSnapshot);
             return stats;
         }
 
@@ -1099,6 +1352,7 @@ internal static class Vp8LEncoder
         stats.AlphaFreq = best.Alpha;
         stats.DistanceFreq = best.Distance;
         BuildCodes(stats, greenAlphabet);
+        BufferPool.Rewind(walkerSnapshot);
         return stats;
     }
 
@@ -1464,7 +1718,8 @@ internal static class Vp8LEncoder
             // 前缀和把"一段区间被 copy 覆盖时原本要花多少位"变成 O(1) 查询。
             // LZ77 搜索每考察一个候选都要评估收益，逐像素累加会把搜索成本放大到
             // 候选数 × 匹配长度 × 4 次查表，在纯色/强渐变图上退化成 O(n²)。
-            var prefix = new int[prefixSource.Length + 1];
+            var prefix = BufferPool.RentInts(prefixSource.Length + 1);
+            prefix[0] = 0; // 复用的数组可能残留旧值，必须显式归零（与新分配等价）
             int accumulated = 0;
             for (int i = 0; i < prefixSource.Length; i++)
             {
@@ -1737,13 +1992,13 @@ internal static class Vp8LEncoder
             int hashBits = MinHashBits;
             while (hashBits < HashBits && (1 << hashBits) < _total) hashBits++;
             _hashShift = 32 - hashBits;
-            _hashHead = useLz77 ? new int[1 << hashBits] : System.Array.Empty<int>();
+            _hashHead = useLz77 ? BufferPool.RentInts(1 << hashBits) : System.Array.Empty<int>();
             if (useLz77) System.Array.Fill(_hashHead, -1);
 
             int chainSize = 1;
             int wanted = Math.Min(_total, MaxDistance + 1);
             while (chainSize < wanted) chainSize <<= 1;
-            _chain = useLz77 ? new int[chainSize] : System.Array.Empty<int>();
+            _chain = useLz77 ? BufferPool.RentInts(chainSize) : System.Array.Empty<int>();
             _chainMask = chainSize - 1;
 
             // 链深度按像素数自适应。哈希只取两个像素，周期图案（渐变、alpha 渐变）上
@@ -1755,7 +2010,9 @@ internal static class Vp8LEncoder
                 ? (maxChainOverride > 0 ? maxChainOverride : ChooseChainDepth(_total))
                 : 0;
             _distanceToPlaneCode = useLz77 ? BuildDistanceToPlaneCode(width) : System.Array.Empty<int>();
-            _cache = cacheBits > 0 ? new uint[1 << cacheBits] : System.Array.Empty<uint>();
+            _cache = cacheBits > 0 ? BufferPool.RentUints(1 << cacheBits) : System.Array.Empty<uint>();
+            // 解码端 color cache 初始为全 0，复用的数组必须显式清零才能与新分配等价。
+            if (cacheBits > 0) System.Array.Clear(_cache);
         }
 
         /// <summary>
@@ -2334,7 +2591,7 @@ internal static class Vp8LEncoder
     /// 表开销对所有模式相同，因此抽样的排序仍然有效；最终模式仍由全量熵决定。
     /// </summary>
     private static PredictorPlan ChoosePredictorPlan(uint[] pixels, int width, int height, int bits,
-        bool uniformOnly, int forcedMode, bool useLz77, int cacheBits)
+        bool uniformOnly, int forcedMode, bool useLz77, int cacheBits, bool fast = false)
     {
         var histogram = new int[4 * NumLiteralCodes];
         int uniformMode = 1;
@@ -2359,7 +2616,7 @@ internal static class Vp8LEncoder
 
         // 1/2 抽样（≥8192 像素时）把 14 个模式的首轮比较降到 1/4 代价。
         int stride = width * height >= 1 << 13 ? 2 : 1;
-        int refine = stride == 1 ? 14 : 4;
+        int refine = fast ? 1 : (stride == 1 ? 14 : 4);
         if (stride == 1)
         {
             for (int mode = 0; mode < 14; mode++)
@@ -2378,12 +2635,12 @@ internal static class Vp8LEncoder
         else
         {
             Span<double> sampleCost = stackalloc double[14];
+            // 对齐 libwebp src/enc/predictor_enc.c:451 ComputeResidualsForTile() /
+            // VP8LPredictorsSub[mode]：分块预取像素一次，再按模式批量累加残差直方图。
+            var allHistograms = new int[14 * 4 * NumLiteralCodes];
+            AccumulateResidualHistogramsAllSampled(pixels, width, 0, width, 0, height, stride, allHistograms);
             for (int mode = 0; mode < 14; mode++)
-            {
-                System.Array.Clear(histogram);
-                AccumulateResidualHistogramSampled(pixels, width, 0, width, 0, height, stride, mode, histogram);
-                sampleCost[mode] = ChannelsEntropyAndTables(histogram);
-            }
+                sampleCost[mode] = ChannelsEntropyAndTables(allHistograms, mode * 4 * NumLiteralCodes);
 
             Span<bool> chosen = stackalloc bool[14];
             for (int round = 0; round < refine; round++)
@@ -2409,6 +2666,15 @@ internal static class Vp8LEncoder
                     uniformMode = bestMode;
                 }
             }
+        }
+
+        if (fast)
+        {
+            // 快档：熵最优的单一 predictor + 统一模式，跳过逐候选整图 LZ77 复评与逐 tile 模式搜索。
+            // 这两步在 1024² 图上约占整条无损链路的 40%（采样见 .perf/fast-lossless），
+            // 且 libwebp 的 predictor_enc.c 同样先用一次残差直方图排序、只对少数候选真编。
+            // 输出仍是合法的 predictor 变换（统一模式），只是不再追求最优模式。
+            return new PredictorPlan(uniformMode, null, uniformCost);
         }
 
         bool repetitionStrong = false;
@@ -2452,17 +2718,47 @@ internal static class Vp8LEncoder
             }
 
             int tokenMode = uniformMode;
-            foreach (int mode in candidates)
+            // 第一阶段：横带首遍估算给全部候选排序——整图 LZ77 走查（首遍 + 精化轮）
+            // 是无损编码里最贵的单步，曾占整条链路的大部分耗时；横带保留真实行宽与邻域，
+            // 足以区分「整行可复制」与「行结构被打散」。
+            // 第二阶段：只让横带前 2 名做整图首遍复评，避免横带与整图在近并列时排错序。
+            var bandScores = new double[candidates.Count];
+            for (int i = 0; i < candidates.Count; i++)
             {
+                int mode = candidates[i];
                 System.Array.Copy(pixels, scratch, pixels.Length);
                 ApplyPredictorPlan(scratch, width, height, bits, new PredictorPlan(mode, null, 0), modePixels);
-                double tokenBits = EstimateTokenBitsSampled(scratch, width, height, cacheBits);
-                if (tokenBits < uniformTokenBits)
+                bandScores[i] = EstimateTokenBitsSampled(scratch, width, height, cacheBits);
+            }
+
+            int bestIndex = 0;
+            for (int i = 1; i < bandScores.Length; i++)
+                if (bandScores[i] < bandScores[bestIndex]) bestIndex = i;
+            double bestBits = bandScores[bestIndex];
+
+            if (pixels.Length > PlanBandPixels && pixels.Length <= PlanFullReevalPixels && candidates.Count > 1)
+            {
+                int secondIndex = bestIndex == 0 ? 1 : 0;
+                for (int i = 0; i < bandScores.Length; i++)
+                    if (i != bestIndex && bandScores[i] < bandScores[secondIndex]) secondIndex = i;
+
+                int[] finalists = { bestIndex, secondIndex };
+                foreach (int index in finalists)
                 {
-                    uniformTokenBits = tokenBits;
-                    tokenMode = mode;
+                    System.Array.Copy(pixels, scratch, pixels.Length);
+                    ApplyPredictorPlan(scratch, width, height, bits,
+                        new PredictorPlan(candidates[index], null, 0), modePixels);
+                    double fullBits = EstimateTokenBits(scratch, width, height, cacheBits);
+                    if (fullBits < bestBits)
+                    {
+                        bestBits = fullBits;
+                        bestIndex = index;
+                    }
                 }
             }
+
+            tokenMode = candidates[bestIndex];
+            uniformTokenBits = bestBits;
             uniformMode = tokenMode;
         }
 
@@ -2520,12 +2816,26 @@ internal static class Vp8LEncoder
     /// </summary>
     private static double EstimateTokenBits(uint[] pixels, int width, int height, int cacheBits)
     {
+        // 独立估算调用（不嵌在 token 流里）：结束时回退本次走查租借的缓冲。
+        var snapshot = BufferPool.Mark();
+        try
+        {
+            return EstimateTokenBitsCore(pixels, width, height, cacheBits);
+        }
+        finally
+        {
+            BufferPool.Rewind(snapshot);
+        }
+    }
+
+    private static double EstimateTokenBitsCore(uint[] pixels, int width, int height, int cacheBits)
+    {
         int greenAlphabet = NumLiteralCodes + NumLengthCodes + (cacheBits > 0 ? 1 << cacheBits : 0);
         var options = new Vp8LEncoderOptions(true, cacheBits > 0, true, useMetaHuffman: false);
         // 估算路径不缓存 token：频次与附加位总已在统计遍累加，直接按码长求和即可，
         // 避免为每个候选模式分配一份整图 token 数组（大图上会造成明显的 GC 抖动）。
         var stats = CollectStatistics(pixels, width, height, cacheBits, greenAlphabet, options,
-            allowMetaHuffman: false, cacheTokens: false);
+            allowMetaHuffman: false, cacheTokens: false, refine: false);
 
         // 码表开销同样计入：不同模式的符号使用分布不同，表大小也随之变化。
         double bits = SumCodeBits(stats.GreenFreq[0], stats.GreenCodes[0]) +
@@ -2551,13 +2861,13 @@ internal static class Vp8LEncoder
     }
 
     /// <summary>
-    /// predictor 模式复评用的 token 位数估计：大图取中部一条不超过 64K 像素的横带，
-    /// 避免为每个候选模式付一次整图 LZ77 走查；小图直接整幅估算。
+    /// predictor 模式复评用的 token 位数估计：大于 <see cref="PlanBandPixels"/> 的图取中部一条
+    /// 不超过 64K 像素的横带，避免为每个候选模式付一次整图 LZ77 走查；小图直接整幅估算。
     /// 横带保留了真实的行宽与邻域关系，足以区分"整行可复制"与"行结构被打散"。
     /// </summary>
     private static double EstimateTokenBitsSampled(uint[] pixels, int width, int height, int cacheBits)
     {
-        if (pixels.Length <= 1 << 20) return EstimateTokenBits(pixels, width, height, cacheBits);
+        if (pixels.Length <= PlanBandPixels) return EstimateTokenBits(pixels, width, height, cacheBits);
         int rows = Math.Clamp(65536 / Math.Max(1, width), 8, height);
         int start = (height - rows) / 2;
         var band = new uint[width * rows];
@@ -2581,40 +2891,89 @@ internal static class Vp8LEncoder
         return EstimateTokenBits(band, width, rows, cacheBits);
     }
 
-    /// <summary>隔行隔列抽样统计残差直方图（仅用于给 predictor 模式排序）。</summary>
-    private static void AccumulateResidualHistogramSampled(uint[] pixels, int width,
-        int x0, int x1, int y0, int y1, int stride, int mode, int[] histogram)
+    /// <summary>
+    /// 分块预取后按模式批量累加 14 种 predictor 的残差直方图，
+    /// 对齐 libwebp src/enc/predictor_enc.c:451 ComputeResidualsForTile() 与
+    /// VP8LPredictorsSub[mode] 的「按模式一次处理一整行」结构。
+    /// 每个模式的直方图与旧的逐模式整图扫描完全一致
+    /// （同样的采样点、同样的邻居、同样的 mod-256 残差），因此模式排序结果不变。
+    /// </summary>
+    private static void AccumulateResidualHistogramsAllSampled(uint[] pixels, int width,
+        int x0, int x1, int y0, int y1, int stride, int[] histograms)
     {
+        const int Block = 64;
+        int perMode = 4 * NumLiteralCodes;
         int yStart = y0 == 0 ? 0 : ((y0 + stride - 1) / stride) * stride;
         int xStart = x0 == 0 ? 0 : ((x0 + stride - 1) / stride) * stride;
+
+        // 分块预取：像素与四个邻居只读一遍，随后按模式批量处理。
+        // 每模式内层只写自己那 4KB 直方图（常驻 L1），避免 14 份直方图交替写
+        // 造成 cache thrash；这更接近 libwebp VP8LPredictorsSub[mode]
+        // 「按模式一次处理一整行」的结构。
+        Span<uint> pixelBuf = stackalloc uint[Block];
+        Span<uint> leftBuf = stackalloc uint[Block];
+        Span<uint> topBuf = stackalloc uint[Block];
+        Span<uint> topLeftBuf = stackalloc uint[Block];
+        Span<uint> topRightBuf = stackalloc uint[Block];
+        Span<uint> borderResidual = stackalloc uint[Block];
+        Span<bool> isBorder = stackalloc bool[Block];
+
         for (int y = yStart; y < y1; y += stride)
         {
             int row = y * width;
             int topRow = row - width;
-            for (int x = xStart; x < x1; x += stride)
+            int nextX = xStart;
+            while (nextX < x1)
             {
-                uint predictor;
-                if (y == 0)
+                int count = 0;
+                while (count < Block && nextX < x1)
                 {
-                    predictor = x == 0 ? 0xFF000000u : pixels[row + x - 1];
+                    int x = nextX;
+                    uint pixel = pixels[row + x];
+                    pixelBuf[count] = pixel;
+                    if (y == 0 || x == 0)
+                    {
+                        // 边界像素的预测与模式无关，14 份直方图写入同一个残差。
+                        uint predictor = y == 0
+                            ? (x == 0 ? 0xFF000000u : pixels[row + x - 1])
+                            : pixels[topRow + x];
+                        borderResidual[count] = ModSubPixels(pixel, predictor);
+                        isBorder[count] = true;
+                    }
+                    else
+                    {
+                        leftBuf[count] = pixels[row + x - 1];
+                        topBuf[count] = pixels[topRow + x];
+                        topLeftBuf[count] = pixels[topRow + x - 1];
+                        topRightBuf[count] = pixels[topRow + x + 1];
+                        isBorder[count] = false;
+                    }
+                    count++;
+                    nextX += stride;
                 }
-                else if (x == 0)
+
+                for (int mode = 0; mode < 14; mode++)
                 {
-                    predictor = pixels[topRow + x];
+                    int offset = mode * perMode;
+                    for (int i = 0; i < count; i++)
+                    {
+                        uint residual = isBorder[i]
+                            ? borderResidual[i]
+                            : ModSubPixels(pixelBuf[i], Vp8LTransforms.Predictor(mode,
+                                leftBuf[i], topBuf[i], topLeftBuf[i], topRightBuf[i]));
+                        AddResidual(histograms, offset, residual);
+                    }
                 }
-                else
-                {
-                    predictor = Vp8LTransforms.Predictor(mode,
-                        pixels[row + x - 1], pixels[topRow + x], pixels[topRow + x - 1],
-                        pixels[topRow + x + 1]);
-                }
-                uint residual = ModSubPixels(pixels[row + x], predictor);
-                histogram[residual & 0xFF]++;
-                histogram[NumLiteralCodes + ((residual >> 8) & 0xFF)]++;
-                histogram[2 * NumLiteralCodes + ((residual >> 16) & 0xFF)]++;
-                histogram[3 * NumLiteralCodes + (residual >> 24)]++;
             }
         }
+    }
+
+    private static void AddResidual(int[] histograms, int offset, uint residual)
+    {
+        histograms[offset + (int)(residual & 0xFF)]++;
+        histograms[offset + NumLiteralCodes + (int)((residual >> 8) & 0xFF)]++;
+        histograms[offset + 2 * NumLiteralCodes + (int)((residual >> 16) & 0xFF)]++;
+        histograms[offset + 3 * NumLiteralCodes + (int)(residual >> 24)]++;
     }
 
     /// <summary>
@@ -2894,11 +3253,15 @@ internal static class Vp8LEncoder
     /// 在强规律图（渐变/纯色）上选出明显更差的逐 tile 方案。
     /// </summary>
     private static double ChannelsEntropyAndTables(int[] histogram)
+        => ChannelsEntropyAndTables(histogram, 0);
+
+    /// <param name="baseOffset">该模式直方图在合并缓冲区中的起始下标。</param>
+    private static double ChannelsEntropyAndTables(int[] histogram, int baseOffset)
     {
         double bits = 0;
         for (int channel = 0; channel < 4; channel++)
         {
-            int offset = channel * NumLiteralCodes;
+            int offset = baseOffset + channel * NumLiteralCodes;
             bits += EntropyBits(histogram, offset, NumLiteralCodes);
             bits += TableBits(histogram, offset, NumLiteralCodes);
         }

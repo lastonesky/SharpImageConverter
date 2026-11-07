@@ -137,6 +137,22 @@ public static class Vp8LDecoder
     }
 
     /// <summary>
+    /// ALPH 的 VP8L 裸流入口（无 5 字节 VP8L 头，尺寸由 ALPH 调用方给出）：
+    /// 解析 transform / color cache / Huffman 头，并返回像素流起点的位读快照。
+    /// </summary>
+    internal static Vp8LImageState ReadBareStreamState(ReadOnlySpan<byte> data, int width, int height,
+                                                       out LsbBitReaderSnapshot pixelSnapshot)
+    {
+        if (width < 1 || height < 1 || width > MaxDimension || height > MaxDimension)
+            throw new WebpBitstreamException($"VP8L 裸流尺寸 {width}x{height} 超出规格");
+
+        var reader = new LsbBitReader(data);
+        var state = ReadImageStreamState(width, height, isLevel0: true, ref reader);
+        pixelSnapshot = reader.Snapshot();
+        return state;
+    }
+
+    /// <summary>
     /// 读取 VP8L 图像流的头部（transform / color cache / Huffman），并返回共享状态。
     /// 对照 libwebp DecodeImageStream() 中“解析头部”的部分；像素解码与逆变换由调用方完成，
     /// 这样整图解码与行增量解码可以复用同一份位流解读逻辑。

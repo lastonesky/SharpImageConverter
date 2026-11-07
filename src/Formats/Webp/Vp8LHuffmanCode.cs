@@ -7,7 +7,9 @@ namespace SharpImageConverter.Formats.Webp;
 /// VP8L 的规范 Huffman 码表（编码端）。
 /// 主符号表码长上限 15 位、码长码（meta）表上限 7 位；常规 Huffman 树若超限，
 /// 用"折叠 + 再平衡"压到上限内，仍保证 Kraft 和恰为 1、位流合法，代价只是压缩率略降。
-/// 码字按规范意义（MSB-first）保存在 <see cref="Codes"/>，由 <see cref="LsbBitWriter.WriteCode"/> 写出。
+/// 码字按规范分配后，在建表时一次性反转为 LSB-first 保存在 <see cref="Codes"/>
+/// （对齐 libwebp src/utils/huffman_encode_utils.c:385-411 ConvertBitDepthsToSymbols），
+/// 由 <see cref="LsbBitWriter.WriteCode"/> 直接写出，不再逐符号反转。
 /// </summary>
 internal sealed class Vp8LHuffmanCode
 {
@@ -22,7 +24,7 @@ internal sealed class Vp8LHuffmanCode
     /// <summary>每个符号的码长，0 表示该符号不参与本表。</summary>
     public int[] Lengths { get; }
 
-    /// <summary>每个符号的规范码字（MSB-first），码长为 0 的符号值为 0。</summary>
+    /// <summary>每个符号的规范码字（已反转为 LSB-first），码长为 0 的符号值为 0。</summary>
     public int[] Codes { get; }
 
     /// <summary>表中唯一的启用符号；-1 表示多个符号（正常解码）。</summary>
@@ -263,11 +265,27 @@ internal sealed class Vp8LHuffmanCode
         {
             for (int symbol = 0; symbol < alphabetSize; symbol++)
             {
-                if (lengths[symbol] == length) codes[symbol] = code++;
+                if (lengths[symbol] == length) codes[symbol] = ReverseBits(code++, length);
             }
             code <<= 1;
         }
         return codes;
+    }
+
+    /// <summary>
+    /// 规范码是 MSB-first，而 VP8L 位流按字节 LSB-first 存放。
+    /// 对齐 libwebp ConvertBitDepthsToSymbols()：建表时反转一次，写数百万个符号时
+    /// 不再重复执行逐位循环。
+    /// </summary>
+    private static int ReverseBits(int value, int count)
+    {
+        int result = 0;
+        for (int i = 0; i < count; i++)
+        {
+            result = (result << 1) | (value & 1);
+            value >>= 1;
+        }
+        return result;
     }
 
     /// <summary>

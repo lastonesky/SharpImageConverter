@@ -8,7 +8,7 @@ VP8L 位流规范与逐条对照结论见 `WebPLoseless.md` 与 `WebpConformance
 
 | 环节 | 现状 |
 |---|---|
-| 帧头 / 量化表 | 1 个 token 分区；`quality → q index` 单调映射；**4 段分段量化**按 16×16 活动度分类，段 delta `{+2,+1,+1,+1}`（见 §3.5） |
+| 帧头 / 量化表 | 1 个 token 分区；`quality → q index` 单调映射；**4 段分段量化**按 16×16 活动度分类，段 delta `{+2,+1,+1,+1}`（见 §3.5）；**partition0 降级（关闭分段）时所有段回退基础 q**——降级路径所有宏块都在 segment 0，若仍叠加段 delta，整图粗两档，色度 DC 预测误差在平坦区落入死区无法修正，会扩散成大面积粉紫偏色 |
 | 帧内预测 | 16×16：DC / TM / V / H；8×8 色度同四种；**4×4（B_PRED）10 种模式** |
 | 模式选择 | **率失真（D + λ·R）**：i4x4 与 16×16 各自完整编码一遍，按重建失真 + 精确码率决胜（见 §3） |
 | 变换量化 | 4×4 整数 DCT，Y2 二次变换；**系数 trellis 量化**（块内 DP + RD 代价，见 §3.6） |
@@ -35,6 +35,11 @@ VP8L 位流规范与逐条对照结论见 `WebPLoseless.md` 与 `WebpConformance
 24 组合计：我方 1,066,296 B，libwebp 1,249,300 B（我方 = **0.853×**）；
 对照同一测量台的上一版基线 1,176,518 B，总体积 **−9.37%**，平均 PSNR
 43.603 dB（基线 43.533 dB，**+0.070 dB**），无单组体积增长（最差 a_text q50 = 0.984×）。
+
+> 复核（2026-11-06，`ad58141`/`d93b036` 合入后）：同 24 组合计 **1,083,010 B**
+> （= libwebp 的 0.867×），较 11-05 的 1,066,296 增加 1.6%——增量来自这两个提交
+> （多 pass / 滤波 RD 与两遍决策复用、滤波采样），与 11-06 的编码效率优化无关
+> （后者输出与 `d93b036` 逐位一致，见 `PerfReport.md` §6.8）。
 
 上一版（2026-11-04，无 trellis、分段未生效）同一内容为 0.856/1.103/0.857/0.982、
 0.845/0.980/0.946/0.951、0.676/0.928/0.940/1.082、0.955/1.185/1.027/1.046、
@@ -146,6 +151,12 @@ PSNR 变化为 −0.009~+0.167 dB。这是同 q 的小样本结果，不能当�
 系数域失真是重建 SSE 的线性近似（VP8 整数 IDCT 非严格正交），DP 用它保持
 「同一块内能量守恒」的单调性；实际模式选择仍以重建后的像素域 SSE 决胜。
 
+实现上（2026-11-06 优化，输出与旧版逐位一致）：空档位成本按块预计算
+（h0/h1 头部 + 零游程前缀和，内层 O(1) 取差，原为每个 n 重算整段的 O(n²)
+BitCost 查询）；候选电平、`NonZeroCost` 与量化误差平方提到位置级预计算
+（原在每个状态内重复）；`Vp8CostTable` 展平为一维表。内核基准 65536 块
+492.6 → 150.1 ms（3.28×），端到端有损编码 1.21~1.69×，见 `PerfReport.md` §6.8。
+
 ### 3.7 滤波强度参与 RD + 按段 lf delta
 
 滤波强度不再由 q 查表定死（`EstimateFilterLevel` 只作为候选起点）：
@@ -168,8 +179,8 @@ PSNR 变化为 −0.009~+0.167 dB。这是同 q 的小样本结果，不能当�
 
 1. **无损 LZ77 长窗与 predictor 聚类**：Huffman 多 pass 已完成（§4「已补齐」），
    剩余差距主要在 predictor 选择与分组聚类，而不是熵编码。
-2. **VP8 行级流式解码（4B）**：本轮的 `WebpRowSource` 只对 VP8L 行增量；VP8 有损
-   仍整帧解码后逐行输出（见 `PerfReport.md` §6.6 的设计取舍与分阶段方案）。
+2. **VP8 行级流式解码（4B）**：`WebpRowSource` 的 VP8 分支已行增量（窗口化重建/输出
+   平面 + 行对 RGB + ALPH 行增量，见 `PerfReport.md` §6.7）。
 3. **λ 与分段参数继续标定**：`ui` q90 体积仍比 libwebp 大 9.4% 且 PSNR 低 0.6 dB，
    该档的 λ 与段 delta 需要单独扫参。
 4. **更大语料基准**：当前 24 组是 6 类合成/固定图，结论仍需真实照片集与截图集复核。
@@ -178,6 +189,8 @@ PSNR 变化为 −0.009~+0.167 dB。这是同 q 的小样本结果，不能当�
 - **系数 trellis**（§3.6）、**4 段分段量化重做**（§3.5）、**滤波强度 RD + 按段 lf delta**（§3.7）。
 - **VP8L 无损多 pass**：首遍实际码长重算 Huffman + 2 轮精化（`PerfReport.md` §6.6）。
 - **VP8L 行级流式解码**：`Vp8LRowDecoder` + 流式 RIFF 解析（`PerfReport.md` §6.6）。
+- **VP8 行级流式解码**：`Vp8Decoder` 窗口模式 + `Vp8RowDecoder` + `AlphRowSource`
+  （`PerfReport.md` §6.7）。
 
 已补齐（2026-11-04）：
 - 动图**逐帧惰性解码**：`WebpDecoder.EnumerateFrames` 每次只合成并返回当前帧快照，
@@ -219,3 +232,34 @@ PSNR 变化为 −0.009~+0.167 dB。这是同 q 的小样本结果，不能当�
 - **`top_right` 的三个写入位置是第 3/7/11 行右侧**（对应 C 里 `top_right` 指针按 BPS
   步进），不是第 0/4/8 行；最右列宏块要把上一行右侧 padding 归一化为边缘像素，
   否则下次读到陈旧值。
+
+## 6. effort 档位（method 0..6）：默认对齐 libwebp 的编码工作量
+
+`WebpEncoderOptions.Method` 过去只是兼容占位参数（"不影响产物"），现在是真的 effort
+档位。目标是让默认路径的**耗时**接近 libwebp，而不是保住输出字节或压缩率——
+两档产物都是合法可解码的 WebP，区别只在耗时与体积。
+
+| 档位 | 有损 VP8 | 无损 VP8L / ALPH |
+| --- | --- | --- |
+| **0..4（默认，对齐 libwebp 默认 method=4）** | 单遍写位流（帧头用默认概率表，不写 1056 项更新）、标量量化替代 6 电平 trellis、i4x4 只取预测域 SSE 最优模式、滤波强度按 q 查表、ALPH 用采样估计选滤波 | 单候选；predictor 只按一次残差熵排序，不做逐候选整图 LZ77 复评与逐 tile 模式搜索；1 轮真实码长精化；单组 Huffman 表；首遍 copy 占比 <0.1% 时跳过精化 |
+| **5..6** | 两遍概率自适应 + 决策重放、全 trellis、i4x4 三候选 RD 复评、滤波强度/分段 delta 实测评分 | 8 候选择优、2 轮精化、meta-Huffman 分组、ALPH 四种滤波真实试排 |
+
+接线：`WebpEncoderOptions.Method` → `WebpCodec` → `WebpEncoder.EncodeRgba` /
+`EncodeLossyRgba` 的 `method` 重载 → `Vp8Encoder.Encode` / `Vp8LEncoderOptions.AutoFast`。
+新增 public 重载 `EncodeRgba(byte[], int, int, int method)` 与
+`EncodeLossyRgba(byte[], int, int, float quality, int method)` 供直接指定档位。
+
+**测试契约**：压缩率护栏（`Full_SizeWithin35PercentOfLibWebp`、
+`AutoSelection_MatchesFullCandidateEnumeration`、有损体积 ≤1.5× 对拍）显式绑定
+method=6；快档只验位流合法性、双解码器一致性、PSNR ≤2dB 与同档确定性。
+`OptimizeWebpTests.WebpEncoderOptions_MethodSelectsEffortDeterministically`
+取代原来的 "MethodHasNoEffectOnOutput"。
+
+**同进程实测**（1024²、q75、3 次中位；libwebp 用简易 API 即 method=4）：
+有损快档/原生耗时比 photo 0.49×、gradient 0.75×、ui 0.65×、noise 0.94×、
+alpha 0.29×；无损 0.83× / 0.66× / 0.72× / 2.10× / 0.62×。
+改动前（完整档作为默认）对应 3.4～18.8×。体积：有损 1.085～1.495× 原生，
+无损除结构化渐变 4.4× 外均在 1.0～1.2×（256×192 渐变快档 166B，优于原生 190B）。
+唯一剩余明显差距是纯随机噪声无损（2.10×）：LZ77 完全无收益，
+libwebp 会更快 bail out，后续可考虑 literal-only 快路径。
+复现探针见 `.perf/EffortProbe`（gitignored，与 GapProbe 同口径样本）。

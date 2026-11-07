@@ -230,7 +230,9 @@ public class WebpLEncoderTests
 
         foreach (var (name, rgba, w, h) in samples)
         {
-            int auto = WebpEncoder.EncodeRgba(rgba, w, h).Length;
+            // 完整候选择优只在 method ≥ 5 启用；默认快档（method=4）走单候选，
+            // 体积本就不要求等于全量枚举的最小值，因此这里显式指定完整档。
+            int auto = WebpEncoder.EncodeRgba(rgba, w, h, 6).Length;
 
             // 与 EncodeBest 的候选集合一一对应（顺序无关，取最小即可）。
             var candidates = new[]
@@ -308,7 +310,9 @@ public class WebpLEncoderTests
         }
         foreach (var sample in samples)
         {
-            int ours = WebpEncoder.EncodeRgba(sample.Rgba, sample.W, sample.H).Length;
+            // 这条是限长 Huffman / 码表退化的体积护栏，针对完整档（method ≥ 5）；
+            // 快档以 effort 换速度，不承诺压缩率，其正确性由往返与双解码器一致性测试覆盖。
+            int ours = WebpEncoder.EncodeRgba(sample.Rgba, sample.W, sample.H, 6).Length;
             int lib = LibWebpTestCodec.EncodeLosslessRgbaForDispatch(sample.Rgba, sample.W, sample.H).Length;
 
             // 小图（<10 万像素）里位流头 + 码表的固定开销占比高，比值天然偏高，

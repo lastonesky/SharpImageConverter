@@ -48,6 +48,13 @@ public static class WebpEncoder
         return EncodeRgba(rgba.AsSpan(), width, height, metadata);
     }
 
+    /// <summary>按 effort 档位编码无损 WebP（0..4 快档，5..6 完整档）。</summary>
+    public static byte[] EncodeRgba(byte[] rgba, int width, int height, int method)
+    {
+        ArgumentNullException.ThrowIfNull(rgba);
+        return EncodeRgba(rgba.AsSpan(), width, height, method, null);
+    }
+
     /// <summary>
     /// 把 RGBA 像素编码为完整 WebP 字节（无损 VP8L）。
     /// </summary>
@@ -58,9 +65,18 @@ public static class WebpEncoder
     /// 把 RGBA 像素编码为完整 WebP 字节（无损 VP8L），并原样写入元数据。
     /// </summary>
     public static byte[] EncodeRgba(ReadOnlySpan<byte> rgba, int width, int height, ImageMetadata? metadata)
+        => EncodeRgba(rgba, width, height, method: 4, metadata);
+
+    /// <summary>
+    /// 按 effort 档位编码无损 WebP：<c>method ≤ 4</c> 走单候选快档（对齐 libwebp 默认），
+    /// <c>method ≥ 5</c> 走完整候选择优（体积更小、耗时更长）。
+    /// </summary>
+    internal static byte[] EncodeRgba(ReadOnlySpan<byte> rgba, int width, int height, int method,
+        ImageMetadata? metadata = null)
     {
         ValidateDimensions(width, height, rgba.Length);
-        var vp8l = Vp8LEncoder.EncodeVp8L(rgba, width, height, Vp8LEncoderOptions.Auto);
+        var options = method >= 5 ? Vp8LEncoderOptions.Auto : Vp8LEncoderOptions.AutoFast;
+        var vp8l = Vp8LEncoder.EncodeVp8L(rgba, width, height, options);
         return WrapInRiff(vp8l, WebpChunkId.Vp8L, width, height, metadata);
     }
 
@@ -96,11 +112,16 @@ public static class WebpEncoder
     /// </summary>
     public static void EncodeRgbaToStream(Stream stream, ReadOnlySpan<byte> rgba, int width, int height,
         ImageMetadata? metadata)
+        => EncodeRgbaToStream(stream, rgba, width, height, method: 4, metadata);
+
+    internal static void EncodeRgbaToStream(Stream stream, ReadOnlySpan<byte> rgba, int width, int height,
+        int method, ImageMetadata? metadata = null)
     {
         ArgumentNullException.ThrowIfNull(stream);
         ValidateDimensions(width, height, rgba.Length);
 
-        var vp8l = Vp8LEncoder.EncodeVp8L(rgba, width, height, Vp8LEncoderOptions.Auto);
+        var options = method >= 5 ? Vp8LEncoderOptions.Auto : Vp8LEncoderOptions.AutoFast;
+        var vp8l = Vp8LEncoder.EncodeVp8L(rgba, width, height, options);
         var riff = WrapInRiff(vp8l, WebpChunkId.Vp8L, width, height, metadata);
         stream.Write(riff, 0, riff.Length);
     }
@@ -133,6 +154,13 @@ public static class WebpEncoder
         return EncodeLossyRgba(rgba.AsSpan(), width, height, quality, metadata: null);
     }
 
+    /// <summary>按 effort 档位编码有损 WebP（0..4 快档，5..6 完整档）。</summary>
+    public static byte[] EncodeLossyRgba(byte[] rgba, int width, int height, float quality, int method)
+    {
+        ArgumentNullException.ThrowIfNull(rgba);
+        return EncodeLossyRgba(rgba.AsSpan(), width, height, quality, method, null);
+    }
+
     /// <summary>
     /// 把 RGBA 像素编码为完整 WebP 字节（有损 VP8 关键帧）。
     /// </summary>
@@ -144,9 +172,17 @@ public static class WebpEncoder
     /// </summary>
     public static byte[] EncodeLossyRgba(ReadOnlySpan<byte> rgba, int width, int height, float quality,
         ImageMetadata? metadata)
+        => EncodeLossyRgba(rgba, width, height, quality, method: 4, metadata);
+
+    /// <summary>
+    /// 按 effort 档位编码有损 WebP：<c>method ≤ 4</c> 单遍 + 标量量化（对齐 libwebp 默认），
+    /// <c>method ≥ 5</c> 两遍概率自适应 + 全 trellis。
+    /// </summary>
+    internal static byte[] EncodeLossyRgba(ReadOnlySpan<byte> rgba, int width, int height, float quality,
+        int method, ImageMetadata? metadata)
     {
         ValidateLossyDimensions(width, height, rgba.Length);
-        var vp8 = Vp8Encoder.Encode(rgba, width, height, quality);
+        var vp8 = Vp8Encoder.Encode(rgba, width, height, quality, method);
 
         int pixelCount = width * height;
         byte[]? alph = null;
@@ -156,7 +192,7 @@ public static class WebpEncoder
             var alpha = new byte[pixelCount];
             for (int p = 0; p < pixelCount; p++)
                 alpha[p] = rgba[p * 4 + 3];
-            alph = AlphEncoder.Encode(alpha, width, height);
+            alph = AlphEncoder.Encode(alpha, width, height, fast: method <= 4);
             break;
         }
 
@@ -187,9 +223,13 @@ public static class WebpEncoder
     /// </summary>
     public static void EncodeLossyRgbaToStream(Stream stream, ReadOnlySpan<byte> rgba, int width, int height,
         float quality, ImageMetadata? metadata = null)
+        => EncodeLossyRgbaToStream(stream, rgba, width, height, quality, method: 4, metadata);
+
+    internal static void EncodeLossyRgbaToStream(Stream stream, ReadOnlySpan<byte> rgba, int width, int height,
+        float quality, int method, ImageMetadata? metadata = null)
     {
         ArgumentNullException.ThrowIfNull(stream);
-        byte[] riff = EncodeLossyRgba(rgba, width, height, quality, metadata);
+        byte[] riff = EncodeLossyRgba(rgba, width, height, quality, method, metadata);
         stream.Write(riff, 0, riff.Length);
     }
 

@@ -431,6 +431,19 @@ internal static class Vp8YuvToRgb
     // ------------------------------------------------------------------
 
     /// <summary>
+    /// 行级流式解码入口（与 ConvertToRgba 共用实现）：按输出行对调用同一 fancy 上采样实现，保证与整帧路径逐位一致。
+    /// <paramref name="topUvOff"/> / <paramref name="curUvOff"/> 分别指向行对的上、下色度行；
+    /// <paramref name="bottomYOff"/> 与 <paramref name="bottomDstOff"/> 为 -1 时只写上行（镜像行）。
+    /// </summary>
+    internal static void ConvertLinePair(
+        byte[] yPlane, int topYOff, int bottomYOff,
+        byte[] uPlane, byte[] vPlane, int topUvOff, int curUvOff,
+        byte[] dst, int topDstOff, int bottomDstOff, int len) =>
+        UpsampleRgbaLinePair(yPlane, topYOff, bottomYOff,
+            uPlane, vPlane, topUvOff, curUvOff,
+            dst, topDstOff, bottomDstOff, len);
+
+    /// <summary>
     /// YUV420（含完整平面，无边框）→ RGBA。每像素 4 字节 R,G,B,A（A=255）。
     /// fancy upsampling，与 libwebp WebPDecodeRGBA 默认路径一致。
     /// </summary>

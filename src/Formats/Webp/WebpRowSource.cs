@@ -15,16 +15,21 @@ namespace SharpImageConverter.Formats.Webp;
 /// 流式策略：
 /// - VP8L（无损）走行增量解码器 <see cref="Vp8LRowDecoder"/>：只顺序读取到 VP8L chunk，
 ///   之后按输出行推进位流，常驻像素只有约 4.2 MB 的 LZ77 环形历史缓冲。
-/// - VP8（有损，含 ALPH）暂时保留整帧解码回退（行级化需要窗口化 VP8 解码器，见 spec 4B），
-///   容器解析本身仍是顺序读取。
+/// - VP8（有损）走行增量解码器 <see cref="Vp8RowDecoder"/>：容器只缓存到 VP8 chunk 为止，
+///   之后按宏块行推进，常驻像素窗口约 300 KB（4K）。
+/// - ALPH：行增量 <see cref="AlphRowSource"/>（原始字节或 VP8L 裸流 + 逐行逆滤波），
+///   不再整图缓冲。
 /// </summary>
 internal sealed class WebpRowSource : IRowImageSource
 {
     private readonly Stream _stream;
     private readonly bool _ownsStream;
-    private readonly byte[]? _rgba;          // 有损回退路径的整帧 RGBA
     private readonly Vp8LRowDecoder? _rowDecoder;
-    private readonly uint[]? _argbRow;       // 行路径的当前行 ARGB 工作区
+    private readonly Vp8RowDecoder? _vp8RowDecoder;
+    private readonly uint[]? _argbRow;       // VP8L 行路径的当前行 ARGB 工作区
+    private readonly byte[]? _rgbaRow;       // VP8 行路径的当前行 RGBA 工作区（需要 alpha 或转 3 通道时）
+    private readonly AlphRowSource? _alphaSource;
+    private readonly byte[]? _alphaRow;      // ALPH 行路径的当前行 alpha 工作区
     private readonly object _lock = new();
     private int _nextRow;
     private bool _disposed;
@@ -49,13 +54,15 @@ internal sealed class WebpRowSource : IRowImageSource
 
         int width, height;
         bool hasAlpha;
-        byte[]? rgba = null;
         Vp8LRowDecoder? rowDecoder;
+        Vp8RowDecoder? vp8RowDecoder;
+        AlphRowSource? alphaSource;
         try
         {
             try
             {
-                ParseStaticImage(stream, out width, out height, out hasAlpha, out rowDecoder, out rgba);
+                ParseStaticImage(stream, out width, out height, out hasAlpha,
+                    out rowDecoder, out vp8RowDecoder, out alphaSource);
             }
             catch (WebpUnsupportedException)
             {
@@ -78,8 +85,13 @@ internal sealed class WebpRowSource : IRowImageSource
         HasAlpha = hasAlpha;
         Channels = hasAlpha ? 4 : 3;
         _rowDecoder = rowDecoder;
-        _rgba = rgba;
+        _vp8RowDecoder = vp8RowDecoder;
+        _alphaSource = alphaSource;
         _argbRow = rowDecoder != null ? new uint[width] : null;
+        _rgbaRow = vp8RowDecoder != null && (Channels == 3 || alphaSource != null)
+            ? new byte[checked(width * 4)]
+            : null;
+        _alphaRow = alphaSource != null ? new byte[width] : null;
     }
 
     public int Width { get; }
@@ -140,25 +152,46 @@ internal sealed class WebpRowSource : IRowImageSource
                     }
                 }
             }
-            else
+            else if (_vp8RowDecoder != null)
             {
-                int sourceOffset = _nextRow * Width * 4;
-                if (Channels == 4)
+                try
                 {
-                    _rgba!.AsSpan(sourceOffset, Width * 4).CopyTo(row);
-                }
-                else
-                {
-                    var source = _rgba!.AsSpan(sourceOffset, Width * 4);
-                    for (int x = 0; x < Width; x++)
+                    if (_rgbaRow != null)
                     {
-                        int s = x * 4;
-                        int d = x * 3;
-                        row[d] = source[s];
-                        row[d + 1] = source[s + 1];
-                        row[d + 2] = source[s + 2];
+                        if (!_vp8RowDecoder.TryReadRgbaRow(_rgbaRow)) return false;
+
+                        if (Channels == 4)
+                        {
+                            _rgbaRow.AsSpan(0, needed).CopyTo(row);
+                            ApplyAlpha(row);
+                        }
+                        else
+                        {
+                            var src = _rgbaRow.AsSpan();
+                            for (int x = 0; x < Width; x++)
+                            {
+                                int s = x * 4;
+                                int d = x * 3;
+                                row[d] = src[s];
+                                row[d + 1] = src[s + 1];
+                                row[d + 2] = src[s + 2];
+                            }
+                        }
+                    }
+                    else if (!_vp8RowDecoder.TryReadRgbaRow(row))
+                    {
+                        return false;
                     }
                 }
+                catch (Exception ex) when (ex is WebpBitstreamException or IndexOutOfRangeException
+                    or ArgumentException or OverflowException)
+                {
+                    throw new InvalidDataException("WebP 图像码流损坏或数据被截断", ex);
+                }
+            }
+            else
+            {
+                throw new InvalidOperationException("WebP 行源未包含任何图像解码器");
             }
 
             _nextRow++;
@@ -166,18 +199,34 @@ internal sealed class WebpRowSource : IRowImageSource
         }
     }
 
+    /// <summary>读取 ALPH 的当前行并写入 RGBA 行的 A 通道。</summary>
+    private void ApplyAlpha(Span<byte> row)
+    {
+        var source = _alphaSource;
+        if (source == null) return;
+
+        var alphaRow = _alphaRow!;
+        if (!source.TryReadRow(alphaRow))
+            throw new InvalidDataException("ALPH 行数据在图像结束前耗尽");
+
+        for (int x = 0; x < Width; x++)
+            row[x * 4 + 3] = alphaRow[x];
+    }
+
     /// <summary>
-    /// 顺序解析 RIFF/WebP 容器并决定解码路径。VP8L 直接构造行增量解码器；
-    /// VP8（有损）把已读字节与剩余流拼成完整文件后回退到整帧解码（保持既有行为）。
+    /// 顺序解析 RIFF/WebP 容器并决定解码路径。VP8L / VP8 都直接构造行增量解码器，
+    /// 读到主图像 chunk 后立即返回，不再消费其后的元数据。
     /// </summary>
     private static void ParseStaticImage(Stream stream, out int width, out int height, out bool hasAlpha,
-                                         out Vp8LRowDecoder? rowDecoder, out byte[]? rgba)
+                                         out Vp8LRowDecoder? rowDecoder, out Vp8RowDecoder? vp8RowDecoder,
+                                         out AlphRowSource? alphaSource)
     {
         width = 0;
         height = 0;
         hasAlpha = false;
         rowDecoder = null;
-        rgba = null;
+        vp8RowDecoder = null;
+        alphaSource = null;
 
         Span<byte> head = stackalloc byte[WebpMagic.HeaderSize];
         ReadExactly(stream, head, "WebP 流在 RIFF 头之前结束");
@@ -204,10 +253,7 @@ internal sealed class WebpRowSource : IRowImageSource
         bool vp8xAlpha = false;
         int canvasWidth = 0;
         int canvasHeight = 0;
-
-        // 有损回退需要从头重建文件；只在找到主图像 chunk 之前缓存已消费的字节。
-        using var capture = new MemoryStream();
-        capture.Write(head);
+        byte[]? alphPayload = null;
 
         while (true)
         {
@@ -218,8 +264,6 @@ internal sealed class WebpRowSource : IRowImageSource
 
             WebpChunkId id = (WebpChunkId)BinaryPrimitives.ReadUInt32LittleEndian(chunkHeader);
             uint size = BinaryPrimitives.ReadUInt32LittleEndian(chunkHeader[4..]);
-            // 回退路径需要逐字节还原文件，chunk 头必须先入缓存（数据在各自分支里追加）。
-            capture.Write(chunkHeader);
 
             if (size > int.MaxValue)
                 throw new WebpContainerException($"chunk {id} 长度 {size} 超过 2GB");
@@ -231,7 +275,7 @@ internal sealed class WebpRowSource : IRowImageSource
             {
                 case WebpChunkId.Vp8X:
                 {
-                    byte[] vp8x = ReadChunkData(stream, size, capture);
+                    byte[] vp8x = ReadChunkData(stream, size);
                     if (vp8x.Length < 10)
                         throw new WebpContainerException("VP8X chunk 过短（至少 10 字节）");
 
@@ -253,13 +297,13 @@ internal sealed class WebpRowSource : IRowImageSource
                         "流式逐行解码不支持动图 WebP（无需整帧缓冲的静态图像）");
 
                 case WebpChunkId.Alph:
-                    // 独立 alpha 通道只能与有损 VP8 配合；内容随回退路径一起缓存。
-                    ReadChunkData(stream, size, capture);
+                    // ALPH 必须先于 VP8（RFC 9649）。保存原始 chunk 数据，待 VP8 尺寸确定后解码。
+                    alphPayload = ReadChunkData(stream, size);
                     break;
 
                 case WebpChunkId.Vp8L:
                 {
-                    byte[] payload = ReadChunkData(stream, size, capture: null);
+                    byte[] payload = ReadChunkData(stream, size);
                     if (payload.Length < 5)
                         throw new WebpContainerException("VP8L chunk 过短（至少 5 字节帧头）");
 
@@ -281,26 +325,28 @@ internal sealed class WebpRowSource : IRowImageSource
 
                 case WebpChunkId.Vp8:
                 {
-                    // 有损 VP8：把已缓存的头部/ALPH 与当前 chunk 及剩余流拼接，走整帧解码。
-                    CopyChunkToCapture(stream, size, capture);
-                    SkipPadding(stream, size, capture);
-                    CopyRemaining(stream, capture);
+                    byte[] payload = ReadChunkData(stream, size);
+                    var decoder = new Vp8RowDecoder(payload);
+                    width = decoder.Width;
+                    height = decoder.Height;
+                    vp8RowDecoder = decoder;
 
-                    byte[] full = capture.ToArray();
-                    rgba = WebpDecoder.DecodeRgba(full, out width, out height);
                     hasAlpha = hasVp8X && vp8xAlpha;
-
                     if (hasVp8X && (canvasWidth != width || canvasHeight != height))
                     {
                         throw new WebpBitstreamException(
                             $"VP8X 画布 {canvasWidth}x{canvasHeight} 与 VP8 图像 {width}x{height} 不一致");
                     }
+
+                    // 只有在容器声明 alpha 时才解码 ALPH；VP8 输出本身 A=255，与整帧路径一致。
+                    if (hasAlpha && alphPayload != null)
+                        alphaSource = new AlphRowSource(alphPayload, width, height);
                     return;
                 }
 
                 default:
-                    // ICCP / EXIF / XMP 等元数据：跳过，但保留字节以备有损回退。
-                    ReadChunkData(stream, size, capture);
+                    // ICCP / EXIF / XMP 等元数据：直接流式跳过，不分配整块缓冲。
+                    SkipChunkData(stream, size);
                     break;
             }
 
@@ -335,8 +381,8 @@ internal sealed class WebpRowSource : IRowImageSource
         return filled;
     }
 
-    /// <summary>读取一个 chunk 的全部数据（含 padding 处理），可选写入 capture。</summary>
-    private static byte[] ReadChunkData(Stream stream, uint size, MemoryStream? capture)
+    /// <summary>读取一个 chunk 的全部数据并消费其 padding。</summary>
+    private static byte[] ReadChunkData(Stream stream, uint size)
     {
         var data = new byte[(int)size];
         int filled = 0;
@@ -346,24 +392,15 @@ internal sealed class WebpRowSource : IRowImageSource
             if (read <= 0) throw new WebpContainerException("chunk 数据被截断");
             filled += read;
         }
-        if (capture != null) capture.Write(data, 0, data.Length);
 
-        SkipPadding(stream, size, capture);
+        SkipPadding(stream, size);
         return data;
     }
 
-    /// <summary>RIFF 偶数对齐：奇数长度的 chunk 后跟 1 字节 padding（截断时容忍缺失）。</summary>
-    private static void SkipPadding(Stream stream, uint size, MemoryStream? capture)
+    /// <summary>流式跳过 chunk 数据（元数据等不需解码的内容），不分配整块缓冲。</summary>
+    private static void SkipChunkData(Stream stream, uint size)
     {
-        if ((size & 1) == 0) return;
-        Span<byte> pad = stackalloc byte[1];
-        if (ReadUpTo(stream, pad) == 1 && capture != null)
-            capture.Write(pad);
-    }
-
-    /// <summary>把 chunk 数据以流式方式追加到 capture（避免一次性再分配大缓冲）。</summary>
-    private static void CopyChunkToCapture(Stream stream, uint size, MemoryStream capture)
-    {
+        uint originalSize = size;
         var buffer = new byte[64 * 1024];
         while (size > 0)
         {
@@ -375,20 +412,17 @@ internal sealed class WebpRowSource : IRowImageSource
                 if (read <= 0) throw new WebpContainerException("chunk 数据被截断");
                 filled += read;
             }
-            capture.Write(buffer, 0, take);
             size -= (uint)take;
         }
+        SkipPadding(stream, originalSize);
     }
 
-    private static void CopyRemaining(Stream stream, MemoryStream capture)
+    /// <summary>RIFF 偶数对齐：奇数长度的 chunk 后跟 1 字节 padding（截断时容忍缺失）。</summary>
+    private static void SkipPadding(Stream stream, uint size)
     {
-        var buffer = new byte[64 * 1024];
-        while (true)
-        {
-            int read = stream.Read(buffer, 0, buffer.Length);
-            if (read <= 0) break;
-            capture.Write(buffer, 0, read);
-        }
+        if ((size & 1) == 0) return;
+        Span<byte> pad = stackalloc byte[1];
+        ReadUpTo(stream, pad);
     }
 
     public void Dispose()

@@ -48,7 +48,7 @@ internal static class AlphEncoder
     /// <param name="alpha">alpha 值，长度必须为 width * height，行优先。</param>
     /// <param name="width">宽度。</param>
     /// <param name="height">高度。</param>
-    public static byte[] Encode(ReadOnlySpan<byte> alpha, int width, int height)
+    public static byte[] Encode(ReadOnlySpan<byte> alpha, int width, int height, bool fast = false)
     {
         if (width < 1 || height < 1)
             throw new ArgumentOutOfRangeException(nameof(width), "ALPH 尺寸必须为正");
@@ -57,8 +57,8 @@ internal static class AlphEncoder
 
         var residual = new byte[alpha.Length];
         var rgba = new byte[checked(alpha.Length * 4)];
-        int filter = SelectFilter(alpha, width, height, residual, rgba);
-        return EncodePlane(residual, rgba, width, height, filter);
+        int filter = SelectFilter(alpha, width, height, residual, rgba, fast);
+        return EncodePlane(residual, rgba, width, height, filter, fast);
     }
 
     /// <summary>
@@ -101,13 +101,14 @@ internal static class AlphEncoder
 
     /// <summary>把残差塞进 VP8L 并拼出 ALPH 负载。</summary>
     private static byte[] EncodePlane(ReadOnlySpan<byte> residual, byte[] rgba,
-        int width, int height, int filter)
+        int width, int height, int filter, bool fast = false)
     {
         // VP8L 内部像素为 ARGB，ALPH 只取 GREEN 通道，因此把残差放进 G、其余通道置 0。
         for (int i = 0; i < residual.Length; i++)
             rgba[i * 4 + 1] = residual[i];
 
-        var vp8l = Vp8LEncoder.EncodeVp8L(rgba, width, height, Vp8LEncoderOptions.Auto);
+        var options = fast ? Vp8LEncoderOptions.AutoFast : Vp8LEncoderOptions.Auto;
+        var vp8l = Vp8LEncoder.EncodeVp8L(rgba, width, height, options);
         if (vp8l.Length < Vp8LHeaderBytes)
             throw new WebpBitstreamException("VP8L 编码器输出过短，无法作为 ALPH 负载");
 
@@ -206,12 +207,24 @@ internal static class AlphEncoder
     /// ④ 超过 <see cref="TrialPixelLimit"/> 的大图退回 libwebp 的零成本采样估计。
     /// </summary>
     private static int SelectFilter(ReadOnlySpan<byte> alpha, int width, int height,
-        byte[] residual, byte[] rgba)
+        byte[] residual, byte[] rgba, bool fast = false)
     {
         if (CountColors(alpha) <= MaxColorsForNoFilter)
         {
             alpha.CopyTo(residual);
             return FilterNone;
+        }
+
+        if (fast)
+        {
+            // 快档：直接用 libwebp 同款零成本采样估计选滤波，跳过 4 次完整编码试排。
+            // 试排只影响体积，不影响 ALPH 位流的合法性或可逆性。
+            int estimated = EstimateBestFilter(alpha, width, height);
+            if (estimated == FilterNone)
+                alpha.CopyTo(residual);
+            else
+                ApplyFilter(alpha, residual, width, height, estimated);
+            return estimated;
         }
 
         if ((long)width * height > TrialPixelLimit)

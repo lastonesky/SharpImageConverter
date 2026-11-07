@@ -77,7 +77,30 @@ internal static class Vp8Trellis
 
         long[] current = scratch.Current;
         long[] next = scratch.Next;
-        Span<int> gapCost = scratch.GapCost;
+        int[] nzCost = scratch.NzCost;
+        long[] diffSq = scratch.DiffSq;
+        int[] nextCtxOf = scratch.NextCtx;
+
+        // 每块一次的空档位成本派生表（原实现在每个 n 上从头重算整段空档，
+        // 是 O(n²) 次 BitCost 查询）：
+        //   h0[c, g] = 空档头部 node0 写 1 的成本，h1[c, g] = 紧随的 node1 写 0；
+        //   zeroPrefix[c] = 空档内第 (first+1..c) 个零位（node1=0，上下文 0）的成本前缀和。
+        // 于是 gapCost(c → n) = h0 + h1 + zeroPrefix[n-1] - zeroPrefix[c]，内层 O(1)。
+        Span<int> h0 = stackalloc int[16 * 3];
+        Span<int> h1 = stackalloc int[16 * 3];
+        Span<int> zeroPrefix = stackalloc int[16];
+        for (int p = 0; p < 16; p++)
+        {
+            int b = Vp8Tables.Bands[p];
+            for (int g = 0; g < 3; g++)
+            {
+                h0[p * 3 + g] = BitCost(nodeCosts, type, b, g, 0, 1);
+                h1[p * 3 + g] = BitCost(nodeCosts, type, b, g, 1, 0);
+            }
+        }
+        zeroPrefix[first] = 0;
+        for (int p = first + 1; p < 16; p++)
+            zeroPrefix[p] = zeroPrefix[p - 1] + BitCost(nodeCosts, type, Vp8Tables.Bands[p], 0, 1, 0);
 
         // 初始状态：m = −1（索引 0），ctx = 块初始上下文。
         int readPrefix = Math.Min(StateCount, 3 * (first + 1));
@@ -92,24 +115,26 @@ internal static class Vp8Trellis
             // 写入目标最高是 (n+1)·3+2，所以前缀 3·(n+2) 足够覆盖读写范围。
             Array.Fill(next, long.MaxValue, 0, Math.Min(StateCount, 3 * (n + 2)));
 
-            // 空档代价只取决于「空档起点 c」与入口上下文，与具体状态无关，故按位置预结算一次：
-            // 位置 n 处 gapCost[c][gctx] = 从 c 起的 node0/node1 头部 + c+1..n−1 的零游程。
-            // 这样内层候选只需一次查表，避免对每个候选重复扫描空档（原实现是 O(n) 次成本查询）。
-            int tail = 0;
-            for (int c = n - 1; c >= first; c--)
+            // 候选电平及其位成本/量化误差只依赖 (coef[n], dq[n], band)，与状态无关：
+            // 提到状态循环外各算一次（原实现在每个状态里重复 BuildCandidates 与 NonZeroCost）。
+            int candidateCount = BuildCandidates(coef[n], dq[n], scratch.Candidates);
+            long zeroDist = (long)distortionWeight * coef[n] * coef[n] * 65536L;
+            for (int c = 0; c < candidateCount; c++)
             {
-                if (c + 1 < n)
-                    tail += BitCost(nodeCosts, type, Vp8Tables.Bands[c + 1], 0, 1, 0);
-                int cband = Vp8Tables.Bands[c];
-                int dst = c * 3;
-                for (int gctx = 0; gctx < 3; gctx++)
+                int level = scratch.Candidates[c];
+                nextCtxOf[c] = level == 1 || level == -1 ? 1 : 2;
+                if (level == 0)
                 {
-                    gapCost[dst + gctx] = tail
-                        + BitCost(nodeCosts, type, cband, gctx, 0, 1)
-                        + BitCost(nodeCosts, type, cband, gctx, 1, 0);
+                    diffSq[c] = 0;
+                    continue;
                 }
+                long diff = coef[n] - level * dq[n];
+                diffSq[c] = (long)distortionWeight * diff * diff * 65536L;
+                for (int g = 0; g < 3; g++)
+                    nzCost[c * 3 + g] = NonZeroCost(nodeCosts, type, band, g, level);
             }
 
+            int tailPrefix = n > first ? zeroPrefix[n - 1] : 0;
             int readLimit = Math.Min(StateCount, 3 * (n + 1));
             for (int state = 0; state < readLimit; state++)
             {
@@ -118,53 +143,45 @@ internal static class Vp8Trellis
 
                 int m = state / 3 - 1;
                 int ctxAfter = state % 3;
-                int baseContext = m < 0 ? ctx : ctxAfter;
 
-                int candidateCount = BuildCandidates(coef[n], dq[n], scratch.Candidates);
+                // 零系数：状态保持（m/ctxAfter 不变），失真只依赖本位置（已预计算）。
+                long zeroCandidate = cost + zeroDist;
+                if (zeroCandidate < next[state])
+                {
+                    next[state] = zeroCandidate;
+                    scratch.SetBackPointer(n, state, state, 0);
+                }
+
+                if (candidateCount == 1) continue; // 全零候选块：没有非零转移
+
+                // 非零系数：先把 m 与 n 之间的空档零系数代价补上。
+                // 与 WriteCoeffs 逐节点对应：每次「当前末尾 < 下一个非零」时，空档起点只写
+                // 一次 node0=1；随后每个零写 node1=0（第一个零沿用前一个非零的上下文，
+                // 其后 curCtx 被清 0）。无非零空档时 node0=1 就落在 n 本身。
+                int gapStart = m < 0 ? first : m + 1;
+                int gapCtx = m < 0 ? ctx : ctxAfter;
+                int gapRate, baseRate;
+                if (gapStart < n)
+                {
+                    int at = gapStart * 3 + gapCtx;
+                    gapRate = h0[at] + h1[at] + tailPrefix - zeroPrefix[gapStart];
+                    baseRate = 0;
+                }
+                else
+                {
+                    gapRate = h0[n * 3 + gapCtx];
+                    baseRate = gapCtx;
+                }
+
+                int stateBase = (n + 1) * 3;
                 for (int c = 0; c < candidateCount; c++)
                 {
                     int level = scratch.Candidates[c];
-                    int rate = 0;
+                    if (level == 0) continue;
 
-                    if (level == 0)
-                    {
-                        // 零系数：只有当下一个非零出现时才需要补 node0/node1 代价，
-                        // 这里不结算，状态保持（m/ctxAfter 不变）。
-                        int newState = state;
-                        long candidate = cost +
-                            (long)distortionWeight * (long)coef[n] * coef[n] * 65536L;
-                        if (candidate < next[newState])
-                        {
-                            next[newState] = candidate;
-                            scratch.SetBackPointer(n, newState, state, 0);
-                        }
-                        continue;
-                    }
-
-                    // 非零系数：先把 m 与 n 之间的空档零系数代价补上。
-                    // 与 WriteCoeffs 逐节点对应：每次「当前末尾 < 下一个非零」时，空档起点只写
-                    // 一次 node0=1；随后每个零写 node1=0（第一个零沿用前一个非零的上下文，
-                    // 其后 curCtx 被清 0）。无非零空档时 node0=1 就落在 n 本身。
-                    int gapStart = m < 0 ? first : m + 1;
-                    int gapCtx = m < 0 ? ctx : ctxAfter;
-                    if (gapStart < n)
-                    {
-                        rate += gapCost[gapStart * 3 + gapCtx];
-                        baseContext = 0;
-                    }
-                    else
-                    {
-                        rate += BitCost(nodeCosts, type, band, gapCtx, 0, 1);
-                        baseContext = gapCtx;
-                    }
-
-                    rate += NonZeroCost(nodeCosts, type, band, baseContext, level);
-                    int nextCtx = level == 1 || level == -1 ? 1 : 2;
-                    int newStateIndex = (n + 1) * 3 + nextCtx;
-
-                    long diff = coef[n] - level * dq[n];
-                    long candidateCost = cost + (long)rate * lambdaQ8
-                        + (long)distortionWeight * diff * diff * 65536L;
+                    int rate = gapRate + nzCost[c * 3 + baseRate];
+                    long candidateCost = cost + (long)rate * lambdaQ8 + diffSq[c];
+                    int newStateIndex = stateBase + nextCtxOf[c];
                     if (candidateCost < next[newStateIndex])
                     {
                         next[newStateIndex] = candidateCost;
@@ -285,7 +302,7 @@ internal static class Vp8Trellis
             cost += BitCost(nodeCosts, type, band, ctx, 2, 1);
             cost += LargeValueCost(nodeCosts, type, band, ctx, magnitude);
         }
-        cost += Vp8CostTable.Cost[128, level < 0 ? 1 : 0];
+        cost += Vp8CostTable.CostFlat[128 * 2 + (level < 0 ? 1 : 0)];
         return cost;
     }
 
@@ -315,20 +332,20 @@ internal static class Vp8Trellis
             if (magnitude <= 6)
             {
                 cost += BitCost(nodeCosts, type, band, ctx, 7, 0);
-                cost += Vp8CostTable.Cost[159, magnitude == 6 ? 1 : 0];
+                cost += Vp8CostTable.CostFlat[159 * 2 + (magnitude == 6 ? 1 : 0)];
             }
             else
             {
                 cost += BitCost(nodeCosts, type, band, ctx, 7, 1);
                 if (magnitude <= 8)
                 {
-                    cost += Vp8CostTable.Cost[165, 0];
-                    cost += Vp8CostTable.Cost[145, magnitude == 8 ? 1 : 0];
+                    cost += Vp8CostTable.CostFlat[165 * 2];
+                    cost += Vp8CostTable.CostFlat[145 * 2 + (magnitude == 8 ? 1 : 0)];
                 }
                 else
                 {
-                    cost += Vp8CostTable.Cost[165, 1];
-                    cost += Vp8CostTable.Cost[145, magnitude == 10 ? 1 : 0];
+                    cost += Vp8CostTable.CostFlat[165 * 2 + 1];
+                    cost += Vp8CostTable.CostFlat[145 * 2 + (magnitude == 10 ? 1 : 0)];
                 }
             }
             return cost;
@@ -349,7 +366,7 @@ internal static class Vp8Trellis
         };
         int extra = magnitude - (3 + (8 << category));
         for (int i = table.Length - 1, k = 0; i >= 0; i--, k++)
-            cost += Vp8CostTable.Cost[table[k], (extra >> i) & 1];
+            cost += Vp8CostTable.CostFlat[(table[k] << 1) | ((extra >> i) & 1)];
         return cost;
     }
 }
@@ -366,8 +383,14 @@ internal sealed class Vp8TrellisScratch
 
     internal readonly int[] Candidates = new int[5];
 
-    /// <summary>[位置 × 3]：位置 n 的空档代价（按空档起点与入口上下文预结算）。</summary>
-    internal readonly int[] GapCost = new int[16 * 3];
+    /// <summary>[候选 × 3]：NonZeroCost 按（band 固定）入口上下文预计算。</summary>
+    internal readonly int[] NzCost = new int[5 * 3];
+
+    /// <summary>[候选]：该电平的量化误差平方（已乘失真权重与 65536）。</summary>
+    internal readonly long[] DiffSq = new long[5];
+
+    /// <summary>[候选]：该电平进入的下一上下文（1 或 2）。</summary>
+    internal readonly int[] NextCtx = new int[5];
 
     internal int BestState;
 

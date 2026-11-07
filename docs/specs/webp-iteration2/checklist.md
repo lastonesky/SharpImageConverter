@@ -32,14 +32,38 @@
 
 ## 任务 4
 
-- [x] `WebpRowSource` 对 VP8L 不再调用整帧 `DecodeRgba`（VP8 回退路径保留，
-      对应未实施的 4B）。
+- [x] `WebpRowSource` 对 VP8L 不再调用整帧 `DecodeRgba`；VP8 有损分支也已行增量
+      （`Vp8RowDecoder` + `AlphRowSource`，见任务 4B）。
 - [x] VP8L（含 ALPH）逐行输出与整图解码逐像素一致。
 - [x] 短读/截断/并发/动图拒绝行为保持。
 - [x] 长图驻留峰值下降 ≥80%，记录实际字节与测量方法。
       4096×4096：67,373,976 B → 4,603,312 B（6.8%，下降 93.2%）。
-- [x] 4B（VP8）要么逐像素一致并达标，要么完全回退并在报告说明，无半截实现。
-      本轮不实施，未改动 VP8 解码路径；取舍与分阶段方案已写入文档与报告。
+- [x] 4B（VP8）逐像素一致并达标，无半截实现；实测数据见任务 4B 与 `PerfReport.md` §6.7。
+
+## 任务 4B（VP8 行级流式，已实施）
+
+> 设计：`docs/specs/webp-iteration2/vp8-row-streaming.md`；实现按 tasks.md 阶段 8.1–8.6。
+> 全部阈值达标，未回退整帧路径。
+
+- [x] 设计方案完成且决策完整：状态机边界、17/9 行重建窗口与 32/16 行输出窗口的理由、
+      滤波延迟模型、行对 RGB 映射、内存公式与数值、接口/异常/并发、阈值与回退。
+- [x] 逐像素对拍：全矩阵（1×1、奇数/非 16 倍数宽高、1×N/N×1、1080p、4K、q10/30/50/75/95、
+      simple/complex、alpha on/off）与整帧路径 RGBA diff = 0。
+      `Vp8RowDecoder_QualityMatrix_*`、`Vp8RowDecoder_FilterAndPartitionMatrix_*`、
+      `Vp8RowDecoder_LargeImages_*`、`Vp8RowDecoder_ExtremeThinImages_*`。
+- [x] loop filter 专项：mbW=1 / mbH=1、高 filter_level 边缘强梯度、末宏块行裁剪、
+      行对边界（`16k-1` 与 `16k` 同批转换）全部 diff = 0。
+      `Vp8RowDecoder_StrongEdgeGradient_*`（filter_strength=63、sharpness 0/4/7）。
+- [x] 内存：4096² 无 alpha 峰值增量 ≤ 整帧 5%（硬上限 20%）；16383² 平面窗口 ≤2 MB；
+      长图相对现状下降 ≥80%；记录测量方法与字节数。
+      4096²：1.6%；16383×1 窗口 1,382,653 B；16383×64 下降 83.1%、64×16383 下降 98.6%。
+- [x] alpha：P3 行增量后 4K alpha 额外内存 ≤4.5 MB，alpha 各 filter 模式 diff = 0，
+      A 通道仅覆盖、不预乘。4K：4,309,168 B。
+- [x] 分配/性能：稳态 `ReadRow` 每图分配 ≤32 KB（1080p 实测 0 B）；
+      1080p/4K q75 吞吐 ≥现状 0.8×（1.00× / 0.92×）。
+- [x] 兼容：公开 API 不变；VP8L 行流式行为不变；动图仍拒绝；
+      短读/EOF/截断错误仍为 `InvalidDataException`，已产出行保持有效。
+- [x] 任一项不通过按 §9.5 回退，不保留半截实现，并在报告写明：本轮全部达标，无回退。
 
 ## 文档/报告
 

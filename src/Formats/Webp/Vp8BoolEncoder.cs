@@ -76,7 +76,7 @@ internal sealed class Vp8BoolEncoder
     {
         if (_costOnly)
         {
-            _cost += Vp8CostTable.Cost[prob, bit];
+            _cost += Vp8CostTable.Cost(prob, bit);
             return;
         }
 

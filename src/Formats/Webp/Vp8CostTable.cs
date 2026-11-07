@@ -12,12 +12,18 @@ namespace SharpImageConverter.Formats.Webp;
 /// </summary>
 internal static class Vp8CostTable
 {
-    /// <summary>cost[prob, bit]，单位 1/256 bit。</summary>
-    internal static readonly int[,] Cost = Build();
+    /// <summary>
+    /// costFlat[(prob &lt;&lt; 1) | bit]，单位 1/256 bit。
+    /// 一维表：trellis 内层每次候选都要查若干次，二维索引的双界检查与乘法是热路径负担。
+    /// </summary>
+    internal static readonly int[] CostFlat = Build();
 
-    private static int[,] Build()
+    /// <summary>按概率与位值取写位成本（1/256 bit）。</summary>
+    internal static int Cost(int prob, int bit) => CostFlat[(prob << 1) | bit];
+
+    private static int[] Build()
     {
-        var table = new int[256, 2];
+        var table = new int[256 * 2];
         for (int p = 0; p < 256; p++)
         {
             // 注意 VP8 的 prob 是 **P(bit == 0)**，不是 P(bit == 1)：
@@ -26,8 +32,8 @@ internal static class Vp8CostTable
             // 且高估倍数随内容漂移，足以让 i4x4 与 16×16 的相对比较完全失真）。
             double p0 = Math.Max(p, 1) / 256.0;
             double p1 = Math.Max(256 - p, 1) / 256.0;
-            table[p, 0] = Math.Max(1, (int)Math.Round(-Math.Log2(p0) * 256));
-            table[p, 1] = Math.Max(1, (int)Math.Round(-Math.Log2(p1) * 256));
+            table[p * 2] = Math.Max(1, (int)Math.Round(-Math.Log2(p0) * 256));
+            table[p * 2 + 1] = Math.Max(1, (int)Math.Round(-Math.Log2(p1) * 256));
         }
         return table;
     }

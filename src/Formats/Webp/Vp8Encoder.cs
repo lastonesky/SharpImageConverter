@@ -183,8 +183,8 @@ internal sealed class Vp8Encoder
                     {
                         int prob = _probs[type, band, ctx, node];
                         int at = ((type * 8 + band) * 3 + ctx) * 11 + node;
-                        _nodeCost[at * 2] = Vp8CostTable.Cost[prob, 0];
-                        _nodeCost[at * 2 + 1] = Vp8CostTable.Cost[prob, 1];
+                        _nodeCost[at * 2] = Vp8CostTable.Cost(prob, 0);
+                        _nodeCost[at * 2 + 1] = Vp8CostTable.Cost(prob, 1);
                     }
                 }
             }
@@ -273,6 +273,13 @@ internal sealed class Vp8Encoder
     /// <summary>trellis 的预分配工作区（每编码器独占，无逐块堆分配）。</summary>
     private readonly Vp8TrellisScratch _trellis = new();
 
+    /// <summary>
+    /// 快档（对应 libwebp <c>method ≤ 4</c>）：单遍编码、标量量化、i4x4 单候选、
+    /// 滤波强度查表。只改变「花多少时间去换压缩率」，不改变位流语法。
+    /// 高档（method ≥ 5）保留两遍概率自适应 + 全 trellis 的完整路径。
+    /// </summary>
+    private readonly bool _fast;
+
 
 
 
@@ -281,8 +288,9 @@ internal sealed class Vp8Encoder
     private readonly int[] _i4QuantBak = new int[256];
     private readonly int[] _i4CodesBak = new int[16];
 
-    private Vp8Encoder(ReadOnlySpan<byte> rgba, int width, int height, int baseQ)
+    internal Vp8Encoder(ReadOnlySpan<byte> rgba, int width, int height, int baseQ, bool fast = false)
     {
+        _fast = fast;
         _width = width;
         _height = height;
         _mbW = (width + 15) >> 4;
@@ -323,17 +331,7 @@ internal sealed class Vp8Encoder
         _segDelta[2] = 1;
         _segDelta[3] = 1;
         BuildSegmentMap();
-
-        for (int segment = 0; segment < 4; segment++)
-        {
-            int segmentQ = Math.Clamp(q + _segDelta[segment], 0, 127);
-            _y1Dc[segment] = Vp8Tables.DcQuantTable[segmentQ];
-            _y1Ac[segment] = Vp8Tables.AcQuantTable[segmentQ];
-            _y2Dc[segment] = _y1Dc[segment] * 2;
-            _y2Ac[segment] = Math.Max(8, (Vp8Tables.AcQuantTable[segmentQ] * 101581) >> 16);
-            _uvDc[segment] = Vp8Tables.DcQuantTable[Math.Clamp(segmentQ + UvDcDeltaQ, 0, 117)];
-            _uvAc[segment] = Vp8Tables.AcQuantTable[Math.Clamp(segmentQ + UvAcDeltaQ, 0, 127)];
-        }
+        BuildQuantTables();
 
         _part0 = new Vp8BoolEncoder(1024);
         _tokens = new Vp8BoolEncoder(1024);
@@ -355,7 +353,7 @@ internal sealed class Vp8Encoder
     /// <param name="width">宽度，1..16383。</param>
     /// <param name="height">高度，1..16383。</param>
     /// <param name="quality">0..100 的质量参数，单调映射为内部 q index。</param>
-    internal static byte[] Encode(ReadOnlySpan<byte> rgba, int width, int height, float quality)
+    internal static byte[] Encode(ReadOnlySpan<byte> rgba, int width, int height, float quality, int method = 4)
     {
         if (width <= 0 || width > MaxDimension)
             throw new ArgumentOutOfRangeException(nameof(width), width,
@@ -366,7 +364,26 @@ internal sealed class Vp8Encoder
         if (rgba.Length != (long)width * height * 4)
             throw new ArgumentException("RGBA 数据长度与宽高不匹配", nameof(rgba));
 
-        var encoder = new Vp8Encoder(rgba, width, height, QualityToQIndex(quality));
+        var encoder = new Vp8Encoder(rgba, width, height, QualityToQIndex(quality), fast: method <= 4);
+
+        if (encoder._fast)
+        {
+            // 快档只跑一遍：用默认 token 概率表直接写位流（RFC 6386 允许关键帧
+            // 不更新概率表，帧头 1056 个更新项全部写 0 即可），省掉统计遍与重放遍
+            // 各一次整帧重建。滤波强度在构造时按 q 查表决定，不做事后评分。
+            encoder.Configure(useSegmentation: true, allowI4: true);
+            encoder.ResetForPass(encoder._probs, statsOnly: false);
+            encoder._abortOnPartition0Overflow = true;
+            byte[] fastFrame = encoder.Run(assemble: true);
+            if (!encoder._probeAborted && encoder._part0.Length <= Partition0BudgetBytes)
+                return fastFrame;
+
+            // partition0 确定超预算：改用「关闭分段 + 强制 16×16」的降级配置重跑一遍。
+            encoder.Configure(useSegmentation: false, allowI4: false);
+            encoder.ResetForPass(CopyDefaultProbs(), statsOnly: false);
+            encoder._abortOnPartition0Overflow = false;
+            return encoder.Run(assemble: true);
+        }
 
         // 默认配置：第一遍统计后检查 partition0 长度，超预算则降级重跑（见类注释）。
         encoder.Configure(useSegmentation: true, allowI4: true);
@@ -412,11 +429,41 @@ internal sealed class Vp8Encoder
     /// <summary>设定本帧的编码配置（默认 / 降级），必须在每遍 ResetForPass 之前调用。</summary>
     private void Configure(bool useSegmentation, bool allowI4)
     {
+        bool segmentationChanged = _useSegmentation != useSegmentation;
         _useSegmentation = useSegmentation;
         _allowI4 = allowI4;
         _skipProb = 128;
         // 换配置意味着重建路径变了，先前记录的决策不再对应当前配置。
         _decisionsValid = false;
+        // 分段开关改变量化档位：关闭分段（partition0 降级路径）必须回到基础量化，
+        // 否则整图叠加 _segDelta[0] 的加粗（见 BuildQuantTables 的注释）。
+        if (segmentationChanged)
+            BuildQuantTables();
+    }
+
+    /// <summary>
+    /// 按当前分段开关构建各段的反量化表（Y1/Y2/UV 的 DC 与 AC 步长）。
+    ///
+    /// 关闭分段（partition0 降级路径）时所有段都使用基础 q：降级后
+    /// <see cref="_currentSegment"/> 恒为 0，若仍叠加 <c>_segDelta[0]</c> 的加粗，
+    /// 整图会比预期粗两档——色度 DC 预测在平坦区留下的偏差（约 ±10~12）会落到
+    /// 量化死区被整体丢弃，残差无法修正，误差沿色度 DC 预测方向逐宏块传播，
+    /// 在白色/浅色背景上形成大面积半透明粉紫偏色（143MP 实测右下角晕染，
+    /// 色度 V 均值 128 → 140）。
+    /// </summary>
+    private void BuildQuantTables()
+    {
+        for (int segment = 0; segment < 4; segment++)
+        {
+            int delta = _useSegmentation ? _segDelta[segment] : 0;
+            int segmentQ = Math.Clamp(_baseQ + delta, 0, 127);
+            _y1Dc[segment] = Vp8Tables.DcQuantTable[segmentQ];
+            _y1Ac[segment] = Vp8Tables.AcQuantTable[segmentQ];
+            _y2Dc[segment] = _y1Dc[segment] * 2;
+            _y2Ac[segment] = Math.Max(8, (Vp8Tables.AcQuantTable[segmentQ] * 101581) >> 16);
+            _uvDc[segment] = Vp8Tables.DcQuantTable[Math.Clamp(segmentQ + UvDcDeltaQ, 0, 117)];
+            _uvAc[segment] = Vp8Tables.AcQuantTable[Math.Clamp(segmentQ + UvAcDeltaQ, 0, 127)];
+        }
     }
 
     /// <summary>
@@ -586,7 +633,8 @@ internal sealed class Vp8Encoder
 
         byte[] part0 = _part0.Finish();
         byte[] tokens = _tokens.Finish();
-        return assemble ? AssembleFrame(part0, tokens) : part0;
+        // 快档单遍若因 partition0 超预算提前中断，产物是不完整的残帧，直接丢弃重跑。
+        return assemble && !_probeAborted ? AssembleFrame(part0, tokens) : part0;
     }
 
     /// <summary>
@@ -598,6 +646,12 @@ internal sealed class Vp8Encoder
     /// </summary>
     private void SelectFilterLevel()
     {
+        if (_fast)
+        {
+            // 快档用构造时的 q→level 查表值，分段 delta 保持全 0；
+            // 不做 6 强度 × 4 组 delta 的候选滤波评分（实测体积/PSNR 收益可忽略）。
+            return;
+        }
         int estimate = EstimateFilterLevel(_baseQ);
         Span<int> candidates = stackalloc int[6];
         int count = 0;
@@ -1292,17 +1346,22 @@ internal sealed class Vp8Encoder
             int leftMode = bx > 0 ? _i4Modes[n - 1] : _i4LeftModes[by];
             int context = topNz[bx] + leftNz[by];
             int bestMode = candidates[0];
-            long bestScore = long.MaxValue;
-            foreach (int mode in candidates)
+            if (!_fast)
             {
-                PrepareI4Block(mbX, mbY, n, off, mode, context, trellis: false);
-                long d = BlockSse4x4(_srcY, _width, _height, _reconY, off, _strideY, baseX, baseY);
-                long bits = CostI4Block(mode, topMode, leftMode, context, n);
-                long score = Score(d, bits);
-                if (score < bestScore)
+                // 高档：对预测域 SSE 前 3 名各做一次变换量化 + 精确码率，按 RD 复评。
+                // 快档直接用 SSE 最优模式，省掉 3 份额外的变换/量化/重建与码率计价。
+                long bestScore = long.MaxValue;
+                foreach (int mode in candidates)
                 {
-                    bestScore = score;
-                    bestMode = mode;
+                    PrepareI4Block(mbX, mbY, n, off, mode, context, trellis: false);
+                    long d = BlockSse4x4(_srcY, _width, _height, _reconY, off, _strideY, baseX, baseY);
+                    long bits = CostI4Block(mode, topMode, leftMode, context, n);
+                    long score = Score(d, bits);
+                    if (score < bestScore)
+                    {
+                        bestScore = score;
+                        bestMode = mode;
+                    }
                 }
             }
 
@@ -1344,7 +1403,7 @@ internal sealed class Vp8Encoder
         int dst = n * 16;
         int seg = _currentSegment;
         int last;
-        if (trellis)
+        if (trellis && !_fast)
         {
             // 候选模式比较时用标量量化（4 个候选 × 16 次 DP 代价过高），最终胜者才做 RD 量化。
             last = Vp8Trellis.Quantize(
@@ -1356,17 +1415,8 @@ internal sealed class Vp8Encoder
         }
         else
         {
-            last = -1;
-            for (int i = 0; i < 16; i++)
-            {
-                int raster = Vp8Tables.Zigzag[i];
-                int dq = i == 0 ? _y1Dc[seg] : _y1Ac[seg];
-                int q = Quantize(_blockCoef[raster], dq);
-                _lumaQuant[dst + i] = q;
-                _lumaSlots[dst + raster] = (short)(q * dq);
-                if (q != 0)
-                    last = i;
-            }
+            last = QuantizeBlockScalar(_blockCoef, _lumaQuant.AsSpan(dst, 16), _lumaSlots.AsSpan(dst, 16),
+                first: 0, dcStep: _y1Dc[seg], acStep: _y1Ac[seg]);
         }
 
         bool any = last >= 0;
@@ -1557,12 +1607,15 @@ internal sealed class Vp8Encoder
         Vp8ForwardTransform.Wht4x4(_lumaDc, _y2Coef);
         int seg = _currentSegment;
         int y2Ctx = _mbNzDc[mbX] + _leftNzDc;
-        int lastY2 = Vp8Trellis.Quantize(
-            _y2Coef, _y2Quant, _y2Dequant,
-            first: 0, type: 1, ctx: y2Ctx,
-            dcStep: _y2Dc[seg], acStep: _y2Ac[seg],
-            nodeCosts: _nodeCost, lambdaQ8: TrellisLambda * _y2Ac[seg],
-            distortionWeight: 4, scratch: _trellis);
+        int lastY2 = _fast
+            ? QuantizeBlockScalar(_y2Coef, _y2Quant, _y2Dequant, first: 0,
+                dcStep: _y2Dc[seg], acStep: _y2Ac[seg])
+            : Vp8Trellis.Quantize(
+                _y2Coef, _y2Quant, _y2Dequant,
+                first: 0, type: 1, ctx: y2Ctx,
+                dcStep: _y2Dc[seg], acStep: _y2Ac[seg],
+                nodeCosts: _nodeCost, lambdaQ8: TrellisLambda * _y2Ac[seg],
+                distortionWeight: 4, scratch: _trellis);
         _y2Nz = lastY2 < 0 ? 0 : lastY2 + 1;
         if (lastY2 >= 0)
             _anyCoefficient = true;
@@ -1593,12 +1646,16 @@ internal sealed class Vp8Encoder
                 int block = y * 4 + x;
                 int dst = block * 16;
                 int bctx = l + (tnz & 1);
-                int last = Vp8Trellis.Quantize(
-                    _lumaCoef.AsSpan(dst, 16), _lumaQuant.AsSpan(dst, 16), _lumaSlots.AsSpan(dst, 16),
-                    first: 1, type: 0, ctx: bctx,
-                    dcStep: _y1Dc[seg], acStep: _y1Ac[seg],
-                    nodeCosts: _nodeCost, lambdaQ8: TrellisLambda * _y1Ac[seg],
-                    distortionWeight: 1, scratch: _trellis);
+                int last = _fast
+                    ? QuantizeBlockScalar(_lumaCoef.AsSpan(dst, 16), _lumaQuant.AsSpan(dst, 16),
+                        _lumaSlots.AsSpan(dst, 16), first: 1,
+                        dcStep: _y1Dc[seg], acStep: _y1Ac[seg])
+                    : Vp8Trellis.Quantize(
+                        _lumaCoef.AsSpan(dst, 16), _lumaQuant.AsSpan(dst, 16), _lumaSlots.AsSpan(dst, 16),
+                        first: 1, type: 0, ctx: bctx,
+                        dcStep: _y1Dc[seg], acStep: _y1Ac[seg],
+                        nodeCosts: _nodeCost, lambdaQ8: TrellisLambda * _y1Ac[seg],
+                        distortionWeight: 1, scratch: _trellis);
                 if (last >= 0)
                     _anyCoefficient = true;
 
@@ -1642,12 +1699,16 @@ internal sealed class Vp8Encoder
                     Vp8ForwardTransform.Dct4x4(_residual, _blockCoef);
 
                     int bctx = l + (tnz & 1);
-                    int last = Vp8Trellis.Quantize(
-                        _blockCoef, _uvQuant.AsSpan(index * 16, 16), _uvSlots.AsSpan(index * 16, 16),
-                        first: 0, type: 2, ctx: bctx,
-                        dcStep: _uvDc[seg], acStep: _uvAc[seg],
-                        nodeCosts: _nodeCost, lambdaQ8: TrellisLambda * _uvAc[seg],
-                        distortionWeight: 1, scratch: _trellis);
+                    int last = _fast
+                        ? QuantizeBlockScalar(_blockCoef, _uvQuant.AsSpan(index * 16, 16),
+                            _uvSlots.AsSpan(index * 16, 16), first: 0,
+                            dcStep: _uvDc[seg], acStep: _uvAc[seg])
+                        : Vp8Trellis.Quantize(
+                            _blockCoef, _uvQuant.AsSpan(index * 16, 16), _uvSlots.AsSpan(index * 16, 16),
+                            first: 0, type: 2, ctx: bctx,
+                            dcStep: _uvDc[seg], acStep: _uvAc[seg],
+                            nodeCosts: _nodeCost, lambdaQ8: TrellisLambda * _uvAc[seg],
+                            distortionWeight: 1, scratch: _trellis);
                     if (last >= 0)
                         _anyCoefficient = true;
 
@@ -2051,16 +2112,55 @@ internal sealed class Vp8Encoder
     //  变换 / 量化 / 重建
     // ==================================================================
 
-    private static int Quantize(int coefficient, int dq)
+    /// <summary>
+    /// 对齐 libwebp src/dsp/quant.h 的定点倒数思路：把逐系数整数除法换成
+    /// 64 位乘法 + 一次校正。recip = ceil(2^32/dq) 时 (m*recip)&gt;&gt;32 只可能等于
+    /// floor(m/dq) 或 floor(m/dq)+1，校正后与原式逐位等价（输出不变）。
+    /// 每块只做 2 次除法求倒数，替代原来的 16 次系数除法。
+    /// </summary>
+    private static uint DivisionReciprocal(int dq)
+    {
+        uint d = (uint)dq;
+        ulong quotient = 0x1_0000_0000UL / d;
+        return (uint)quotient + (0x1_0000_0000UL % d == 0 ? 0u : 1u);
+    }
+
+    private static int Quantize(int coefficient, int dq, uint recip)
     {
         if (coefficient == 0)
             return 0;
 
         int magnitude = coefficient < 0 ? -coefficient : coefficient;
-        int quantized = (magnitude + (dq >> 1)) / dq;
-        if (quantized > MaxCoefficient)
-            quantized = MaxCoefficient;
+        ulong m = (ulong)magnitude + (uint)(dq >> 1);
+        uint q = (uint)((m * recip) >> 32);
+        if ((ulong)q * (uint)dq > m) q--;             // ceil 倒数带来的 +1
+        else if ((ulong)(q + 1) * (uint)dq <= m) q++; // 对称保护（正常不会触发）
+        int quantized = (int)Math.Min(q, (uint)MaxCoefficient);
         return coefficient < 0 ? -quantized : quantized;
+    }
+
+    /// <summary>
+    /// 快档用的标量量化，替代 RD trellis。输出布局与 <see cref="Vp8Trellis.Quantize"/>
+    /// 完全相同（levels 扫描序、slots 光栅序），因此 token 写出与重建路径无需分叉。
+    /// <paramref name="first"/> 为 1 时（Y1 AC）不触碰光栅序 0，该位置由 Y2 的 DC 分发填充。
+    /// </summary>
+    private static int QuantizeBlockScalar(ReadOnlySpan<int> coefficients, Span<int> levels,
+        Span<short> slots, int first, int dcStep, int acStep)
+    {
+        uint dcRecip = DivisionReciprocal(dcStep);
+        uint acRecip = DivisionReciprocal(acStep);
+        int last = -1;
+        for (int n = first; n < 16; n++)
+        {
+            int raster = Vp8Tables.Zigzag[n];
+            int dq = n == 0 ? dcStep : acStep;
+            int q = Quantize(coefficients[raster], dq, n == 0 ? dcRecip : acRecip);
+            levels[n] = q;
+            slots[raster] = (short)(q * dq);
+            if (q != 0)
+                last = n;
+        }
+        return last;
     }
 
     private static void ApplyTransform(short[] slots, int offset, byte[] dst, int dstOff, int stride, int code)

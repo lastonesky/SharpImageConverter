@@ -193,6 +193,406 @@ public class WebpStreamingDecodeTests
         VerifyStreamingMatchesFull(webp, rgba, w, h);
     }
 
+    /// <summary>
+    /// P0：窗口化 VP8 解码器（17/9 行重建窗口 + 32/16 行输出窗口）与整帧解码器
+    /// 已在滤波阶段最终化的输出行必须逐字节一致。覆盖奇数/偶数尺寸、宏块行边界与非边界。
+    /// </summary>
+    [Fact]
+    public void Vp8WindowedDecoder_OutputPlanesMatchFullDecode()
+    {
+        (int W, int H)[] sizes =
+        [
+            (1, 1), (2, 2), (3, 3), (15, 17), (16, 16), (17, 15),
+            (33, 65), (64, 64), (65, 33), (127, 61),
+        ];
+
+        foreach (var (w, h) in sizes)
+        {
+            byte[] rgba = PhotoLikeRgba(w, h);
+            byte[] webp = WebpEncoder.EncodeLossyRgba(rgba, w, h, 75f);
+            byte[] payload = ExtractVp8Payload(webp);
+
+            var full = Vp8Decoder.Decode(payload);
+            var windowed = Vp8Decoder.CreateWindowed(payload);
+            windowed.BeginRowStream();
+
+            int chromaWidth = (w + 1) / 2;
+            int chromaHeight = (h + 1) / 2;
+
+            while (windowed.HasMoreMacroblockRows)
+            {
+                windowed.DecodeNextMacroblockRow();
+                int k = windowed.CurrentMacroblockRow;
+
+                // 本次滤波后新最终化的行：亮度 16(k-1)..16k、色度 8(k-1)..8k。
+                // 更早的行在上一次迭代中已交付/校验，窗口平移后不再驻留。
+                int lumaStart = k == 0 ? 0 : 16 * (k - 1);
+                int lumaEnd = Math.Min(16 * k, h - 1);
+                for (int r = lumaStart; r <= lumaEnd; r++)
+                {
+                    int windowRow = MapWindowRow(r, k, 16);
+                    for (int x = 0; x < w; x++)
+                    {
+                        Assert.True(full.Y[r * w + x] == windowed.OutY[windowRow * windowed.StrideOutY + x],
+                            $"Y mismatch w={w} h={h} k={k} r={r} x={x}");
+                    }
+                }
+
+                int chromaStart = k == 0 ? 0 : 8 * (k - 1);
+                int chromaEnd = Math.Min(8 * k, chromaHeight - 1);
+                for (int c = chromaStart; c <= chromaEnd; c++)
+                {
+                    int windowRow = MapWindowRow(c, k, 8);
+                    for (int x = 0; x < chromaWidth; x++)
+                    {
+                        Assert.True(full.U[c * chromaWidth + x] == windowed.OutU[windowRow * windowed.StrideOutUv + x],
+                            $"U mismatch w={w} h={h} k={k} c={c} x={x}");
+                        Assert.True(full.V[c * chromaWidth + x] == windowed.OutV[windowRow * windowed.StrideOutUv + x],
+                            $"V mismatch w={w} h={h} k={k} c={c} x={x}");
+                    }
+                }
+
+                if (windowed.HasMoreMacroblockRows)
+                    windowed.SlideWindows();
+            }
+        }
+    }
+
+    /// <summary>P1：Vp8RowDecoder 逐行 RGBA 输出与整帧解码 + fancy upsampling 逐字节一致。</summary>
+    [Fact]
+    public void Vp8RowDecoder_RgbaMatchesFullDecode()
+    {
+        (int W, int H)[] sizes =
+        [
+            (1, 1), (2, 2), (3, 3), (15, 17), (16, 16), (17, 15),
+            (33, 65), (64, 64), (65, 33), (127, 61), (256, 129),
+        ];
+
+        foreach (var (w, h) in sizes)
+        {
+            byte[] rgba = PhotoLikeRgba(w, h);
+            byte[] webp = WebpEncoder.EncodeLossyRgba(rgba, w, h, 75f);
+            VerifyVp8RowDecoderMatchesFull(webp, w, h);
+        }
+    }
+
+    /// <summary>
+    /// §9.1 质量矩阵：q ∈ {10, 30, 50, 75, 95} × 奇数/偶数/非 16 倍数/1×N/N×1 尺寸，
+    /// 逐行 RGBA 输出与整帧路径必须 diff = 0。
+    /// </summary>
+    [Fact]
+    public void Vp8RowDecoder_QualityMatrix_RgbaMatchesFullDecode()
+    {
+        (int W, int H)[] sizes =
+        [
+            (1, 1), (1, 3), (3, 1), (15, 17), (17, 15), (16, 16),
+            (17, 16), (16, 17), (17, 17), (31, 33), (33, 31), (100, 37),
+        ];
+        float[] qualities = [10f, 30f, 50f, 75f, 95f];
+
+        foreach (float q in qualities)
+        {
+            foreach (var (w, h) in sizes)
+            {
+                byte[] rgba = PhotoLikeRgba(w, h);
+                byte[] webp = WebpEncoder.EncodeLossyRgba(rgba, w, h, q);
+                VerifyVp8RowDecoderMatchesFull(webp, w, h);
+            }
+        }
+    }
+
+    /// <summary>
+    /// §9.1：simple / complex 环内滤波 × token 分区数 1/2/4/8 × 奇数与非 16 倍数尺寸。
+    /// 码流由 libwebp 显式配置生成（自身编码器固定输出 complex + 单分区）。
+    /// </summary>
+    [Fact]
+    public void Vp8RowDecoder_FilterAndPartitionMatrix_RgbaMatchesFullDecode()
+    {
+        (int W, int H)[][] sizes =
+        [
+            [(17, 17)], [(33, 65)], [(64, 48)], [(100, 37)],
+        ];
+
+        foreach (var group in sizes)
+        {
+            foreach (var (w, h) in group)
+            {
+                byte[] rgba = PhotoLikeRgba(w, h);
+                foreach (int filterType in new[] { 0, 1 })            // 0 = simple, 1 = complex
+                {
+                    foreach (int partitions in new[] { 0, 1, 2, 3 })  // log2(分区数)
+                    {
+                        foreach (float q in new[] { 30f, 75f })
+                        {
+                            byte[] webp = LibWebpTestCodec.EncodeWithConfig(
+                                rgba, w, h, w * 4, hasAlpha: true, q, method: 4, lossless: false, exact: false,
+                                filterType: filterType, partitions: partitions);
+                            VerifyVp8RowDecoderMatchesFull(webp, w, h);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// §9.2：高滤波强度 + 竖直强梯度（单像素条纹），强制 VFilter 改写上一宏块行最后 4 行，
+    /// 验证滤波延迟足够。
+    /// </summary>
+    [Fact]
+    public void Vp8RowDecoder_StrongEdgeGradient_RgbaMatchesFullDecode()
+    {
+        (int W, int H)[] sizes = [(65, 49), (17, 33), (3, 35)];
+        foreach (var (w, h) in sizes)
+        {
+            byte[] rgba = StripeRgba(w, h);
+            foreach (int sharpness in new[] { 0, 4, 7 })
+            {
+                byte[] webp = LibWebpTestCodec.EncodeWithConfig(
+                    rgba, w, h, w * 4, hasAlpha: true, 20f, method: 4, lossless: false, exact: false,
+                    filterType: 1, filterStrength: 63, filterSharpness: sharpness);
+                VerifyVp8RowDecoderMatchesFull(webp, w, h);
+            }
+        }
+    }
+
+    /// <summary>§9.1：1080p 与 4K 的真实尺寸对拍（无 alpha）。</summary>
+    [Fact]
+    public void Vp8RowDecoder_LargeImages_RgbaMatchesFullDecode()
+    {
+        foreach (var (w, h) in new[] { (1920, 1080), (3840, 2160) })
+        {
+            byte[] rgba = PhotoLikeRgba(w, h);
+            byte[] webp = WebpEncoder.EncodeLossyRgba(rgba, w, h, 75f);
+            VerifyVp8RowDecoderMatchesFull(webp, w, h);
+        }
+    }
+
+    /// <summary>§9.1：16383×1 与 1×16383 的极端长宽比。</summary>
+    [Fact]
+    public void Vp8RowDecoder_ExtremeThinImages_RgbaMatchesFullDecode()
+    {
+        foreach (var (w, h) in new[] { (16383, 1), (1, 16383) })
+        {
+            byte[] rgba = PhotoLikeRgba(w, h);
+            byte[] webp = WebpEncoder.EncodeLossyRgba(rgba, w, h, 75f);
+            VerifyVp8RowDecoderMatchesFull(webp, w, h);
+        }
+    }
+
+    /// <summary>
+    /// P3 容器级 alpha 矩阵：libwebp 的 alpha 压缩开关 × 四种滤波（none/horizontal/vertical/gradient
+    /// 由 alpha_filtering 0/1/2 与预处理组合覆盖），行源输出与整图解码逐像素一致。
+    /// </summary>
+    [Fact]
+    public void LossyAlpha_LibWebpFilterModes_RowOutputMatchesFullDecode()
+    {
+        int w = 129, h = 37;
+        byte[] rgba = AlphaGradient4(w, h);
+
+        foreach (int alphaCompression in new[] { 0, 1 })
+        {
+            foreach (int alphaFiltering in new[] { 0, 1, 2 })
+            {
+                foreach (int preprocessing in new[] { 0, 1 })
+                {
+                    byte[] webp = LibWebpTestCodec.EncodeWithConfig(
+                        rgba, w, h, w * 4, hasAlpha: true, 60f, method: 4, lossless: false, exact: false,
+                        alphaCompression: alphaCompression, alphaFiltering: alphaFiltering,
+                        preprocessing: preprocessing);
+                    VerifyStreamingMatchesFull(webp, rgba, w, h);
+                }
+            }
+        }
+    }
+
+    private static void VerifyVp8RowDecoderMatchesFull(byte[] webp, int w, int h)
+    {
+        byte[] payload = ExtractVp8Payload(webp);
+
+        var full = Vp8Decoder.Decode(payload);
+        byte[] expected = Vp8YuvToRgb.ConvertToRgba(
+            full.Y, full.U, full.V, w, h, w, (w + 1) / 2);
+
+        var rowDecoder = new Vp8RowDecoder(payload);
+        Assert.Equal(w, rowDecoder.Width);
+        Assert.Equal(h, rowDecoder.Height);
+
+        byte[] row = new byte[checked(w * 4)];
+        for (int y = 0; y < h; y++)
+        {
+            Assert.True(rowDecoder.TryReadRgbaRow(row));
+            for (int i = 0; i < w * 4; i++)
+            {
+                Assert.True(row[i] == expected[y * w * 4 + i],
+                    $"RGBA mismatch w={w} h={h} row={y} offset={i} (x={i / 4}, c={i & 3})");
+            }
+        }
+        Assert.False(rowDecoder.TryReadRgbaRow(row));
+    }
+
+    /// <summary>P3：ALPH 原始字节 + 四种逆滤波的行增量输出与整图解码一致。</summary>
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(3)]
+    public void AlphRowSource_RawFilters_MatchExpected(int filter)
+    {
+        (int W, int H)[] sizes = [(1, 1), (2, 3), (17, 9), (64, 33)];
+        foreach (var (w, h) in sizes)
+        {
+            byte[] alpha = AlphaGradient(w, h);
+            byte[] alphH = BuildRawAlph(alpha, w, h, filter);
+            var expected = AlphDecoder.Decode(alphH, w, h);
+            var source = new AlphRowSource(alphH, w, h);
+            byte[] row = new byte[w];
+            for (int y = 0; y < h; y++)
+            {
+                Assert.True(source.TryReadRow(row));
+                for (int x = 0; x < w; x++)
+                    Assert.True(row[x] == expected[y * w + x],
+                        $"alpha mismatch filter={filter} w={w} h={h} y={y} x={x}");
+            }
+            Assert.False(source.TryReadRow(row));
+        }
+    }
+
+    /// <summary>P3：真实 ALPH（VP8L 压缩 + 编码器选择的滤波）逐行输出与整图解码一致。</summary>
+    [Fact]
+    public void AlphRowSource_Vp8lAlphaRows_MatchFullDecoder()
+    {
+        (int W, int H)[] sizes = [(1, 1), (3, 2), (17, 33), (64, 65), (129, 47)];
+        foreach (var (w, h) in sizes)
+        {
+            byte[] rgba = AlphaGradient4(w, h);
+            byte[] webp = WebpEncoder.EncodeLossyRgba(rgba, w, h, 75f);
+            byte[] alph = ExtractChunkPayload(webp, "ALPH", require: true);
+            byte[] expected = AlphDecoder.Decode(alph, w, h);
+
+            var source = new AlphRowSource(alph, w, h);
+            byte[] row = new byte[w];
+            for (int y = 0; y < h; y++)
+            {
+                Assert.True(source.TryReadRow(row));
+                for (int x = 0; x < w; x++)
+                    Assert.True(row[x] == expected[y * w + x],
+                        $"alpha mismatch w={w} h={h} y={y} x={x}");
+            }
+            Assert.False(source.TryReadRow(row));
+        }
+    }
+
+    private static byte[] AlphaGradient(int width, int height)
+    {
+        var alpha = new byte[width * height];
+        for (int y = 0; y < height; y++)
+            for (int x = 0; x < width; x++)
+                alpha[y * width + x] = (byte)((x * 7 + y * 11) & 0xFF);
+        return alpha;
+    }
+
+    private static byte[] AlphaGradient4(int width, int height)
+    {
+        byte[] rgb = PhotoLikeRgba(width, height);
+        byte[] alpha = AlphaGradient(width, height);
+        for (int i = 0; i < width * height; i++)
+            rgb[i * 4 + 3] = alpha[i];
+        return rgb;
+    }
+
+    /// <summary>按指定滤波方式对 alpha 做前向滤波，生成未压缩 ALPH chunk 数据。</summary>
+    private static byte[] BuildRawAlph(byte[] alpha, int width, int height, int filter)
+    {
+        var data = new byte[1 + width * height];
+        data[0] = (byte)(filter << 2); // compression=0, preprocessing=0, reserved=0
+        Span<byte> residual = data.AsSpan(1);
+
+        for (int y = 0; y < height; y++)
+        {
+            int rowStart = y * width;
+            int prevStart = rowStart - width;
+
+            if (filter == 0)
+            {
+                for (int x = 0; x < width; x++)
+                    residual[rowStart + x] = alpha[rowStart + x];
+                continue;
+            }
+
+            if (y == 0 || filter == 1)
+            {
+                // 首行（以及 horizontal 的每一行）都以「上一行首像素」为预测起点。
+                int pred = y == 0 ? 0 : alpha[prevStart];
+                for (int x = 0; x < width; x++)
+                {
+                    int idx = rowStart + x;
+                    residual[idx] = (byte)(alpha[idx] - pred);
+                    pred = alpha[idx];
+                }
+                continue;
+            }
+
+            if (filter == 2)
+            {
+                for (int x = 0; x < width; x++)
+                    residual[rowStart + x] = (byte)(alpha[rowStart + x] - alpha[prevStart + x]);
+                continue;
+            }
+
+            // gradient（y > 0）
+            residual[rowStart] = (byte)(alpha[rowStart] - alpha[prevStart]);
+            for (int x = 1; x < width; x++)
+            {
+                int idx = rowStart + x;
+                int pred = alpha[idx - 1] + alpha[prevStart + x] - alpha[prevStart + x - 1];
+                if (pred < 0) pred = 0;
+                else if (pred > 255) pred = 255;
+                residual[idx] = (byte)(alpha[idx] - pred);
+            }
+        }
+        return data;
+    }
+
+    private static byte[] ExtractChunkPayload(byte[] webp, string id, bool require)
+    {
+        int pos = 12;
+        while (pos + 8 <= webp.Length)
+        {
+            uint size = BitConverter.ToUInt32(webp, pos + 4);
+            int next = pos + 8 + (int)size + (int)(size & 1);
+            if (webp[pos] == id[0] && webp[pos + 1] == id[1] &&
+                webp[pos + 2] == id[2] && webp[pos + 3] == id[3])
+            {
+                return webp.AsSpan(pos + 8, (int)size).ToArray();
+            }
+            if (next <= pos || next > webp.Length) break;
+            pos = next;
+        }
+        if (require) throw new InvalidDataException($"未找到 {id} chunk");
+        return Array.Empty<byte>();
+    }
+
+    private static int MapWindowRow(int absoluteRow, int mbY, int rowsPerMacroblock) =>
+        absoluteRow >= rowsPerMacroblock * mbY
+            ? rowsPerMacroblock + absoluteRow - rowsPerMacroblock * mbY
+            : absoluteRow - rowsPerMacroblock * (mbY - 1);
+
+    private static byte[] ExtractVp8Payload(byte[] webp)
+    {
+        int pos = 12;
+        while (pos + 8 <= webp.Length)
+        {
+            uint size = BitConverter.ToUInt32(webp, pos + 4);
+            int next = pos + 8 + (int)size + (int)(size & 1);
+            if (webp[pos] == 'V' && webp[pos + 1] == 'P' && webp[pos + 2] == '8' && webp[pos + 3] == ' ')
+                return webp.AsSpan(pos + 8, (int)size).ToArray();
+            if (next <= pos || next > webp.Length) break;
+            pos = next;
+        }
+        throw new InvalidDataException("未找到 VP8 chunk");
+    }
+
     [Fact]
     public void LosslessTruncatedInsideVp8LChunk_ThrowsInvalidData()
     {
@@ -312,6 +712,25 @@ public class WebpStreamingDecodeTests
                 rgba[o + 1] = (byte)((g + (int)((seed >> 19) & 0x1F)) & 0xFF);
                 rgba[o + 2] = (byte)((b + (int)((seed >> 11) & 0x1F)) & 0xFF);
                 rgba[o + 3] = (byte)(255 - (int)((seed >> 3) & 0x0F));
+            }
+        }
+        return rgba;
+    }
+
+    /// <summary>单像素黑白竖直条纹：在 4×4 块内产生最陡的垂直/水平边界，压测环内滤波。</summary>
+    private static byte[] StripeRgba(int w, int h)
+    {
+        var rgba = new byte[w * h * 4];
+        for (int y = 0; y < h; y++)
+        {
+            for (int x = 0; x < w; x++)
+            {
+                int o = (y * w + x) * 4;
+                byte v = (byte)((x & 1) == 0 ? 0 : 255);
+                rgba[o] = v;
+                rgba[o + 1] = v;
+                rgba[o + 2] = v;
+                rgba[o + 3] = 255;
             }
         }
         return rgba;

@@ -150,7 +150,27 @@ internal sealed class Vp8Decoder
     private int _strideOutY;
     private int _strideOutUv;
 
-    private Vp8Decoder(byte[] data) => _data = data;
+    // ---- 行级流式（窗口化）模式 ----
+    // 整帧模式：平面覆盖完整宏块网格，基址随 mbY 推进（与原有行为完全一致）。
+    // 窗口模式：重建平面只保留 "上方边界行 + 当前 16/8 行"，输出平面只保留 "上一宏块行 + 当前宏块行"，
+    // 每完成一行宏块后把当前半区平移到上一半区。基址固定，由 Vp8RowDecoder 逐行驱动。
+    private readonly bool _windowed;
+    private int _curReconYBase;
+    private int _curReconUvBase;
+    private int _curOutYBase;
+    private int _curOutUvBase;
+    private int _nextMbY;
+
+    private const int WindowReconRowsY = 17;
+    private const int WindowReconRowsUv = 9;
+    private const int WindowOutRowsY = 32;
+    private const int WindowOutRowsUv = 16;
+
+    private Vp8Decoder(byte[] data, bool windowed)
+    {
+        _data = data;
+        _windowed = windowed;
+    }
 
     /// <summary>帧标签的最低有效位为 0 表示关键帧（RFC 6386 §9.1）。</summary>
     public static bool IsKeyFrame(ReadOnlySpan<byte> chunk) =>
@@ -163,9 +183,15 @@ internal sealed class Vp8Decoder
     /// </summary>
     public static Vp8DecodedImage Decode(ReadOnlySpan<byte> chunk)
     {
-        var decoder = new Vp8Decoder(chunk.ToArray());
+        var decoder = new Vp8Decoder(chunk.ToArray(), windowed: false);
         return decoder.Run();
     }
+
+    /// <summary>
+    /// 创建窗口化解码器：平面只保留行级流式解码所需的窗口，由调用方逐宏块行推进。
+    /// 与 <see cref="Decode"/> 共用全部头解析 / 宏块解码 / 滤波逻辑，输出逐字节一致。
+    /// </summary>
+    internal static Vp8Decoder CreateWindowed(byte[] data) => new(data, windowed: true);
 
     private Vp8DecodedImage Run()
     {
@@ -175,6 +201,73 @@ internal sealed class Vp8Decoder
         DecodeFrame();
         return CropOutput();
     }
+
+    // ==================================================================
+    //  行级流式驱动（窗口模式）
+    // ==================================================================
+
+    /// <summary>
+    /// 窗口模式初始化：解析帧头 / 全局头、分配窗口平面并预计算滤波强度。
+    /// 必须在读取任何宏块行之前调用一次。
+    /// </summary>
+    internal void BeginRowStream()
+    {
+        ParseFrameHeader();
+        ParseGlobalHeader();
+        AllocatePlanes();
+        PrecomputeFilterStrengths();
+        _nextMbY = 0;
+        _curReconYBase = _strideReconY;
+        _curReconUvBase = _strideReconUv;
+        _curOutYBase = 16 * _strideOutY;
+        _curOutUvBase = 8 * _strideOutUv;
+    }
+
+    /// <summary>是否还有未解码的宏块行。</summary>
+    internal bool HasMoreMacroblockRows => _nextMbY < _mbH;
+
+    /// <summary>最近一次解码完成（已重建并滤波）的宏块行号；尚未解码任何行时为 -1。</summary>
+    internal int CurrentMacroblockRow => _nextMbY - 1;
+
+    /// <summary>
+    /// 解码、重建并滤波下一宏块行。返回后不会自动平移窗口，
+    /// 以便调用方在 "上一半区 / 当前半区" 都仍有效时交付该行产生的输出。
+    /// </summary>
+    internal void DecodeNextMacroblockRow()
+    {
+        if (!_windowed)
+            throw new InvalidOperationException("整帧解码器不支持逐宏块行驱动");
+        if (_nextMbY >= _mbH)
+            throw new InvalidOperationException("所有宏块行均已解码");
+
+        DecodeMacroblockRow(_nextMbY);
+        _nextMbY++;
+    }
+
+    /// <summary>
+    /// 把当前半区平移到上一半区（重建平面最后一行 / 输出平面当前 16、8 行）。
+    /// 调用方必须已交付所有依赖当前半区的输出行。
+    /// </summary>
+    internal void SlideWindows()
+    {
+        if (!_windowed)
+            throw new InvalidOperationException("整帧解码器不支持窗口平移");
+
+        Array.Copy(_reconY, 16 * _strideReconY, _reconY, 0, _strideReconY);
+        Array.Copy(_reconU, 8 * _strideReconUv, _reconU, 0, _strideReconUv);
+        Array.Copy(_reconV, 8 * _strideReconUv, _reconV, 0, _strideReconUv);
+        Array.Copy(_outY, 16 * _strideOutY, _outY, 0, 16 * _strideOutY);
+        Array.Copy(_outU, 8 * _strideOutUv, _outU, 0, 8 * _strideOutUv);
+        Array.Copy(_outV, 8 * _strideOutUv, _outV, 0, 8 * _strideOutUv);
+    }
+
+    internal int Width => _width;
+    internal int Height => _height;
+    internal byte[] OutY => _outY;
+    internal byte[] OutU => _outU;
+    internal byte[] OutV => _outV;
+    internal int StrideOutY => _strideOutY;
+    internal int StrideOutUv => _strideOutUv;
 
     // ==================================================================
     //  帧头（RFC 6386 §9.1 / §9.2）
@@ -423,42 +516,72 @@ internal sealed class Vp8Decoder
     private void AllocatePlanes()
     {
         _strideReconY = Pad * 2 + _mbW * 16;
-        int hReconY = Pad * 2 + _mbH * 16;
-        _reconY = new byte[_strideReconY * hReconY];
-
         _strideReconUv = Pad * 2 + _mbW * 8;
-        int hReconUv = Pad * 2 + _mbH * 8;
-        _reconU = new byte[_strideReconUv * hReconUv];
-        _reconV = new byte[_strideReconUv * hReconUv];
-
-        // 图像上边界：libwebp 用 127（RFC 6386 约定"不可用样本"）。整个上空行统一填 127 即可，
-        // 因为只在首个宏块行被读取，且 libwebp 在该行也始终为 127。
-        for (int row = 0; row < Pad; row++)
-        {
-            int rowStart = row * _strideReconY;
-            Array.Fill(_reconY, (byte)127, rowStart, _strideReconY);
-        }
-        for (int row = 0; row < Pad; row++)
-        {
-            int rowStart = row * _strideReconUv;
-            Array.Fill(_reconU, (byte)127, rowStart, _strideReconUv);
-            Array.Fill(_reconV, (byte)127, rowStart, _strideReconUv);
-        }
-
-        // 图像左边界：libwebp 用 129。只对第 0 个宏块列的左邻样本可见。
-        for (int row = Pad; row < hReconY; row++)
-            _reconY[row * _strideReconY + Pad - 1] = 129;
-        for (int row = Pad; row < hReconUv; row++)
-        {
-            _reconU[row * _strideReconUv + Pad - 1] = 129;
-            _reconV[row * _strideReconUv + Pad - 1] = 129;
-        }
-
         _strideOutY = _mbW * 16;
-        _outY = new byte[_strideOutY * (_mbH * 16)];
         _strideOutUv = _mbW * 8;
-        _outU = new byte[_strideOutUv * (_mbH * 8)];
-        _outV = new byte[_strideOutUv * (_mbH * 8)];
+
+        if (_windowed)
+        {
+            // 窗口模式：重建平面 = 1 行上边界 + 当前 16/8 行；输出平面 = 上一宏块行 + 当前宏块行。
+            // 上边界行沿用 127，左边界列沿用 129；每行宏块完成后由 SlideWindows 把当前内容
+            // 平移到窗口前半区，因此基址在整个流式解码期间保持固定。
+            _reconY = new byte[_strideReconY * WindowReconRowsY];
+            _reconU = new byte[_strideReconUv * WindowReconRowsUv];
+            _reconV = new byte[_strideReconUv * WindowReconRowsUv];
+            _outY = new byte[_strideOutY * WindowOutRowsY];
+            _outU = new byte[_strideOutUv * WindowOutRowsUv];
+            _outV = new byte[_strideOutUv * WindowOutRowsUv];
+
+            // 第 0 行是 "图像上边界"：libwebp 在该行始终为 127，用于首个宏块行的预测。
+            Array.Fill(_reconY, (byte)127, 0, _strideReconY);
+            Array.Fill(_reconU, (byte)127, 0, _strideReconUv);
+            Array.Fill(_reconV, (byte)127, 0, _strideReconUv);
+
+            // 左边界 129 只用于当前行；第 0 行保持 127 以匹配整帧模式的上边界语义。
+            for (int row = 1; row < WindowReconRowsY; row++)
+                _reconY[row * _strideReconY + Pad - 1] = 129;
+            for (int row = 1; row < WindowReconRowsUv; row++)
+            {
+                _reconU[row * _strideReconUv + Pad - 1] = 129;
+                _reconV[row * _strideReconUv + Pad - 1] = 129;
+            }
+        }
+        else
+        {
+            int hReconY = Pad * 2 + _mbH * 16;
+            _reconY = new byte[_strideReconY * hReconY];
+
+            int hReconUv = Pad * 2 + _mbH * 8;
+            _reconU = new byte[_strideReconUv * hReconUv];
+            _reconV = new byte[_strideReconUv * hReconUv];
+
+            // 图像上边界：libwebp 用 127（RFC 6386 约定"不可用样本"）。整个上空行统一填 127 即可，
+            // 因为只在首个宏块行被读取，且 libwebp 在该行也始终为 127。
+            for (int row = 0; row < Pad; row++)
+            {
+                int rowStart = row * _strideReconY;
+                Array.Fill(_reconY, (byte)127, rowStart, _strideReconY);
+            }
+            for (int row = 0; row < Pad; row++)
+            {
+                int rowStart = row * _strideReconUv;
+                Array.Fill(_reconU, (byte)127, rowStart, _strideReconUv);
+                Array.Fill(_reconV, (byte)127, rowStart, _strideReconUv);
+            }
+
+            // 图像左边界：libwebp 用 129。只对第 0 个宏块列的左邻样本可见。
+            for (int row = Pad; row < hReconY; row++)
+                _reconY[row * _strideReconY + Pad - 1] = 129;
+            for (int row = Pad; row < hReconUv; row++)
+            {
+                _reconU[row * _strideReconUv + Pad - 1] = 129;
+                _reconV[row * _strideReconUv + Pad - 1] = 129;
+            }
+
+            _outY = new byte[_strideOutY * (_mbH * 16)];
+            _outU = new byte[_strideOutUv * (_mbH * 8)];
+            _outV = new byte[_strideOutUv * (_mbH * 8)];
+        }
 
         // 4×4 子块偏移按重建平面实际行距展开（对应 frame_dec.c 的 kScan，但那里行距固定为 BPS=32）。
         _kScan = new int[16];
@@ -539,31 +662,45 @@ internal sealed class Vp8Decoder
     private void DecodeFrame()
     {
         PrecomputeFilterStrengths();
+        _nextMbY = 0;
 
-        for (int mbY = 0; mbY < _mbH; mbY++)
+        while (_nextMbY < _mbH)
         {
-            Vp8BoolDecoder tokenBr = _parts[mbY & _numPartsMinusOne];
+            // 整帧模式与行级模式共用同一套基址语义：基址指向当前宏块行在平面中的起点。
+            _curReconYBase = (Pad + _nextMbY * 16) * _strideReconY;
+            _curReconUvBase = (Pad + _nextMbY * 8) * _strideReconUv;
+            _curOutYBase = _nextMbY * 16 * _strideOutY;
+            _curOutUvBase = _nextMbY * 8 * _strideOutUv;
 
-            ParseIntraModeRow(mbY);
-            if (_partition0.Eof)
-                throw new WebpBitstreamException("VP8 partition0 提前结束（intra 模式行截断）");
-
-            for (int mbX = 0; mbX < _mbW; mbX++)
-            {
-                DecodeMacroblock(tokenBr, mbX, mbY);
-                if (tokenBr.Eof)
-                    throw new WebpBitstreamException(
-                        $"VP8 token 分区提前结束（宏块 {mbX},{mbY}）");
-            }
-
-            // 对应 VP8InitScanline：清空左侧上下文。
-            _leftNz = 0;
-            _leftNzDc = 0;
-            Array.Clear(_leftModes);
-
-            CopyRowToOutput(mbY);
-            FilterRow(mbY);
+            DecodeMacroblockRow(_nextMbY);
+            _nextMbY++;
         }
+    }
+
+    /// <summary>解码一个宏块行：intra 模式、全部宏块、输出拷贝与环内滤波。</summary>
+    private void DecodeMacroblockRow(int mbY)
+    {
+        Vp8BoolDecoder tokenBr = _parts[mbY & _numPartsMinusOne];
+
+        ParseIntraModeRow(mbY);
+        if (_partition0.Eof)
+            throw new WebpBitstreamException("VP8 partition0 提前结束（intra 模式行截断）");
+
+        for (int mbX = 0; mbX < _mbW; mbX++)
+        {
+            DecodeMacroblock(tokenBr, mbX, mbY);
+            if (tokenBr.Eof)
+                throw new WebpBitstreamException(
+                    $"VP8 token 分区提前结束（宏块 {mbX},{mbY}）");
+        }
+
+        // 对应 VP8InitScanline：清空左侧上下文。
+        _leftNz = 0;
+        _leftNzDc = 0;
+        Array.Clear(_leftModes);
+
+        CopyRowToOutput(mbY);
+        FilterRow(mbY);
     }
 
     private void ParseIntraModeRow(int mbY)
@@ -870,7 +1007,7 @@ internal sealed class Vp8Decoder
     private void ReconstructMacroblock(int mbX, int mbY)
     {
         int strideY = _strideReconY;
-        int yOff = (Pad + mbY * 16) * strideY + Pad + mbX * 16;
+        int yOff = _curReconYBase + Pad + mbX * 16;
         short[] coeffs = _coeffs;
         uint bits = _nonZeroY[mbX];
 
@@ -899,7 +1036,7 @@ internal sealed class Vp8Decoder
         }
 
         int strideUv = _strideReconUv;
-        int uvOff = (Pad + mbY * 8) * strideUv + Pad + mbX * 8;
+        int uvOff = _curReconUvBase + Pad + mbX * 8;
         int uvPred = CheckMode(mbX, mbY, _uvModeOfMb[mbX]);
         int uvMode = uvPred >= 4 ? 0 : uvPred;
         bool uvHasTop = uvPred != 4 && uvPred != 6;
@@ -992,14 +1129,14 @@ internal sealed class Vp8Decoder
 
     private void CopyRowToOutput(int mbY)
     {
-        int srcY = (Pad + mbY * 16) * _strideReconY + Pad;
-        int dstY = mbY * 16 * _strideOutY;
+        int srcY = _curReconYBase + Pad;
+        int dstY = _curOutYBase;
         int rowBytes = _mbW * 16;
         for (int j = 0; j < 16; j++)
             Array.Copy(_reconY, srcY + j * _strideReconY, _outY, dstY + j * _strideOutY, rowBytes);
 
-        int srcUv = (Pad + mbY * 8) * _strideReconUv + Pad;
-        int dstUv = mbY * 8 * _strideOutUv;
+        int srcUv = _curReconUvBase + Pad;
+        int dstUv = _curOutUvBase;
         int uvRowBytes = _mbW * 8;
         for (int j = 0; j < 8; j++)
         {
@@ -1018,8 +1155,8 @@ internal sealed class Vp8Decoder
         if (_filterType == 0)
             return;
 
-        int yBase = mbY * 16 * _strideOutY;
-        int uvBase = mbY * 8 * _strideOutUv;
+        int yBase = _curOutYBase;
+        int uvBase = _curOutUvBase;
 
         for (int mbX = 0; mbX < _mbW; mbX++)
         {

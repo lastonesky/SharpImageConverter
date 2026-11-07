@@ -24,12 +24,14 @@ namespace SharpImageConverter.Formats.Webp
         public WebpConcurrencyStrategy ConcurrencyStrategy { get; init; }
 
         /// <summary>
-        /// 历史参数（原 libwebp <c>config.method</c>，0~6）。
+        /// effort 档位（对齐 libwebp <c>config.method</c>，0~6）。
         /// </summary>
         /// <remarks>
-        /// 纯 C# 编码器没有 effort 档位，<b>本值不会影响产物</b>；保留只为让既有调用方与
-        /// <c>--webp-method</c> 参数面继续可编译/可解析。编码器的努力程度由
-        /// <see cref="Vp8LEncoderOptions.Auto"/> 的候选集与有损 VP8 的固定流程决定。
+        /// <c>0..4</c> 为快档：有损单遍 + 标量量化 + i4x4 单候选 + 滤波查表；
+        /// 无损单候选 + 无精化轮 + 单组 Huffman 表。
+        /// <c>5..6</c> 为完整档：有损两遍概率自适应 + 全 trellis + 双路 RD 决胜；
+        /// 无损多候选择优 + 真实码长精化 + meta-Huffman。
+        /// 两档输出都是合法可解码的 WebP，区别只在耗时与体积。
         /// </remarks>
         public int Method { get; init; }
 

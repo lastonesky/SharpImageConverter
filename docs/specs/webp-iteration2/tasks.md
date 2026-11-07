@@ -79,6 +79,27 @@
 - [x] 7.2 完成三项数据表与最终 Markdown 报告。
 - [x] 7.3 删除临时测量工程或保留在 `.perf`（不影响交付目录）。保留 `.perf/QualityProbe` 供复测。
 
+## 阶段 8：任务 4B 实施 —— VP8 行级流式
+
+> 设计稿：`docs/specs/webp-iteration2/vp8-row-streaming.md`。按 P0→P3 串行实施，
+> 每阶段构建 + WebP 测试通过后进入下一阶段；全部 §9.5 阈值达标，无回退。
+> 说明：VP8 宽度上限为 16383，长图用例使用 `16383×64` / `64×16383`（等价覆盖
+> §9.3 的 20000 级长宽比，且可被合法编码）。
+
+- [x] 8.1 P0：`Vp8Decoder` 窗口化核心（当前行固定基址、`CreateWindowed/BeginRowStream`、
+      `DecodeNextMacroblockRow`、`SlideWindows`），整帧模式行为不变；
+      通过：现有 WebP 测试全绿 + 整帧/窗口模式平面逐字节对拍一致。
+- [x] 8.2 P1：新增 `Vp8RowDecoder`（`Init / DecodeNextMacroblockRow / EmitReadyRows / Flush`）
+      与 `Vp8YuvToRgb.ConvertLinePair` 行对转换；通过：不接 RowSource 的
+      全尺寸矩阵（无 alpha）RGBA diff = 0。
+- [x] 8.3 P2：`WebpRowSource` VP8 分支接线（不再整帧 `DecodeRgba`）；
+      ALPH 先按整幅 1 B/px 合并；通过：流式测试全绿、4096² 与长图内存达标。
+- [x] 8.4 P3：`AlphRowSource` 行增量（压缩=VP8L 复用 `Vp8LRowDecoder` 裸流核心）；
+      通过：alpha 全矩阵 diff = 0、4K alpha 额外内存 ≤4.5 MB。
+- [x] 8.5 P4：性能/分配收尾与文档（`docs/WebpEncoder.md`、`docs/PerfReport.md`、
+      `CHANGELOG.md`）；通过：吞吐 ≥0.8× 现状、稳态每图分配 ≤32 KB、全量测试全绿。
+- [x] 8.6 验收：按 `vp8-row-streaming.md` §9.5 全部阈值；全部达标，未触发回退。
+
 ## 命令
 
 ```

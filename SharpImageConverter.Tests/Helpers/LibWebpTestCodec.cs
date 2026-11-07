@@ -127,7 +127,14 @@ namespace SharpImageConverter.Tests.Helpers
             throw new InvalidOperationException("WebPNewInternal 创建失败（ABI 版本不匹配或库不兼容）");
         }
 
-        private static void InitConfig(ref WebPConfig config, float quality, int method = 3, bool lossless = false, bool exact = true)
+        /// <summary>
+        /// 初始化编码配置。过滤/分区/alpha 参数以 -1 表示"使用 libwebp 默认值"，
+        /// 只有测试需要显式覆盖时才传入具体值（用于覆盖 simple/complex 滤波、
+        /// 多 token 分区与不同 alpha 滤波模式）。
+        /// </summary>
+        private static void InitConfig(ref WebPConfig config, float quality, int method = 3, bool lossless = false, bool exact = true,
+            int filterType = -1, int filterStrength = -1, int filterSharpness = -1, int partitions = -1,
+            int alphaCompression = -1, int alphaFiltering = -1, int preprocessing = -1)
         {
             for (int i = 0; i < EncoderAbiVersionsToTry.Length; i++)
             {
@@ -138,6 +145,13 @@ namespace SharpImageConverter.Tests.Helpers
                     config.lossless = lossless ? 1 : 0;
                     if (lossless) config.near_lossless = 0;
                     config.exact = exact ? 1 : 0;
+                    if (filterType >= 0) config.filter_type = filterType;
+                    if (filterStrength >= 0) config.filter_strength = filterStrength;
+                    if (filterSharpness >= 0) config.filter_sharpness = filterSharpness;
+                    if (partitions >= 0) config.partitions = partitions;
+                    if (alphaCompression >= 0) config.alpha_compression = alphaCompression;
+                    if (alphaFiltering >= 0) config.alpha_filtering = alphaFiltering;
+                    if (preprocessing >= 0) config.preprocessing = preprocessing;
                     if (WebPValidateConfig(ref config) == 0) throw new InvalidOperationException("WebP 编码参数无效");
                     return;
                 }
@@ -154,10 +168,13 @@ namespace SharpImageConverter.Tests.Helpers
             throw new InvalidOperationException("WebPPictureInitInternal 创建失败（ABI 版本不匹配或库不兼容）");
         }
 
-        internal static byte[] EncodeWithConfig(ReadOnlySpan<byte> pixels, int width, int height, int stride, bool hasAlpha, float quality, int method = 3, bool lossless = false, bool exact = true)
+        internal static byte[] EncodeWithConfig(ReadOnlySpan<byte> pixels, int width, int height, int stride, bool hasAlpha, float quality, int method = 3, bool lossless = false, bool exact = true,
+            int filterType = -1, int filterStrength = -1, int filterSharpness = -1, int partitions = -1,
+            int alphaCompression = -1, int alphaFiltering = -1, int preprocessing = -1)
         {
             using var ms = new MemoryStream();
-            EncodeWithConfigToStream(ms, pixels, width, height, stride, hasAlpha, quality, method, lossless, exact);
+            EncodeWithConfigToStream(ms, pixels, width, height, stride, hasAlpha, quality, method, lossless, exact,
+                filterType, filterStrength, filterSharpness, partitions, alphaCompression, alphaFiltering, preprocessing);
             return ms.ToArray();
         }
 
@@ -170,7 +187,9 @@ namespace SharpImageConverter.Tests.Helpers
             }
         }
 
-        internal static void EncodeWithConfigToStream(Stream stream, ReadOnlySpan<byte> pixels, int width, int height, int stride, bool hasAlpha, float quality, int method = 3, bool lossless = false, bool exact = true)
+        internal static void EncodeWithConfigToStream(Stream stream, ReadOnlySpan<byte> pixels, int width, int height, int stride, bool hasAlpha, float quality, int method = 3, bool lossless = false, bool exact = true,
+            int filterType = -1, int filterStrength = -1, int filterSharpness = -1, int partitions = -1,
+            int alphaCompression = -1, int alphaFiltering = -1, int preprocessing = -1)
         {
             WebPConfig config = default;
             WebPPicture picture = default;
@@ -178,7 +197,8 @@ namespace SharpImageConverter.Tests.Helpers
             WebPWriterState? state = null;
             try
             {
-                InitConfig(ref config, quality, method, lossless, exact);
+                InitConfig(ref config, quality, method, lossless, exact,
+                    filterType, filterStrength, filterSharpness, partitions, alphaCompression, alphaFiltering, preprocessing);
                 InitPicture(ref picture);
                 picture.width = width;
                 picture.height = height;
