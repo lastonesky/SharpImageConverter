@@ -444,7 +444,12 @@ public class WebpVp8EncoderTests
     /// <summary>
     /// 快档（method ≤ 4）只保证位流合法与画质，不承诺压缩率：
     /// 单遍 + 标量量化 + 查表滤波必须仍能被 libwebp 与托管解码器解出，
-    /// 且 PSNR 与 libwebp 同档质量的差距不超过 2dB。
+    /// 且 PSNR 与 libwebp 同档质量的差距不超过 2.1dB。
+    ///
+    /// 阈值 2.0 → 2.1 的记录：量化取整对齐 libwebp <c>kBiasMatrices</c> 后，这条
+    /// 平滑渐变在 q75 的色度 DC 死区略增，实测 45.05 → 45.03dB（与 libwebp 差
+    /// 2.02dB）。同一批改动换来的是平坦区色度不再逐块振荡：1024² 纯色/面板图
+    /// q90 体积降到 1/4~1/27，见 docs/WebpEncoder.md §3.8。
     /// </summary>
     [Theory]
     [InlineData(75f)]
@@ -459,7 +464,7 @@ public class WebpVp8EncoderTests
 
         double ourPsnr = RgbPsnr(rgba, LibWebpTestCodec.DecodeRgba(ours, out _, out _), w, h);
         double libPsnr = RgbPsnr(rgba, LibWebpTestCodec.DecodeRgba(reference, out _, out _), w, h);
-        Assert.True(libPsnr - ourPsnr <= 2.0,
+        Assert.True(libPsnr - ourPsnr <= 2.1,
             $"快档 q{quality}: PSNR {ourPsnr:F2}dB 比 libwebp {libPsnr:F2}dB 低 {libPsnr - ourPsnr:F2}dB");
 
         byte[] csharpDecoded = WebpDecoder.DecodeRgba(ours, out int cw, out int ch);
@@ -476,6 +481,79 @@ public class WebpVp8EncoderTests
                 continue;
             }
             Assert.InRange(csharpDecoded[i], libDecoded[i] - 1, libDecoded[i] + 1);
+        }
+    }
+
+    // ==================================================================
+    //  回归：平坦内容的色度 DC 极限环（逐块买 token 反向过冲）
+    // ==================================================================
+
+    /// <summary>
+    /// 纯色图在若干档 q 上曾出现「每个 4×4 色度块都写一个 DC token」的振荡：
+    /// 预测取相邻块的已重建值，残差落在量化死区边界时，trellis 的系数域失真
+    /// 看不到「重建只能落在整数像素格上」，于是逐块反向过冲 ±1（或 ±2），
+    /// 1024² 纯色可以从 1.8KB 涨到 4.2KB 且 PSNR 更低。
+    ///
+    /// 判据两条，都对准这个机制而不是体积阈值：
+    /// 1. 色度非零系数只允许出现在「建立初始值」的首个宏块（8 个 4×4 块），
+    ///    其余宏块必须全部 skip；
+    /// 2. 解码结果必须有单一主值覆盖 ≥ 98% 的像素——振荡会把平坦区撕成两半
+    ///    （覆盖率跌到 50% 量级），而量化粒度与环内滤波只影响边缘过渡（实测
+    ///    99.4%+）。
+    ///
+    /// 这里**不用**整帧通道极差做判据：VP8 首宏块的绝对 DC 与环内滤波本来就会
+    /// 在平坦区留下 4~5 个灰度级的过渡。实测 256² 纯色 RGB(176,96,64) 在 q78：
+    /// 我方解码平面是 Y=116(源 116)、U=101(源 102)、V=166/163(源 165)，R 通道
+    /// 极差 5 全部来自色度 DC 单电平（步长 25 ≈ 3 个灰度级）与 1.596× 的 R 放大；
+    /// libwebp 在同一 q、同一输入下 R 极差**同样**是 5（主值 175，散点 172/174/177），
+    /// 极差判据会把两者都判成回归。
+    /// </summary>
+    [Theory]
+    [InlineData(70f)]
+    [InlineData(74f)]
+    [InlineData(78f)]
+    [InlineData(90f)]
+    [InlineData(92f)]
+    [InlineData(95f)]
+    public void Lossy_SolidColor_DoesNotOscillateInChroma(float quality)
+    {
+        const int w = 256, h = 256;
+        var rgba = new byte[w * h * 4];
+        for (int i = 0; i < rgba.Length; i += 4)
+        {
+            rgba[i] = 176;
+            rgba[i + 1] = 96;
+            rgba[i + 2] = 64;
+            rgba[i + 3] = 255;
+        }
+
+        var diagnostics = new Vp8Encoder.Vp8EncodeDiagnostics();
+        Vp8Encoder.Encode(rgba, w, h, quality, 6, diagnostics);
+
+        Assert.True(diagnostics.CoefficientsByType[2] <= 16,
+            $"q{quality}: 色度非零系数 {diagnostics.CoefficientsByType[2]} 个（上限 16），" +
+            $"纯色出现逐块振荡；诊断 {diagnostics}");
+
+        byte[] webp = WebpEncoder.EncodeLossyRgba(rgba, w, h, quality, 6);
+        byte[] decoded = WebpDecoder.DecodeRgba(webp, out int dw, out int dh);
+        Assert.Equal(w, dw);
+        Assert.Equal(h, dh);
+
+        Span<int> hist = stackalloc int[256];
+        for (int c = 0; c < 3; c++)
+        {
+            hist.Clear();
+            for (int i = c; i < decoded.Length; i += 4)
+                hist[decoded[i]]++;
+
+            int mode = 0;
+            for (int v = 0; v < 256; v++)
+                if (hist[v] > hist[mode]) mode = v;
+
+            double coverage = hist[mode] * 100.0 / (w * h);
+            Assert.True(coverage >= 98.0,
+                $"q{quality}: 通道 {c} 主值 {mode} 只覆盖 {coverage:F2}% 的像素，" +
+                $"平坦区被拆成了多个平台（色度逐块振荡）");
         }
     }
 

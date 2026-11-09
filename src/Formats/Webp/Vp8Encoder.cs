@@ -161,6 +161,15 @@ internal sealed class Vp8Encoder
     private long _skipCount;
     private long _mbCount;
 
+    /// <summary>块内 AC（光栅序 1..15）是否全零。</summary>
+    private static bool IsAcZero(ReadOnlySpan<int> coeffs)
+    {
+        for (int i = 1; i < 16; i++)
+            if (coeffs[i] != 0)
+                return false;
+        return true;
+    }
+
     /// <summary>当前生效的 token 概率表（第一遍为默认表，第二遍为统计更新后的表）。</summary>
     private byte[,,,] _probs;
 
@@ -283,6 +292,76 @@ internal sealed class Vp8Encoder
 
 
 
+    /// <summary>
+    /// 编码统计快照。仅用于诊断与探针（不影响位流），每遍 <see cref="ResetForPass"/> 清零。
+    /// 排查「同一张图在某档 q 上体积异常放大」这类问题时必须先看这里：
+    /// i4x4 占比、skip 占比、非零系数总量三者能直接区分「模式决策跑偏」与「量化跑偏」。
+    /// </summary>
+    internal sealed class Vp8EncodeDiagnostics
+    {
+        /// <summary>实际使用的 q index（0..127）。</summary>
+        public int BaseQ;
+
+        /// <summary>本帧生效的环内滤波基准强度。</summary>
+        public int FilterLevel;
+
+        /// <summary>参与编码的宏块数。</summary>
+        public int MacroBlocks;
+
+        /// <summary>走 i4x4（B_PRED）的宏块数。</summary>
+        public int I4MacroBlocks;
+
+        /// <summary>整块 skip 的宏块数。</summary>
+        public int SkipMacroBlocks;
+
+        /// <summary>各段的宏块数（关闭分段时全部计入段 0）。</summary>
+        public readonly int[] SegmentCounts = new int[4];
+
+        /// <summary>写进 token 分区的非零系数总个数。</summary>
+        public long Coefficients;
+
+        /// <summary>按系数类型分桶的非零系数个数：0=Y1、1=Y2、2=UV。</summary>
+        public readonly long[] CoefficientsByType = new long[4];
+
+        /// <summary>UV 块非零系数的扫描位置直方图（0=DC）。诊断「色度到底花在哪」。</summary>
+        public readonly long[] UvPositionHistogram = new long[16];
+
+        /// <summary>色度源平面与重建平面的平均绝对误差（1/1000 单位）。诊断偏色/漂移用。</summary>
+        public int UvMeanAbsErrorX1000;
+
+        /// <summary>亮度源平面与重建平面的平均绝对误差（1/1000 单位）。</summary>
+        public int YMeanAbsErrorX1000;
+
+        /// <summary>partition0 字节数。</summary>
+        public int Partition0Bytes;
+
+        /// <summary>token 分区字节数。</summary>
+        public int TokenBytes;
+
+        public void Reset()
+        {
+            MacroBlocks = 0;
+            I4MacroBlocks = 0;
+            SkipMacroBlocks = 0;
+            Array.Clear(SegmentCounts);
+            Coefficients = 0;
+            Array.Clear(CoefficientsByType);
+            Array.Clear(UvPositionHistogram);
+            YMeanAbsErrorX1000 = 0;
+            UvMeanAbsErrorX1000 = 0;
+            Partition0Bytes = 0;
+            TokenBytes = 0;
+        }
+
+        public override string ToString() =>
+            $"q={BaseQ} lf={FilterLevel} mb={MacroBlocks} i4={I4MacroBlocks} skip={SkipMacroBlocks} " +
+            $"seg=[{SegmentCounts[0]},{SegmentCounts[1]},{SegmentCounts[2]},{SegmentCounts[3]}] " +
+            $"coef={Coefficients} part0={Partition0Bytes} tokens={TokenBytes}";
+    }
+
+    /// <summary>本实例最近一遍的统计快照（诊断用）。</summary>
+    internal Vp8EncodeDiagnostics Diagnostics { get; } = new();
+
     /// <summary>i4x4 试排后的亮度重建块备份（16×16，按行 16 字节）。</summary>
     private readonly byte[] _i4ReconBak = new byte[16 * 16];
     private readonly int[] _i4QuantBak = new int[256];
@@ -354,6 +433,15 @@ internal sealed class Vp8Encoder
     /// <param name="height">高度，1..16383。</param>
     /// <param name="quality">0..100 的质量参数，单调映射为内部 q index。</param>
     internal static byte[] Encode(ReadOnlySpan<byte> rgba, int width, int height, float quality, int method = 4)
+        => Encode(rgba, width, height, quality, method, diagnostics: null);
+
+    /// <summary>
+    /// <see cref="Encode(ReadOnlySpan{byte}, int, int, float, int)"/> 的诊断重载：
+    /// 编码结束后把最后一编的统计快照（i4/skip 占比、各段宏块数、非零系数数、分区字节数）
+    /// 复制到 <paramref name="diagnostics"/>。快照不影响位流。
+    /// </summary>
+    internal static byte[] Encode(ReadOnlySpan<byte> rgba, int width, int height, float quality, int method,
+        Vp8EncodeDiagnostics? diagnostics)
     {
         if (width <= 0 || width > MaxDimension)
             throw new ArgumentOutOfRangeException(nameof(width), width,
@@ -365,57 +453,85 @@ internal sealed class Vp8Encoder
             throw new ArgumentException("RGBA 数据长度与宽高不匹配", nameof(rgba));
 
         var encoder = new Vp8Encoder(rgba, width, height, QualityToQIndex(quality), fast: method <= 4);
+        try
+        {
+            return encoder.EncodeFrame(method);
+        }
+        finally
+        {
+            if (diagnostics != null)
+            {
+                var src = encoder.Diagnostics;
+                diagnostics.BaseQ = src.BaseQ;
+                diagnostics.FilterLevel = src.FilterLevel;
+                diagnostics.MacroBlocks = src.MacroBlocks;
+                diagnostics.I4MacroBlocks = src.I4MacroBlocks;
+                diagnostics.SkipMacroBlocks = src.SkipMacroBlocks;
+                Array.Copy(src.SegmentCounts, diagnostics.SegmentCounts, 4);
+                diagnostics.Coefficients = src.Coefficients;
+                Array.Copy(src.CoefficientsByType, diagnostics.CoefficientsByType, 4);
+                Array.Copy(src.UvPositionHistogram, diagnostics.UvPositionHistogram, 16);
+                diagnostics.YMeanAbsErrorX1000 = src.YMeanAbsErrorX1000;
+                diagnostics.UvMeanAbsErrorX1000 = src.UvMeanAbsErrorX1000;
+                diagnostics.Partition0Bytes = src.Partition0Bytes;
+                diagnostics.TokenBytes = src.TokenBytes;
+            }
+        }
+    }
 
-        if (encoder._fast)
+    /// <summary>按 effort 档位跑完所有编码遍，返回帧载荷。</summary>
+    private byte[] EncodeFrame(int method)
+    {
+        if (_fast)
         {
             // 快档只跑一遍：用默认 token 概率表直接写位流（RFC 6386 允许关键帧
             // 不更新概率表，帧头 1056 个更新项全部写 0 即可），省掉统计遍与重放遍
             // 各一次整帧重建。滤波强度在构造时按 q 查表决定，不做事后评分。
-            encoder.Configure(useSegmentation: true, allowI4: true);
-            encoder.ResetForPass(encoder._probs, statsOnly: false);
-            encoder._abortOnPartition0Overflow = true;
-            byte[] fastFrame = encoder.Run(assemble: true);
-            if (!encoder._probeAborted && encoder._part0.Length <= Partition0BudgetBytes)
+            Configure(useSegmentation: true, allowI4: true);
+            ResetForPass(_probs, statsOnly: false);
+            _abortOnPartition0Overflow = true;
+            byte[] fastFrame = Run(assemble: true);
+            if (!_probeAborted && _part0.Length <= Partition0BudgetBytes)
                 return fastFrame;
 
             // partition0 确定超预算：改用「关闭分段 + 强制 16×16」的降级配置重跑一遍。
-            encoder.Configure(useSegmentation: false, allowI4: false);
-            encoder.ResetForPass(CopyDefaultProbs(), statsOnly: false);
-            encoder._abortOnPartition0Overflow = false;
-            return encoder.Run(assemble: true);
+            Configure(useSegmentation: false, allowI4: false);
+            ResetForPass(CopyDefaultProbs(), statsOnly: false);
+            _abortOnPartition0Overflow = false;
+            return Run(assemble: true);
         }
 
         // 默认配置：第一遍统计后检查 partition0 长度，超预算则降级重跑（见类注释）。
-        encoder.Configure(useSegmentation: true, allowI4: true);
-        encoder.ResetForPass(encoder._probs, statsOnly: true);
+        Configure(useSegmentation: true, allowI4: true);
+        ResetForPass(_probs, statsOnly: true);
         // 超大图的默认配置会撑爆 partition0 时，探测遍一旦确定超 19 位上限就提前收手，避免白跑整遍。
-        encoder._abortOnPartition0Overflow = true;
-        encoder.Run(assemble: false);
-        encoder._abortOnPartition0Overflow = false;
+        _abortOnPartition0Overflow = true;
+        Run(assemble: false);
+        _abortOnPartition0Overflow = false;
 
-        if (encoder._probeAborted || encoder._part0.Length > Partition0BudgetBytes)
+        if (_probeAborted || _part0.Length > Partition0BudgetBytes)
         {
             // 降级配置（关闭分段 + 强制 16×16）每宏块 partition0 开销有内容无关的硬上界
             // （skip ≤1 + i4x4 判定 ≤1.2 + 亮度模式树 ≤4 + 色度模式树 ≤3 ≈ 9 bit），
             // 但实际取值随内容波动大，直接用第一遍实测裁决，不做保守预筛——
             // 只有极端尺寸（约 16000×16000 以上）才会白跑一遍。
-            encoder.Configure(useSegmentation: false, allowI4: false);
-            encoder.ResetForPass(encoder._probs, statsOnly: true);
-            encoder.Run(assemble: false);
+            Configure(useSegmentation: false, allowI4: false);
+            ResetForPass(_probs, statsOnly: true);
+            Run(assemble: false);
 
-            if (encoder._part0.Length > Partition0BudgetBytes)
-                throw Partition0Overflow(width, height, encoder._part0.Length);
+            if (_part0.Length > Partition0BudgetBytes)
+                throw Partition0Overflow(_width, _height, _part0.Length);
         }
 
         // skip 概率按第一遍的实际分布自适应，两遍都生效。
-        encoder.AdaptSkipProb();
+        AdaptSkipProb();
 
         // 环内滤波强度：用第一遍已建好的重建帧做候选强度实测选择。
-        encoder.SelectFilterLevel();
+        SelectFilterLevel();
 
         // 第二遍：用本帧统计得到的概率写位流，并重放第一遍的模式决策。
-        encoder.ResetForPass(encoder.AdaptProbabilities(), statsOnly: false);
-        return encoder.Run(assemble: true);
+        ResetForPass(AdaptProbabilities(), statsOnly: false);
+        return Run(assemble: true);
     }
 
     /// <summary>partition0 即使在降级配置下仍超 19 位上限时给出可操作的错误说明。</summary>
@@ -459,8 +575,11 @@ internal sealed class Vp8Encoder
             int segmentQ = Math.Clamp(_baseQ + delta, 0, 127);
             _y1Dc[segment] = Vp8Tables.DcQuantTable[segmentQ];
             _y1Ac[segment] = Vp8Tables.AcQuantTable[segmentQ];
+            // Y2 的两级量化步长都翻倍：WHT 输出比 4×4 DCT 大一号（见 Vp8Tables.Y2AcQuantTable）。
+            // DC 正好是 ×2；AC 不是——它走 libwebp 的 kAcTable2 独立曲线（历史实现用
+            // AcQuantTable×1.55 加 Max(8,…) 拟合，实测 128 个下标逐项等价，只是多了个魔数）。
             _y2Dc[segment] = _y1Dc[segment] * 2;
-            _y2Ac[segment] = Math.Max(8, (Vp8Tables.AcQuantTable[segmentQ] * 101581) >> 16);
+            _y2Ac[segment] = Vp8Tables.Y2AcQuantTable[segmentQ];
             _uvDc[segment] = Vp8Tables.DcQuantTable[Math.Clamp(segmentQ + UvDcDeltaQ, 0, 117)];
             _uvAc[segment] = Vp8Tables.AcQuantTable[Math.Clamp(segmentQ + UvAcDeltaQ, 0, 127)];
         }
@@ -524,6 +643,7 @@ internal sealed class Vp8Encoder
     {
         _probs = probs;
         BuildNodeCosts();
+        Diagnostics.Reset();
         _statsOnly = statsOnly;
         _recordDecisions = statsOnly;
         _replayDecisions = !statsOnly && _decisionsValid;
@@ -633,8 +753,49 @@ internal sealed class Vp8Encoder
 
         byte[] part0 = _part0.Finish();
         byte[] tokens = _tokens.Finish();
+        if (!_statsOnly)
+            MeasureReconError();
+        Diagnostics.BaseQ = _baseQ;
+        Diagnostics.FilterLevel = _filterLevel;
+        Diagnostics.Partition0Bytes = part0.Length;
+        Diagnostics.TokenBytes = tokens.Length;
         // 快档单遍若因 partition0 超预算提前中断，产物是不完整的残帧，直接丢弃重跑。
         return assemble && !_probeAborted ? AssembleFrame(part0, tokens) : part0;
+    }
+
+    /// <summary>
+    /// 采样重建平面相对源平面的平均绝对误差（亮度、色度 U/V 合并），写进诊断快照。
+    /// 色度误差是「色度漂移」类问题的第一手指标：量化步长正常时它应随 q 单调增长，
+    /// 若在某档 q 上突然从 ~0.1 跳到 ~1，说明残差被系统性偏差占满（预测/舍入不一致），
+    /// 而不是量化变粗。
+    /// </summary>
+    private void MeasureReconError()
+    {
+        long yErr = 0, uvErr = 0;
+        long yCount = 0, uvCount = 0;
+        for (int y = 0; y < _height; y++)
+        {
+            int row = (Pad + y) * _strideY + Pad;
+            int src = y * _width;
+            for (int x = 0; x < _width; x++)
+            {
+                yErr += Math.Abs(_reconY[row + x] - _srcY[src + x]);
+            }
+            yCount += _width;
+        }
+        for (int y = 0; y < _ch; y++)
+        {
+            int row = (Pad + y) * _strideUv + Pad;
+            int src = y * _cw;
+            for (int x = 0; x < _cw; x++)
+            {
+                uvErr += Math.Abs(_reconU[row + x] - _srcU[src + x]);
+                uvErr += Math.Abs(_reconV[row + x] - _srcV[src + x]);
+            }
+            uvCount += _cw;
+        }
+        Diagnostics.YMeanAbsErrorX1000 = yCount == 0 ? 0 : (int)(yErr * 1000 / yCount);
+        Diagnostics.UvMeanAbsErrorX1000 = uvCount == 0 ? 0 : (int)(uvErr * 1000 / (uvCount * 2));
     }
 
     /// <summary>
@@ -1000,6 +1161,7 @@ internal sealed class Vp8Encoder
 
         if (_recordDecisions)
             RecordDecision(mbX, mbY, useI4, yMode, uvMode);
+        CountMacroblock(useI4, skip);
 
         WriteMacroblockModes(mbX, useI4, yMode, uvMode, skip);
         if (skip)
@@ -1020,6 +1182,16 @@ internal sealed class Vp8Encoder
         {
             WriteResidualTokens(mbX);
         }
+    }
+
+    /// <summary>累计单个宏块的诊断计数（<see cref="Diagnostics"/>）。</summary>
+    private void CountMacroblock(bool useI4, bool skip)
+    {
+        var d = Diagnostics;
+        d.MacroBlocks++;
+        if (useI4) d.I4MacroBlocks++;
+        if (skip) d.SkipMacroBlocks++;
+        d.SegmentCounts[_currentSegment]++;
     }
 
     /// <summary>记录第一遍的模式决策，供第二遍重放（<see cref="_i4Modes"/> 仍是 i4x4 的胜者）。</summary>
@@ -1066,6 +1238,7 @@ internal sealed class Vp8Encoder
         }
 
         bool skip = !(_anyCoefficient || chromaAny);
+        CountMacroblock(useI4, skip);
 
         WriteMacroblockModes(mbX, useI4, yMode, uvMode, skip);
         if (skip)
@@ -1416,7 +1589,7 @@ internal sealed class Vp8Encoder
         else
         {
             last = QuantizeBlockScalar(_blockCoef, _lumaQuant.AsSpan(dst, 16), _lumaSlots.AsSpan(dst, 16),
-                first: 0, dcStep: _y1Dc[seg], acStep: _y1Ac[seg]);
+                first: 0, type: 3, dcStep: _y1Dc[seg], acStep: _y1Ac[seg]);
         }
 
         bool any = last >= 0;
@@ -1608,7 +1781,7 @@ internal sealed class Vp8Encoder
         int seg = _currentSegment;
         int y2Ctx = _mbNzDc[mbX] + _leftNzDc;
         int lastY2 = _fast
-            ? QuantizeBlockScalar(_y2Coef, _y2Quant, _y2Dequant, first: 0,
+            ? QuantizeBlockScalar(_y2Coef, _y2Quant, _y2Dequant, first: 0, type: 1,
                 dcStep: _y2Dc[seg], acStep: _y2Ac[seg])
             : Vp8Trellis.Quantize(
                 _y2Coef, _y2Quant, _y2Dequant,
@@ -1648,7 +1821,7 @@ internal sealed class Vp8Encoder
                 int bctx = l + (tnz & 1);
                 int last = _fast
                     ? QuantizeBlockScalar(_lumaCoef.AsSpan(dst, 16), _lumaQuant.AsSpan(dst, 16),
-                        _lumaSlots.AsSpan(dst, 16), first: 1,
+                        _lumaSlots.AsSpan(dst, 16), first: 1, type: 0,
                         dcStep: _y1Dc[seg], acStep: _y1Ac[seg])
                     : Vp8Trellis.Quantize(
                         _lumaCoef.AsSpan(dst, 16), _lumaQuant.AsSpan(dst, 16), _lumaSlots.AsSpan(dst, 16),
@@ -1699,9 +1872,14 @@ internal sealed class Vp8Encoder
                     Vp8ForwardTransform.Dct4x4(_residual, _blockCoef);
 
                     int bctx = l + (tnz & 1);
-                    int last = _fast
+                    // 纯 DC 块（AC 全零）不走 trellis：色度 DC 预测在平坦区会形成
+                    // ±1 的残差极限环，trellis 的系数域失真看不穿「重建只能落在
+                    // 整数像素格上」这件事，会逐块买一个 token 反向过冲（libwebp 干脆
+                    // 对 UV 完全关掉 trellis，见 DO_TRELLIS_UV 0）。有 AC 的块仍走 trellis。
+                    bool flatBlock = IsAcZero(_blockCoef);
+                    int last = _fast || flatBlock
                         ? QuantizeBlockScalar(_blockCoef, _uvQuant.AsSpan(index * 16, 16),
-                            _uvSlots.AsSpan(index * 16, 16), first: 0,
+                            _uvSlots.AsSpan(index * 16, 16), first: 0, type: 2,
                             dcStep: _uvDc[seg], acStep: _uvAc[seg])
                         : Vp8Trellis.Quantize(
                             _blockCoef, _uvQuant.AsSpan(index * 16, 16), _uvSlots.AsSpan(index * 16, 16),
@@ -1952,6 +2130,19 @@ internal sealed class Vp8Encoder
             }
         }
 
+        // 诊断：只统计真正写进 token 分区的那一遍（成本试探实例与统计遍都不计）。
+        if (ReferenceEquals(bw, _tokens) && last >= first)
+        {
+            Diagnostics.Coefficients += last - first + 1;
+            Diagnostics.CoefficientsByType[type] += last - first + 1;
+            if (type == 2)
+            {
+                for (int i = first; i <= last; i++)
+                    if (scan[i] != 0)
+                        Diagnostics.UvPositionHistogram[i]++;
+            }
+        }
+
         int n = first;
         int band = bands[n];
         int curCtx = ctx;
@@ -2113,48 +2304,52 @@ internal sealed class Vp8Encoder
     // ==================================================================
 
     /// <summary>
-    /// 对齐 libwebp src/dsp/quant.h 的定点倒数思路：把逐系数整数除法换成
-    /// 64 位乘法 + 一次校正。recip = ceil(2^32/dq) 时 (m*recip)&gt;&gt;32 只可能等于
-    /// floor(m/dq) 或 floor(m/dq)+1，校正后与原式逐位等价（输出不变）。
-    /// 每块只做 2 次除法求倒数，替代原来的 16 次系数除法。
-    /// </summary>
-    private static uint DivisionReciprocal(int dq)
-    {
-        uint d = (uint)dq;
-        ulong quotient = 0x1_0000_0000UL / d;
-        return (uint)quotient + (0x1_0000_0000UL % d == 0 ? 0u : 1u);
-    }
-
-    private static int Quantize(int coefficient, int dq, uint recip)
-    {
-        if (coefficient == 0)
-            return 0;
-
-        int magnitude = coefficient < 0 ? -coefficient : coefficient;
-        ulong m = (ulong)magnitude + (uint)(dq >> 1);
-        uint q = (uint)((m * recip) >> 32);
-        if ((ulong)q * (uint)dq > m) q--;             // ceil 倒数带来的 +1
-        else if ((ulong)(q + 1) * (uint)dq <= m) q++; // 对称保护（正常不会触发）
-        int quantized = (int)Math.Min(q, (uint)MaxCoefficient);
-        return coefficient < 0 ? -quantized : quantized;
-    }
-
-    /// <summary>
     /// 快档用的标量量化，替代 RD trellis。输出布局与 <see cref="Vp8Trellis.Quantize"/>
     /// 完全相同（levels 扫描序、slots 光栅序），因此 token 写出与重建路径无需分叉。
     /// <paramref name="first"/> 为 1 时（Y1 AC）不触碰光栅序 0，该位置由 Y2 的 DC 分发填充。
     /// </summary>
     private static int QuantizeBlockScalar(ReadOnlySpan<int> coefficients, Span<int> levels,
-        Span<short> slots, int first, int dcStep, int acStep)
+        Span<short> slots, int first, int type, int dcStep, int acStep)
     {
-        uint dcRecip = DivisionReciprocal(dcStep);
-        uint acRecip = DivisionReciprocal(acStep);
+        int dcIq = Vp8Quant.DivisionInverse(dcStep);
+        int acIq = Vp8Quant.DivisionInverse(acStep);
+        // 偏置只与（系数类型, 是否 DC）有关，提到循环外：16 次数组访问 → 2 次。
+        int biasDc = Vp8Quant.BiasOf(type, 0);
+        int biasAc = Vp8Quant.BiasOf(type, 1);
         int last = -1;
         for (int n = first; n < 16; n++)
         {
             int raster = Vp8Tables.Zigzag[n];
-            int dq = n == 0 ? dcStep : acStep;
-            int q = Quantize(coefficients[raster], dq, n == 0 ? dcRecip : acRecip);
+            bool isDc = n == 0;
+            int dq = isDc ? dcStep : acStep;
+            int coefficient = coefficients[raster];
+            // 亮度 AC 先按频率抬高幅值（libwebp 的 kFreqSharpening），再带偏置量化。
+            int sharpen = Vp8Quant.Sharpen(type, n, dq);
+            if (sharpen != 0 && coefficient != 0)
+                coefficient += coefficient < 0 ? -sharpen : sharpen;
+
+            int q = Vp8Quant.Quantize(coefficient, isDc ? dcIq : acIq, isDc ? biasDc : biasAc);
+
+            // DC 电平按真实重建量择优（见 Vp8Quant.DcRecon）：量化步长与 IDCT 的
+            // 「>> 3 + 4」舍入不是同一粒度，纯按系数比取整会在平坦区过冲并振荡。
+            // Y2 的 DC 走 WHT 分发，重建映射不同，不做这一步。
+            //
+            // 最优电平必落在「不带偏置的最近两格」之内：DcRecon 随电平单调不减，
+            // 单个电平至少挪 dq/8 ≥ 0.5 个灰度级（dq ≥ 4），所以失真随电平先降后升，
+            // 只需比较 floor(|c|/dq) 与 floor(|c|/dq)+1（同符号）两个候选——不必展开
+            // 「q±1」的循环，热路径上省掉一次不可预测的分支。
+            if (isDc && type != 1)
+            {
+                int magnitude = coefficient < 0 ? -coefficient : coefficient;
+                // 失真按带符号的真实重建量算（(dc + 4) >> 3 正负不对称，取绝对值会差 1 格）。
+                int step = coefficient < 0 ? -1 : 1;
+                int lower = step * (int)((uint)magnitude * (uint)dcIq >> Vp8Quant.QFix);
+                int upper = lower + step;
+                long lowerErr = Vp8Quant.DcPixelError(coefficient, lower, dq);
+                long upperErr = Vp8Quant.DcPixelError(coefficient, upper, dq);
+                q = upperErr < lowerErr ? upper : lower;
+            }
+
             levels[n] = q;
             slots[raster] = (short)(q * dq);
             if (q != 0)

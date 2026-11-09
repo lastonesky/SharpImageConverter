@@ -70,6 +70,9 @@ internal static class Vp8Trellis
         Span<int> dq = stackalloc int[16];
         for (int n = 0; n < 16; n++)
             dq[n] = n == 0 ? dcStep : acStep;
+        // 量化用的是 libwebp 的定点倒数（QUANTDIV），与标量路径同一口径。
+        int dcIq = Vp8Quant.DivisionInverse(dcStep);
+        int acIq = Vp8Quant.DivisionInverse(acStep);
 
         Span<int> coef = stackalloc int[16];
         for (int n = 0; n < 16; n++)
@@ -117,7 +120,8 @@ internal static class Vp8Trellis
 
             // 候选电平及其位成本/量化误差只依赖 (coef[n], dq[n], band)，与状态无关：
             // 提到状态循环外各算一次（原实现在每个状态里重复 BuildCandidates 与 NonZeroCost）。
-            int candidateCount = BuildCandidates(coef[n], dq[n], scratch.Candidates);
+            int candidateCount = BuildCandidates(coef[n], n == 0 ? dcIq : acIq,
+                Vp8Quant.BiasOf(type, n), scratch.Candidates);
             long zeroDist = (long)distortionWeight * coef[n] * coef[n] * 65536L;
             for (int c = 0; c < candidateCount; c++)
             {
@@ -128,7 +132,12 @@ internal static class Vp8Trellis
                     diffSq[c] = 0;
                     continue;
                 }
-                long diff = coef[n] - level * dq[n];
+                // DC 位置用真实重建量折算（见 Vp8Quant.DcRecon）：电平 1 并不等于
+                // 一个量化步的像素偏移，按系数域线性比较会在平坦区选出过冲的电平。
+                long recon = n == 0 && type != 1
+                    ? (long)Vp8Quant.DcRecon(level, dq[n]) << 3
+                    : (long)level * dq[n];
+                long diff = coef[n] - recon;
                 diffSq[c] = (long)distortionWeight * diff * diff * 65536L;
                 for (int g = 0; g < 3; g++)
                     nzCost[c * 3 + g] = NonZeroCost(nodeCosts, type, band, g, level);
@@ -244,14 +253,14 @@ internal static class Vp8Trellis
     }
 
     /// <summary>按四舍五入给出最近电平，并在其邻域生成候选。</summary>
-    private static int BuildCandidates(int coefficient, int step, int[] candidates)
+    private static int BuildCandidates(int coefficient, int iq, int bias, int[] candidates)
     {
         int count = 0;
         candidates[count++] = 0;
         if (coefficient == 0)
             return count;
 
-        int q = Vp8EncoderQuantize(coefficient, step);
+        int q = QuantizeWithBias(coefficient, iq, bias);
         AddCandidate(candidates, ref count, q);
         AddCandidate(candidates, ref count, q - 1);
         AddCandidate(candidates, ref count, q + 1);
@@ -273,11 +282,15 @@ internal static class Vp8Trellis
             candidates[count++] = level;
     }
 
-    private static int Vp8EncoderQuantize(int coefficient, int dq)
+    /// <summary>
+    /// 候选电平的基准值：与 <see cref="Vp8Quant.Quantize"/> 同一取整口径（含类型偏置），
+    /// 保证 trellis 的候选集合始终包含标量量化的结果。
+    /// </summary>
+    private static int QuantizeWithBias(int coefficient, int iq, int bias)
     {
         if (coefficient == 0) return 0;
-        int magnitude = coefficient < 0 ? -coefficient : coefficient;
-        int quantized = (magnitude + (dq >> 1)) / dq;
+        uint magnitude = (uint)(coefficient < 0 ? -coefficient : coefficient);
+        int quantized = (int)((magnitude * (uint)iq + ((uint)bias << (Vp8Quant.QFix - 8))) >> Vp8Quant.QFix);
         if (quantized > MaxCoefficient) quantized = MaxCoefficient;
         return coefficient < 0 ? -quantized : quantized;
     }
