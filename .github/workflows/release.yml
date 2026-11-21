@@ -29,8 +29,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # 三个平台都在原生 runner 上构建：win/linux 的原生库按宿主 OS 选择即可正确，
-        # osx-arm64 还必须用 install_name_tool 修 @rpath 并做 ad-hoc 签名（见 tools/build-cli.sh）。
+        # 三个平台都在原生 runner 上构建；osx-arm64 的 ad-hoc 签名必须在 macOS 上
+        # 执行（见 tools/build-cli.sh）。编解码全部为纯托管代码，不携带原生库。
         include:
           - os: windows-latest
             rid: win-x64
@@ -70,15 +70,8 @@ jobs:
           [ -n "$bin" ] || { echo "::error::未找到可执行文件"; exit 1; }
           file "$bin"
 
-          if [ "$RUNNER_OS" = "macOS" ]; then
-            # macOS 走目录式发布：确认修好的 @rpath 依赖副本确实在二进制旁边
-            d=$(dirname "$bin")
-            ls "$d" | grep -q 'libwebp\.7\.dylib' || { echo "::error::缺少 libwebp.7.dylib"; exit 1; }
-            ls "$d" | grep -q 'libsharpyuv\.0\.dylib' || { echo "::error::缺少 libsharpyuv.0.dylib"; exit 1; }
-          fi
-
-          "$bin" examples/car.png "$work/a.webp"          # 编码：走原生 libwebp
-          "$bin" "$work/a.webp" "$work/b.png"             # 解码：走原生 libwebpdecoder
+          "$bin" examples/car.png "$work/a.webp"          # 编码：纯托管 WebP 编码器
+          "$bin" "$work/a.webp" "$work/b.png"             # 解码：纯托管 WebP 解码器
           "$bin" examples/car.png "$work/c.jpg" --quality 85
           for f in a.webp b.png c.jpg; do
             if [ ! -s "$work/$f" ]; then

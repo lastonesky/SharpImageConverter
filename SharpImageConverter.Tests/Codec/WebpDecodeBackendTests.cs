@@ -12,7 +12,7 @@ namespace SharpImageConverter.Tests.Codec;
 /// （<see cref="WebpDecoder.DecodeRgbaInto(ReadOnlySpan{byte}, Span{byte}, out int, out int)}）的回归测试。
 ///
 /// 覆盖：
-/// - Auto 与 CSharp 都走纯 C# 托管解码，并与 libwebp 黑盒对拍；
+/// - Auto 与 CSharp 都走纯 C# 托管解码；
 /// - 动图不进入单图解码入口，Auto/CSharp 统一抛 <see cref="WebpUnsupportedException"/>；
 /// - DecodeRgbaInto 与 DecodeRgba 逐字节一致，且不越界写调用方缓冲区。
 /// </summary>
@@ -68,28 +68,6 @@ public class WebpDecodeBackendTests
     // ==================================================================
     //  后端分派
     // ==================================================================
-
-    [Fact]
-    public void Auto_Lossless_UsesCSharp_AndMatchesLibWebp()
-    {
-        var (rgba, w, h) = SampleImage(48, 40, seed: 4);
-        byte[] webp = EncodeLossless(rgba, w, h);
-
-        byte[] expected = LibWebpTestCodec.DecodeRgba(webp, out _, out _);
-
-        int aw = 0, ah = 0;
-        byte[] actual = WithBackend(WebpDecodeBackend.Auto, () =>
-        {
-            var px = DecodeViaAdapter(webp, out int w2, out int h2);
-            aw = w2;
-            ah = h2;
-            return px;
-        });
-
-        Assert.Equal(w, aw);
-        Assert.Equal(h, ah);
-        Assert.Equal(expected, actual);
-    }
 
     [Fact]
     public void Auto_Lossy_UsesCSharpBackend()

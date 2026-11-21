@@ -12,15 +12,13 @@
 #   SHA256SUMS.txt
 #
 # 自 1.3.0 起改为**依赖框架**发布（--self-contained false）：自包含运行时体积太大，
-# 使用者需自行安装 .NET 10 运行时。win/linux 仍是单文件（托管程序集打进 exe，
-# 原生 libwebp 以 IncludeNativeLibrariesForSelfExtract 内嵌、运行时自解压到临时目录），
+# 使用者需自行安装 .NET 10 运行时。win/linux 仍是单文件（托管程序集打进 exe），
 # 资产形态与自包含版相同，只是体积大幅缩小。
 #
-# 平台差异（仍然成立）：
-# - macOS 的 webp dylib 带着构建机的 @rpath 与版本化依赖名（@rpath/libsharpyuv.0.dylib 等），
-#   别的机器上解析不了依赖。修复必须用 macOS 的 install_name_tool 在发布目录里改，因此
-#   macOS 走**目录式**发布（原生库散落在可执行文件旁），并补 @loader_path rpath、
-#   按依赖名提供副本、再做 ad-hoc 签名。⇒ osx-arm64 必须在 macOS 上构建（CI 用 macos-15）。
+# 编解码实现全部为纯托管代码（WebP 为纯 C# 编解码器），发布不携带任何原生库，
+# 无需 install_name_tool / @rpath 修复。macOS 仍走目录式发布并做 ad-hoc 签名：
+# arm64 上可执行文件必须有签名，签名动作必须在 macOS 上执行。
+# ⇒ osx-arm64 必须在 macOS 上构建（CI 用 macos-15）。
 #
 # 版本号取自 src/SharpImageConverter.csproj 的 <Version>，因此必须先改版本号再执行本脚本。
 # CI 侧对应 .github/workflows/release.yml。
@@ -53,23 +51,11 @@ sha256() {
   fi
 }
 
-# 修好 macOS 原生库的依赖解析（见文件头说明）
-fix_macos_native_libs() {
+# macOS 发布目录做 ad-hoc 签名（见文件头说明）
+sign_macos_app() {
   local dir="$1"
   cd "$dir"
-  local f
-  for f in libwebp.dylib libwebpdecoder.dylib libwebpmux.dylib libwebpdemux.dylib libsharpyuv.dylib; do
-    [ -f "$f" ] || continue
-    install_name_tool -add_rpath @loader_path "$f" 2>/dev/null || true
-  done
-  # 依赖声明用的是版本化名字（@rpath/libwebp.7.dylib 等），按这些名字提供副本
-  cp -f libwebp.dylib        libwebp.7.dylib
-  cp -f libsharpyuv.dylib    libsharpyuv.0.dylib
-  cp -f libwebpdecoder.dylib libwebpdecoder.3.dylib
-  cp -f libwebpmux.dylib     libwebpmux.3.dylib
-  cp -f libwebpdemux.dylib   libwebpdemux.2.dylib
-  # arm64 上所有可执行代码都必须有签名（ad-hoc 即可），否则 dlopen 会失败
-  for f in ./*.dylib; do codesign --force --sign - "$f" >/dev/null 2>&1 || true; done
+  # arm64 上可执行代码必须有签名（ad-hoc 即可），否则无法运行
   codesign --force --sign - ./SharpImageConverter.Cli >/dev/null 2>&1 || true
   cd - >/dev/null
 }
@@ -91,7 +77,7 @@ for RID in "${RIDS[@]}"; do
   esac
 
   if [ "$RID" = "osx-arm64" ] && [ "$(uname -s)" != "Darwin" ]; then
-    echo "错误：osx-arm64 必须在 macOS 上构建（原生库依赖需要用 install_name_tool 修复）" >&2
+    echo "错误：osx-arm64 必须在 macOS 上构建（ad-hoc 签名必须在 macOS 上执行）" >&2
     exit 1
   fi
 
@@ -107,7 +93,7 @@ for RID in "${RIDS[@]}"; do
       -p:DebugType=none \
       -p:GenerateDocumentationFile=false \
       -o "$STAGE/$NAME" >/dev/null
-    fix_macos_native_libs "$STAGE/$NAME"
+    sign_macos_app "$STAGE/$NAME"
     # shellcheck disable=SC2086
     tar $TAR_EXTRA -czf "$OUT/$NAME.tar.gz" -C "$STAGE" "$NAME"
   else
