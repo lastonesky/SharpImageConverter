@@ -485,6 +485,39 @@ namespace SharpImageConverter.Tests
             }
         }
 
+        [Fact]
+        public void CheckPlain_OversizePixels_PrefersStreamingOnlyWhenTargetSupportsIt()
+        {
+            string png = NewTemp(".png");
+            try
+            {
+                // 只写签名 + IHDR：内存预检只需要文件头，不需要可解码的像素数据。
+                byte[] header =
+                [
+                    0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A,
+                    0x00, 0x00, 0x00, 0x0D,
+                    (byte)'I', (byte)'H', (byte)'D', (byte)'R',
+                    0x00, 0x00, 0x9C, 0x40, 0x00, 0x00, 0x61, 0xA8, // 40000×25000
+                    0x08, 0x02, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x00, 0x00
+                ];
+                File.WriteAllBytes(png, header);
+
+                // 预算给足，但 10 亿像素超出单幅解码上限（≈7.15 亿 RGB）：应选流式而不是放行整幅解码。
+                var streaming = MemoryGuard.CheckPlain(ImageFormatKind.Png, ImageFormatKind.Png, png, long.MaxValue / 4);
+                Assert.Equal(MemoryGuard.Action.UseStreaming, streaming.Action);
+
+                // 目标不支持逐行编码（WebP 需要整幅输入）：必须直接拒绝，而不是先挑流式再失败。
+                var refused = MemoryGuard.CheckPlain(ImageFormatKind.Png, ImageFormatKind.Webp, png, long.MaxValue / 4);
+                Assert.Equal(MemoryGuard.Action.Refuse, refused.Action);
+                Assert.Contains("超出单幅解码上限", refused.Reason);
+            }
+            finally
+            {
+                if (File.Exists(png)) File.Delete(png);
+            }
+        }
+
         private static byte[] MinimalGif(int w, int h)
         {
             using var ms = new MemoryStream();

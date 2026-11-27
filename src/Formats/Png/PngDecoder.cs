@@ -105,6 +105,12 @@ public class PngDecoder
 
             if (type == TypeIDAT)
             {
+                if (ColorType == 3 && _palette == null)
+                {
+                    throw new InvalidDataException("PNG 调色板图像缺少 PLTE 块");
+                }
+                // 输出为 RGB24：按 3 B/px 校验，避免 W*H*3 溢出 int。
+                DecodeLimits.ValidatePixelCount("PNG", Width, Height, 3);
                 int idatLength = (int)length;
                 int expectedDecompressedSize = GetExpectedDecompressedSize();
                 byte[] decompressed = ArrayPool<byte>.Shared.Rent(expectedDecompressedSize);
@@ -123,68 +129,75 @@ public class PngDecoder
             byte[] data;
             byte[]? rented = null;
             int dataLength = (int)length;
-            if (dataLength > 0)
+            try
             {
-                if (type == TypeIHDR || type == TypePLTE || type == TypeTRNS || type == TypeEXIF || type == TypeICCP || type == TypeSRGB)
+                if (dataLength > 0)
                 {
-                    data = new byte[dataLength];
+                    if (type == TypeIHDR || type == TypePLTE || type == TypeTRNS || type == TypeEXIF || type == TypeICCP || type == TypeSRGB)
+                    {
+                        data = new byte[dataLength];
+                    }
+                    else
+                    {
+                        rented = ArrayPool<byte>.Shared.Rent(dataLength);
+                        data = rented;
+                    }
+                    ReadExact(stream, data, 0, dataLength);
                 }
                 else
                 {
-                    rented = ArrayPool<byte>.Shared.Rent(dataLength);
-                    data = rented;
+                    data = Array.Empty<byte>();
                 }
-                ReadExact(stream, data, 0, dataLength);
-            }
-            else
-            {
-                data = Array.Empty<byte>();
-            }
 
-            ReadExact(stream, crcBytes, 0, 4);
-            if (ValidateChunkCrc)
-            {
-                uint fileCrc = ReadBigEndianUint32(crcBytes, 0);
-                uint calcCrc = Crc32.Compute(typeBytes);
-                if (dataLength > 0) calcCrc = Crc32.Update(calcCrc, data, 0, dataLength);
-                if (calcCrc != fileCrc)
+                ReadExact(stream, crcBytes, 0, 4);
+                if (ValidateChunkCrc)
                 {
-                    string typeName = Encoding.ASCII.GetString(typeBytes);
-                    throw new InvalidDataException($"CRC mismatch in chunk {typeName}. Expected {fileCrc:X8}, got {calcCrc:X8}");
+                    uint fileCrc = ReadBigEndianUint32(crcBytes, 0);
+                    uint calcCrc = Crc32.Compute(typeBytes);
+                    if (dataLength > 0) calcCrc = Crc32.Update(calcCrc, data, 0, dataLength);
+                    if (calcCrc != fileCrc)
+                    {
+                        string typeName = Encoding.ASCII.GetString(typeBytes);
+                        throw new InvalidDataException($"CRC mismatch in chunk {typeName}. Expected {fileCrc:X8}, got {calcCrc:X8}");
+                    }
+                }
+
+                switch (type)
+                {
+                    case TypeIHDR:
+                        ParseIHDR(data);
+                        break;
+                    case TypePLTE:
+                        _palette = data;
+                        break;
+                    case TypeTRNS:
+                        _transparency = data;
+                        break;
+                    case TypeEXIF:
+                        ParseExifChunk(data);
+                        break;
+                    case TypeICCP:
+                        ParseIccpChunk(data);
+                        break;
+                    case TypeSRGB:
+                        ParseSrgbChunk();
+                        break;
+                    case TypeIEND:
+                        break;
+                    default:
+                        break;
                 }
             }
-
-            switch (type)
+            finally
             {
-                case TypeIHDR:
-                    ParseIHDR(data);
-                    break;
-                case TypePLTE:
-                    _palette = data;
-                    break;
-                case TypeTRNS:
-                    _transparency = data;
-                    break;
-                case TypeEXIF:
-                    ParseExifChunk(data);
-                    break;
-                case TypeICCP:
-                    ParseIccpChunk(data);
-                    break;
-                case TypeSRGB:
-                    ParseSrgbChunk();
-                    break;
-                case TypeIEND:
-                    break;
-                default:
-                    break;
+                // 未知/辅助 chunk 的读取缓冲来自 ArrayPool：CRC 校验失败或解析抛异常时也必须归还，
+                // 否则每个畸形文件都会从池里漏掉一块。
+                if (rented != null)
+                {
+                    ArrayPool<byte>.Shared.Return(rented);
+                }
             }
             if (type == TypeIEND) break;
-
-            if (rented != null)
-            {
-                ArrayPool<byte>.Shared.Return(rented);
-            }
         }
         throw new InvalidDataException("Missing IDAT chunk.");
     }
@@ -226,6 +239,12 @@ public class PngDecoder
 
             if (type == TypeIDAT)
             {
+                if (ColorType == 3 && _palette == null)
+                {
+                    throw new InvalidDataException("PNG 调色板图像缺少 PLTE 块");
+                }
+                // 输出为 RGBA32：按 4 B/px 校验，避免 W*H*4 溢出 int。
+                DecodeLimits.ValidatePixelCount("PNG", Width, Height, 4);
                 int idatLength = (int)length;
                 int expectedDecompressedSize = GetExpectedDecompressedSize();
                 byte[] decompressed = ArrayPool<byte>.Shared.Rent(expectedDecompressedSize);
@@ -360,7 +379,17 @@ public class PngDecoder
         }
 
         public override int Read(byte[] buffer, int offset, int count)
+            => ReadCore(buffer.AsSpan(offset, count));
+
+        /// <summary>
+        /// 直接读入 <see cref="Span{T}"/>。基类的默认实现会先租一个临时数组再整块拷贝，
+        /// 而 IDAT 解压是「每 32 KB 读一次」的热路径，重写后省掉每次读的一次分配 + 一次 memcpy。
+        /// </summary>
+        public override int Read(Span<byte> buffer) => ReadCore(buffer);
+
+        private int ReadCore(Span<byte> buffer)
         {
+            if (buffer.Length == 0) return 0;
             if (_done) return 0;
             if (_remaining == 0)
             {
@@ -368,11 +397,11 @@ public class PngDecoder
                 if (_done) return 0;
             }
 
-            int toRead = count;
+            int toRead = buffer.Length;
             if (toRead > _remaining) toRead = _remaining;
-            int read = _stream.Read(buffer, offset, toRead);
+            int read = _stream.Read(buffer[..toRead]);
             if (read == 0) throw new InvalidDataException("Unexpected EOF");
-            if (_validateCrc) _crc = Crc32.Update(_crc, buffer, offset, read);
+            if (_validateCrc) _crc = Crc32.Update(_crc, buffer[..read]);
             _remaining -= read;
             if (_remaining == 0)
             {
@@ -512,13 +541,16 @@ public class PngDecoder
     private int GetExpectedDecompressedSize()
     {
         int bitsPerPixel = GetBitsPerPixel();
-        if (Width <= 0 || Height <= 0) return 0;
+        if (Width <= 0 || Height <= 0)
+        {
+            throw new InvalidDataException($"PNG 尺寸无效：{Width}×{Height}");
+        }
 
         if (InterlaceMethod == 0)
         {
-            long stride = ((long)Width * bitsPerPixel + 7) / 8;
+            long stride = GetStrideBytes(Width, bitsPerPixel);
             long total = (stride + 1) * Height;
-            if ((ulong)total > int.MaxValue) return 0;
+            DecodeLimits.ValidateBufferBytes("PNG", total, "解压后扫描线");
             return (int)total;
         }
 
@@ -532,17 +564,33 @@ public class PngDecoder
             int passW = (Width - startX[pass] + stepX[pass] - 1) / stepX[pass];
             int passH = (Height - startY[pass] + stepY[pass] - 1) / stepY[pass];
             if (passW <= 0 || passH <= 0) continue;
-            long stride = ((long)passW * bitsPerPixel + 7) / 8;
+            long stride = GetStrideBytes(passW, bitsPerPixel);
             sum += (stride + 1) * passH;
-            if ((ulong)sum > int.MaxValue) return 0;
+            DecodeLimits.ValidateBufferBytes("PNG", sum, "解压后扫描线");
         }
         return (int)sum;
     }
 
+    /// <summary>一行的字节数（含行尾不足 8 位的补齐）。宽度很大时 int 乘法会溢出，故用 long 计算。</summary>
+    private static long GetStrideBytes(int width, int bitsPerPixel)
+        => ((long)width * bitsPerPixel + 7) / 8;
+
     private void ParseIHDR(byte[] data)
     {
-        Width = (int)ReadBigEndianUint32(data, 0);
-        Height = (int)ReadBigEndianUint32(data, 4);
+        // IHDR 的 chunk 长度完全由文件声明，长度不足时下面的定长读取会越界。
+        if (data.Length < 13)
+        {
+            throw new InvalidDataException($"PNG IHDR 长度不足：{data.Length} 字节（至少 13 字节）");
+        }
+
+        uint rawWidth = ReadBigEndianUint32(data, 0);
+        uint rawHeight = ReadBigEndianUint32(data, 4);
+        if (rawWidth == 0 || rawHeight == 0 || rawWidth > int.MaxValue || rawHeight > int.MaxValue)
+        {
+            throw new InvalidDataException($"PNG 尺寸无效：{rawWidth}×{rawHeight}");
+        }
+        Width = (int)rawWidth;
+        Height = (int)rawHeight;
         BitDepth = data[8];
         ColorType = data[9];
         CompressionMethod = data[10];
@@ -552,6 +600,22 @@ public class PngDecoder
         if (CompressionMethod != 0) throw new NotSupportedException("Unknown compression method");
         if (FilterMethod != 0) throw new NotSupportedException("Unknown filter method");
         if (InterlaceMethod > 1) throw new NotSupportedException("Unknown interlace method");
+
+        // 规范只允许这 5 种颜色类型与对应的位深组合；其余组合没有解码路径。
+        bool validDepth = ColorType switch
+        {
+            0 => BitDepth is 1 or 2 or 4 or 8 or 16,
+            2 => BitDepth is 8 or 16,
+            3 => BitDepth is 1 or 2 or 4 or 8,
+            4 => BitDepth is 8 or 16,
+            6 => BitDepth is 8 or 16,
+            _ => false,
+        };
+        if (!validDepth)
+        {
+            throw new InvalidDataException(
+                $"PNG 位深/颜色类型组合不受支持：bitDepth={BitDepth}，colorType={ColorType}");
+        }
     }
 
     private byte[] ProcessImage(ReadOnlySpan<byte> rawData)
@@ -618,7 +682,7 @@ public class PngDecoder
             if (passW == 0 || passH == 0) continue;
 
             // Calculate raw size for this pass
-            int stride = (passW * GetBitsPerPixel() + 7) / 8;
+            int stride = (int)GetStrideBytes(passW, GetBitsPerPixel());
             int passSize = (stride + 1) * passH; // +1 for filter byte
 
             ReadOnlySpan<byte> passData = rawData.Slice(dataOffset, passSize);
@@ -646,7 +710,7 @@ public class PngDecoder
             int passW = (Width - startX[pass] + stepX[pass] - 1) / stepX[pass];
             int passH = (Height - startY[pass] + stepY[pass] - 1) / stepY[pass];
             if (passW == 0 || passH == 0) continue;
-            int stride = (passW * GetBitsPerPixel() + 7) / 8;
+            int stride = (int)GetStrideBytes(passW, GetBitsPerPixel());
             int passSize = (stride + 1) * passH;
             ReadOnlySpan<byte> passData = rawData.Slice(dataOffset, passSize);
             dataOffset += passSize;
@@ -672,7 +736,7 @@ public class PngDecoder
 
     private byte[] ProcessPass(ReadOnlySpan<byte> rawData, int w, int h, int bpp)
     {
-        int stride = (w * GetBitsPerPixel() + 7) / 8;
+        int stride = (int)GetStrideBytes(w, GetBitsPerPixel());
 
         if (ColorType == 2 && BitDepth == 8)
         {
@@ -696,7 +760,7 @@ public class PngDecoder
 
     private byte[] ProcessPassRgba(ReadOnlySpan<byte> rawData, int w, int h, int bpp)
     {
-        int stride = (w * GetBitsPerPixel() + 7) / 8;
+        int stride = (int)GetStrideBytes(w, GetBitsPerPixel());
 
         if (ColorType == 6 && BitDepth == 8)
         {

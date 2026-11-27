@@ -106,6 +106,7 @@ public class GifEncoder
                 $"GIF 单帧编码只接受 RGB24，当前为 {image.PixelFormat}；请先调用 ToRgb24()。",
                 nameof(image));
         }
+        ValidateDimensions(image.Width, image.Height);
 
         var timing = BeginTiming(image.Width * image.Height, 1);
         long t0 = Now(timing);
@@ -118,6 +119,18 @@ public class GifEncoder
             timing.Label = "rgb24";
         }
         FinishTiming(timing);
+    }
+
+    /// <summary>
+    /// GIF 的逻辑屏幕与帧矩形都是 u16；超出会在写头时被截断，产出无法解码的文件。
+    /// </summary>
+    private static void ValidateDimensions(int width, int height)
+    {
+        if (width is <= 0 or > 65535 || height is <= 0 or > 65535)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(width), $"GIF 尺寸必须是 1..65535，当前 {width}×{height}");
+        }
     }
 
     /// <summary>
@@ -180,6 +193,15 @@ public class GifEncoder
 
     public void EncodeRgba(int width, int height, byte[] rgba, Stream stream)
     {
+        ValidateDimensions(width, height);
+        long expected = (long)width * height * 4;
+        if (rgba.Length != expected)
+        {
+            throw new ArgumentException(
+                $"RGBA 缓冲区长度 {rgba.Length} 与尺寸 {width}×{height} 不匹配（应为 {expected}）。",
+                nameof(rgba));
+        }
+
         var timing = BeginTiming(width * height, 1);
         long t0 = Now(timing);
 

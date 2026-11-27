@@ -396,6 +396,34 @@ public static class JpegEncoder
         ArrayPool<SampledMcuRef>.Shared.Return(batch.Items);
     }
 
+    /// <summary>
+    /// 将已闭合的批次送入队列；Enqueue 因取消抛异常时由本方法归还批次，
+    /// 避免与调用方 catch 重复归还同一个 ArrayPool 数组。
+    /// </summary>
+    /// <param name="freeLast">生产循环里最后一个 MCU 由调用方 catch 释放；Flush 时批次已闭合，全部由这里释放。</param>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static void EnqueueBatchWithCleanup(
+        PipeQueue<McuBatch> output,
+        McuBatch batch,
+        CancellationToken token,
+        bool freeLast)
+    {
+        try
+        {
+            output.Enqueue(batch, token);
+        }
+        catch
+        {
+            int count = batch.Count - (freeLast ? 1 : 0);
+            for (int i = 0; i < count; i++)
+            {
+                batch.Items[i].Free();
+            }
+            ReturnMcuBatch(batch);
+            throw;
+        }
+    }
+
     private static void EnqueueSampledMcu(
         PipeQueue<McuBatch> output,
         ref McuBatch? currentBatch,
@@ -407,8 +435,9 @@ public static class JpegEncoder
         currentBatch.Items[currentBatch.Count++] = mcu;
         if (currentBatch.Count == batchSize)
         {
-            output.Enqueue(currentBatch, token);
+            McuBatch full = currentBatch;
             currentBatch = null;
+            EnqueueBatchWithCleanup(output, full, token, freeLast: true);
         }
     }
 
@@ -416,8 +445,9 @@ public static class JpegEncoder
     {
         if (currentBatch != null && currentBatch.Count > 0)
         {
-            output.Enqueue(currentBatch, token);
+            McuBatch batch = currentBatch;
             currentBatch = null;
+            EnqueueBatchWithCleanup(output, batch, token, freeLast: false);
         }
     }
 

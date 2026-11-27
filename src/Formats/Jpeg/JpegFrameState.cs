@@ -218,6 +218,15 @@ internal sealed partial class JpegFrameState
 
         ushort height = (ushort)((segment[1] << 8) | segment[2]);
         ushort width = (ushort)((segment[3] << 8) | segment[4]);
+        if (width == 0 || height == 0)
+        {
+            ThrowHelper.ThrowInvalidData($"Invalid JPEG dimensions: {width}×{height}.");
+        }
+
+        // 解码输出是 RGB24（3 B/px）：像素数与输出缓冲都必须落在单个数组的 int 索引范围内。
+        // 缺少这道校验时，大尺寸灰度图会先分配上 GB 的系数缓冲，再在 new byte[w*h*3] 处溢出。
+        DecodeLimits.ValidatePixelCount("JPEG", width, height, 3);
+
         byte count = segment[5];
         if (count <= 0 || count > 4)
         {

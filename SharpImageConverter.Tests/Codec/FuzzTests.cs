@@ -51,5 +51,24 @@ namespace SharpImageConverter.Tests
 
             AssertMutatedInputsFailOnlyWithInvalidData(data, 5678, mutated => _ = JpegDecoder.Decode(mutated));
         }
+
+        [Fact]
+        public void Fuzz_Mutated_Gif_Inputs_FailOnlyWithInvalidData()
+        {
+            var img = TestImageFactory.CreateGradient(32, 32);
+            using var ms = new MemoryStream();
+            new GifEncoder().Encode(new ImageFrame(img.Width, img.Height, img.Buffer), ms);
+            byte[] data = ms.ToArray();
+
+            AssertMutatedInputsFailOnlyWithInvalidData(
+                data,
+                9012,
+                mutated =>
+                {
+                    using var s = new MemoryStream(mutated);
+                    _ = new GifDecoder().DecodeRgb24(s);
+                },
+                allowTruncation: true);
+        }
     }
 }

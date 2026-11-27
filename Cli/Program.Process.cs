@@ -187,9 +187,9 @@ sealed partial class Program
                     && StreamingConversion.IsSupported(source, target, options.InputPath))
                 {
                     options.ForceStreaming = true;
-                    Console.WriteLine(
-                        $"🧠 预计峰值 {verdict.EstimateBytes / 1048576.0:F1} MB，超过预算 " +
-                        $"{verdict.BudgetBytes / 1048576.0:F1} MB；已切换到逐行流式转换（{source} → {target}）。");
+                    // 注意：Verdict.EstimateBytes 此时是“流式路径”的估算值，不能与非流式预算直接比较；
+                    // Reason 里已是「非流式估算 vs 预算 + 流式估算」的完整口径。
+                    Console.WriteLine($"🧠 {verdict.Reason} 已切换到逐行流式转换（{source} → {target}）。");
                     return;
                 }
                 if (source == ImageFormatKind.Jpeg)
@@ -526,8 +526,8 @@ sealed partial class Program
 
         if (outExt == ".webp")
         {
-            WebpAnimationEncoder.EncodeRgba32(outputPath, frames, durations, loop,
-                new WebpEncoderOptions(quality, WebpConcurrencyStrategy.Auto, lossless: options.WebpLossless));
+            AtomicFile.Write(outputPath, fs => WebpAnimationEncoder.EncodeRgba32(fs, frames, durations, loop,
+                new WebpEncoderOptions(quality, WebpConcurrencyStrategy.Auto, lossless: options.WebpLossless)));
             reporter.Info($"✅ WebP 动图: {frames.Count} 帧 {frames[0].Width}x{frames[0].Height}，循环 {loop} 次");
             return;
         }
@@ -581,8 +581,8 @@ sealed partial class Program
         int loop = anim.LoopCount;
         float qWebp = options.WebpQuality ?? 75f;
         // 必须走 RGBA 路径：GIF 的透明索引只存在于 alpha 通道，走 Rgb24 会把透明背景变成不透明。
-        WebpAnimationEncoder.EncodeRgba32(outputPath, anim.RgbaFrames!, anim.FrameDurationsMs, loop,
-            new WebpEncoderOptions(qWebp, WebpConcurrencyStrategy.Auto, lossless: options.WebpLossless));
+        AtomicFile.Write(outputPath, fs => WebpAnimationEncoder.EncodeRgba32(fs, anim.RgbaFrames!, anim.FrameDurationsMs, loop,
+            new WebpEncoderOptions(qWebp, WebpConcurrencyStrategy.Auto, lossless: options.WebpLossless)));
     }
     static void ProcessGifToWebpWithOps(CliOptions options)
     {
@@ -598,8 +598,8 @@ sealed partial class Program
         }
 
         float qWebpOps = options.WebpQuality ?? 75f;
-        WebpAnimationEncoder.EncodeRgba32(outputPath, processed, anim.FrameDurationsMs, anim.LoopCount,
-            new WebpEncoderOptions(qWebpOps, WebpConcurrencyStrategy.Auto, lossless: options.WebpLossless));
+        AtomicFile.Write(outputPath, fs => WebpAnimationEncoder.EncodeRgba32(fs, processed, anim.FrameDurationsMs, anim.LoopCount,
+            new WebpEncoderOptions(qWebpOps, WebpConcurrencyStrategy.Auto, lossless: options.WebpLossless)));
     }
 
     /// <summary>

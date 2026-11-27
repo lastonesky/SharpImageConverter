@@ -212,9 +212,12 @@ namespace SharpImageConverter.Formats.Gif
             byte[] gct = new byte[768];
             if (hasGct) ReadExact(stream, gct, 0, gctColors * 3);
 
-            int pixelCount = width * height;
+            // 逻辑屏幕宽高各为 u16，乘积最大约 43 亿，int 会溢出成负数。
+            // 整幅解码要一次性分配画布，因此这里按输出字节数直接拒绝过大的 GIF。
             bool rgbaMode = ctx.Mode is DecodeMode.Rgba32 or DecodeMode.AnimationRgba;
             int components = rgbaMode ? 4 : 3;
+            DecodeLimits.ValidatePixelCount("GIF", width, height, components);
+            int pixelCount = width * height;
             byte[] canvas = new byte[pixelCount * components];
 
             if (timing is not null)
@@ -305,50 +308,66 @@ namespace SharpImageConverter.Formats.Gif
                     int palCount = hasLct ? lctColors : gctColors;
 
                     int lzwMin = stream.ReadByte();
-                    byte[] indices = pool.Rent(iw * ih);
+                    // 帧矩形同样是 u16×u16：乘积会溢出 int，且直接决定索引缓冲的分配量。
+                    long framePixelsLong = (long)iw * ih;
+                    if (framePixelsLong > DecodeLimits.MaxPixels)
+                    {
+                        throw new InvalidDataException(
+                            $"GIF 帧尺寸 {iw}×{ih}（{framePixelsLong:N0} 像素）超出单幅解码上限 {DecodeLimits.MaxPixels:N0} 像素");
+                    }
+                    int framePixels = (int)framePixelsLong;
+                    byte[] indices = pool.Rent(framePixels);
                     long tl0 = Now(timing);
-                    lzwDecoder.Decode(indices.AsSpan(0, iw * ih), iw, ih, lzwMin, ctx.RequireComplete);
-                    long tl1 = Now(timing);
-
-                    long tb0 = Now(timing);
-                    bool opaqueFullCover = !interlace && transIndex < 0 &&
-                        ix == 0 && iy == 0 && iw == width && ih == height &&
-                        AllIndicesInRange(indices, iw * ih, palCount);
-
-                    if (!canvasReady)
+                    long tr1;
+                    try
                     {
-                        if (hasBgColor && !opaqueFullCover)
+                        lzwDecoder.Decode(indices.AsSpan(0, framePixels), iw, ih, lzwMin, ctx.RequireComplete);
+                        long tl1 = Now(timing);
+
+                        long tb0 = Now(timing);
+                        bool opaqueFullCover = !interlace && transIndex < 0 &&
+                            ix == 0 && iy == 0 && iw == width && ih == height &&
+                            AllIndicesInRange(indices, framePixels, palCount);
+
+                        if (!canvasReady)
                         {
-                            FillBackground(canvas, components, bgR, bgG, bgB);
+                            if (hasBgColor && !opaqueFullCover)
+                            {
+                                FillBackground(canvas, components, bgR, bgG, bgB);
+                            }
+                            canvasReady = true;
+
+                            // 只在首帧判定一次：此后的帧只会局部覆盖画布，被写入的像素 alpha 一律 255。
+                            //   - opaqueFullCover：整幅画布都被本帧覆盖；
+                            //   - hasBgColor：先整幅填了背景色（同样带 alpha=255）。
+                            // 两者皆不满足时存在「从未被写入」的像素，RGBA 下其 alpha 保持初始值 0；
+                            // 而 transIndex >= 0 时本帧可能写出 alpha=0。这两种情况都不断言全不透明。
+                            ctx.FirstFrameFullyOpaque = transIndex < 0 && (opaqueFullCover || hasBgColor);
                         }
-                        canvasReady = true;
+                        long tb1 = Now(timing);
 
-                        // 只在首帧判定一次：此后的帧只会局部覆盖画布，被写入的像素 alpha 一律 255。
-                        //   - opaqueFullCover：整幅画布都被本帧覆盖；
-                        //   - hasBgColor：先整幅填了背景色（同样带 alpha=255）。
-                        // 两者皆不满足时存在「从未被写入」的像素，RGBA 下其 alpha 保持初始值 0；
-                        // 而 transIndex >= 0 时本帧可能写出 alpha=0。这两种情况都不断言全不透明。
-                        ctx.FirstFrameFullyOpaque = transIndex < 0 && (opaqueFullCover || hasBgColor);
+                        if (disposal == 3)
+                        {
+                            backBuffer ??= NativeBufferOwner<byte>.Allocate(canvas.Length);
+                            canvas.AsSpan().CopyTo(backBuffer.Span);
+                        }
+                        long tb2 = Now(timing);
+
+                        RenderFrame(canvas, indices, width, height, ix, iy, iw, ih, interlace, transIndex, palette, palCount, rgbaMode, opaqueFullCover,
+                            compositeTransparent: ctx.Mode == DecodeMode.AnimationRgba);
+                        tr1 = Now(timing);
+
+                        if (timing is not null)
+                        {
+                            timing.LzwTicks += tl1 - tl0;
+                            timing.BackgroundTicks += (tb1 - tb0) + (tb2 - tb1);
+                            timing.RenderTicks += tr1 - tb2;
+                        }
                     }
-                    long tb1 = Now(timing);
-
-                    if (disposal == 3)
+                    finally
                     {
-                        backBuffer ??= NativeBufferOwner<byte>.Allocate(canvas.Length);
-                        canvas.AsSpan().CopyTo(backBuffer.Span);
-                    }
-                    long tb2 = Now(timing);
-
-                    RenderFrame(canvas, indices, width, height, ix, iy, iw, ih, interlace, transIndex, palette, palCount, rgbaMode, opaqueFullCover,
-                        compositeTransparent: ctx.Mode == DecodeMode.AnimationRgba);
-                    long tr1 = Now(timing);
-                    pool.Return(indices);
-
-                    if (timing is not null)
-                    {
-                        timing.LzwTicks += tl1 - tl0;
-                        timing.BackgroundTicks += (tb1 - tb0) + (tb2 - tb1);
-                        timing.RenderTicks += tr1 - tb2;
+                        // 索引缓冲来自 ArrayPool：LZW 抛异常（畸形数据）时也必须归还。
+                        pool.Return(indices);
                     }
 
                     if (ctx.Mode == DecodeMode.Rgba32)

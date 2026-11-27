@@ -10,6 +10,9 @@ namespace SharpImageConverter.Formats.Gif
 {
     internal sealed class LzwDecoder(Stream stream) : IDisposable
     {
+        /// <summary>GIF LZW 码表容量上限（12 位码）。</summary>
+        private const int MaxCodeTableSize = 4096;
+
         private readonly Stream _stream = stream;
         private readonly byte[] _blockBuffer = new byte[256];
         private int _blockLength;
@@ -36,6 +39,14 @@ namespace SharpImageConverter.Formats.Gif
         /// </param>
         public void Decode(Span<byte> pixels, int width, int height, int dataSize, bool requireComplete = false)
         {
+            // GIF 规范要求最小码长 2..8（少数编码器写 1，同样有确定含义，保留可解码）。
+            // 超出范围时 clearCode / codeSize 失去意义：例如 12 会取到 12 位码，
+            // 直接越过 4096 项的 prefix/suffix 码表。
+            if (dataSize is < 1 or > 8)
+            {
+                throw new InvalidDataException($"GIF LZW 最小码长无效：{dataSize}（合法范围 1..8）");
+            }
+
             Span<int> prefix = _prefix.Span;
             Span<byte> suffix = _suffix.Span;
             Span<byte> pixelStack = _pixelStack.Span;
@@ -145,8 +156,15 @@ namespace SharpImageConverter.Formats.Gif
                     {
                         // Output is OldString + OldString[0]
                         int temp = oldCode;
+                        // 码表链在合法数据上一定递减到 < clearCode；加环上界，避免畸形码表
+                        // 让 temp 在 prefix 链里无限打转。
+                        int guard = 0;
                         while (temp >= clearCode)
                         {
+                            if ((uint)temp >= MaxCodeTableSize || ++guard > MaxCodeTableSize)
+                            {
+                                throw new InvalidDataException("GIF LZW 码表链异常（存在环或长度超出 4096）");
+                            }
                             temp = prefix[temp];
                         }
                         firstChar = temp;
@@ -157,10 +175,18 @@ namespace SharpImageConverter.Formats.Gif
                     // Expand code into pixel stack
                     while (code >= clearCode)
                     {
+                        if ((uint)code >= MaxCodeTableSize || top >= pixelStack.Length)
+                        {
+                            throw new InvalidDataException("GIF LZW 码表链异常（存在环或长度超出 4096）");
+                        }
                         pixelStack[top++] = suffix[code];
                         code = prefix[code];
                     }
                     firstChar = code;
+                    if (top >= pixelStack.Length)
+                    {
+                        throw new InvalidDataException("GIF LZW 码表链异常（存在环或长度超出 4096）");
+                    }
                     pixelStack[top++] = (byte)firstChar;
 
                     // Add new code to table if possible

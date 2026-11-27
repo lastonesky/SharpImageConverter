@@ -46,9 +46,37 @@ namespace SharpImageConverter.Processing
             bool jpegProgressive = false,
             bool useFloatingPointIdct = false)
         {
-            string? dir = Path.GetDirectoryName(outputPath);
+            string fullPath = Path.GetFullPath(outputPath);
+            string? dir = Path.GetDirectoryName(fullPath);
             if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
 
+            // 逐行编码在中途失败（截断输入、取消）时不能留下半截目标文件：
+            // 先写同目录临时文件，成功后再原子替换。
+            string tempPath = Path.Combine(
+                string.IsNullOrEmpty(dir) ? "." : dir,
+                $".{Path.GetFileName(fullPath)}.{Guid.NewGuid():N}.tmp");
+            try
+            {
+                ConvertCore(inputPath, tempPath, target, gray, jpegQuality, jpegSubsampling, jpegProgressive, useFloatingPointIdct);
+                File.Move(tempPath, fullPath, overwrite: true);
+            }
+            catch
+            {
+                try { File.Delete(tempPath); } catch (IOException) { } catch (UnauthorizedAccessException) { }
+                throw;
+            }
+        }
+
+        private static void ConvertCore(
+            string inputPath,
+            string outputPath,
+            ImageFormatKind target,
+            bool gray,
+            int jpegQuality,
+            JpegChromaSubsampling jpegSubsampling,
+            bool jpegProgressive,
+            bool useFloatingPointIdct)
+        {
             using IRowImageSource source = CreateSource(inputPath, useFloatingPointIdct);
             if (target == ImageFormatKind.Jpeg)
             {

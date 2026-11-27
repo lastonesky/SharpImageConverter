@@ -51,7 +51,8 @@ namespace SharpImageConverter.Tests
         /// IndexOutOfRangeException 这类**解析器自身缺陷**会被当成"健壮"而静默通过 —— 恰恰是 fuzz
         /// 最该抓的东西。这里收窄到受控异常，其余一律失败，并报告是第几个变异体。
         /// </remarks>
-        private static void AssertMutatedInputsFailOnlyWithInvalidData(byte[] original, int seed, Action<byte[]> decode)
+        private static void AssertMutatedInputsFailOnlyWithInvalidData(
+            byte[] original, int seed, Action<byte[]> decode, bool allowTruncation = false)
         {
             var rng = new Random(seed);
             var sw = Stopwatch.StartNew();
@@ -65,6 +66,10 @@ namespace SharpImageConverter.Tests
                 catch (InvalidDataException)
                 {
                     // 受控失败：格式层面拒绝即可
+                }
+                catch (EndOfStreamException) when (allowTruncation)
+                {
+                    // 受控失败：GIF/BMP 等解码器用 EndOfStreamException 表示「输入被截断」
                 }
                 catch (NotSupportedException)
                 {

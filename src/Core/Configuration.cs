@@ -266,8 +266,7 @@ namespace SharpImageConverter.Core
         {
             ArgumentNullException.ThrowIfNull(frame);
             ArgumentException.ThrowIfNullOrEmpty(path);
-            using var fs = new FileStream(path, FileMode.Create, FileAccess.Write);
-            Save(frame, fs, Path.GetExtension(path), options);
+            SaveFileCore(frame, path, Path.GetExtension(path), options);
         }
 
         /// <summary>
@@ -283,8 +282,19 @@ namespace SharpImageConverter.Core
         {
             ArgumentNullException.ThrowIfNull(frame);
             ArgumentException.ThrowIfNullOrEmpty(path);
-            using var fs = new FileStream(path, FileMode.Create, FileAccess.Write);
-            Save(frame, fs, extension, options);
+            SaveFileCore(frame, path, extension, options);
+        }
+
+        /// <summary>
+        /// 写文件的统一入口：先解析格式（失败时不创建文件），再写同目录临时文件并原子替换，
+        /// 这样编码中途失败不会留下 0 字节或半截的目标文件。
+        /// </summary>
+        private void SaveFileCore(ImageFrame frame, string path, string extension, SaveOptions? options)
+        {
+            // 必须在校验通过后才碰文件系统：此前是先 new FileStream 再校验扩展名，
+            // 不支持的扩展名会留下一个 0 字节文件。
+            Type formatType = ResolveFormatTypeOrThrow(extension);
+            AtomicFile.Write(path, fs => SaveCore(frame, fs, formatType, options));
         }
 
         /// <summary>
@@ -299,9 +309,14 @@ namespace SharpImageConverter.Core
         {
             ArgumentNullException.ThrowIfNull(frame);
             ArgumentNullException.ThrowIfNull(stream);
+            Type formatType = ResolveFormatTypeOrThrow(extension);
+            SaveCore(frame, stream, formatType, options);
+        }
+
+        private void SaveCore(ImageFrame frame, Stream stream, Type formatType, SaveOptions? options)
+        {
             options ??= EmptySaveOptions;
 
-            Type formatType = ResolveFormatTypeOrThrow(extension);
             if (HasAlpha(frame.PixelFormat) && _encodersRgba.TryGetValue(formatType, out var encoderRgba))
             {
                 encoderRgba.EncodeRgba32(stream, AsRgba32Image(frame.ToRgba32()), options);

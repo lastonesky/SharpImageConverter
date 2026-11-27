@@ -91,7 +91,13 @@ namespace SharpImageConverter.Compression
             long encode = EstimateEncodeWorkspaceBytes(target, pixels, frameCount);
             long estimate = decode + encode;
 
-            if (estimate <= budget)
+            // 整幅解码的输出至少 3 B/px：像素数超过单个数组的表示能力时，再充裕的 RAM 也放不下，
+            // 只能走逐行流式（若该组合支持），否则拒绝。否则内存预检会在「预算够」时误判放行，
+            // 随后解码器再抛出「超出单幅解码上限」。
+            long fullDecodePixelLimit = DecodeLimits.MaxBufferBytes / 3;
+            bool oversize = pixels > fullDecodePixelLimit;
+
+            if (!oversize && estimate <= budget)
             {
                 return new Verdict(Action.Ok, estimate, budget, string.Empty);
             }
@@ -103,9 +109,19 @@ namespace SharpImageConverter.Compression
                 if (source == ImageFormatKind.Jpeg) streamingEstimate += fileBytes;
                 if (streamingEstimate <= budget)
                 {
+                    string reason = oversize
+                        ? $"图像 {width}×{height}（{pixels:N0} 像素）超出单幅解码上限 {fullDecodePixelLimit:N0} 像素（整幅像素缓冲无法用单个数组表示）"
+                        : $"预计峰值 {Mb(estimate)} MB，超过预算 {Mb(budget)} MB";
                     return new Verdict(Action.UseStreaming, streamingEstimate, budget,
-                        $"预计峰值 {Mb(estimate)} MB，超过预算 {Mb(budget)} MB；可改用流式处理（预计 {Mb(streamingEstimate)} MB）");
+                        $"{reason}；可改用流式处理（预计 {Mb(streamingEstimate)} MB）");
                 }
+            }
+
+            if (oversize)
+            {
+                return new Verdict(Action.Refuse, estimate, budget,
+                    $"图像 {width}×{height}（{pixels:N0} 像素）超出单幅解码上限 {fullDecodePixelLimit:N0} 像素" +
+                    "（整幅像素缓冲无法用单个数组表示），且该源/目标组合不支持逐行处理；已拒绝处理。");
             }
 
             return new Verdict(Action.Refuse, estimate, budget,
@@ -133,6 +149,15 @@ namespace SharpImageConverter.Compression
             long pixels = (long)width * height;
             long budget = GetBudgetBytes(options.MemoryLimitBytes);
             long estimate = EstimateOptimizeBytes(source, pixels, frameCount, options) + TryGetFileLength(inputPath);
+
+            // optimize 需要整幅像素做候选搜索，没有流式降级路径：超出单幅解码上限时直接拒绝。
+            long fullDecodePixelLimit = DecodeLimits.MaxBufferBytes / 3;
+            if (pixels > fullDecodePixelLimit)
+            {
+                return new Verdict(Action.Refuse, estimate, budget,
+                    $"图像 {width}×{height}（{pixels:N0} 像素）超出单幅解码上限 {fullDecodePixelLimit:N0} 像素" +
+                    "（整幅像素缓冲无法用单个数组表示），optimize 无法逐行处理；已拒绝。");
+            }
 
             if (estimate <= budget)
             {
@@ -173,7 +198,6 @@ namespace SharpImageConverter.Compression
             bool jpegFusedRow = false)
         {
             long row = Math.Max(64, width) * 8L;
-            long frames = Math.Max(1, frameCount);
             long pixels = (long)width * height;
 
             long decode = source switch
@@ -199,7 +223,9 @@ namespace SharpImageConverter.Compression
                 ImageFormatKind.Gif => pixels * 4 + row + pixels * 4,
                 // JPEG 逐行编码只需要一个 MCU 行高的 RGB 窄带 + Huffman 状态。
                 ImageFormatKind.Jpeg => row * 2 + (256L << 10),
-                _ => EstimateEncodeWorkspaceBytes(target, pixels, (int)Math.Min(frames, int.MaxValue)),
+                // 目标不支持逐行编码（如 WebP 需要整幅输入）：给出不可能满足的估算，
+                // 让调用方落到 Refuse，而不是打印「可改用流式处理」后又被 IsSupported 拒绝。
+                _ => long.MaxValue / 4,
             };
 
             return decode + encode;

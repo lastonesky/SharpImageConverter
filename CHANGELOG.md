@@ -1,5 +1,29 @@
 ## 未发布
 
+### 健壮性：畸形输入不再外泄解析器内部异常；落盘原子化
+
+- **PNG**：IHDR 长度 < 13、位深/颜色类型组合非法、调色板图像缺 PLTE 均抛
+  `InvalidDataException`（此前短 IHDR 会读越界，抛 `IndexOutOfRangeException`）。
+  扫描线 stride 与非隔行解压尺寸改用 long 计算，溢出时明确报「超出单幅解码上限」，
+  不再返回 0 后报误导性的「Decompressed data exceeds destination size」。
+- **GIF**：逻辑屏幕与帧矩形的 `宽×高` 改用 long 校验（此前 60000×60000 溢出成负数，
+  抛 `ArgumentOutOfRangeException`）；LZW 最小码长限定 1..8，码表链增加环/长度上界，
+  畸形码流不可能再无限写 `pixelStack`。
+- **JPEG**：SOF 阶段按 RGB24 输出校验像素数，超限在分配系数缓冲之前拒绝
+  （此前超大灰度图会先申请数 GB 再在 `new byte[w*h*3]` 处溢出）。
+- **整幅解码统一上限**：`DecodeLimits`（≈5.36 亿 RGBA / 7.15 亿 RGB 像素，即单个数组的
+  int 索引能力），可用 `SIC_MAX_DECODE_PIXELS` 调低。更大的图像走逐行流式：CLI 内存预检
+  在像素数超出整幅上限时优先切换流式（目标支持时），不再「预算够」放行后由解码器报错；
+  目标不支持逐行（如 WebP 输出）时直接拒绝并说明原因。
+- **落盘原子化**：`Configuration.Save`、逐行流式转换与 CLI 的 GIF/WebP 直写路径统一改为
+  同目录临时文件 + `File.Move`，编码失败不再留下 0 字节或半截目标文件；
+  不支持的扩展名在创建文件之前就报错。
+- **资源**：PNG 辅助 chunk 缓冲与 GIF 索引缓冲在异常路径归还 `ArrayPool`；
+  JPEG 编码器取消路径修复同一 MCU 缓冲的双重归还。
+- **性能**：`IdatStream` 重写 `Read(Span<byte>)`，PNG 解压的每次读不再额外租数组 + 拷贝。
+- **测试**：新增 PNG/GIF 畸形输入、落盘无残留、像素上限与流式降级判定回归；
+  GIF 纳入变异模糊测试。
+
 ## 1.4.0（相对 v1.3.0）
 
 ### WebP 有损：量化取整对齐 libwebp + DC 按真实重建量择优，平坦区不再逐块振荡

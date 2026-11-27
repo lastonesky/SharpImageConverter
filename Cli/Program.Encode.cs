@@ -119,7 +119,7 @@ sealed partial class Program
                 EnableDiagnostics = options.GifDebug,
                 DiagnosticsLog = options.GifDebug ? Console.WriteLine : null,
             };
-            encoder.EncodeRgb24(outputPath, image);
+            AtomicFile.Write(outputPath, fs => encoder.EncodeRgb24(fs, image));
             return;
         }
 
@@ -133,7 +133,7 @@ sealed partial class Program
             };
             // 只在用户显式指定时覆盖，默认档由 WebpEncoderOptions 决定（当前为 method 3）
             if (options.WebpMethod.HasValue) encoder.Method = options.WebpMethod.Value;
-            encoder.EncodeRgb24(outputPath, image);
+            AtomicFile.Write(outputPath, fs => encoder.EncodeRgb24(fs, image));
             return;
         }
 
@@ -166,7 +166,7 @@ sealed partial class Program
                 EnableDiagnostics = options.GifDebug,
                 DiagnosticsLog = options.GifDebug ? Console.WriteLine : null,
             };
-            encoder.EncodeRgba32(outputPath, image);
+            AtomicFile.Write(outputPath, fs => encoder.EncodeRgba32(fs, image));
             return;
         }
 
@@ -179,7 +179,7 @@ sealed partial class Program
                 ConcurrencyStrategy = options.ParallelWebpEncode ? WebpConcurrencyStrategy.Parallel : WebpConcurrencyStrategy.Auto,
             };
             if (options.WebpMethod.HasValue) encoder.Method = options.WebpMethod.Value;
-            encoder.EncodeRgba32(outputPath, image);
+            AtomicFile.Write(outputPath, fs => encoder.EncodeRgba32(fs, image));
             return;
         }
 

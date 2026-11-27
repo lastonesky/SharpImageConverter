@@ -77,6 +77,30 @@ public static class Crc32
     }
 
     /// <summary>
+    /// 在现有 CRC 的基础上继续更新（span 版本，语义与数组重载完全一致）。
+    /// </summary>
+    public static uint Update(uint crc, ReadOnlySpan<byte> data)
+    {
+        if (IsHardwareSupported)
+        {
+            return Crc32Hardware.Compute(crc, data);
+        }
+
+        if (data.Length >= 64)
+        {
+            return Crc32Optimized.Compute(crc, data);
+        }
+
+        crc = ~crc;
+        foreach (byte b in data)
+        {
+            byte index = (byte)(crc ^ b);
+            crc = (crc >> 8) ^ Table[index];
+        }
+        return ~crc;
+    }
+
+    /// <summary>
     /// 计算 CRC-32（可指定初始值）。
     /// </summary>
     public static uint Compute(uint crc, byte[] bytes, int offset, int count)
